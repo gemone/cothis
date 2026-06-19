@@ -1,0 +1,17 @@
+[project]
+name = "cothis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "gemo", email = "git@gemo.one" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+cothis = "cothis:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
