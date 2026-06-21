@@ -1,16 +1,22 @@
 [project]
 name = "cothis"
 version = "0.1.0"
-description = "Add your description here"
+description = "A basic coding agent."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "gemo", email = "git@gemo.one" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "any-llm-sdk[all]>=1.17.0",
+    "pydantic>=2.13.4",
+    "typer>=0.25.1",
+]
 
 [project.scripts]
-cothis = "cothis:main"
+cothis = "cothis.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12.0"]
