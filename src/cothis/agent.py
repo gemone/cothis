@@ -18,15 +18,23 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
-from any_llm import AnyLLM
-from any_llm.types.completion import ChatCompletionMessage
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+
+if TYPE_CHECKING:
+    from any_llm import AnyLLM
+    from any_llm.types.completion import ChatCompletionMessage
 
 Tool = Callable[..., Any]
 Message = dict[str, Any]
-CompletionInput = dict[str, Any] | ChatCompletionMessage
+# cothis: string-form type alias so the module top level does not import
+# any_llm.types.completion at runtime. ChatCompletionMessage resolves only
+# under static type checkers (see TYPE_CHECKING above).
+# noqa: UP040 — PEP 695 `type` syntax would eagerly evaluate the RHS and
+# pull any_llm back in; the string-form TypeAlias is the only form that
+# stays lazy.
+CompletionInput: TypeAlias = "dict[str, Any] | ChatCompletionMessage"  # noqa: UP040
 
 
 class MaxIterationsError(RuntimeError):
@@ -70,6 +78,13 @@ class Agent(BaseModel):
     _tool_map: dict[str, Tool] = PrivateAttr(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
+        # cothis: lazy-import any_llm here (not at module top level) so
+        # `import cothis.agent` stays cheap. Importing any_llm eagerly pulls
+        # openai + anthropic types (~1s cold-start), and we only need it
+        # once the Agent is actually constructed. The matching loading
+        # spinner in cli.py wraps this exact call.
+        from any_llm import AnyLLM
+
         self._llm = AnyLLM.create(
             self.provider,
             api_key=self.api_key,

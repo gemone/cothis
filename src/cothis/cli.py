@@ -14,11 +14,14 @@ os.environ.setdefault("ANY_LLM_UNIFIED_EXCEPTIONS", "1")
 
 import click
 import typer
+from rich.console import Console
+from rich.markdown import Markdown
 
 from cothis.agent import Agent
 from cothis.tools import TOOLS
 
 app = typer.Typer()
+console = Console()
 
 # Set by the root callback's --debug option. Consumed by main() to decide
 # whether to surface the full traceback.
@@ -61,18 +64,25 @@ def ask(
     ),
 ) -> None:
     """Run the agent once and print its final answer."""
-    agent = Agent(
-        model=model,
-        provider=provider,
-        tools=TOOLS,
-        system_prompt=(
-            "You are a concise, helpful assistant with filesystem access. "
-            "Use the `fs.read` and `fs.write` tools to inspect and modify files."
-        ),
-        max_iterations=max_iterations,
-    )
-    answer = asyncio.run(agent.run(prompt))
-    typer.echo(answer)
+    # cothis: two-phase status — loading covers lazy any_llm import + Agent
+    # construction; thinking covers the full run() loop (LLM calls + tool
+    # execution). rich's Status wraps a Live(transient=True) internally, so
+    # each spinner's text disappears on exit and the Markdown answer is the
+    # only thing left on screen.
+    with console.status("loading...", spinner="dots"):
+        agent = Agent(
+            model=model,
+            provider=provider,
+            tools=TOOLS,
+            system_prompt=(
+                "You are a concise, helpful assistant with filesystem access. "
+                "Use the `fs.read` and `fs.write` tools to inspect and modify files."
+            ),
+            max_iterations=max_iterations,
+        )
+    with console.status("thinking...", spinner="dots"):
+        answer = asyncio.run(agent.run(prompt))
+    console.print(Markdown(answer))
 
 
 def main() -> None:
