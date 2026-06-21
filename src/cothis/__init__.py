@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from cothis!")
+"""cothis — a basic coding agent."""
