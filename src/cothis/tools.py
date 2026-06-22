@@ -19,7 +19,7 @@ def _named(name: str) -> Callable[[Tool], Tool]:
     """
 
     def decorator(func: Tool) -> Tool:
-        func.__name__ = name
+        func.__name__ = name  # ty: ignore[unresolved-attribute] — every actual tool is a `def` (has __name__); the Callable[..., Any] alias is too wide for ty to see that.
         return func
 
     return decorator

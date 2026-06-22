@@ -11,6 +11,7 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "any-llm-sdk[all]>=1.17.0",
+    "prompt-toolkit>=3.0",
     "pydantic>=2.13.4",
     "rich>=15.0.0",
     "typer>=0.25.1",
@@ -25,8 +26,16 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-mock>=3.15.1",
     "ruff>=0.15.18",
+    "ty>=0.0.51",
 ]
 
 [tool.ruff.lint]
 select = ["I", "TC", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

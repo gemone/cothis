@@ -5,6 +5,9 @@ A basic coding agent built on top of
 provider through a single interface, with a small ReAct-style loop that
 can call tools (`fs.read`, `fs.write`).
 
+- `cothis ask "..."` — one-shot prompt, plain-text output (pipe-friendly).
+- `cothis chat` — interactive multi-turn session, streamed Markdown output.
+
 Requires Python ≥ 3.14.
 
 ---
@@ -43,6 +46,8 @@ cothis --help
 
 ## Usage
 
+### `ask` — one-shot prompt
+
 ```bash
 # Defaults: openrouter + openai/gpt-oss-120b
 uv run cothis ask "What is 47 * 83?"
@@ -54,13 +59,35 @@ uv run cothis ask -m anthropic/claude-3.5-haiku "Hello"
 export OPENAI_API_KEY=sk-...
 uv run cothis ask -p openai -m gpt-4.1-mini "Hello"
 
+# ask prints plain text to stdout, so it composes with pipes:
+uv run cothis ask "list three primes" | wc -l
+
 # Show full traceback on error
 uv run cothis --debug ask "hi"
 # or
 DEBUG=1 uv run cothis ask "hi"
 ```
 
-Run `cothis --help` or `cothis ask --help` for the full list of flags.
+### `chat` — interactive multi-turn session
+
+```bash
+uv run cothis chat
+```
+
+`chat` reuses one agent across turns, so conversation history
+accumulates. Each turn's final answer is streamed token-by-token and
+rendered as Markdown; tool calls (`fs.read`, `fs.write`) are printed
+inline as `calling <name>(<args>)`. Exit with `Ctrl-D` or `Ctrl-C`.
+
+The same `--provider` / `-p`, `--model` / `-m`, and `--max-iterations`
+flags apply as to `ask`:
+
+```bash
+uv run cothis chat -m anthropic/claude-3.5-haiku
+```
+
+Run `cothis --help`, `cothis ask --help`, or `cothis chat --help` for
+the full list of flags.
 
 
 ## Configuration
@@ -120,6 +147,25 @@ DEBUG=1 uv run cothis ask "hi"
 # or
 uv run cothis --debug ask "hi"
 ```
+
+## Development
+
+The dev dependency group includes [`ruff`](https://docs.astral.sh/ruff/)
+(formatting / lint), [`ty`](https://docs.astral.sh/ty/) (type checking),
+and [`pytest`](https://docs.pytest.org/) (tests):
+
+```bash
+uv sync                              # install dev deps
+uv run ruff check src/ tests/       # lint + import sorting
+uv run ty check                     # type check
+uv run pytest                       # unit tests (pure helpers, no network)
+```
+
+Tests cover the silent-breakage surface of the streaming chat path:
+the by-index merge of streamed tool-call fragments
+(`Agent._assemble_tool_calls`) and the best-effort JSON parse that backs
+the on-screen tool-call display (`_safe_parse_args`). Tests are pure and
+run offline — no LLM calls.
 
 ## License
 
