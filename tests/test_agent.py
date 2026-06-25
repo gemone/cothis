@@ -18,8 +18,15 @@ OpenRouter produced for a real ``add(a=2, b=3)`` tool call, captured once.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
+
+import pytest
+from pydantic import ValidationError
 
 from cothis.agent import Agent, _safe_parse_args
+
+if TYPE_CHECKING:
+    from cothis.tools import Tool
 
 
 def _frag(
@@ -115,3 +122,14 @@ def test_safe_parse_args_non_dict_falls_back_to_raw() -> None:
     # Lists / numbers aren't valid tool args; surface them raw.
     assert _safe_parse_args("[1,2,3]") == {"_raw": "[1,2,3]"}
     assert _safe_parse_args("42") == {"_raw": "42"}
+
+
+def test_agent_rejects_non_tool() -> None:
+    # ``tools`` field validation rejects anything not satisfying the Tool
+    # protocol. Validation runs during __init__ before model_post_init, so
+    # AnyLLM.create is never reached (no provider/network needed). ``cast``
+    # satisfies ty at the call site without a per-line type-ignore — the value
+    # is deliberately wrong at runtime.
+    not_a_tool = cast("Tool", object())
+    with pytest.raises(ValidationError):
+        Agent(model="x", provider="mistral", tools=[not_a_tool])

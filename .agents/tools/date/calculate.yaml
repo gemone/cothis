@@ -1,0 +1,22 @@
+# Date arithmetic.
+#
+# `offset` (int days) is substituted into the per-platform command and
+# returns the resulting date as YYYY-MM-DD.
+# - Linux/macOS: GNU/BSD date `-d "N days"`
+# - Windows: PowerShell `(Get-Date).AddDays(N)`
+name: date.calculate
+description: >-
+    Calculate a date offset from today and return it as YYYY-MM-DD.
+    eg. offset=1 returns tomorrow, offset=-7 returns a week ago, offset=0 returns today.
+args:
+    - name: offset
+      type: int
+      description: >-
+          Days to offset from today. Positive = future, negative = past.
+          eg. 1 means tomorrow, -1 means yesterday, 30 means a month from now.
+command:
+    - if: runner.os == 'Linux' || runner.os == 'macOS'
+      run: date -d "{offset} days" +%Y-%m-%d
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: (Get-Date).AddDays({offset}).ToString('yyyy-MM-dd')

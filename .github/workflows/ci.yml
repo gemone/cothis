@@ -1,0 +1,40 @@
+name: ci
+
+# Runs ruff, ty, and the test suite on all three platforms. The 3-OS
+# matrix matters because the YAML tools have per-platform `command:`
+# branches gated by `if:` (e.g. `date` on Linux/macOS vs `Get-Date` on
+# Windows); running only on Linux would silently miss a broken Windows
+# branch.
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+jobs:
+    test:
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, windows-latest, macos-latest]
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install uv
+              uses: astral-sh/setup-uv@v6
+
+            - name: Set up Python
+              run: uv python install
+
+            - name: Install dependencies
+              run: uv sync
+
+            - name: Ruff
+              run: uv run ruff check
+
+            - name: Type check (ty)
+              run: uv run ty check
+
+            - name: Pytest
+              run: uv run pytest -q

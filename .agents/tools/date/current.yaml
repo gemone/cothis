@@ -1,0 +1,16 @@
+# Current date/time.
+#
+# Output is normalised to `YYYY-MM-DD HH:MM:SS` on every platform so the
+# model can parse it without guessing at the host's locale. Linux/macOS
+# use `date "+..."`, Windows uses PowerShell `Get-Date -Format`.
+name: date.current
+description: >-
+    Get the current system date and time.
+    eg. returns "2026-06-23 23:44:04" (local time, YYYY-MM-DD HH:MM:SS).
+    No arguments.
+command:
+    - if: runner.os == 'Linux' || runner.os == 'macOS'
+      run: date "+%Y-%m-%d %H:%M:%S"
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: Get-Date -Format 'yyyy-MM-dd HH:mm:ss'

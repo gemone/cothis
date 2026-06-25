@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 # Enable any-llm's unified exception hierarchy so provider-specific errors
 # are converted into any_llm.exceptions.* regardless of which provider
@@ -20,7 +21,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 
 from cothis.agent import Agent, ToolCallEvent
-from cothis.tools import TOOLS
+from cothis.tools import TOOLS, Tool, load_tools_from_dir
 
 app = typer.Typer()
 console = Console()
@@ -30,14 +31,32 @@ console = Console()
 # behavior a user learns in one mode transfers to the other. Ceiling: no
 # env var / flag override today. Upgrade path: add ``--system-prompt`` /
 # ``COTHIS_SYSTEM_PROMPT`` and fall back to this constant.
+#
+# cothis: the prompt deliberately does NOT name tools. Which tools are
+# available is surfaced to the model purely via the ``tools=`` schemas
+# passed to the completion API — naming them here is redundant and drifts
+# the moment a YAML/Python tool is added or a built-in is removed. The
+# model learns its capabilities from the tool schemas, not the prompt.
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a concise, helpful assistant with filesystem access. "
-    "Use the `fs.read` and `fs.write` tools to inspect and modify files."
+    "You are a concise, helpful assistant. Use the tools you are given "
+    "to inspect and modify files and run commands as needed."
 )
 
 # Set by the root callback's --debug option. Consumed by main() to decide
 # whether to surface the full traceback.
 _debug = False
+
+
+def _all_tools() -> list[Tool]:
+    """Built-in tools plus any declared in ``./.agents/tools/*.yaml``.
+
+    cothis: discovery is cwd-relative only today (no ``~/.config/cothis``
+    user-global path, no config-file override). The ceiling: a user must
+    ``cd`` into the project whose tools they want. Upgrade path: add
+    ``~/.config/cothis/tools/`` and let project-local shadow user-global
+    by appending after it.
+    """
+    return [*TOOLS, *load_tools_from_dir(Path(".agents/tools"))]
 
 
 @app.callback()
@@ -90,7 +109,7 @@ def ask(
         agent = Agent(
             model=model,
             provider=provider,
-            tools=TOOLS,
+            tools=_all_tools(),
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
         )
@@ -149,7 +168,7 @@ async def _chat_session(
         agent = Agent(
             model=model,
             provider=provider,
-            tools=TOOLS,
+            tools=_all_tools(),
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
         )

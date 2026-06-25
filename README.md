@@ -3,7 +3,8 @@
 A basic coding agent built on top of
 [`any-llm`](https://github.com/mozilla-ai/any-llm) — talk to any LLM
 provider through a single interface, with a small ReAct-style loop that
-can call tools (`fs.read`, `fs.write`).
+call tools. Built-in tools are `fs.read` and `fs.write`; you can add more
+as YAML shell tools under `.agents/tools/` (see [Custom tools](#custom-tools)).
 
 - `cothis ask "..."` — one-shot prompt, plain-text output (pipe-friendly).
 - `cothis chat` — interactive multi-turn session, streamed Markdown output.
@@ -76,8 +77,9 @@ uv run cothis chat
 
 `chat` reuses one agent across turns, so conversation history
 accumulates. Each turn's final answer is streamed token-by-token and
-rendered as Markdown; tool calls (`fs.read`, `fs.write`) are printed
-inline as `calling <name>(<args>)`. Exit with `Ctrl-D` or `Ctrl-C`.
+rendered as Markdown; tool calls (`fs.read`, `fs.write`, and any YAML
+tools you've added) are printed inline as `calling <name>(<args>)`. Exit
+with `Ctrl-D` or `Ctrl-C`.
 
 The same `--provider` / `-p`, `--model` / `-m`, and `--max-iterations`
 flags apply as to `ask`:
@@ -88,6 +90,35 @@ uv run cothis chat -m anthropic/claude-3.5-haiku
 
 Run `cothis --help`, `cothis ask --help`, or `cothis chat --help` for
 the full list of flags.
+
+
+## Custom tools
+
+cothis discovers shell tools as YAML files under `.agents/tools/` (relative
+to the current working directory). Each file declares a `name`, a
+`description` (shown to the LLM), and a `command:`. A flat `command:` runs
+on every platform; a `command:` list lets you pick a branch per platform
+or condition via GitHub-Actions-style `if:` expressions, with an optional
+`default:` fallback.
+
+```yaml
+# .agents/tools/date/current.yaml
+name: date.current
+description: Get the current date and time as YYYY-MM-DD HH:MM:SS.
+command:
+  - if: runner.os == 'Linux' || runner.os == 'macOS'
+    run: date "+%Y-%m-%d %H:%M:%S"
+  - if: runner.os == 'Windows'
+    shell: pwsh
+    run: Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+```
+
+Tools for which no branch matches the current platform (and no
+`default:`) are silently not registered — the LLM never sees a tool it
+can't run here.
+Arguments are declared under `args:` and substituted into the command at
+`{arg_name}` placeholders; `has_shell('pwsh')` / `has_exe('git')` in `if:`
+gate a branch on a binary actually being on PATH.
 
 
 ## Configuration
@@ -161,11 +192,13 @@ uv run ty check                     # type check
 uv run pytest                       # unit tests (pure helpers, no network)
 ```
 
-Tests cover the silent-breakage surface of the streaming chat path:
-the by-index merge of streamed tool-call fragments
-(`Agent._assemble_tool_calls`) and the best-effort JSON parse that backs
-the on-screen tool-call display (`_safe_parse_args`). Tests are pure and
-run offline — no LLM calls.
+Tests cover the silent-breakage surfaces of the project: the
+streaming chat path (by-index merge of streamed tool-call fragments,
+best-effort JSON parse for on-screen display) and the YAML tool loader
+(command rendering, the GitHub-Actions-style `if:` evaluator, per-arg
+description carry-through to the LLM schema, and malformed-YAML error
+paths). Tests run offline — no LLM calls. (YAML-tool tests do spawn
+short-lived subprocesses like `echo`; they never touch the network.)
 
 ## License
 

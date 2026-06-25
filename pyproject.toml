@@ -13,6 +13,7 @@ dependencies = [
     "any-llm-sdk[all]>=1.17.0",
     "prompt-toolkit>=3.0",
     "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
     "rich>=15.0.0",
     "typer>=0.25.1",
 ]

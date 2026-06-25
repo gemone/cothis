@@ -17,18 +17,28 @@ Example
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+# cothis: ``Tool`` must be runtime-imported (not TYPE_CHECKING-only) because
+# pydantic resolves the ``list[Tool]`` field annotation at model-build time
+# via ``typing.get_type_hints``, which needs ``Tool`` in the module globals.
+# ``from __future__ import annotations`` makes the annotation a string, so
+# ruff's TC001 rule can't see the runtime use and wants it moved under
+# TYPE_CHECKING — which would crash pydantic. This noqa is the honest
+# representation of that constraint.
+from cothis.tools import Tool  # noqa: TC001
+
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from any_llm import AnyLLM
     from any_llm.types.completion import ChatCompletionMessage
 
-Tool = Callable[..., Any]
+
 Message = dict[str, Any]
 
 
@@ -73,15 +83,6 @@ class ToolCallEvent:
     arguments: dict[str, Any]
 
 
-# cothis: string-form type alias so the module top level does not import
-# any_llm.types.completion at runtime. ChatCompletionMessage resolves only
-# under static type checkers (see TYPE_CHECKING above).
-# noqa: UP040 — PEP 695 `type` syntax would eagerly evaluate the RHS and
-# pull any_llm back in; the string-form TypeAlias is the only form that
-# stays lazy.
-CompletionInput: TypeAlias = "dict[str, Any] | ChatCompletionMessage"  # noqa: UP040
-
-
 class MaxIterationsError(RuntimeError):
     """Raised when the agent exhausts its iteration budget before finishing."""
 
@@ -111,7 +112,7 @@ class Agent(BaseModel):
 
     model: str
     provider: str
-    tools: Sequence[Tool] = Field(default_factory=list)
+    tools: list[Tool] = Field(default_factory=list)
     system_prompt: str | None = None
     max_iterations: int = 10
     api_key: str | None = None
@@ -130,7 +131,9 @@ class Agent(BaseModel):
     # cothis: ceiling — messages grow without bound across a long ``chat``
     # session. Token cost per turn rises linearly. No windowing/summarisation
     # is planned; Ctrl-C and start a new session when it gets slow.
-    _messages: list[CompletionInput] = PrivateAttr(default_factory=list)
+    _messages: list[dict[str, Any] | ChatCompletionMessage] = PrivateAttr(
+        default_factory=list
+    )
 
     def model_post_init(self, __context: Any) -> None:
         # cothis: lazy-import any_llm here (not at module top level) so
@@ -145,10 +148,7 @@ class Agent(BaseModel):
             api_key=self.api_key,
             api_base=self.api_base,
         )
-        self._tool_map = {
-            tool.__name__: tool  # ty: ignore[unresolved-attribute] — same as tools._named: real tools are `def`s, the Callable alias is just too wide.
-            for tool in self.tools
-        }
+        self._tool_map = {tool.__name__: tool for tool in self.tools}
 
     async def run(self, user_input: str) -> str:
         """Run the agent loop to completion and return the final answer.
@@ -170,7 +170,7 @@ class Agent(BaseModel):
             response = await self._llm.acompletion(
                 model=self.model,
                 messages=self._messages,
-                tools=list(self.tools) or None,
+                tools=self._tool_schemas(),
             )
             message = response.choices[0].message
             self._messages.append(message)
@@ -214,7 +214,7 @@ class Agent(BaseModel):
             response = await self._llm.acompletion(
                 model=self.model,
                 messages=self._messages,
-                tools=list(self.tools) or None,
+                tools=self._tool_schemas(),
                 stream=True,
             )
 
@@ -276,6 +276,21 @@ class Agent(BaseModel):
         )
 
     # --- internals -----------------------------------------------------
+
+    def _tool_schemas(self) -> list[Tool] | None:
+        """Tools in the form any-llm's ``acompletion`` expects.
+
+        A tool may carry a pre-built OpenAI schema dict on
+        ``__cothis_schema__`` (YAML shell tools do, so their per-arg
+        ``description:`` text reaches the model — any-llm's
+        ``callable_to_tool`` would otherwise strip it). Tools without the
+        attribute fall through as callables and any-llm converts them.
+        Returns ``None`` when there are no tools, matching the prior
+        ``list(self.tools) or None`` behaviour.
+        """
+        if not self.tools:
+            return None
+        return [getattr(tool, "__cothis_schema__", tool) for tool in self.tools]
 
     def _ensure_messages(self, user_input: str) -> None:
         """Populate ``self._messages`` for this turn.
