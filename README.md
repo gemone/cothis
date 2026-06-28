@@ -96,29 +96,46 @@ the full list of flags.
 
 cothis discovers shell tools as YAML files under `.agents/tools/` (relative
 to the current working directory). Each file declares a `name`, a
-`description` (shown to the LLM), and a `command:`. A flat `command:` runs
-on every platform; a `command:` list lets you pick a branch per platform
-or condition via GitHub-Actions-style `if:` expressions, with an optional
-`default:` fallback.
+`description` (shown to the LLM), and a `command:`. Two execution modes,
+driven by the type of `command:`:
+
+- **argv mode** — `command:` is a YAML list. The list is passed straight
+  to `execve` (no shell), so each element is one argv item. Safe by
+  default; `argv[0]` must be on PATH or the tool is not registered.
+  ```yaml
+  command: ["git", "status", "--short"]
+  ```
+- **shell mode** — `command:` is a string. A `shell:` field naming the
+  interpreter (`bash`, `pwsh`, …) is **required**; the string is passed
+  to that shell, supporting pipes / `&&` / redirection. The shell must
+  be on PATH or the tool is not registered.
+  ```yaml
+  shell: bash
+  command: grep foo file | wc -l
+  ```
+
+Arguments are declared under `args:` and substituted into the command at
+`{arg_name}` placeholders. Only args actually referenced by the selected
+command appear in the LLM schema (declared-but-unused args are dropped
+with a warning).
+
+Per-platform variants live under `platforms:` (keys: `linux`, `macos`,
+`unix` = linux+macOS, `windows`). The top-level `command:` / `shell:` /
+`args:` are the default; a matching platform entry overrides them.
 
 ```yaml
 # .agents/tools/date/current.yaml
 name: date.current
 description: Get the current date and time as YYYY-MM-DD HH:MM:SS.
-command:
-  - if: runner.os == 'Linux' || runner.os == 'macOS'
-    run: date "+%Y-%m-%d %H:%M:%S"
-  - if: runner.os == 'Windows'
+command: ["date", "+%Y-%m-%d %H:%M:%S"]
+platforms:
+  windows:
     shell: pwsh
-    run: Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    command: "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"
 ```
 
-Tools for which no branch matches the current platform (and no
-`default:`) are silently not registered — the LLM never sees a tool it
-can't run here.
-Arguments are declared under `args:` and substituted into the command at
-`{arg_name}` placeholders; `has_shell('pwsh')` / `has_exe('git')` in `if:`
-gate a branch on a binary actually being on PATH.
+Tools whose executable (argv[0] or the declared `shell:`) is not on PATH
+are silently not registered — the LLM never sees a tool it can't run here.
 
 
 ## Configuration

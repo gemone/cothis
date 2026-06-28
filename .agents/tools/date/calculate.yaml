@@ -14,9 +14,8 @@ args:
       description: >-
           Days to offset from today. Positive = future, negative = past.
           eg. 1 means tomorrow, -1 means yesterday, 30 means a month from now.
-command:
-    - if: runner.os == 'Linux' || runner.os == 'macOS'
-      run: date -d "{offset} days" +%Y-%m-%d
-    - if: runner.os == 'Windows'
-      shell: pwsh
-      run: (Get-Date).AddDays({offset}).ToString('yyyy-MM-dd')
+command: ["date", "-d", "{offset} days", "+%Y-%m-%d"]
+platforms:
+    windows:
+        shell: pwsh
+        command: "(Get-Date).AddDays({offset}).ToString('yyyy-MM-dd')"

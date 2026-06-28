@@ -30,7 +30,10 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # ruff's TC001 rule can't see the runtime use and wants it moved under
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
-from cothis.tools import Tool  # noqa: TC001
+from cothis.tools import (
+    Tool,  # noqa: TC001
+    _schema_for,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -210,11 +213,17 @@ class Agent(BaseModel):
         """
         self._ensure_messages(user_input)
 
-        for _turn in range(self.max_iterations):
-            response = await self._llm.acompletion(
-                model=self.model,
-                messages=self._messages,
-                tools=self._tool_schemas(),
+        tool_schemas = self._tool_schemas()
+        messages = self._messages
+        model = self.model
+        llm = self._llm
+        max_iterations = self.max_iterations
+
+        for _turn in range(max_iterations):
+            response = await llm.acompletion(
+                model=model,
+                messages=messages,
+                tools=tool_schemas,
                 stream=True,
             )
 
@@ -231,7 +240,7 @@ class Agent(BaseModel):
             if not tool_call_chunks:
                 # Final turn: content was streamed above. Record the full
                 # assistant message so the next turn sees consistent history.
-                self._messages.append(
+                messages.append(
                     {"role": "assistant", "content": "".join(content_parts)}
                 )
                 return
@@ -241,7 +250,7 @@ class Agent(BaseModel):
             # yielding its ToolCallEvent immediately before execution so the
             # caller sees per-call ordering on multi-tool turns.
             assembled = self._assemble_tool_calls(tool_call_chunks)
-            self._messages.append(
+            messages.append(
                 {
                     "role": "assistant",
                     "content": "".join(content_parts) or None,
@@ -263,7 +272,7 @@ class Agent(BaseModel):
                     name=tc.function.name,
                     arguments=_safe_parse_args(tc.function.arguments),
                 )
-                self._messages.append(
+                messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -277,20 +286,19 @@ class Agent(BaseModel):
 
     # --- internals -----------------------------------------------------
 
-    def _tool_schemas(self) -> list[Tool] | None:
+    def _tool_schemas(self) -> list[Any] | None:
         """Tools in the form any-llm's ``acompletion`` expects.
 
-        A tool may carry a pre-built OpenAI schema dict on
-        ``__cothis_schema__`` (YAML shell tools do, so their per-arg
-        ``description:`` text reaches the model — any-llm's
-        ``callable_to_tool`` would otherwise strip it). Tools without the
-        attribute fall through as callables and any-llm converts them.
+        Delegates to ``tools._schema_for`` so the schema-serialisation rule
+        (pre-built dict vs callable) lives next to the Tool definitions,
+        not here.
+
         Returns ``None`` when there are no tools, matching the prior
         ``list(self.tools) or None`` behaviour.
         """
         if not self.tools:
             return None
-        return [getattr(tool, "__cothis_schema__", tool) for tool in self.tools]
+        return [_schema_for(tool) for tool in self.tools]
 
     def _ensure_messages(self, user_input: str) -> None:
         """Populate ``self._messages`` for this turn.

@@ -8,9 +8,8 @@ description: >-
     Get the current system date and time.
     eg. returns "2026-06-23 23:44:04" (local time, YYYY-MM-DD HH:MM:SS).
     No arguments.
-command:
-    - if: runner.os == 'Linux' || runner.os == 'macOS'
-      run: date "+%Y-%m-%d %H:%M:%S"
-    - if: runner.os == 'Windows'
-      shell: pwsh
-      run: Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+command: ["date", "+%Y-%m-%d %H:%M:%S"]
+platforms:
+    windows:
+        shell: pwsh
+        command: "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"

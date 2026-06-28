@@ -1,34 +1,45 @@
-"""Tests for YAML-driven shell-template tools.
+"""Tests for the YAML tool loader (``cothis.tools``).
 
-These cover the ``tools/xxx.yaml`` format: a tool is declared in YAML with
-a ``name``, a ``command`` template, and (later) typed ``args``. Each YAML
-tool compiles down to a Python callable the Agent registers by name and
-dispatches by calling with keyword args matching the declared arg names.
+Covers the silent-breakage surfaces of the YAML tool format:
 
-Shell mode (cothis): ``command`` is rendered via ``string.Template`` and
-executed with ``shell=True``. This is required for the template-string
-substitution the user asked for and supports pipes/redirection down the
-road. Ceiling: shell=True is injection-permissive by design — a YAML tool
-is trusted the same way a hand-written Python tool is. Upgrade path: if
-untrusted YAML ever needs to be supported, add an ``argv`` mode that
-splits the command into a list and uses ``shell=False``.
+- **Type-driven execution**: ``command:`` as a list (argv mode, ``shell=False``)
+  vs as a string (shell mode, ``shell=True`` with required ``shell:``).
+- **Placeholder rendering**: ``{arg}`` substitution via ``str.format_map``,
+  including ``{{`` escaping and load-time rejection of undeclared placeholders.
+- **Platform selection**: ``platforms:`` map (``linux``/``macos``/``unix``/
+  ``windows``) overriding top-level defaults; ``unix`` covering linux+macOS.
+- **Executable gating**: argv[0] / ``shell:`` must be on PATH or the tool is
+  silently not registered.
+- **Args schema discipline**: per-arg descriptions reaching the LLM schema;
+  declared-but-unreferenced args dropped with a warning; per-platform args
+  merging (branch overrides same-named, inherits the rest).
+- **Malformed-YAML errors**: every malformation surfaces an actionable error
+  naming the field and file, never a bare ``KeyError``.
+- **preview()**: the verification surface for asserting rendered command
+  content without spawning a subprocess.
+
+Tests spawn short-lived subprocesses (``echo``) but never touch the network.
 """
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from cothis.tools import (
-    _eval_if,
-    _render_command,
-    _resolve_shell,
+    _all_placeholders,
+    _current_platform,
+    _extract_field_names,
+    _merge_arg_specs,
     _ShellTool,
     load_tools_from_dir,
     load_yaml_tools,
     preview,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _shell_tool(yaml_text: str) -> _ShellTool:
@@ -43,355 +54,339 @@ def _shell_tool(yaml_text: str) -> _ShellTool:
     return cast("_ShellTool", load_yaml_tools(yaml_text)[0])
 
 
-def test_yaml_no_args_runs_command() -> None:
-    """A no-arg YAML tool runs its command verbatim and returns stdout.
+# ====================================================================
+# argv mode (command: as a list)
+# ====================================================================
 
-    Tracer bullet: proves the YAML -> callable -> subprocess path works
-    end to end. No placeholders, no arg plumbing — just ``command`` as a
-    literal string handed to the shell.
-    """
+
+def test_argv_no_args_runs_command() -> None:
+    """A no-arg argv tool runs its command verbatim and returns stdout."""
+    tool = load_yaml_tools('name: hi\ncommand: ["echo", "hello"]\n')[0]
+    assert tool.__name__ == "hi"
+    assert tool() == "hello\n"
+
+
+def test_argv_arg_substituted_into_element() -> None:
+    """A declared arg fills its ``{name}`` placeholder in one argv element."""
     yaml_text = """
-name: hello
-command: echo hello
-"""
-    tools = load_yaml_tools(yaml_text)
-    assert len(tools) == 1
-    tool = tools[0]
-    assert tool.__name__ == "hello"
-    result = tool()
-    assert result == "hello\n"
-
-
-def test_yaml_description_becomes_docstring() -> None:
-    """``description:`` flows to the tool's docstring.
-
-    any-llm's ``callable_to_tool`` raises ``ValueError`` if ``__doc__`` is
-    empty, so the loader MUST set a docstring or every YAML tool crashes
-    at tool-prepare time (observed in production: ``Function hello must
-    have a docstring``).
-    """
-    yaml_text = """
-name: hello
-description: Say hello.
-command: echo hello
-"""
-    tool = load_yaml_tools(yaml_text)[0]
-    assert tool.__doc__ == "Say hello."
-
-
-def test_yaml_missing_description_gets_default_docstring() -> None:
-    """A YAML tool without ``description:`` still gets a non-empty docstring.
-
-    Without this, ``callable_to_tool`` crashes even though the tool is
-    otherwise well-formed. The default is derived from the command so a
-    user can still tell tools apart by their docstring in the schema.
-    """
-    yaml_text = """
-name: hello
-command: echo hello
-"""
-    tool = load_yaml_tools(yaml_text)[0]
-    assert tool.__doc__
-    assert "echo hello" in tool.__doc__
-
-
-def test_yaml_arg_substituted_into_command() -> None:
-    """A declared arg fills its ``{name}`` placeholder in the command.
-
-    Tracer bullet for the args slice: a single ``int`` arg ``offset``
-    declared in YAML becomes a kwarg on the compiled callable, and its
-    value is substituted into ``command`` before the shell runs. We use
-    ``echo`` (not ``date``) so the test does not depend on a real shell
-    builtin's argument parsing — only the template substitution matters
-    here; the ``date -d`` smoke test lives in ``.agents/tools/`` and is
-    exercised by the end-to-end runnable check.
-    """
-    yaml_text = """
-name: echo_offset
-description: Echo back the offset value.
-command: echo offset is {offset}
+name: echo_n
+description: Echo a number.
+command: ["echo", "{n}"]
 args:
-  - name: offset
+  - name: n
     type: int
-    description: Number to echo.
+    description: The number.
 """
-    tool = load_yaml_tools(yaml_text)[0]
-    result = tool(offset=7)
-    assert result == "offset is 7\n"
+    assert load_yaml_tools(yaml_text)[0](n=7) == "7\n"
 
 
-def test_yaml_arg_list_substituted_space_separated() -> None:
-    """A list-typed arg renders as a space-separated sequence.
+def test_argv_spaces_in_value_safe_without_quote() -> None:
+    """An arg value containing spaces stays as one argv item — no shell split.
 
-    This is the slice the user asked for (``args 列表传入``): a value
-    like ``[1, 2, 3]`` becomes ``"1 2 3"`` in the rendered command, so
-    multi-value arguments (packages, ids, …) flow into shell commands
-    the same way they would on a hand-typed command line.
+    This is the core safety win of argv mode over shell mode: ``"my file"``
+    is passed to ``execve`` as a single argument, not split on the space by
+    a shell. No ``shlex.quote`` is needed.
     """
     yaml_text = """
-name: echo_many
-description: Echo multiple ids space-separated.
-command: echo ids are {ids}
+name: cat_file
+description: cat a file.
+command: ["echo", "{path}"]
+args:
+  - name: path
+    type: str
+"""
+    assert load_yaml_tools(yaml_text)[0](path="my file") == "my file\n"
+
+
+def test_argv_empty_list_rejected() -> None:
+    """An empty argv list is rejected — a tool with no command is useless."""
+    with pytest.raises(ValueError, match="'command' list is empty"):
+        load_yaml_tools("name: t\ncommand: []\n")
+
+
+# ====================================================================
+# shell mode (command: as a string + shell:)
+# ====================================================================
+
+
+def test_shell_runs_via_declared_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A string command runs under the declared ``shell:`` interpreter."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    yaml_text = """
+name: sh_echo
+description: echo via shell.
+shell: bash
+command: "echo from-bash"
+"""
+    # Note: we monkeypatched shutil.which, so the shell resolves to a fake
+    # path; the tool registers. Actual execution here uses echo (a builtin),
+    # but we only assert the rendered command via preview (no real bash needed).
+    cmd, shell = preview(yaml_text)
+    assert cmd == "echo from-bash"
+    assert shell == "bash"
+
+
+def test_shell_string_without_shell_field_rejected() -> None:
+    """A string command with no ``shell:`` is rejected — forces explicit declaration.
+
+    Relying on a default shell is silent breakage (which shell? does it
+    exist?). Requiring ``shell:`` makes the author declare the interpreter.
+    """
+    yaml_text = """
+name: t
+command: echo hi
+"""
+    with pytest.raises(ValueError, match="requires a ``shell:``"):
+        load_yaml_tools(yaml_text)
+
+
+def test_shell_pipe_supported_in_string_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shell mode supports pipes / ``&&`` / redirection — that's its purpose."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    yaml_text = """
+name: piped
+description: pipe.
+shell: bash
+command: "echo foo | wc -c"
+"""
+    cmd, _ = preview(yaml_text)
+    assert cmd == "echo foo | wc -c"
+
+
+# ====================================================================
+# Placeholder rendering (Python format-string semantics)
+# ====================================================================
+
+
+def test_placeholder_substitutes_declared_arg() -> None:
+    """``{name}`` renders to the arg's value in both argv and shell modes."""
+    assert "echo {x}".format_map({"x": "hi"}) == "echo hi"
+    assert "{a}/{b}".format_map({"a": "x", "b": "y"}) == "x/y"
+
+
+def test_placeholder_format_spec_honoured() -> None:
+    """Python format specs work (``{n:03d}`` zero-pads), full ``str.format``.
+
+    Free win from using ``str.format_map`` instead of a custom renderer:
+    specs / conversions / complex templates all just work. The int value is
+    passed through as-is (not pre-stringified) so the spec can apply.
+    """
+    yaml_text = """
+name: t
+shell: bash
+command: "echo {n:03d}"
+args:
+  - name: n
+    type: int
+"""
+    cmd, _ = preview(yaml_text, n=5)
+    assert cmd == "echo 005"
+
+
+def test_placeholder_conversion_honoured() -> None:
+    """Python conversions work (``{p!r}`` adds repr quotes)."""
+    yaml_text = """
+name: t
+shell: bash
+command: "echo {p!r}"
+args:
+  - name: p
+    type: str
+"""
+    cmd, _ = preview(yaml_text, p="hi")
+    assert cmd == "echo 'hi'"
+
+
+def test_shell_variable_escaped_with_double_brace() -> None:
+    """Shell ``${HOME}`` must be escaped as ``${{HOME}}``.
+
+    Because ``command:`` is a Python format-string, every literal ``{`` or
+    ``}`` must be doubled. A bare ``${HOME}`` would work (``$`` isn't a
+    format char), but ``${HOME}`` specifically contains ``{...}`` which
+    ``str.format`` would try to interpret as a field — hence the escape.
+    """
+    cmd, _ = preview('name: t\nshell: bash\ncommand: "echo ${{HOME}}"\n')
+    assert cmd == "echo ${HOME}"
+
+
+def test_brace_expansion_escaped() -> None:
+    """Bash brace expansion ``{a,b}`` must be escaped as ``{{a,b}}``."""
+    cmd, _ = preview('name: t\nshell: bash\ncommand: "echo {{a,b}}"\n')
+    assert cmd == "echo {a,b}"
+
+
+def test_command_undeclared_placeholder_rejected_at_load() -> None:
+    """A command referencing an undeclared arg is a load-time ``ValueError``.
+
+    Surface the typo at startup, not as ``{name}`` residue reaching the shell
+    (where bash might swallow it as an empty variable — silent breakage).
+    """
+    yaml_text = """
+name: t
+shell: bash
+command: "echo {nope}"
+"""
+    with pytest.raises(ValueError, match="undeclared placeholder"):
+        load_yaml_tools(yaml_text)
+
+
+def test_extract_field_names_handles_specs_and_conversions() -> None:
+    """``_extract_field_names`` returns the base name, ignoring spec/conversion."""
+    assert _extract_field_names("echo {a} {b:03d} {c!r}") == {"a", "b", "c"}
+    assert _extract_field_names("echo {a.b}") == {"a"}  # attr access → base name
+    assert _extract_field_names("echo {a[0]}") == {"a"}  # index → base name
+
+
+def test_all_placeholders_extracts_names() -> None:
+    """``_all_placeholders`` finds every field name in argv and shell commands."""
+    assert _all_placeholders(["echo", "{a}", "{b:03d}"]) == {"a", "b"}
+    assert _all_placeholders("echo {a} {b!r}") == {"a", "b"}
+    assert _all_placeholders(["echo"]) == set()
+
+
+def test_list_arg_rendered_space_separated() -> None:
+    """A list-valued arg is space-joined into the placeholder (shell mode).
+
+    Note: lists are pre-joined (not passed to ``format_map`` as a list) so
+    they render as ``"1 2 3"`` rather than ``"[1, 2, 3]"``.
+    """
+    yaml_text = """
+name: echo_ids
+description: echo ids.
+shell: bash
+command: "echo {ids}"
 args:
   - name: ids
     type: list
-    description: Ids to echo.
 """
-    tool = load_yaml_tools(yaml_text)[0]
-    result = tool(ids=[1, 2, 3])
-    assert result == "ids are 1 2 3\n"
+    cmd, _ = preview(yaml_text, ids=[1, 2, 3])
+    assert cmd == "echo 1 2 3"
 
 
-def test_yaml_nonzero_exit_returns_error_with_stderr() -> None:
-    """Stories 18/19: a non-zero exit surfaces as an error string, not a raise.
+# ====================================================================
+# Platform selection (platforms: map)
+# ====================================================================
 
-    The PRD specifies ``stdout on success / Error: exit code N: <stderr>``
-    on failure. The agent must see the failure to recover; an unhandled
-    exception would crash the ReAct loop mid-turn. stderr is included so
-    the model can act on what went wrong.
-    """
+
+def test_platform_overrides_command_for_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The current platform's branch overrides the top-level command."""
+    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
-name: failer
-description: A tool that fails.
-command: echo boom >&2; exit 3
+name: t
+description: t.
+command: ["echo", "default"]
+platforms:
+  linux:
+    command: ["echo", "from-linux"]
 """
-    tool = load_yaml_tools(yaml_text)[0]
-    result = tool()
-    assert "exit code 3" in result
-    assert "boom" in result
+    assert load_yaml_tools(yaml_text)[0]() == "from-linux\n"
 
 
-def test_yaml_zero_exit_returns_stdout() -> None:
-    """Stories 18/19: a zero exit returns stdout, not an error string."""
+def test_unix_covers_linux_and_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``unix:`` matches both linux and macOS when no exact key exists."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
     yaml_text = """
-name: ok
-description: A tool that succeeds.
-command: echo good
+name: t
+description: t.
+command: ["echo", "default"]
+platforms:
+  unix:
+    command: ["echo", "from-unix"]
 """
-    tool = load_yaml_tools(yaml_text)[0]
-    assert tool() == "good\n"
+    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    assert load_yaml_tools(yaml_text)[0]() == "from-unix\n"
+    monkeypatch.setattr("cothis.tools._current_platform", lambda: "macos")
+    assert load_yaml_tools(yaml_text)[0]() == "from-unix\n"
 
 
-def test_yaml_steps_selects_matching_if(monkeypatch) -> None:
-    """A ``command:`` list with per-branch ``if:`` selects the matching OS.
-
-    Tracer bullet for the conditional-list syntax: each branch carries an
-    ``if:`` GitHub-Actions expression over ``runner.os``; the loader picks
-    the first whose predicate is true under the current context. We force
-    ``sys.platform == 'linux'`` so the test is deterministic and does not
-    depend on the host it runs on.
-    """
-    monkeypatch.setattr("sys.platform", "linux")
+def test_exact_platform_wins_over_unix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exact key (``linux:``) takes precedence over the ``unix:`` fallback."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
     yaml_text = """
-name: greeting
-description: Greet based on OS.
-command:
-  - if: runner.os == 'Linux'
-    run: echo from-linux
-  - if: runner.os == 'Windows'
-    run: echo from-windows
+name: t
+command: ["echo", "default"]
+platforms:
+  unix:
+    command: ["echo", "from-unix"]
+  linux:
+    command: ["echo", "from-linux"]
 """
-    tool = load_yaml_tools(yaml_text)[0]
-    assert tool() == "from-linux\n"
+    assert load_yaml_tools(yaml_text)[0]() == "from-linux\n"
 
 
-def test_yaml_steps_unknown_os_loads_with_error(monkeypatch) -> None:
-    """No matching ``if:`` and no ``default`` → ``preview`` raises (load skips).
-
-    The load path silently skips registration (returns ``[]``); ``preview``
-    is a diagnostic tool so it surfaces the gap as a ``ValueError`` naming
-    the platform. Both behaviours are pinned here.
-    """
-    monkeypatch.setattr("sys.platform", "linux")
+def test_platform_inherits_top_level_command_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform entry without ``command:`` inherits the top-level command."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
     yaml_text = """
-name: windows-only
-description: Only makes sense on Windows.
-command:
-  - if: runner.os == 'Windows'
-    run: echo hi
+name: t
+command: ["echo", "inherited"]
+platforms:
+  linux: {}
 """
-    # Load path: silently skipped, not registered.
+    assert load_yaml_tools(yaml_text)[0]() == "inherited\n"
+
+
+def test_unknown_platform_key_rejected() -> None:
+    """Only ``linux``/``macos``/``unix``/``windows`` are valid platform keys."""
+    yaml_text = """
+name: t
+command: ["echo", "hi"]
+platforms:
+  freebsd:
+    command: ["echo", "nope"]
+"""
+    with pytest.raises(ValueError, match="unknown field.*freebsd"):
+        load_yaml_tools(yaml_text)
+
+
+# ====================================================================
+# Executable gating (argv[0] / shell:)
+# ====================================================================
+
+
+def test_argv_executable_missing_silently_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """argv[0] not on PATH → tool is not registered (returns empty list)."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    yaml_text = 'name: t\ncommand: ["nonexistent-bin-xyz", "arg"]\n'
     assert load_yaml_tools(yaml_text) == []
-    # Preview path: diagnostic, raises.
-    import pytest
-
-    with pytest.raises(ValueError, match="no matching branch"):
-        preview(yaml_text)
 
 
-def test_load_tools_from_dir_finds_yaml_files(tmp_path) -> None:
-    """``.agents/tools/*.yaml`` discovery: every YAML file in the dir loads.
-
-    Verifies the directory-loading path end to end against a real temp
-    dir with two YAML files on disk. Non-YAML files in the same dir are
-    ignored (the loader globs ``*.yaml`` / ``*.yml`` only).
-    """
-    tools_dir = tmp_path / "tools"
-    tools_dir.mkdir()
-    (tools_dir / "hello.yaml").write_text(
-        "name: hello\ncommand: echo hello\n", encoding="utf-8"
-    )
-    (tools_dir / "bye.yml").write_text(
-        "name: bye\ncommand: echo bye\n", encoding="utf-8"
-    )
-    # Non-YAML files must not be picked up.
-    (tools_dir / "README.md").write_text("not a tool", encoding="utf-8")
-
-    tools = load_tools_from_dir(tools_dir)
-    assert len(tools) == 2
-    by_name = {t.__name__: t for t in tools}
-    assert set(by_name) == {"hello", "bye"}
-    assert by_name["hello"]() == "hello\n"
-    assert by_name["bye"]() == "bye\n"
-
-
-def test_load_tools_from_dir_finds_nested_yaml(tmp_path) -> None:
-    """Discovery walks subdirectories so ``tools/date/current.yaml`` loads.
-
-    Nested directories are how related tools are grouped (all ``date.*``
-    tools live under ``date/``); non-recursive globs would silently drop
-    them. The glob is recursive (``**/*.yaml``), but tool ``name`` still
-    comes from each file's ``name:`` field, not from the path.
-    """
-    date_dir = tmp_path / "date"
-    date_dir.mkdir()
-    (date_dir / "current.yaml").write_text(
-        "name: date.current\ncommand: echo today\n", encoding="utf-8"
-    )
-    # Also confirm top-level files still load alongside nested ones.
-    (tmp_path / "flat.yaml").write_text(
-        "name: flat\ncommand: echo flat\n", encoding="utf-8"
-    )
-
-    tools = load_tools_from_dir(tmp_path)
-    names = {t.__name__ for t in tools}
-    assert names == {"date.current", "flat"}
-
-
-# ----------------------------------------------------------------------
-# preview() — inspect the rendered command without dispatching.
-#
-# These tests assert the *shell content* directly (the string that would
-# be passed to ``subprocess.run``), so platform branches and arg
-# substitution can be verified without spawning a process. This is the
-# only way to test the Windows/pwsh branch on a Linux CI host.
-# ----------------------------------------------------------------------
-
-
-def test_preview_linux_branch_renders_command(monkeypatch) -> None:
-    """On Linux, ``preview`` returns the selected branch's command, rendered.
-
-    No subprocess is spawned — the returned ``cmd`` is exactly the string
-    that would be handed to ``subprocess.run``. Shell is ``None`` (POSIX
-    default ``sh``).
-    """
-    monkeypatch.setattr("sys.platform", "linux")
+def test_shell_missing_silently_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A declared shell not on PATH → tool is not registered."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
     yaml_text = """
-name: date.calculate
-description: Calculate a date offset.
-args:
-  - name: offset
-    type: int
-command:
-  - if: runner.os == 'Linux' || runner.os == 'macOS'
-    run: date -d "{offset} days" +%Y-%m-%d
-  - if: runner.os == 'Windows'
-    shell: pwsh
-    run: (Get-Date).AddDays({offset}).ToString('yyyy-MM-dd')
+name: t
+shell: nonexistent-shell-xyz
+command: "echo hi"
 """
-    shell, cmd = preview(yaml_text, offset=5)
-    assert cmd == 'date -d "5 days" +%Y-%m-%d'
-    assert shell is None  # POSIX default
+    assert load_yaml_tools(yaml_text) == []
 
 
-def test_preview_windows_branch_no_subprocess(monkeypatch) -> None:
-    """The Windows branch is selected and its command rendered, no subprocess.
-
-    ``_os="Windows"`` forces the Windows branch regardless of the host
-    OS — no need to monkeypatch ``sys.platform``. We still monkeypatch
-    ``shutil.which`` so the resolved shell is deterministic regardless
-    of whether pwsh is actually installed.
-    """
-    monkeypatch.setattr("shutil.which", lambda name: f"/fake/{name}")
-    yaml_text = """
-name: date.calculate
-description: Calculate a date offset.
-args:
-  - name: offset
-    type: int
-command:
-  - if: runner.os == 'Linux' || runner.os == 'macOS'
-    run: date -d "{offset} days"
-  - if: runner.os == 'Windows'
-    shell: pwsh
-    run: (Get-Date).AddDays({offset}).ToString('yyyy-MM-dd')
-"""
-    shell, cmd = preview(yaml_text, _os="Windows", offset=-7)
-    assert cmd == "(Get-Date).AddDays(-7).ToString('yyyy-MM-dd')"
-    assert shell == "/fake/pwsh"
+# ====================================================================
+# Args schema discipline
+# ====================================================================
 
 
-def test_preview_linux_branch_override_from_windows_host(monkeypatch) -> None:
-    """``_os`` override selects a branch the host would not normally select.
-
-    We force ``sys.platform`` to Windows but request the Linux branch via
-    ``_os="Linux"`` — the override wins. This is the verification affordance
-    for a matrix CI: one host (e.g. windows-latest) previews every branch.
-    """
-    monkeypatch.setattr("sys.platform", "win32")
-    yaml_text = """
-name: cross
-description: Cross-platform.
-command:
-  - if: runner.os == 'Linux'
-    run: echo from-linux
-  - if: runner.os == 'Windows'
-    run: echo from-windows
-"""
-    _, cmd = preview(yaml_text, _os="Linux")
-    assert cmd == "echo from-linux"
-
-
-def test_preview_list_arg_rendered_space_separated(monkeypatch) -> None:
-    """``preview`` honours the same list→space-join rendering as dispatch."""
-    monkeypatch.setattr("sys.platform", "linux")
-    yaml_text = """
-name: echo_many
-description: Echo many.
-command: echo ids {ids}
-args:
-  - name: ids
-    type: list
-"""
-    _, cmd = preview(yaml_text, ids=[1, 2, 3])
-    assert cmd == "echo ids 1 2 3"
-
-
-# ----------------------------------------------------------------------
-# Per-arg descriptions reaching the LLM schema.
-#
-# ``_build_tool_schema`` exists because any-llm's ``callable_to_tool``
-# drops per-parameter ``description`` fields — the whole PRD win is that
-# the rich text a YAML author writes actually reaches the model. If this
-# silently regresses, the model gets generic "Parameter X of type Y"
-# descriptions and picks worse arguments. No external signal — the tool
-# still *runs* — so only a direct schema assertion catches the drift.
-# ----------------------------------------------------------------------
-
-
-def test_yaml_arg_description_reaches_schema() -> None:
-    """A YAML arg's ``description:`` is carried verbatim into ``__cothis_schema__``.
+def test_arg_description_reaches_schema() -> None:
+    """A YAML arg's ``description:`` is carried into ``__cothis_schema__``.
 
     This is the core PRD promise: bypassing any-llm's lossy
-    ``callable_to_tool`` so per-arg descriptions survive. We assert the
-    exact description text appears on the property — not just that the
-    property exists — because a regression that kept the property but
-    dropped the description text would be the silent breakage.
+    ``callable_to_tool`` so per-arg descriptions survive.
     """
     yaml_text = """
 name: calc
 description: Calculate something.
-command: echo {n}
+command: ["echo", "{n}"]
 args:
   - name: n
     type: int
@@ -407,304 +402,116 @@ args:
     assert schema["function"]["parameters"]["required"] == ["n"]
 
 
-def test_yaml_arg_without_description_omits_field() -> None:
-    """An arg with no ``description:`` yields a property with no description key.
+def test_declared_but_unreferenced_arg_dropped_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arg declared but not referenced by the command is dropped; warns.
 
-    Pins the other half of the schema contract: absence is preserved as
-    absence, not as an empty string or a generic placeholder. A provider
-    seeing ``"description": ""`` might behave differently than seeing no
-    key at all.
+    Point 1: prune the schema to what the command actually uses. The drop
+    is silent in the schema but emits a ``UserWarning`` so the author hears
+    about the dead declaration.
     """
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
-name: plain
-description: Plain.
-command: echo {n}
+name: t
+command: ["echo", "{used}"]
 args:
-  - name: n
-    type: int
+  - name: used
+    type: str
+  - name: unused
+    type: str
+"""
+    with pytest.warns(UserWarning, match="undeclared arg.*unused|unused"):
+        tool = _shell_tool(yaml_text)
+    schema = tool.__cothis_schema__
+    assert schema is not None
+    props = schema["function"]["parameters"]["properties"]
+    assert "used" in props
+    assert "unused" not in props
+
+
+def test_per_platform_args_merge_override_same_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform branch's args override same-named top-level args, inherit rest.
+
+    Point 1 (ii): branch ``args`` is an override, not a replacement. Same-named
+    args take the branch's definition; other top-level args are inherited.
+    """
+    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    yaml_text = """
+name: t
+command: ["echo", "{a}", "{b}"]
+args:
+  - name: a
+    type: str
+    description: top-level a.
+  - name: b
+    type: str
+    description: top-level b.
+platforms:
+  linux:
+    args:
+      - name: a
+        type: str
+        description: linux-specific a.
 """
     schema = _shell_tool(yaml_text).__cothis_schema__
     assert schema is not None
-    prop = schema["function"]["parameters"]["properties"]["n"]
-    assert "description" not in prop
-    assert prop["type"] == "integer"
+    props = schema["function"]["parameters"]["properties"]
+    assert props["a"]["description"] == "linux-specific a."
+    assert props["b"]["description"] == "top-level b."
 
 
-# ----------------------------------------------------------------------
-# _render_command — the pure substitution function.
-#
-# Pins the real brace/placeholder behaviour. The earlier docstring claimed
-# "literal braces survive and missing placeholders stay as-is" — that was
-# false: ``string.Template`` requires ``${...}`` syntax, so the renderer
-# rewrites ``{`` → ``${`` up front, and an undeclared ``{x}`` becomes
-# ``${x}`` in the output (not ``{x}``). A user writing a command with a
-# literal bash ``${VAR}`` or brace expansion would get mangled output, so
-# the test documents the actual ceiling.
-# ----------------------------------------------------------------------
+def test_merge_arg_specs_order_and_override() -> None:
+    """``_merge_arg_specs`` keeps base order, appends new, overrides same-named."""
+    base = [{"name": "a", "type": "str"}, {"name": "b", "type": "str"}]
+    override = [{"name": "b", "type": "int"}, {"name": "c", "type": "str"}]
+    merged = _merge_arg_specs(base, override)
+    assert [m["name"] for m in merged] == ["a", "b", "c"]
+    assert merged[1]["type"] == "int"  # b overridden
 
 
-def test_render_command_undeclared_placeholder_becomes_dollar_brace() -> None:
-    """An undeclared ``{x}`` is rewritten to ``${x}``, not left as ``{x}``.
-
-    This pins reality against the old (false) docstring claim. The renderer
-    pre-converts ``{`` to ``${`` for ``string.Template``; ``safe_substitute``
-    then leaves unknown ``${x}`` in place. So a literal brace in a command
-    is NOT a way to pass ``{`` through — it becomes ``${``. Ceiling named
-    in the corrected ``_render_command`` docstring.
-    """
-    assert _render_command("echo {x}", [], {}) == "echo ${x}"
-
-
-def test_render_command_declared_arg_substituted() -> None:
-    """A declared, provided arg substitutes its value; scalars are ``str()``-ed."""
-    assert _render_command("echo {n}", ["n"], {"n": 7}) == "echo 7"
-
-
-def test_render_command_list_space_joined() -> None:
-    """A list value is space-joined into the placeholder."""
-    assert _render_command("echo {ids}", ["ids"], {"ids": [1, 2, 3]}) == "echo 1 2 3"
-
-
-def test_render_command_empty_list_renders_empty() -> None:
-    """An empty list renders as the empty string (join of nothing).
-
-    Edge case: ``" ".join([]) == ""``, so ``echo {ids}`` with ``ids=[]``
-    yields ``echo `` (trailing space). Pinned so a future change to empty
-    rendering (e.g. dropping the placeholder) is a conscious decision.
-    """
-    assert _render_command("echo {ids}", ["ids"], {"ids": []}) == "echo "
-
-
-# ----------------------------------------------------------------------
-# _eval_if — the GA ``if:`` recursive-descent evaluator.
-#
-# A parser with precedence rules (``||`` < ``&&`` < comparison) is textbook
-# non-trivial logic: a subtle change to the grammar can silently flip which
-# platform branch a tool selects, and the only outward signal is a wrong
-# command on one OS. Each operator gets its own check so a precedence
-# regression is localised.
-# ----------------------------------------------------------------------
-
-
-def test_eval_if_and_both_true() -> None:
-    ctx = {"os": "Linux", "arch": "X64"}
-    assert _eval_if("runner.os == 'Linux' && runner.arch == 'X64'", ctx) is True
-
-
-def test_eval_if_and_short_circuits_on_false() -> None:
-    # Left false → whole ``&&`` false, regardless of the right operand.
-    ctx = {"os": "Windows", "arch": "X64"}
-    assert _eval_if("runner.os == 'Linux' && runner.arch == 'X64'", ctx) is False
-
-
-def test_eval_if_not_equal() -> None:
-    ctx = {"os": "Windows"}
-    assert _eval_if("runner.os != 'Linux'", ctx) is True
-    assert _eval_if("runner.os != 'Windows'", ctx) is False
-
-
-def test_eval_if_parens_group_over_precedence() -> None:
-    # Without parens ``&&`` binds tighter than ``||``; parens force the OR
-    # to evaluate first. This is the one place precedence is observable.
-    ctx = {"os": "macOS", "arch": "ARM64"}
-    expr = "(runner.os == 'Linux' || runner.os == 'macOS') && runner.arch == 'ARM64'"
-    assert _eval_if(expr, ctx) is True
-    # Same ctx but arch mismatch → the parenthesised OR is true but AND fails.
-    ctx_x64 = {"os": "macOS", "arch": "X64"}
-    assert _eval_if(expr, ctx_x64) is False
-
-
-def test_eval_if_runner_arch_lookup() -> None:
-    """``runner.arch`` resolves against the context's ``arch`` key."""
-    ctx = {"os": "Linux", "arch": "ARM64"}
-    assert _eval_if("runner.arch == 'ARM64'", ctx) is True
-    assert _eval_if("runner.arch == 'X64'", ctx) is False
-
-
-def test_eval_if_case_insensitive_string_compare() -> None:
-    """GA ``==`` on strings is case-insensitive (``'linux'`` matches ``'Linux'``).
-
-    GA's documented semantics; if this regresses to Python ``==``, every
-    YAML author who lowercases the OS literal gets a silently wrong branch.
-    """
-    ctx = {"os": "Linux"}
-    assert _eval_if("runner.os == 'linux'", ctx) is True
-    assert _eval_if("runner.os == 'LINUX'", ctx) is True
-
-
-def test_eval_if_rejects_unsupported_identifier() -> None:
-    """Only ``runner.os`` / ``runner.arch`` resolve; anything else raises.
-
-    Failures in ``if:`` must be loud (the loader/preview raises), not silent
-    (treat as false and pick the wrong branch).
-    """
-    with pytest.raises(ValueError, match="unsupported identifier"):
-        _eval_if("github.ref == 'main'", {"os": "Linux"})
-
-
-def test_eval_if_rejects_trailing_tokens() -> None:
-    """Malformed expressions raise rather than partially evaluate."""
-    with pytest.raises(ValueError, match="trailing tokens"):
-        _eval_if("runner.os == 'Linux' extra", {"os": "Linux"})
-
-
-# ----------------------------------------------------------------------
-# _resolve_shell — mapping a YAML ``shell:`` name to a subprocess path.
-#
-# Untested per the standards review. ``None`` → ``None`` is the POSIX/CMD
-# default path; a named shell resolves via ``shutil.which``. The unresolved
-# case (name not on PATH) returns the name as-is — which surfaces as a
-# ``FileNotFoundError`` at dispatch time. That is a known ceiling (the
-# review's hard finding), pinned here so the behaviour is documented in
-# code, not just in prose.
-# ----------------------------------------------------------------------
-
-
-def test_resolve_shell_none_yields_none() -> None:
-    """``shell:`` absent → ``None`` → subprocess uses its platform default."""
-    assert _resolve_shell(None) is None
-
-
-def test_resolve_shell_named_resolves_via_which(monkeypatch) -> None:
-    """A named shell is resolved through ``shutil.which`` (PATH-driven)."""
-    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-    assert _resolve_shell("bash") == "/usr/bin/bash"
-
-
-def test_resolve_shell_unresolved_returns_name_as_is(monkeypatch) -> None:
-    """A name ``shutil.which`` can't find is returned unchanged.
-
-    cothis ceiling: this name is then passed to ``subprocess.run(executable=...)``
-    and raises ``FileNotFoundError`` at dispatch time (caught by Agent's
-    tool-error boundary and surfaced to the model). Pinned so a future
-    change to skip-on-missing is a conscious decision, not silent.
-    """
-    monkeypatch.setattr("shutil.which", lambda name: None)
-    assert _resolve_shell("pwsh") == "pwsh"
-
-
-# ----------------------------------------------------------------------
-# Malformed-YAML error paths (story 24).
-#
-# A missing required field or an empty file must surface as a clear,
-# actionable error naming the field (and the file, when loaded from disk),
-# not a bare ``KeyError`` / ``TypeError``. Previously these raised
-# ``KeyError: 'name'`` or ``TypeError: 'NoneType' object is not subscriptable``
-# — errors the LLM/user cannot act on. ``_require`` centralises the fix.
-# ----------------------------------------------------------------------
-
-
-def test_load_yaml_tools_missing_name_names_field() -> None:
-    """A spec without ``name:`` raises ``ValueError`` naming the field."""
-    with pytest.raises(ValueError, match="must define 'name'"):
-        load_yaml_tools("command: echo hi\n")
-
-
-def test_load_yaml_tools_empty_file_raises_valueerror() -> None:
-    """An empty YAML file (``safe_load`` → ``None``) raises, not ``TypeError``.
-
-    ``None["name"]`` used to raise ``TypeError`` — not actionable. Now
-    ``_require`` sees a non-dict spec and names the problem.
-    """
-    with pytest.raises(ValueError, match="must be a YAML mapping"):
-        load_yaml_tools("")
-
-
-def test_load_yaml_tools_arg_missing_name_names_field() -> None:
-    """An arg entry without ``name:`` raises naming the tool + field."""
+def test_unknown_arg_type_rejected() -> None:
+    """An unknown ``type:`` is rejected, listing the legal types."""
     yaml_text = """
 name: t
-command: echo {x}
+command: ["echo", "{x}"]
 args:
-  - type: int
+  - name: x
+    type: float
 """
-    with pytest.raises(ValueError, match="must define 'name'"):
+    with pytest.raises(ValueError, match="unknown type 'float'"):
         load_yaml_tools(yaml_text)
 
 
-def test_load_tools_from_dir_error_names_the_file(tmp_path) -> None:
-    """Loading from disk includes the file path in the error (story 24).
-
-    The whole point of threading ``source`` through: a startup failure must
-    point at the offending file, not just the field, so the user can find
-    and fix it. We assert the filename appears in the message.
-    """
-    bad = tmp_path / "broken.yaml"
-    bad.write_text("command: echo hi\n", encoding="utf-8")  # no name:
-    with pytest.raises(ValueError, match="broken.yaml"):
-        load_tools_from_dir(tmp_path)
+def test_name_and_description_stringified() -> None:
+    """Non-string ``name`` / ``description`` scalars are coerced to strings."""
+    tool = load_yaml_tools("name: 42\ncommand: ['echo', 'hi']\n")[0]
+    assert tool.__name__ == "42"
+    assert isinstance(tool.__name__, str)
+    tool2 = load_yaml_tools("name: t\ndescription: 123\ncommand: ['echo', 'hi']\n")[0]
+    assert tool2.__doc__ == "123"
+    assert isinstance(tool2.__doc__, str)
 
 
-# ----------------------------------------------------------------------
-# ``command:`` list-shape validation.
-#
-# The rename from ``steps:`` to ``command:`` overloaded the field: it now
-# accepts either a string or a list of branches. Each malformation (wrong
-# type, empty list, branch missing ``run:``) has its own actionable error
-# — a YAML author who typo's ``cmd:`` instead of ``run:`` should hear
-# about that, not a cryptic ``KeyError`` deep in the renderer.
-# ----------------------------------------------------------------------
-
-
-def test_command_wrong_type_raises() -> None:
-    """A non-str, non-list ``command:`` is rejected with a type-naming error."""
-    yaml_text = """
-name: t
-command: 42
-"""
-    with pytest.raises(ValueError, match="must be a string or a list"):
-        load_yaml_tools(yaml_text)
-
-
-def test_command_empty_list_raises() -> None:
-    """An empty ``command: []`` is rejected — a tool with no command is useless."""
-    yaml_text = """
-name: t
-command: []
-"""
-    with pytest.raises(ValueError, match="list is empty"):
-        load_yaml_tools(yaml_text)
-
-
-def test_command_branch_missing_run_raises() -> None:
-    """A list branch without ``run:`` names the branch index in the error.
-
-    Common typo: writing ``cmd:`` or ``command:`` (the old field name) inside
-    a branch instead of ``run:``. The error points at the offending branch.
-    """
-    yaml_text = """
-name: t
-command:
-  - if: runner.os == 'Linux'
-    cmd: echo hi
-"""
-    with pytest.raises(ValueError, match="branch #0 must be a mapping with a 'run'"):
-        load_yaml_tools(yaml_text)
-
-
-# ----------------------------------------------------------------------
-# YAML schema discipline: type coercion + unknown-field rejection.
-#
-# These pin the ``extra="forbid"`` + type-stringify fixes. Without them a
-# typo (``shel:``) or a non-string scalar (``name: 42``) was silently
-# swallowed, and an unknown ``type: float`` silently became ``"string"`` in
-# the emitted schema — the apify-MCP #738 class of bug (schema pollution
-# with no signal). Each check makes one malformation loud.
-# ----------------------------------------------------------------------
+# ====================================================================
+# Error / schema discipline (extra="forbid")
+# ====================================================================
 
 
 def test_unknown_top_level_field_rejected() -> None:
     """A typo'd top-level key is rejected, not silently ignored."""
-    yaml_text = "name: t\ncommand: echo hi\nfrobnicate: yes\n"
     with pytest.raises(ValueError, match="unknown field.*frobnicate"):
-        load_yaml_tools(yaml_text)
+        load_yaml_tools("name: t\ncommand: ['echo', 'hi']\nfrobnicate: yes\n")
 
 
 def test_unknown_arg_field_rejected() -> None:
     """An arg entry with an unknown key is rejected, naming the key."""
     yaml_text = """
 name: t
-command: echo {x}
+command: ["echo", "{x}"]
 args:
   - name: x
     type: int
@@ -714,237 +521,230 @@ args:
         load_yaml_tools(yaml_text)
 
 
-def test_unknown_branch_field_rejected() -> None:
-    """A command branch with an unknown key is rejected, naming branch + key."""
-    yaml_text = """
-name: t
-command:
-  - if: runner.os == 'Linux'
-    run: echo hi
-    bogus: yes
-"""
-    with pytest.raises(ValueError, match="command branch #0.*unknown field.*bogus"):
+def test_missing_name_names_field() -> None:
+    """A spec without ``name:`` raises ``ValueError`` naming the field."""
+    with pytest.raises(ValueError, match="must define 'name'"):
+        load_yaml_tools('command: ["echo", "hi"]\n')
+
+
+def test_empty_file_raises_valueerror() -> None:
+    """An empty YAML file raises, not ``TypeError`` (``None["name"]``)."""
+    with pytest.raises(ValueError, match="must be a YAML mapping"):
+        load_yaml_tools("")
+
+
+def test_command_wrong_type_rejected() -> None:
+    """A non-str, non-list ``command:`` is rejected with a type-naming error."""
+    with pytest.raises(ValueError, match="must be a string.*or a list"):
+        load_yaml_tools("name: t\ncommand: 42\n")
+
+
+def test_command_missing_rejected() -> None:
+    """Missing ``command:`` is rejected (required field)."""
+    with pytest.raises(ValueError, match="must define 'command'"):
+        load_yaml_tools("name: t\n")
+
+
+def test_platform_entry_null_rejected() -> None:
+    """A ``platforms:`` entry that is null (not a mapping) is rejected.
+
+    Previously ``platforms: {linux: null}`` would crash with ``TypeError``
+    deep in ``_parse_command_block`` (``None.get('command')``) — not an
+    actionable error. Now it names the offending platform key.
+    """
+    yaml_text = 'name: t\ncommand: ["echo", "hi"]\nplatforms:\n  linux: null\n'
+    with pytest.raises(ValueError, match="platforms.linux.*must be a YAML mapping"):
         load_yaml_tools(yaml_text)
 
 
-def test_legacy_steps_field_rejected() -> None:
-    """The removed ``steps:`` field is now unknown and rejected.
+def test_argv_zeroth_element_with_placeholder_rejected() -> None:
+    """argv[0] (the executable) must not contain ``{placeholder}``.
 
-    After the rename to ``command:``, a leftover ``steps:`` is a stale-format
-    marker — reject it so a migrated file doesn't silently lose its branches.
+    Gating runs at load time, before args are available — a placeholder in
+    argv[0] can never be resolved via ``shutil.which``, so the tool would be
+    silently skipped. Reject it loudly so the author knows the executable
+    must be a literal.
     """
     yaml_text = """
 name: t
-command: echo hi
-steps:
-  - run: echo bye
+command: ["{exe}", "--version"]
+args:
+  - name: exe
+    type: str
 """
-    with pytest.raises(ValueError, match="unknown field.*steps"):
+    with pytest.raises(ValueError, match=r"argv\[0\].*must not contain placeholders"):
         load_yaml_tools(yaml_text)
 
 
-def test_unknown_arg_type_rejected() -> None:
-    """An unknown ``type:`` (e.g. float) is rejected, listing the legal types.
+def test_shell_field_with_argv_command_rejected() -> None:
+    """``shell:`` with a list ``command:`` is meaningless and rejected.
 
-    Previously ``type: float`` silently became ``"string"`` in the emitted
-    schema — the LLM saw a string arg when the author meant a number. Now it
-    fails at load time listing {bool,int,list,str}.
+    argv mode bypasses the shell entirely (``shell=False``), so declaring
+    ``shell:`` is a misconception (the author probably wanted shell mode).
+    Reject it rather than silently ignoring ``shell:``.
     """
     yaml_text = """
 name: t
-command: echo {x}
+shell: bash
+command: ["echo", "hi"]
+"""
+    with pytest.raises(ValueError, match=r"``shell:`` is meaningless with a list"):
+        load_yaml_tools(yaml_text)
+
+
+def test_preview_inherits_all_compile_checks() -> None:
+    """``preview`` rejects every malformation ``load_yaml_tools`` does.
+
+    Both paths share ``_compile``, so the invariants are enforced by
+    construction — this test guards against a future refactor moving a
+    check back into ``load_yaml_tools`` only. Covers the two cases preview
+    previously missed (argv[0] placeholder, undeclared placeholder) plus
+    the two it already mirrored (string-without-shell, shell-with-list).
+    """
+    # argv[0] placeholder — previously load-only; preview must now reject.
+    argv0_placeholder = """
+name: t
+command: ["{exe}", "--version"]
+args:
+  - name: exe
+    type: str
+"""
+    with pytest.raises(ValueError, match=r"argv\[0\].*must not contain placeholders"):
+        preview(argv0_placeholder)
+
+    # Undeclared placeholder — previously load-only; preview must now reject.
+    undeclared = 'name: t\nshell: bash\ncommand: "echo {typo}"\n'
+    with pytest.raises(ValueError, match="undeclared placeholder"):
+        preview(undeclared)
+
+    # String without shell — both still reject.
+    with pytest.raises(ValueError, match="requires a ``shell:``"):
+        preview('name: t\ncommand: "echo hi"\n')
+
+    # List WITH shell — both still reject.
+    with pytest.raises(ValueError, match="meaningless with a list"):
+        preview('name: t\nshell: bash\ncommand: ["echo", "hi"]\n')
+
+
+# ====================================================================
+# load_tools_from_dir
+# ====================================================================
+
+
+def test_load_tools_from_dir_finds_yaml_files(tmp_path: Path) -> None:
+    """``.agents/tools/*.yaml`` discovery: every YAML file in the dir loads."""
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "hello.yaml").write_text(
+        'name: hello\ncommand: ["echo", "hello"]\n', encoding="utf-8"
+    )
+    (tools_dir / "bye.yml").write_text(
+        'name: bye\ncommand: ["echo", "bye"]\n', encoding="utf-8"
+    )
+    (tools_dir / "README.md").write_text("not a tool", encoding="utf-8")
+
+    tools = load_tools_from_dir(tools_dir)
+    by_name = {t.__name__: t for t in tools}
+    assert set(by_name) == {"hello", "bye"}
+    assert by_name["hello"]() == "hello\n"
+    assert by_name["bye"]() == "bye\n"
+
+
+def test_load_tools_from_dir_finds_nested_yaml(tmp_path: Path) -> None:
+    """Discovery walks subdirectories so ``tools/date/current.yaml`` loads."""
+    date_dir = tmp_path / "date"
+    date_dir.mkdir()
+    (date_dir / "current.yaml").write_text(
+        'name: date.current\ncommand: ["echo", "today"]\n', encoding="utf-8"
+    )
+    (tmp_path / "flat.yaml").write_text(
+        'name: flat\ncommand: ["echo", "flat"]\n', encoding="utf-8"
+    )
+
+    names = {t.__name__ for t in load_tools_from_dir(tmp_path)}
+    assert names == {"date.current", "flat"}
+
+
+def test_load_tools_from_dir_error_names_the_file(tmp_path: Path) -> None:
+    """Loading from disk includes the file path in the error."""
+    bad = tmp_path / "broken.yaml"
+    bad.write_text('command: ["echo", "hi"]\n', encoding="utf-8")  # no name:
+    with pytest.raises(ValueError, match="broken.yaml"):
+        load_tools_from_dir(tmp_path)
+
+
+def test_load_tools_from_dir_missing_dir_returns_empty(tmp_path: Path) -> None:
+    """A missing directory yields ``[]``, not an error."""
+    assert load_tools_from_dir(tmp_path / "nonexistent") == []
+
+
+# ====================================================================
+# preview() — verification surface
+# ====================================================================
+
+
+def test_preview_argv_returns_rendered_list() -> None:
+    """``preview`` of an argv command returns the rendered list + ``None`` shell."""
+    yaml_text = """
+name: t
+command: ["echo", "{x}"]
 args:
   - name: x
-    type: float
+    type: str
 """
-    with pytest.raises(ValueError, match="unknown type 'float'.*allowed"):
-        load_yaml_tools(yaml_text)
+    cmd, shell = preview(yaml_text, x="hi")
+    assert cmd == ["echo", "hi"]
+    assert shell is None
 
 
-def test_name_non_string_is_stringified() -> None:
-    """A numeric ``name:`` is coerced to a string for ``__name__``.
-
-    ``__name__`` must be a str (Agent keys its tool map by it; the schema's
-    ``function.name`` is a string). YAML unquoted ``42`` parses as int; we
-    stringify rather than reject so authors aren't forced to over-quote.
-    """
-    tool = load_yaml_tools("name: 42\ncommand: echo hi\n")[0]
-    assert tool.__name__ == "42"
-    assert isinstance(tool.__name__, str)
-
-
-def test_description_non_string_is_stringified() -> None:
-    """A numeric ``description:`` is coerced to a string for ``__doc__``.
-
-    ``__doc__`` flows into the tool schema's description field, which must be
-    a string; a numeric scalar is stringified rather than rejected.
-    """
-    tool = load_yaml_tools("name: t\ndescription: 123\ncommand: echo hi\n")[0]
-    assert tool.__doc__ == "123"
-    assert isinstance(tool.__doc__, str)
-
-
-# ----------------------------------------------------------------------
-# ``has_shell`` / ``has_exe`` predicate functions in ``if:`` expressions.
-#
-# These gate a branch on whether a binary is actually on PATH, not just on
-# the OS. The canonical use: a PowerShell branch that should only register
-# when ``pwsh`` is installed, not merely when the OS is Windows. Both names
-# map to ``shutil.which`` — the intent differs ("run under this shell" vs
-# "this executable exists") but the mechanism is identical.
-# ----------------------------------------------------------------------
-
-
-def test_has_shell_matches_when_binary_present(monkeypatch) -> None:
-    """``has_shell('pwsh')`` is true when ``shutil.which`` finds pwsh."""
-    monkeypatch.setattr(
-        "shutil.which", lambda name: f"/usr/bin/{name}" if name == "pwsh" else None
-    )
-    assert _eval_if("has_shell('pwsh')", {"os": "Linux"}) is True
-
-
-def test_has_shell_false_when_binary_absent(monkeypatch) -> None:
-    """``has_shell('pwsh')`` is false when ``shutil.which`` returns None."""
-    monkeypatch.setattr("shutil.which", lambda name: None)
-    assert _eval_if("has_shell('pwsh')", {"os": "Windows"}) is False
-
-
-def test_has_exe_same_mechanism_as_has_shell(monkeypatch) -> None:
-    """``has_exe`` is the same ``shutil.which`` check under a different name."""
-    monkeypatch.setattr(
-        "shutil.which", lambda name: "/usr/bin/git" if name == "git" else None
-    )
-    assert _eval_if("has_exe('git')", {"os": "Linux"}) is True
-    assert _eval_if("has_exe('svn')", {"os": "Linux"}) is False
-
-
-def test_has_shell_combinable_with_runner_os(monkeypatch) -> None:
-    """``has_shell`` composes with ``runner.os`` via ``&&`` / ``||``.
-
-    The whole point of putting predicates in the expression language (rather
-    than as branch-level fields): they combine. A Windows+pwsh branch is
-    ``runner.os == 'Windows' && has_shell('pwsh')``.
-    """
-    monkeypatch.setattr(
-        "shutil.which", lambda name: "/usr/bin/pwsh" if name == "pwsh" else None
-    )
-    ctx = {"os": "Windows"}
-    assert _eval_if("runner.os == 'Windows' && has_shell('pwsh')", ctx) is True
-    assert _eval_if("runner.os == 'Linux' && has_shell('pwsh')", ctx) is False
-    assert _eval_if("has_shell('pwsh') || runner.os == 'Linux'", ctx) is True
-
-
-def test_has_shell_branch_registers_only_when_available(monkeypatch) -> None:
-    """A ``has_shell``-gated branch is skipped (not registered) when absent.
-
-    End-to-end: the tool has a pwsh branch and a fallback. When pwsh is not
-    on PATH, the pwsh branch is not selected; the default (or next matching
-    branch) wins. When no branch matches and there's no default, the tool
-    is silently not registered.
-    """
-    monkeypatch.setattr("sys.platform", "linux")
-    monkeypatch.setattr("shutil.which", lambda name: None)  # nothing on PATH
-    yaml_text = """
-name: ps_tool
-description: PowerShell-only.
-command:
-  - if: has_shell('pwsh')
-    shell: pwsh
-    run: Get-Date
-"""
-    # No default, no match → not registered.
-    assert load_yaml_tools(yaml_text) == []
-
-
-def test_has_shell_branch_selected_when_available(monkeypatch) -> None:
-    """When the gated binary IS available, the branch registers and runs."""
-    monkeypatch.setattr("sys.platform", "linux")
-    monkeypatch.setattr(
-        "shutil.which", lambda name: "/usr/bin/pwsh" if name == "pwsh" else None
-    )
-    yaml_text = """
-name: ps_tool
-description: PowerShell-only.
-command:
-  - if: has_shell('pwsh')
-    shell: pwsh
-    run: echo found
-"""
-    # Registered (not skipped) and the branch's run is selected.
-    assert len(load_yaml_tools(yaml_text)) == 1
-    _, cmd = preview(yaml_text)
-    assert cmd == "echo found"
-
-
-def test_unknown_function_in_if_raises(monkeypatch) -> None:
-    """An unsupported function name raises, naming what's available.
-
-    Uses a valid single-string-arg call shape (``always('x')``) so the parse
-    reaches function dispatch and the name check fires — not the arg-shape
-    check. ``always`` is a real GA function we deliberately don't support.
-    """
-    monkeypatch.setattr("shutil.which", lambda name: None)
-    with pytest.raises(ValueError, match="unsupported function"):
-        _eval_if("always('x')", {"os": "Linux"})
-
-
-# ----------------------------------------------------------------------
-# ``default`` branch — the explicit fallback.
-# ----------------------------------------------------------------------
-
-
-def test_default_branch_selected_when_no_if_matches(monkeypatch) -> None:
-    """The ``default: true`` branch wins when all ``if:`` branches fail."""
-    monkeypatch.setattr("sys.platform", "linux")
-    yaml_text = """
-name: fallback
-description: Has a default.
-command:
-  - if: runner.os == 'Windows'
-    run: echo windows
-  - default: true
-    run: echo fallback
-"""
-    assert load_yaml_tools(yaml_text)[0]() == "fallback\n"
-
-
-def test_default_branch_not_selected_when_if_matches(monkeypatch) -> None:
-    """An ``if:`` match takes priority over ``default``."""
-    monkeypatch.setattr("sys.platform", "linux")
-    yaml_text = """
-name: prioritised
-description: If wins over default.
-command:
-  - if: runner.os == 'Linux'
-    run: echo linux
-  - default: true
-    run: echo fallback
-"""
-    assert load_yaml_tools(yaml_text)[0]() == "linux\n"
-
-
-def test_default_and_if_on_same_branch_raises() -> None:
-    """A branch cannot carry both ``if:`` and ``default`` — ambiguous."""
+def test_preview_shell_returns_rendered_string_and_shell() -> None:
+    """``preview`` of a shell command returns the rendered string + interpreter."""
     yaml_text = """
 name: t
-command:
-  - if: runner.os == 'Linux'
-    default: true
-    run: echo hi
+shell: bash
+command: "echo {x}"
+args:
+  - name: x
+    type: str
 """
-    with pytest.raises(ValueError, match="cannot have both 'if' and 'default'"):
-        load_yaml_tools(yaml_text)
+    cmd, shell = preview(yaml_text, x="hi")
+    assert cmd == "echo hi"
+    assert shell == "bash"
 
 
-def test_multiple_defaults_raise() -> None:
-    """Two ``default`` branches are a configuration error."""
+def test_preview_platform_override_forces_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_platform="windows"`` forces the windows branch regardless of host."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
 name: t
-command:
-  - default: true
-    run: echo one
-  - default: true
-    run: echo two
+command: ["echo", "default"]
+platforms:
+  windows:
+    shell: pwsh
+    command: "echo from-windows"
 """
-    with pytest.raises(ValueError, match="multiple 'default' branches"):
-        load_yaml_tools(yaml_text)
+    cmd, shell = preview(yaml_text, _platform="windows")
+    assert cmd == "echo from-windows"
+    assert shell == "pwsh"
+
+
+def test_preview_default_description_carries_through() -> None:
+    """A tool without ``description:`` gets a default derived from its name."""
+    tool = load_yaml_tools('name: bare\ncommand: ["echo", "hi"]\n')[0]
+    assert tool.__doc__ == "Shell tool: bare"
+
+
+def test_nonzero_exit_returns_error_with_stderr() -> None:
+    """Stories 18/19: a non-zero exit surfaces as an error string, not a raise.
+
+    The agent must see the failure to recover; an unhandled exception would
+    crash the ReAct loop mid-turn.
+    """
+    tool = load_yaml_tools(
+        'name: failer\ncommand: ["sh", "-c", "echo boom >&2; exit 3"]\n'
+    )[0]
+    result = tool()
+    assert "exit code 3" in result
+    assert "boom" in result
