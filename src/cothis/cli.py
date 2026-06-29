@@ -66,17 +66,29 @@ def _root(
         False,
         "--debug",
         envvar="DEBUG",
-        help="Show full tracebacks on error (default: suppressed).",
+        help="Show full tracebacks + all debug logs (cothis, openai, httpx).",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        envvar="VERBOSE",
+        help="Show cothis tool-call I/O (without openai/httpx noise). Implied by --debug.",
     ),
 ) -> None:
     """cothis — a basic any-llm agent loop."""
     global _debug
     _debug = debug
-    # ``--debug`` (or ``DEBUG=1``) enables DEBUG-level logging across cothis.
-    # Today this surfaces every tool call's input/output (see ``Agent._execute``);
-    # the silent-gate skip in ``load_yaml_tools`` is another candidate consumer.
-    if debug:
+    # ``--debug`` = everything (cothis + openai + httpx + traceback).
+    # ``-v`` / ``--verbose`` = cothis only (tool-call I/O, gating skips) —
+    # the signal you actually want when checking what reached the model,
+    # without the HTTP/TLS noise swamping it.
+    if debug or verbose:
         logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+    if verbose and not debug:
+        # Quiet the chatty downstream loggers; keep ``cothis.*`` at DEBUG.
+        for noisy in ("openai", "httpx", "httpcore", "asyncio"):
+            logging.getLogger(noisy).setLevel(logging.INFO)
 
 
 @app.command()
@@ -207,7 +219,7 @@ async def _chat_session(
     while True:
         try:
             prompt_text = await session.prompt_async(">>> ")
-        except (EOFError, KeyboardInterrupt):
+        except EOFError, KeyboardInterrupt:
             # Ctrl-D / Ctrl-C at the prompt: end the session quietly.
             # Execution-mid Ctrl-C still bubbles up through main().
             console.print()
