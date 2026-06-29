@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from cothis.tools import Tool, _parse_docstring, tool
+from cothis.tools import Tool, ToolDef, _parse_docstring, tool
 
 
 def test_summary_from_first_paragraph() -> None:
@@ -53,7 +53,7 @@ def test_summary_from_first_paragraph() -> None:
 
 
 def test_per_arg_description_from_args_section() -> None:
-    """"The ``Args:`` section's per-line descriptions reach the schema."""
+    """ "The ``Args:`` section's per-line descriptions reach the schema."""
 
     @tool
     def add(a: int, b: int) -> int:
@@ -72,7 +72,7 @@ def test_per_arg_description_from_args_section() -> None:
 
 
 def test_type_mapping_from_annotation() -> None:
-    """"Python annotations map to JSON-Schema types."""
+    """ "Python annotations map to JSON-Schema types."""
 
     @tool
     def typed(n: int, s: str, f: float, b: bool, items: list) -> str:
@@ -96,7 +96,7 @@ def test_type_mapping_from_annotation() -> None:
 
 
 def test_unknown_annotation_falls_back_to_string() -> None:
-    """"An annotation not in the type map defaults to ``string``."""
+    """ "An annotation not in the type map defaults to ``string``."""
 
     @tool
     def custom(x: Any) -> str:
@@ -112,7 +112,7 @@ def test_unknown_annotation_falls_back_to_string() -> None:
 
 
 def test_required_vs_optional_from_defaults() -> None:
-    """"Args with defaults are optional; args without are required."""
+    """ "Args with defaults are optional; args without are required."""
 
     @tool
     def f(req: str, opt: str = "x") -> str:
@@ -129,7 +129,7 @@ def test_required_vs_optional_from_defaults() -> None:
 
 
 def test_multiline_description_collapsed() -> None:
-    """"Multi-line arg descriptions are collapsed to single-line."""
+    """ "Multi-line arg descriptions are collapsed to single-line."""
 
     @tool
     def read(path: str) -> str:
@@ -171,7 +171,7 @@ def test_tool_with_positional_name() -> None:
 
 
 def test_tool_with_keyword_name_and_description() -> None:
-    """"``@tool(name=..., description=...)`` overrides both fields."""
+    """ "``@tool(name=..., description=...)`` overrides both fields."""
 
     @tool(name="custom.tool", description="Override description.")
     def f(x: str) -> str:
@@ -185,7 +185,7 @@ def test_tool_with_keyword_name_and_description() -> None:
 
 
 def test_tool_no_parens_uses_dunder_name() -> None:
-    """"``@tool`` (no parens) uses ``__name__`` as the tool name."""
+    """ "``@tool`` (no parens) uses ``__name__`` as the tool name."""
 
     @tool
     def bare(x: str) -> str:
@@ -196,7 +196,7 @@ def test_tool_no_parens_uses_dunder_name() -> None:
 
 
 def test_no_docstring_yields_default_description() -> None:
-    """"A function without a docstring falls back to a derived description."""
+    """ "A function without a docstring falls back to a derived description."""
 
     @tool
     def bare(x: str) -> str:
@@ -208,7 +208,7 @@ def test_no_docstring_yields_default_description() -> None:
 
 
 def test_no_args_section_yields_no_descriptions() -> None:
-    """"A docstring without ``Args:`` produces no per-arg descriptions."""
+    """ "A docstring without ``Args:`` produces no per-arg descriptions."""
 
     @tool
     def f(x: str) -> str:
@@ -221,7 +221,7 @@ def test_no_args_section_yields_no_descriptions() -> None:
 
 
 def test_var_args_dropped_from_schema() -> None:
-    """"``*args`` and ``**kwargs`` are excluded from the schema."""
+    """ "``*args`` and ``**kwargs`` are excluded from the schema."""
 
     @tool
     def f(a: str, *args: Any, **kwargs: Any) -> str:
@@ -237,7 +237,7 @@ def test_var_args_dropped_from_schema() -> None:
 
 
 def test_parse_docstring_helper_directly() -> None:
-    """"``_parse_docstring`` returns (first-paragraph summary, {arg: description})."""
+    """ "``_parse_docstring`` returns (first-paragraph summary, {arg: description})."""
     summary, args = _parse_docstring(
         """Summary line.
 
@@ -253,13 +253,13 @@ def test_parse_docstring_helper_directly() -> None:
 
 
 def test_parse_docstring_empty() -> None:
-    """"An empty/None docstring yields empty summary + empty args."""
+    """ "An empty/None docstring yields empty summary + empty args."""
     assert _parse_docstring(None) == ("", {})
     assert _parse_docstring("") == ("", {})
 
 
 def test_tool_returns_same_callable_type() -> None:
-    """"``@tool`` returns the function itself (not a wrapper), with attributes."""
+    """ "``@tool`` returns the function itself (not a wrapper), with attributes."""
 
     @tool
     def f(x: str) -> str:
@@ -311,7 +311,7 @@ def test_load_gitignore_returns_none_when_absent(tmp_path: Any) -> None:
 
 
 def test_load_gitignore_parses_patterns(tmp_path: Any) -> None:
-    """"``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
+    """ "``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
     from cothis.tools import _load_gitignore
 
     (tmp_path / ".gitignore").write_text("*.log\nbuild/\n")
@@ -370,7 +370,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
 
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
-    """"Recursive listing yields entries with nested relative paths."""
+    """ "Recursive listing yields entries with nested relative paths."""
     from cothis.tools import dir
 
     (tmp_path / "pkg").mkdir()
@@ -387,7 +387,7 @@ def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
 
 
 def test_format_default_is_json(monkeypatch: Any) -> None:
-    """"Without ``COTHIS_TOOL_OUTPUT_FORMAT``, structured output is JSON."""
+    """ "Without ``COTHIS_TOOL_OUTPUT_FORMAT``, structured output is JSON."""
     from cothis.tools import _format_tool_output
 
     monkeypatch.delenv("COTHIS_TOOL_OUTPUT_FORMAT", raising=False)
@@ -400,7 +400,9 @@ def test_format_csv_table(monkeypatch: Any) -> None:
     from cothis.tools import _format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
-    out = _format_tool_output([{"name": "src", "type": "dir"}, {"name": "x", "type": "file"}])
+    out = _format_tool_output(
+        [{"name": "src", "type": "dir"}, {"name": "x", "type": "file"}]
+    )
     lines = out.splitlines()
     assert lines[0] == "name,type"
     assert lines[1] == "src,dir"
@@ -460,3 +462,130 @@ def test_format_unknown_value_defaults_to_json(monkeypatch: Any) -> None:
     import json as _json
 
     assert _json.loads(out) == {"a": 1}
+
+
+# --------------------------------------------------------------------
+# ToolDef class (issue #4)
+# --------------------------------------------------------------------
+
+
+def test_tool_returns_tooldef_instance() -> None:
+    """``@tool`` returns a ``ToolDef``, not a bare function."""
+
+    @tool
+    def f(x: str) -> str:
+        """F."""
+        return x
+
+    assert isinstance(f, ToolDef)
+    assert isinstance(f, Tool)  # satisfies the dispatch Protocol
+
+
+def test_tooldef_satisfies_tool_protocol() -> None:
+    """A ``ToolDef`` has ``__name__``, ``__call__``, and ``__cothis_schema__``."""
+
+    @tool("ns.name")
+    def my_tool(x: str) -> str:
+        """My tool.
+
+        Args:
+            x: an arg.
+        """
+        return x
+
+    assert my_tool.__name__ == "ns.name"
+    assert callable(my_tool)
+    assert my_tool.__cothis_schema__["function"]["name"] == "ns.name"
+    # __call__ delegates to the wrapped function.
+    assert my_tool(x="hello") == "hello"
+
+
+def test_hook_registration_appends_to_ordered_list() -> None:
+    """Each ``.pre_execute()`` / ``.after_execute()`` / etc. call appends to a list.
+
+    Multiple callbacks on the same stage are stored in registration order.
+    This is the storage contract the chain semantics (pipeline / AND) depend on.
+    """
+
+    @tool("x")
+    def x(arg: str) -> str:
+        """X."""
+        return arg
+
+    @x.pre_execute()
+    def first(args: Any) -> Any:
+        return args
+
+    @x.pre_execute()
+    def second(args: Any) -> Any:
+        return args
+
+    @x.after_execute()
+    def after(result: Any, args: Any) -> Any:
+        return result
+
+    # pre_execute has two callbacks, in registration order.
+    assert x._hooks["pre_execute"] == [first, second]
+    # after_execute has one.
+    assert x._hooks["after_execute"] == [after]
+    # Stages with no registrations are empty.
+    assert x._hooks["pre_load"] == []
+    assert x._hooks["after_load"] == []
+    assert x._hooks["on_error"] == []
+
+
+def test_hook_decorator_returns_callback_unchanged() -> None:
+    """The hook decorator returns the callback so it stays referenceable."""
+
+    @tool("x")
+    def x(arg: str) -> str:
+        """X."""
+        return arg
+
+    @x.pre_load()
+    def my_check() -> Any:
+        return True
+
+    # The decorator returned ``my_check``, so it's still in scope under that name.
+    assert my_check in x._hooks["pre_load"]
+
+
+def test_all_five_hook_stages_exist() -> None:
+    """``ToolDef`` exposes all five lifecycle stages as decorator methods."""
+
+    @tool("x")
+    def x(arg: str) -> str:
+        """X."""
+        return arg
+
+    # Each stage is a callable that returns a decorator.
+    for stage_name in (
+        "pre_load",
+        "after_load",
+        "pre_execute",
+        "after_execute",
+        "on_error",
+    ):
+        decorator_factory = getattr(x, stage_name)
+        decorator = decorator_factory()
+        # Registering a callback through it works.
+
+        @decorator
+        def cb(*args: Any) -> Any:
+            pass
+
+        assert cb in x._hooks[stage_name]
+
+
+def test_builtin_tools_are_tooldef_instances() -> None:
+    """``fs.read``, ``fs.dir``, ``fs.write`` are all ``ToolDef`` instances.
+
+    Regression check: the migration from bare decorated functions to
+    ``ToolDef`` must not break the built-in tools.
+    """
+    from cothis.tools import dir, read, write
+
+    for t in (read, dir, write):
+        assert isinstance(t, ToolDef)
+        assert isinstance(t, Tool)
+        assert t.__cothis_schema__ is not None

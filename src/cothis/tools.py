@@ -125,82 +125,17 @@ def tool(
         @tool(name="fs.read", description="...")  # keyword overrides
         def read(path: str) -> str: ...
 
-    Reads the function's Google-style docstring (summary line + ``Args:``
-    section, parsed by ``griffe``) and ``inspect.signature`` (types +
-    defaults), builds an OpenAI-format tool schema carrying per-arg
-    descriptions, and attaches it to ``func.__cothis_schema__``. The
-    function's ``__name__`` is the tool name unless overridden via
-    ``name=`` (or the positional first arg).
-
-    Why this exists: ``any-llm``'s ``callable_to_tool`` drops per-parameter
-    ``description`` fields — every parameter comes out as a generic
-    ``"Parameter <name> of type <type>"``. The decorator pre-builds the
-    schema so descriptions reach the model intact (same side-channel as
-    ``_ShellTool.__cothis_schema__``).
+    Returns a ``ToolDef`` instance that wraps the function. ``ToolDef``
+    satisfies the ``Tool`` Protocol (``__name__`` + ``__call__``) and carries
+    a pre-built OpenAI schema on ``__cothis_schema__`` (bypassing any-llm's
+    lossy ``callable_to_tool``, which drops per-parameter ``description``
+    fields). It also exposes the five lifecycle hook decorators
+    (``.pre_load()`` / ``.after_load()`` / ``.pre_execute()`` /
+    ``.after_execute()`` / ``.on_error()``) — see CONTEXT.md "Tool lifecycle".
     """
 
-    def decorate(fn: Any) -> Tool:
-        summary, arg_descs = _parse_docstring(inspect.getdoc(fn))
-        sig = inspect.signature(fn)
-        # ``from __future__ import annotations`` makes annotations strings;
-        # ``get_type_hints`` resolves them back to real type objects so the
-        # ``_PY_JSON_TYPE`` lookup works. Failure (forward-ref, eval error)
-        # leaves the annotation unresolved → falls back to ``string``.
-        # cothis: ceiling — unresolved annotations silently become "string"
-        # in the schema rather than failing loudly. Acceptable today because
-        # every shipped tool uses builtins; upgrade path: surface unresolved
-        # annotations as a load-time warning so a typo in a type hint
-        # doesn't silently mistype a parameter for the model.
-        try:
-            hints = typing.get_type_hints(fn)
-        except Exception:  # noqa: BLE001 — any hint-resolution failure is non-fatal
-            hints = {}
-        properties: dict[str, dict[str, Any]] = {}
-        required: list[str] = []
-        for pname, param in sig.parameters.items():
-            if param.kind in (
-                inspect.Parameter.VAR_POSITIONAL,
-                inspect.Parameter.VAR_KEYWORD,
-            ):
-                continue  # *args / **kwargs have no schema representation
-            annotation = hints.get(pname, param.annotation)
-            # ``int | None`` (Optional) resolves to a Union; unwrap the
-            # non-None arm so the type map lookup sees ``int``, not ``Union``.
-            # Falls back to ``string`` if the annotation can't be resolved
-            # (forward ref, custom type, eval error) — the common case is a
-            # builtin, so this is the safe default.
-            origin = typing.get_origin(annotation)
-            if origin in (typing.Union, type(None)):
-                args = [a for a in typing.get_args(annotation) if a is not type(None)]
-                annotation = args[0] if args else str
-            prop: dict[str, Any] = {"type": _PY_JSON_TYPE.get(annotation, "string")}
-            desc = arg_descs.get(pname)
-            if desc:
-                prop["description"] = desc
-            properties[pname] = prop
-            # An arg is required unless it has a default. ``None`` default
-            # still counts as "has a default" (the caller can omit it).
-            if param.default is inspect.Parameter.empty:
-                required.append(pname)
-        tool_name = name or fn.__name__
-        if name:
-            fn.__name__ = name
-        tool_desc = (
-            description or summary or inspect.getdoc(fn) or f"Python tool: {tool_name}"
-        )
-        fn.__cothis_schema__ = {  # type: ignore[attr-defined]
-            "type": "function",
-            "function": {
-                "name": tool_name,
-                "description": tool_desc,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
-            },
-        }
-        return cast("Tool", fn)
+    def decorate(fn: Any) -> ToolDef:
+        return ToolDef(fn, name=name, description=description)
 
     # ``@tool("fs.read")`` — positional arg is the name string, not the function.
     if isinstance(func, str):
@@ -212,6 +147,227 @@ def tool(
         return decorate(func)
     # ``@tool(...)`` (with parens) → return a decorator for later application.
     return decorate
+
+
+# The five lifecycle stages a hook can register on. Used as dict keys in
+# ``ToolDef._hooks`` and as the ``phase`` argument to ``on_error`` callbacks.
+# Order matches the lifecycle (see CONTEXT.md "Tool lifecycle").
+_HOOK_STAGES = ("pre_load", "after_load", "pre_execute", "after_execute", "on_error")
+
+
+class ToolDef:
+    """A tool definition: a callable + its schema + lifecycle hooks.
+
+    Produced by the ``@tool`` decorator. Wraps a function with:
+    - ``__name__`` / ``__doc__`` / ``__signature__`` / ``__cothis_schema__`` —
+      the surface the ``Tool`` protocol + any-llm expect.
+    - ``__call__(**args)`` — delegates to the wrapped function.
+    - Five hook-decorator methods (``.pre_load()`` etc.) — register callbacks
+      into an ordered list per stage. Callbacks are stored here but invoked
+      by the discovery loader (#5/#6) and ``_execute`` (#7); this class only
+      owns registration + storage.
+
+    Hook callbacks are stored in ``self._hooks[stage]`` as a list in
+    registration order. The decorator methods return the callback unchanged
+    so stacking works::
+
+        @tool("x")
+        def x(arg: str) -> str: ...
+
+        @x.pre_execute()
+        def validate(args): ...
+
+        @x.pre_execute()   # second callback — appended, runs after validate
+        def sanitize(args): ...
+    """
+
+    __name__: str
+    __doc__: str
+    __signature__: inspect.Signature
+    __cothis_schema__: dict[str, Any]
+
+    def __init__(
+        self,
+        fn: Any,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        self._fn = fn
+        tool_name = name or fn.__name__
+        # Schema construction: parse docstring + signature once, here.
+        # ``__name__`` etc. are set so this object satisfies ``Tool`` Protocol.
+        self.__name__ = tool_name
+        self.__doc__ = description or inspect.getdoc(fn) or f"Python tool: {tool_name}"
+        self.__signature__ = inspect.signature(fn)
+        self.__cothis_schema__ = _build_schema(fn, tool_name, description)
+        # Hook storage: ordered list per stage. Populated lazily by the
+        # decorator methods below; invoked by #6 (load hooks) and #7
+        # (execute hooks). Empty list = no callbacks = current behavior.
+        self._hooks: dict[str, list[Callable[..., Any]]] = {
+            stage: [] for stage in _HOOK_STAGES
+        }
+
+    def __call__(self, **kwargs: Any) -> Any:
+        return self._fn(**kwargs)
+
+    # --- Hook registration (decorators that append to the chain) --------
+    #
+    # Each method takes a callback, appends it to ``self._hooks[stage]`` in
+    # registration order, and returns the callback unchanged (so the decorator
+    # doesn't change the callback's visibility / reference). The callbacks
+    # are NOT invoked here — the discovery loader (#6) and ``_execute`` (#7)
+    # are responsible for running the chains with the right semantics
+    # (pipeline / short-circuit-AND / side-effect).
+
+    def pre_load(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a ``pre_load`` callback (environment gate, pre-registration).
+
+        Returns a decorator that appends the callback to the chain. The
+        callback is invoked by the discovery loader (#6) — returns ``False``
+        to skip the tool, raises to skip + trigger ``on_error``.
+        """
+        stage = self._hooks["pre_load"]
+
+        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
+            stage.append(cb)
+            return cb
+
+        return decorator
+
+    def after_load(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register an ``after_load`` callback (initialisation, post-registration).
+
+        Returns a decorator that appends the callback to the chain. Invoked by
+        the discovery loader (#6) after ``pre_load`` passes — side-effect only.
+        """
+        stage = self._hooks["after_load"]
+
+        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
+            stage.append(cb)
+            return cb
+
+        return decorator
+
+    def pre_execute(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a ``pre_execute`` callback (input interception, pipeline).
+
+        Returns a decorator that appends the callback to the chain. Invoked by
+        ``_execute`` (#7) — receives ``args: dict``, returns the (possibly
+        modified) dict; the final dict reaches ``tool(**args)``.
+        """
+        stage = self._hooks["pre_execute"]
+
+        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
+            stage.append(cb)
+            return cb
+
+        return decorator
+
+    def after_execute(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register an ``after_execute`` callback (output interception, pipeline).
+
+        Returns a decorator that appends the callback to the chain. Invoked by
+        ``_execute`` (#7) — receives ``(result, args)``, returns the (possibly
+        modified) result; flows into ``_format_tool_output`` / ``str()``.
+        """
+        stage = self._hooks["after_execute"]
+
+        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
+            stage.append(cb)
+            return cb
+
+        return decorator
+
+    def on_error(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register an ``on_error`` callback (failure observer, side-effect only).
+
+        Returns a decorator that appends the callback to the chain. Invoked
+        when any prior stage raises — receives ``(exc, phase, args, result)``.
+        Pure side-effect: cannot recover. Its own exceptions are swallowed.
+        """
+        stage = self._hooks["on_error"]
+
+        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
+            stage.append(cb)
+            return cb
+
+        return decorator
+
+
+def _build_schema(
+    fn: Any, tool_name: str, description_override: str | None
+) -> dict[str, Any]:
+    """Build the OpenAI-format tool schema from a function's docstring + signature.
+
+    Reads the Google-style docstring (``griffe``) for the summary line and
+    per-arg descriptions, and ``inspect.signature`` + ``typing.get_type_hints``
+    for arg types + required/optional. ``description_override`` (from
+    ``@tool(description=…)``) replaces the docstring summary if given.
+
+    This is the same logic that used to live inline in the ``tool`` decorator;
+    extracted so ``ToolDef.__init__`` stays focused on object construction.
+    """
+    summary, arg_descs = _parse_docstring(inspect.getdoc(fn))
+    sig = inspect.signature(fn)
+    # ``from __future__ import annotations`` makes annotations strings;
+    # ``get_type_hints`` resolves them back to real type objects so the
+    # ``_PY_JSON_TYPE`` lookup works. Failure (forward-ref, eval error)
+    # leaves the annotation unresolved → falls back to ``string``.
+    # cothis: ceiling — unresolved annotations silently become "string"
+    # in the schema rather than failing loudly. Acceptable today because
+    # every shipped tool uses builtins; upgrade path: surface unresolved
+    # annotations as a load-time warning so a typo in a type hint
+    # doesn't silently mistype a parameter for the model.
+    try:
+        hints = typing.get_type_hints(fn)
+    except Exception:  # noqa: BLE001 — any hint-resolution failure is non-fatal
+        hints = {}
+    properties: dict[str, dict[str, Any]] = {}
+    required: list[str] = []
+    for pname, param in sig.parameters.items():
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue  # *args / **kwargs have no schema representation
+        annotation = hints.get(pname, param.annotation)
+        # ``int | None`` (Optional) resolves to a Union; unwrap the
+        # non-None arm so the type map lookup sees ``int``, not ``Union``.
+        # Falls back to ``string`` if the annotation can't be resolved
+        # (forward ref, custom type, eval error) — the common case is a
+        # builtin, so this is the safe default.
+        origin = typing.get_origin(annotation)
+        if origin in (typing.Union, type(None)):
+            non_none = [a for a in typing.get_args(annotation) if a is not type(None)]
+            annotation = non_none[0] if non_none else str
+        prop: dict[str, Any] = {"type": _PY_JSON_TYPE.get(annotation, "string")}
+        desc = arg_descs.get(pname)
+        if desc:
+            prop["description"] = desc
+        properties[pname] = prop
+        # An arg is required unless it has a default. ``None`` default
+        # still counts as "has a default" (the caller can omit it).
+        if param.default is inspect.Parameter.empty:
+            required.append(pname)
+    tool_desc = (
+        description_override
+        or summary
+        or inspect.getdoc(fn)
+        or f"Python tool: {tool_name}"
+    )
+    return {
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": tool_desc,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
 
 
 @tool("fs.read")

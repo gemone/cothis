@@ -30,6 +30,37 @@ are formatted; `str` results bypass (text is text). Formats: `json`
 paths; bare-list-of-scalars falls back to json), `yaml` (native nesting).
 _Avoid_: tool response, tool payload.
 
+**Hook chain**:
+An ordered list of callbacks registered on one lifecycle stage of a tool
+(`pre_load` / `after_load` / `pre_execute` / `after_execute` / `on_error`).
+Callbacks run in registration order. For data-carrying stages
+(`pre_execute`, `after_execute`) the chain is a **pipeline**: each callback's
+output feeds the next. For predicate stages (`pre_load`) the chain is
+**short-circuit AND**: any `False` return skips the tool. An exception in
+any callback **short-circuits** the chain (remaining callbacks don't run);
+the `on_error` stage is the escape hatch for audit/logging when this
+happens.
+_Avoid_: plugin, filter, interceptor (overloaded).
+
+**Tool lifecycle**:
+The five stages a `ToolDef` passes through, from discovery to dispatch.
+Each stage has a hook chain (see Hook chain). Stages and their semantics:
+
+| Stage | When | Input | Return | Chain semantics | Exception → |
+|---|---|---|---|---|---|
+| `pre_load` | discovery, before registration | none | `False` = skip | short-circuit AND | skip tool |
+| `after_load` | discovery, after `pre_load` passes | none | unused (side effect) | all run, no short-circuit | skip tool |
+| `pre_execute` | `_execute`, before tool body | `args: dict` | `dict` (modified) | pipeline (A's output → B's input) | short-circuit → on_error → error to LLM |
+| `after_execute` | `_execute`, after tool body, before formatting | `result, args` | `result` (modified) | pipeline | use original result |
+| `on_error` | any prior stage raised | `exc, phase, args, result` (missing = None) | `None` (side effect only — cannot recover) | short-circuit on its own exception | swallowed to `logger.debug` |
+
+`on_error` is pure side-effect: it observes failures (audit, telemetry,
+alerts) but **cannot recover** them. Its own exceptions are swallowed
+(chain terminates, `logger.debug` records, main flow's original error
+proceeds). `phase` is one of `"pre_load"` / `"after_load"` /
+`"pre_execute"` / `"tool"` / `"after_execute"`, naming which stage raised.
+_Avoid_: pipeline stage, middleware (both too generic).
+
 **Tool source**:
 A path that yields `Tool` objects. **Currently implemented**: Python
 (`@tool`-decorated functions) and YAML (declarative shell template).
