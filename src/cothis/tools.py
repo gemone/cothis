@@ -139,7 +139,7 @@ def tool(
     ``_ShellTool.__cothis_schema__``).
     """
 
-    def decorate(fn: Callable[..., Any]) -> Tool:
+    def decorate(fn: Any) -> Tool:
         summary, arg_descs = _parse_docstring(inspect.getdoc(fn))
         sig = inspect.signature(fn)
         # ``from __future__ import annotations`` makes annotations strings;
@@ -541,7 +541,12 @@ class CommandBlock:
         """
         if isinstance(self.command, list):
             return self.command[0]
-        return self.shell  # type: ignore[return-value]  # locked non-None by _compile
+        # Shell mode: ``_compile`` guarantees ``shell`` is non-None here
+        # (it rejects string commands without a ``shell:`` field). The assert
+        # turns that compile-time invariant into a runtime check + gives the
+        # type checker a narrowing point.
+        assert self.shell is not None
+        return self.shell
 
     def render(self, **kwargs: Any) -> list[str] | str:
         """Substitute Placeholders into the selected command.
