@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import inspect
+import io
+import json
 import logging
+import os
 import shutil
 import string
 import subprocess
@@ -1152,6 +1156,106 @@ def _schema_for(tool: Tool) -> Tool | dict[str, Any]:
     Tools are defined, not in ``agent.py``.
     """
     return getattr(tool, "__cothis_schema__", tool)
+
+
+# --------------------------------------------------------------------
+# Tool output formatting
+#
+# ``_execute`` calls ``_format_tool_output(result)`` on every structured
+# (dict/list) tool result. The format is chosen via the
+# ``COTHIS_TOOL_OUTPUT_FORMAT`` env var (``json`` | ``csv`` | ``tsv`` | ``yaml``),
+# defaulting to ``json``.
+#
+# Format applicability (CSV/TSV are tabular; YAML/JSON can express anything):
+# - ``list[dict]``  → table in csv/tsv; native in yaml/json.
+# - ``single dict`` → one-row table (nested dicts flattened with dotted
+#   key paths: ``{"a": {"b": 1}}`` → ``a.b``); native in yaml/json.
+# - ``list[non-dict]`` or deeply nested → csv/tsv FALL BACK to json (a bare
+#   list of scalars isn't a table; flattening would lose too much).
+# - ``str`` results bypass formatting entirely (text is text).
+# --------------------------------------------------------------------
+
+
+def _flatten_dict(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Flatten nested dicts with dotted key paths (``{"a": {"b": 1}}`` → ``{"a.b": 1}``).
+
+    Non-dict values (including lists) are left as-is on the leaf — they'll be
+    JSON-encoded per cell by the CSV writer.
+    """
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(_flatten_dict(v, key))
+        else:
+            out[key] = v
+    return out
+
+
+def _to_tabular(data: Any, delimiter: str) -> str | None:
+    """Render ``data`` as CSV/TSV (``delimiter`` = ``,`` or ``\t``).
+
+    Returns ``None`` when ``data`` isn't tabular (bare list of scalars, or a
+    shape CSV can't express) — caller falls back to JSON. Nested dicts are
+    flattened with dotted paths; nested lists/scalars are JSON-encoded per cell.
+    """
+    # Normalise to a list of single-row records.
+    if isinstance(data, dict):
+        rows = [_flatten_dict(data)]
+    elif isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
+        rows = [_flatten_dict(r) for r in data]
+    else:
+        # Bare list of scalars, empty list, or list with non-dict items:
+        # not a table. Signal fallback.
+        return None
+
+    # Union of keys across rows preserves column discovery order.
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for k in row:
+            if k not in seen:
+                fieldnames.append(k)
+                seen.add(k)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, delimiter=delimiter)
+    writer.writeheader()
+    for row in rows:
+        # Cells must be strings; JSON-encode non-scalars so values stay
+        # model-parseable instead of Python repr.
+        writer.writerow(
+            {
+                k: v if isinstance(v, str) else ("" if v is None else json.dumps(v))
+                for k, v in row.items()
+            }
+        )
+    return buf.getvalue().rstrip("\r\n")
+
+
+def _format_tool_output(result: Any) -> str:
+    """Serialise a structured tool result for the tool message.
+
+    Format is chosen via ``COTHIS_TOOL_OUTPUT_FORMAT`` (``json`` | ``csv`` |
+    ``tsv`` | ``yaml``), defaulting to ``json``. Only ``dict``/``list`` results
+    go through this path; ``str`` results bypass it (text is text).
+
+    CSV/TSV fall back to JSON when the shape isn't tabular (bare list of
+    scalars, deeply nested structures). YAML handles every shape natively.
+    """
+    fmt = os.environ.get("COTHIS_TOOL_OUTPUT_FORMAT", "json").lower()
+    if fmt in ("csv", "tsv"):
+        delim = "\t" if fmt == "tsv" else ","
+        rendered = _to_tabular(result, delim)
+        if rendered is not None:
+            return rendered
+        # Non-tabular shape → fall back to JSON so nothing is lost.
+    if fmt == "yaml":
+        # ``allow_unicode=True`` keeps CJK / emoji readable; ``sort_keys=False``
+        # preserves insertion order so the model sees fields in the author's
+        # intended order.
+        return yaml.dump(result, allow_unicode=True, sort_keys=False).rstrip("\n")
+    return json.dumps(result)
 
 
 def load_tools_from_dir(dir_path: Path) -> list[Tool]:

@@ -53,7 +53,7 @@ def test_summary_from_first_paragraph() -> None:
 
 
 def test_per_arg_description_from_args_section() -> None:
-    """The ``Args:`` section's per-line descriptions reach the schema."""
+    """"The ``Args:`` section's per-line descriptions reach the schema."""
 
     @tool
     def add(a: int, b: int) -> int:
@@ -72,7 +72,7 @@ def test_per_arg_description_from_args_section() -> None:
 
 
 def test_type_mapping_from_annotation() -> None:
-    """Python annotations map to JSON-Schema types."""
+    """"Python annotations map to JSON-Schema types."""
 
     @tool
     def typed(n: int, s: str, f: float, b: bool, items: list) -> str:
@@ -96,7 +96,7 @@ def test_type_mapping_from_annotation() -> None:
 
 
 def test_unknown_annotation_falls_back_to_string() -> None:
-    """An annotation not in the type map defaults to ``string``."""
+    """"An annotation not in the type map defaults to ``string``."""
 
     @tool
     def custom(x: Any) -> str:
@@ -112,7 +112,7 @@ def test_unknown_annotation_falls_back_to_string() -> None:
 
 
 def test_required_vs_optional_from_defaults() -> None:
-    """Args with defaults are optional; args without are required."""
+    """"Args with defaults are optional; args without are required."""
 
     @tool
     def f(req: str, opt: str = "x") -> str:
@@ -129,7 +129,7 @@ def test_required_vs_optional_from_defaults() -> None:
 
 
 def test_multiline_description_collapsed() -> None:
-    """Multi-line arg descriptions are collapsed to single-line."""
+    """"Multi-line arg descriptions are collapsed to single-line."""
 
     @tool
     def read(path: str) -> str:
@@ -171,7 +171,7 @@ def test_tool_with_positional_name() -> None:
 
 
 def test_tool_with_keyword_name_and_description() -> None:
-    """``@tool(name=..., description=...)`` overrides both fields."""
+    """"``@tool(name=..., description=...)`` overrides both fields."""
 
     @tool(name="custom.tool", description="Override description.")
     def f(x: str) -> str:
@@ -185,7 +185,7 @@ def test_tool_with_keyword_name_and_description() -> None:
 
 
 def test_tool_no_parens_uses_dunder_name() -> None:
-    """``@tool`` (no parens) uses ``__name__`` as the tool name."""
+    """"``@tool`` (no parens) uses ``__name__`` as the tool name."""
 
     @tool
     def bare(x: str) -> str:
@@ -196,7 +196,7 @@ def test_tool_no_parens_uses_dunder_name() -> None:
 
 
 def test_no_docstring_yields_default_description() -> None:
-    """A function without a docstring falls back to a derived description."""
+    """"A function without a docstring falls back to a derived description."""
 
     @tool
     def bare(x: str) -> str:
@@ -208,7 +208,7 @@ def test_no_docstring_yields_default_description() -> None:
 
 
 def test_no_args_section_yields_no_descriptions() -> None:
-    """A docstring without ``Args:`` produces no per-arg descriptions."""
+    """"A docstring without ``Args:`` produces no per-arg descriptions."""
 
     @tool
     def f(x: str) -> str:
@@ -221,7 +221,7 @@ def test_no_args_section_yields_no_descriptions() -> None:
 
 
 def test_var_args_dropped_from_schema() -> None:
-    """``*args`` and ``**kwargs`` are excluded from the schema."""
+    """"``*args`` and ``**kwargs`` are excluded from the schema."""
 
     @tool
     def f(a: str, *args: Any, **kwargs: Any) -> str:
@@ -237,7 +237,7 @@ def test_var_args_dropped_from_schema() -> None:
 
 
 def test_parse_docstring_helper_directly() -> None:
-    """``_parse_docstring`` returns (first-paragraph summary, {arg: description})."""
+    """"``_parse_docstring`` returns (first-paragraph summary, {arg: description})."""
     summary, args = _parse_docstring(
         """Summary line.
 
@@ -253,13 +253,13 @@ def test_parse_docstring_helper_directly() -> None:
 
 
 def test_parse_docstring_empty() -> None:
-    """An empty/None docstring yields empty summary + empty args."""
+    """"An empty/None docstring yields empty summary + empty args."""
     assert _parse_docstring(None) == ("", {})
     assert _parse_docstring("") == ("", {})
 
 
 def test_tool_returns_same_callable_type() -> None:
-    """``@tool`` returns the function itself (not a wrapper), with attributes."""
+    """"``@tool`` returns the function itself (not a wrapper), with attributes."""
 
     @tool
     def f(x: str) -> str:
@@ -311,7 +311,7 @@ def test_load_gitignore_returns_none_when_absent(tmp_path: Any) -> None:
 
 
 def test_load_gitignore_parses_patterns(tmp_path: Any) -> None:
-    """``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
+    """"``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
     from cothis.tools import _load_gitignore
 
     (tmp_path / ".gitignore").write_text("*.log\nbuild/\n")
@@ -370,7 +370,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
 
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
-    """Recursive listing yields entries with nested relative paths."""
+    """"Recursive listing yields entries with nested relative paths."""
     from cothis.tools import dir
 
     (tmp_path / "pkg").mkdir()
@@ -379,3 +379,84 @@ def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
     names = {e["name"] for e in result}
     assert "pkg" in names
     assert "pkg/mod.py" in names
+
+
+# --------------------------------------------------------------------
+# Tool output formatting (COTHIS_TOOL_OUTPUT_FORMAT)
+# --------------------------------------------------------------------
+
+
+def test_format_default_is_json(monkeypatch: Any) -> None:
+    """"Without ``COTHIS_TOOL_OUTPUT_FORMAT``, structured output is JSON."""
+    from cothis.tools import _format_tool_output
+
+    monkeypatch.delenv("COTHIS_TOOL_OUTPUT_FORMAT", raising=False)
+    out = _format_tool_output([{"a": 1}])
+    assert out == '[{"a": 1}]'
+
+
+def test_format_csv_table(monkeypatch: Any) -> None:
+    """``list[dict]`` renders as a CSV table with header + rows."""
+    from cothis.tools import _format_tool_output
+
+    monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
+    out = _format_tool_output([{"name": "src", "type": "dir"}, {"name": "x", "type": "file"}])
+    lines = out.splitlines()
+    assert lines[0] == "name,type"
+    assert lines[1] == "src,dir"
+    assert lines[2] == "x,file"
+
+
+def test_format_tsv_uses_tab_delimiter(monkeypatch: Any) -> None:
+    """``tsv`` is the same as csv but with tab separators."""
+    from cothis.tools import _format_tool_output
+
+    monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "tsv")
+    out = _format_tool_output([{"a": "1", "b": "2"}])
+    assert "\t" in out
+    assert out.splitlines()[0] == "a\tb"
+
+
+def test_format_csv_flattens_nested_dict(monkeypatch: Any) -> None:
+    """``csv`` flattens nested dicts with dotted key paths."""
+    from cothis.tools import _format_tool_output
+
+    monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
+    out = _format_tool_output({"name": "src", "meta": {"type": "dir", "size": 1024}})
+    header = out.splitlines()[0]
+    assert "meta.type" in header
+    assert "meta.size" in header
+    assert "name" in header
+
+
+def test_format_csv_bare_list_falls_back_to_json(monkeypatch: Any) -> None:
+    """A bare list of scalars isn't tabular → CSV falls back to JSON."""
+    from cothis.tools import _format_tool_output
+
+    monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
+    out = _format_tool_output(["a", "b", "c"])
+    import json as _json
+
+    assert _json.loads(out) == ["a", "b", "c"]
+
+
+def test_format_yaml_handles_nested(monkeypatch: Any) -> None:
+    """YAML renders nested structures natively (no flattening)."""
+    from cothis.tools import _format_tool_output
+
+    monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "yaml")
+    out = _format_tool_output({"name": "src", "meta": {"type": "dir"}})
+    assert "name: src" in out
+    assert "meta:" in out
+    assert "  type: dir" in out  # nested key is indented, not flattened
+
+
+def test_format_unknown_value_defaults_to_json(monkeypatch: Any) -> None:
+    """An unrecognised ``COTHIS_TOOL_OUTPUT_FORMAT`` value falls back to JSON."""
+    from cothis.tools import _format_tool_output
+
+    monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "xml")
+    out = _format_tool_output({"a": 1})
+    import json as _json
+
+    assert _json.loads(out) == {"a": 1}

@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # representation of that constraint.
 from cothis.tools import (
     Tool,  # noqa: TC001
+    _format_tool_output,
     _schema_for,
 )
 
@@ -397,10 +398,9 @@ class Agent(BaseModel):
 
         Return shape depends on the tool's result type:
         - ``str`` → returned as-is (text output, confirmations, errors, stdout).
-        - ``dict`` / ``list`` → ``json.dumps`` to a JSON string. Structured
-          data serialises as JSON so the model can parse it accurately
-          (a bare ``str(dict)`` would use Python repr quotes, which LLMs
-          parse less reliably than JSON).
+        - ``dict`` / ``list`` → formatted via ``_format_tool_output`` (json by
+          default; csv/tsv/yaml via ``COTHIS_TOOL_OUTPUT_FORMAT``). Structured
+          data is serialised so the model can parse it accurately.
         - anything else → ``str(result)`` fallback.
         """
         name = tool_call.function.name
@@ -426,9 +426,9 @@ class Agent(BaseModel):
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             logger.debug("← %s raised: %s", name, exc)
             return f"Error calling {name}: {exc}"
-        # Structured result → JSON (accurate, model-parseable). Str → as-is.
+        # Structured result → format (json/csv/tsv/yaml). Str → as-is.
         if isinstance(result, (dict, list)):
-            rendered = json.dumps(result)
+            rendered = _format_tool_output(result)
         else:
             rendered = str(result)
         logger.debug("← %s: %s", name, rendered)
