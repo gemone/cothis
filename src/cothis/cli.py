@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -71,6 +72,11 @@ def _root(
     """cothis — a basic any-llm agent loop."""
     global _debug
     _debug = debug
+    # ``--debug`` (or ``DEBUG=1``) enables DEBUG-level logging across cothis.
+    # Today this surfaces every tool call's input/output (see ``Agent._execute``);
+    # the silent-gate skip in ``load_yaml_tools`` is another candidate consumer.
+    if debug:
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
 
 
 @app.command()
@@ -219,51 +225,54 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
       * ``ToolCallEvent``  — printed inline (``calling fs.read(...)``) so the
         user can see why a multi-step turn is taking time. Printed *above*
         the spinner's animation row, which rich's Status handles cleanly.
-      * ``str``            — a content delta of the final answer. The first
-        content delta stops the spinner and switches to a Live-rendered
-        Markdown view that re-formats as tokens arrive.
+      * ``str``            — a content delta of the final answer.
+
+    The ReAct loop is multi-turn: tool-call turns and content turns alternate.
+    This consumer drives a two-state display:
+      * ``thinking``  — spinner running; ToolCallEvents printed inline.
+      * ``streaming`` — spinner stopped; a Live Markdown view re-renders as
+        content deltas arrive.
+    Transitions happen per-event, not per-turn, because a single provider
+    turn can interleave tool calls and content. The consumer must drain
+    the *whole* generator — closing it early (the old ``break`` + ``return``
+    shape) truncated the ReAct loop the moment a tool-call-only turn had no
+    content delta to show, so the agent stopped after one tool call.
     """
     stream = agent.run_stream(prompt)
     status = console.status("thinking...", spinner="dots")
+    live: Live | None = None
+    accumulated = ""
     status.start()
     try:
-        first_content: str | None = None
         async for event in stream:
             if isinstance(event, ToolCallEvent):
-                # Tool calls are printed inline while the spinner runs. The
-                # spinner is transient (rich's Status uses Live(transient=True)
-                # internally) so once it stops, only these printed lines and
-                # the final answer remain on screen.
+                # Back to thinking state: tear down Live if we were streaming,
+                # restart the spinner, print the tool call above it.
+                if live is not None:
+                    live.stop()
+                    live = None
+                    accumulated = ""
+                    status.start()
                 console.print(_format_tool_call(event), style="dim")
                 continue
-            # First content delta: stop the spinner, switch to Live rendering.
-            first_content = event
-            break
+            # Content delta. First one of a fresh streaming phase: stop the
+            # spinner, spin up Live. Subsequent ones just update it.
+            if live is None:
+                status.stop()
+                accumulated = event
+                live = Live(
+                    Markdown(accumulated), console=console, refresh_per_second=10
+                )
+                live.start()
+            else:
+                accumulated += event
+                live.update(Markdown(accumulated))
     finally:
-        status.stop()
-
-    if first_content is None:
-        # Stream ended with only tool-call events (or nothing at all).
-        # Nothing to Live-render; the printed tool calls already left a trail.
-        return
-
-    # Live re-renders the whole Markdown on each update so code blocks,
-    # lists etc. format progressively. Live's own __exit__ leaves the final
-    # frame on screen, which is exactly what we want.
-    accumulated = first_content
-    with Live(Markdown(accumulated), console=console, refresh_per_second=10) as live:
-        async for chunk in stream:
-            # ``run_stream`` only yields ToolCallEvents on intermediate turns
-            # and the loop above already drained those before the first
-            # content delta, so we never expect a ToolCallEvent here. The
-            # isinstance guard is still required: ty can't prove narrowing
-            # across the async-for boundary, and without it ``accumulated +=
-            # chunk`` doesn't typecheck (str + ToolCallEvent is invalid).
-            if isinstance(chunk, ToolCallEvent):
-                continue
-            accumulated += chunk
-            live.update(Markdown(accumulated))
-    console.print()
+        if live is not None:
+            live.stop()
+            console.print()
+        else:
+            status.stop()
 
 
 def _format_tool_call(event: ToolCallEvent) -> str:

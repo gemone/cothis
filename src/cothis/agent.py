@@ -10,13 +10,13 @@ The loop is the standard ReAct-style cycle:
 Example
 -------
 >>> from cothis.agent import Agent
->>> agent = Agent(model="mistral-small-latest", provider="mistral")
 >>> print(agent.run("What is 47 * 83?"))
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 
 
 Message = dict[str, Any]
+
+logger = logging.getLogger("cothis.agent")
 
 
 def _safe_parse_args(raw: str | None) -> dict[str, Any]:
@@ -178,14 +180,30 @@ class Agent(BaseModel):
             message = response.choices[0].message
             self._messages.append(message)
 
-            if not message.tool_calls:
-                return message.content or ""
+            if message.tool_calls:
+                for tool_msg in self._execute_tool_calls(message.tool_calls):
+                    self._messages.append(tool_msg)
+                continue
 
-            for tool_msg in self._execute_tool_calls(message.tool_calls):
-                self._messages.append(tool_msg)
+            # No tool calls: the model is done. But some providers emit a
+            # turn with neither tool_calls nor content (the model "had nothing
+            # to say" this round, or a provider filter dropped the content).
+            # Returning "" silently would print a blank line and exit, which
+            # looks like a crash to the user. Loop again instead — if the
+            # model genuinely has nothing, we'll hit ``MaxIterationsError``
+            # which is at least a loud, named failure.
+            #
+            # cothis: ceiling — we can't distinguish "provider dropped content
+            # mid-stream" from "model genuinely chose to say nothing". Both
+            # look like content=None. Retry is the safe default but wastes a
+            # turn on the second case. Upgrade path: provider-specific sniffing
+            # (e.g. OpenRouter's finish_reason) to tell drop from silence.
+            if message.content:
+                return message.content
 
         raise MaxIterationsError(
-            f"Agent did not finish within {self.max_iterations} iterations."
+            f"Agent did not finish within {self.max_iterations} iterations. "
+            f"Last message had no content and no tool calls."
         )
 
     async def run_stream(self, user_input: str) -> AsyncIterator[str | ToolCallEvent]:
@@ -238,12 +256,16 @@ class Agent(BaseModel):
                     tool_call_chunks.extend(delta.tool_calls)
 
             if not tool_call_chunks:
-                # Final turn: content was streamed above. Record the full
-                # assistant message so the next turn sees consistent history.
-                messages.append(
-                    {"role": "assistant", "content": "".join(content_parts)}
-                )
-                return
+                # No tool calls this turn. If there was content, it's the
+                # final answer — record it and return. If content was also
+                # empty (some providers emit a no-content/no-tool turn),
+                # loop again instead of ending silently — same fix as ``run``.
+                if content_parts or "".join(content_parts):
+                    messages.append(
+                        {"role": "assistant", "content": "".join(content_parts)}
+                    )
+                    return
+                continue
 
             # Intermediate tool-call turn: append the assistant message that
             # requested the tool calls, then dispatch each call individually,
@@ -281,7 +303,8 @@ class Agent(BaseModel):
                 )
 
         raise MaxIterationsError(
-            f"Agent did not finish within {self.max_iterations} iterations."
+            f"Agent did not finish within {self.max_iterations} iterations. "
+            f"Last message had no content and no tool calls."
         )
 
     # --- internals -----------------------------------------------------
@@ -370,20 +393,43 @@ class Agent(BaseModel):
         ]
 
     def _execute(self, tool_call: Any) -> str:
-        """Dispatch a single tool call and return its result as a string."""
+        """Dispatch a single tool call and return its result as a string.
+
+        Return shape depends on the tool's result type:
+        - ``str`` → returned as-is (text output, confirmations, errors, stdout).
+        - ``dict`` / ``list`` → ``json.dumps`` to a JSON string. Structured
+          data serialises as JSON so the model can parse it accurately
+          (a bare ``str(dict)`` would use Python repr quotes, which LLMs
+          parse less reliably than JSON).
+        - anything else → ``str(result)`` fallback.
+        """
         name = tool_call.function.name
         raw_args = tool_call.function.arguments or "{}"
         try:
             args: dict[str, Any] = json.loads(raw_args)
         except json.JSONDecodeError:
+            logger.debug("tool %s args parse failed: %s", name, raw_args)
             return f"Error: could not parse tool arguments for {name!r}: {raw_args}"
 
         tool = self._tool_map.get(name)
         if tool is None:
+            logger.debug("tool %s not in tool_map (unknown tool)", name)
             return f"Error: unknown tool {name!r}."
 
+        # Debug visibility: log the full input/output of every tool call so
+        # ``--debug`` (or ``LOGLEVEL=DEBUG``) surfaces what the model sent
+        # and what the tool returned.
+        arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
+        logger.debug("→ %s(%s)", name, arg_repr)
         try:
             result = tool(**args)
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
+            logger.debug("← %s raised: %s", name, exc)
             return f"Error calling {name}: {exc}"
-        return str(result)
+        # Structured result → JSON (accurate, model-parseable). Str → as-is.
+        if isinstance(result, (dict, list)):
+            rendered = json.dumps(result)
+        else:
+            rendered = str(result)
+        logger.debug("← %s: %s", name, rendered)
+        return rendered

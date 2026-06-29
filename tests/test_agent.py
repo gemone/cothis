@@ -17,13 +17,15 @@ OpenRouter produced for a real ``add(a=2, b=3)`` tool call, captured once.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
 
-from cothis.agent import Agent, _safe_parse_args
+from cothis.agent import Agent, MaxIterationsError, _safe_parse_args
 
 if TYPE_CHECKING:
     from cothis.tools import Tool
@@ -133,3 +135,167 @@ def test_agent_rejects_non_tool() -> None:
     not_a_tool = cast("Tool", object())
     with pytest.raises(ValidationError):
         Agent(model="x", provider="mistral", tools=[not_a_tool])
+
+
+def test_run_retries_on_empty_message_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty provider message (no content, no tool_calls) loops, doesn't exit.
+
+    Regression check for the silent-blank-exit bug: ``run`` used to return
+    ``message.content or ""`` on any no-tool-call turn, so a provider emitting
+    an empty message made ``ask`` print a blank line and exit. The fix: only
+    return when content is non-empty; otherwise loop. This test fakes a
+    provider that emits one empty turn then a real answer, and asserts both
+    that ``run`` retries and that it ultimately returns the content.
+    """
+    import asyncio
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+
+    state = {"turn": 0}
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        state["turn"] += 1
+        resp = MagicMock()
+        msg = MagicMock()
+        if state["turn"] == 1:
+            msg.content = None  # provider emits nothing
+            msg.tool_calls = None
+        else:
+            msg.content = "recovered"
+            msg.tool_calls = None
+        resp.choices = [MagicMock(message=msg)]
+        return resp
+
+    monkeypatch.setattr(agent._llm, "acompletion", fake_acompletion)
+    result = asyncio.run(agent.run("hi"))
+    assert result == "recovered"
+    assert state["turn"] == 2  # retried once after the empty turn
+
+
+def test_run_raises_on_persistent_empty_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent empty messages exhaust ``max_iterations`` (loud, not silent).
+
+    Without this, a provider that always emits empty messages would loop
+    forever or silently exit. The fix drives to ``MaxIterationsError``.
+    """
+    import asyncio
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=3)
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        resp = MagicMock()
+        msg = MagicMock()
+        msg.content = None
+        msg.tool_calls = None
+        resp.choices = [MagicMock(message=msg)]
+        return resp
+
+    monkeypatch.setattr(agent._llm, "acompletion", fake_acompletion)
+    with pytest.raises(MaxIterationsError, match="no content and no tool calls"):
+        asyncio.run(agent.run("hi"))
+
+
+def test_execute_str_result_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tool returning ``str`` gets passed through to the tool message as-is.
+
+    Str output (file contents, confirmations, stdout, error strings) is the
+    common case; it must not be re-encoded.
+    """
+    import any_llm
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+    agent._tool_map["str_tool"] = lambda **kw: "plain text"
+
+    tc = MagicMock()
+    tc.id = "c1"
+    tc.function.name = "str_tool"
+    tc.function.arguments = "{}"
+    assert agent._execute(tc) == "plain text"
+
+
+def test_execute_dict_result_serialised_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool returning ``dict`` is serialised as JSON, not ``str(dict)``.
+
+    Why: ``str(dict)`` uses Python repr quotes (``{'k': 'v'}``), which LLMs
+    parse unreliably. JSON (``{"k": "v"}``) is the model-native shape.
+    """
+    import any_llm
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+    payload = {"name": "src", "type": "dir", "children": ["a.py", "b.py"]}
+    agent._tool_map["dict_tool"] = lambda **kw: payload
+
+    tc = MagicMock()
+    tc.id = "c1"
+    tc.function.name = "dict_tool"
+    tc.function.arguments = "{}"
+    rendered = agent._execute(tc)
+    # Round-trips through json.loads → model sees accurate structure.
+    assert json.loads(rendered) == payload
+    # Uses JSON double-quoted form, not Python repr single-quoted.
+    assert '"name": "src"' in rendered
+    assert "'name'" not in rendered
+
+
+def test_execute_list_result_serialised_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool returning ``list`` is serialised as JSON (same rationale as dict)."""
+    import any_llm
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+    payload = [{"name": "x", "type": "f"}, {"name": "y", "type": "d"}]
+    agent._tool_map["list_tool"] = lambda **kw: payload
+
+    tc = MagicMock()
+    tc.id = "c1"
+    tc.function.name = "list_tool"
+    tc.function.arguments = "{}"
+    rendered = agent._execute(tc)
+    assert json.loads(rendered) == payload
+
+
+def test_execute_non_str_non_collection_falls_back_to_str(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool returning an int (or other non-collection) falls back to ``str()``."""
+    import any_llm
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+    agent._tool_map["int_tool"] = lambda **kw: 42
+
+    tc = MagicMock()
+    tc.id = "c1"
+    tc.function.name = "int_tool"
+    tc.function.arguments = "{}"
+    assert agent._execute(tc) == "42"

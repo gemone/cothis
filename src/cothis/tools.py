@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import shutil
 import string
 import subprocess
 import sys
+import typing
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+import griffe
+import pathspec
 import yaml
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+logger = logging.getLogger("cothis.tools")
 
 
 @runtime_checkable
@@ -34,40 +41,361 @@ class Tool(Protocol):
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
-def _named(name: str) -> Callable[[Tool], Tool]:
-    """Override a callable's tool name.
+# Python type → JSON-Schema type name. Shared with the YAML arg-type map
+# (``_ARG_TYPES`` / ``_JSON_TYPE`` below) so a new type lands in both places.
+_PY_JSON_TYPE: dict[type, str] = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
+}
 
-    ``any-llm`` derives the tool name from ``func.__name__``, which by
-    default cannot contain a dot (Python identifiers). This decorator
-    rewrites ``__name__`` so we can register namespaced tools such as
-    ``fs.read`` and ``fs.write``.
+
+def _parse_docstring(doc: str | None) -> tuple[str, dict[str, str]]:
+    """Parse a Google-style docstring into (summary, per-arg descriptions).
+
+    ``summary`` is the first paragraph (everything before ``Args:``), with
+    embedded newlines collapsed to spaces. The per-arg dict maps parameter
+    name → description string (also newline-collapsed). Both are empty
+    string / empty dict when the docstring is absent or has no ``Args:``
+    section.
+
+    Uses ``griffe`` because docstring parsing is brittle (multi-line
+    descriptions, indentation edge cases, mixed formats) and a hand-rolled
+    regex parser would be a long-term source of silent schema drift.
+    """
+    if not doc:
+        return "", {}
+    # griffe emits "No type or annotation for parameter" log warnings when
+    # ``parent`` is None (it can't cross-check names against a signature).
+    # We don't need that cross-check — types come from ``inspect.signature``
+    # — so silence griffe's logger during parse.
+    # cothis: ceiling — we discard griffe's type cross-check entirely and
+    # trust our own ``get_type_hints`` path. If a future griffe version
+    # emits at a different log level or via a different logger name, the
+    # warnings resurface; upgrade path is to construct a minimal ``parent``
+    # Function object so griffe has the signature it wants.
+    griffe_logger = logging.getLogger("griffe")
+    old_level = griffe_logger.level
+    griffe_logger.setLevel(logging.ERROR)
+    try:
+        parsed = griffe.Docstring(doc, parent=None).parse("google")
+    finally:
+        griffe_logger.setLevel(old_level)
+    summary = ""
+    arg_descs: dict[str, str] = {}
+    for section in parsed:
+        kind = section.kind.value
+        if kind == "text" and not summary:
+            # First text section's first paragraph only — that's the one-line
+            # summary the LLM sees as the tool's top-level description. The
+            # rest of the section (extended notes, parameter-behaviour prose)
+            # stays out of the schema; per-arg detail lives in each parameter's
+            # own ``description`` via the ``Args:`` section below.
+            first_para = section.value.split("\n\n", 1)[0]
+            summary = " ".join(first_para.split())
+        elif kind == "parameters":
+            for param in section.value:
+                arg_descs[param.name] = " ".join(param.description.split())
+    return summary, arg_descs
+
+
+def tool(
+    func: Callable[..., Any] | str | None = None,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+) -> Any:
+    """Decorate a function as a cothis tool with a rich LLM schema.
+
+    Three usage forms::
+
+        @tool                           # name from ``__name__``
+        def simple(x: str) -> str: ...
+
+        @tool("fs.read")                # positional name override
+        def read(path: str) -> str: ...
+
+        @tool(name="fs.read", description="...")  # keyword overrides
+        def read(path: str) -> str: ...
+
+    Reads the function's Google-style docstring (summary line + ``Args:``
+    section, parsed by ``griffe``) and ``inspect.signature`` (types +
+    defaults), builds an OpenAI-format tool schema carrying per-arg
+    descriptions, and attaches it to ``func.__cothis_schema__``. The
+    function's ``__name__`` is the tool name unless overridden via
+    ``name=`` (or the positional first arg).
+
+    Why this exists: ``any-llm``'s ``callable_to_tool`` drops per-parameter
+    ``description`` fields — every parameter comes out as a generic
+    ``"Parameter <name> of type <type>"``. The decorator pre-builds the
+    schema so descriptions reach the model intact (same side-channel as
+    ``_ShellTool.__cothis_schema__``).
     """
 
-    def decorator(func: Tool) -> Tool:
-        func.__name__ = name
-        return func
+    def decorate(fn: Callable[..., Any]) -> Tool:
+        summary, arg_descs = _parse_docstring(inspect.getdoc(fn))
+        sig = inspect.signature(fn)
+        # ``from __future__ import annotations`` makes annotations strings;
+        # ``get_type_hints`` resolves them back to real type objects so the
+        # ``_PY_JSON_TYPE`` lookup works. Failure (forward-ref, eval error)
+        # leaves the annotation unresolved → falls back to ``string``.
+        # cothis: ceiling — unresolved annotations silently become "string"
+        # in the schema rather than failing loudly. Acceptable today because
+        # every shipped tool uses builtins; upgrade path: surface unresolved
+        # annotations as a load-time warning so a typo in a type hint
+        # doesn't silently mistype a parameter for the model.
+        try:
+            hints = typing.get_type_hints(fn)
+        except Exception:  # noqa: BLE001 — any hint-resolution failure is non-fatal
+            hints = {}
+        properties: dict[str, dict[str, Any]] = {}
+        required: list[str] = []
+        for pname, param in sig.parameters.items():
+            if param.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue  # *args / **kwargs have no schema representation
+            annotation = hints.get(pname, param.annotation)
+            # ``int | None`` (Optional) resolves to a Union; unwrap the
+            # non-None arm so the type map lookup sees ``int``, not ``Union``.
+            # Falls back to ``string`` if the annotation can't be resolved
+            # (forward ref, custom type, eval error) — the common case is a
+            # builtin, so this is the safe default.
+            origin = typing.get_origin(annotation)
+            if origin in (typing.Union, type(None)):
+                args = [a for a in typing.get_args(annotation) if a is not type(None)]
+                annotation = args[0] if args else str
+            prop: dict[str, Any] = {"type": _PY_JSON_TYPE.get(annotation, "string")}
+            desc = arg_descs.get(pname)
+            if desc:
+                prop["description"] = desc
+            properties[pname] = prop
+            # An arg is required unless it has a default. ``None`` default
+            # still counts as "has a default" (the caller can omit it).
+            if param.default is inspect.Parameter.empty:
+                required.append(pname)
+        tool_name = name or fn.__name__
+        if name:
+            fn.__name__ = name
+        tool_desc = (
+            description or summary or inspect.getdoc(fn) or f"Python tool: {tool_name}"
+        )
+        fn.__cothis_schema__ = {  # type: ignore[attr-defined]
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": tool_desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+        return cast("Tool", fn)
 
-    return decorator
+    # ``@tool("fs.read")`` — positional arg is the name string, not the function.
+    if isinstance(func, str):
+        name = func
+        func = None
+
+    # ``@tool`` (no parens) → ``func`` is the function directly.
+    if func is not None:
+        return decorate(func)
+    # ``@tool(...)`` (with parens) → return a decorator for later application.
+    return decorate
 
 
-@_named("fs.read")
-def read(path: str) -> str:
-    """Read the contents of a UTF-8 text file from the filesystem.
+@tool("fs.read")
+def read(
+    path: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
+    """Read the contents of a UTF-8 text file, optionally a line range.
 
     Use this to inspect an existing file before reading or modifying it.
+    Without ``start_line`` / ``end_line``, returns the whole file. With
+    them, returns the slice (1-based, inclusive on both ends).
+
+    Output carries 1-based line numbers (right-aligned, tab-separated) so
+    the model can reference exact lines in follow-up calls (e.g. a
+    precise ``start_line`` / ``end_line`` for a large file).
 
     Args:
         path: Path to the file to read. Relative paths are resolved
             against the current working directory.
             eg. "src/main.py", "./README.md", "/etc/hostname".
+        start_line: 1-based line number to start reading from (inclusive).
+            Omit or pass null to read from the beginning of the file.
+            eg. 10, 1.
+        end_line: 1-based line number to stop reading at (inclusive).
+            Omit or pass null to read to the end of the file.
+            eg. 20, 100.
 
     Returns:
-        The file contents decoded as UTF-8.
+        The requested line range with 1-based line-number prefixes.
     """
-    return Path(path).read_text(encoding="utf-8")
+    text = Path(path).read_text(encoding="utf-8")
+    lines = text.splitlines()
+    total = len(lines)
+    # 1-based, inclusive on both ends. ``None`` means "from start" / "to end".
+    # ``end_line`` beyond EOF is clamped (the model can't know the file length);
+    # ``start_line`` beyond EOF is an actionable error — returning "" would
+    # give the model nothing to act on (AGENTS.md: "error messages that the
+    # LLM can act on").
+    start = max(1, start_line or 1)
+    end = min(total, end_line or total)
+    if start > total:
+        return f"Error: start_line {start} is beyond EOF (file has {total} lines)"
+    width = len(str(end))
+    selected = [f"{i:>{width}}\t{lines[i - 1]}" for i in range(start, end + 1)]
+    return "\n".join(selected)
 
 
-@_named("fs.write")
+# Directories ``fs.dir`` never descends into, even with ``all=True`` — they're
+# either huge (``.venv``, ``node_modules``), not source (``.git``), or build
+# artifacts (``__pycache__``). Hardcoded, not configurable: cothis is basic,
+# and every entry here is a directory whose contents would never help the
+# model understand a project. Listed as a module constant so future noise
+# sources are added in one place.
+_IGNORED_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".next",
+        "dist",
+        "build",
+        "target",
+        ".DS_Store",
+    }
+)
+# Cap on entries ``fs.dir(recursive=True)`` returns. A recursive listing is
+# meant for "show me the project shape", not "dump 50k site-packages files";
+# a sane project fits well under this. Over-cap → truncate with a count.
+_MAX_DIR_ENTRIES = 500
+
+
+def _load_gitignore(root: Path) -> pathspec.PathSpec | None:
+    """Load ``.gitignore`` patterns from ``root`` (the directory being listed).
+
+    Returns a ``PathSpec`` for matching, or ``None`` if ``root`` has no
+    ``.gitignore`` (so callers skip the matching pass entirely). Patterns
+    are resolved relative to ``root`` — this is the simplest correct scope:
+    it doesn't walk up the directory tree (cothis: YAGNI; the common case is
+    a single ``.gitignore`` at the project root the user cd'd into).
+    """
+    ignore_file = root / ".gitignore"
+    if not ignore_file.is_file():
+        return None
+    return pathspec.PathSpec.from_lines(
+        "gitignore", ignore_file.read_text().splitlines()
+    )
+
+
+@tool("fs.dir")
+def dir(
+    path: str, recursive: bool = False, all: bool = False
+) -> list[dict[str, str]] | dict[str, Any] | str:
+    """List the contents of a directory.
+
+    Use this to discover the structure of a project before reading specific
+    files. Returns a list of entries, each with a ``name`` (path relative to
+    ``path``) and ``type`` (``"dir"`` or ``"file"``). Without ``recursive``,
+    lists one level; with ``recursive=True``, walks the whole subtree.
+
+    By default, follows the same hygiene rules ``git status`` does:
+    paths matched by the directory's ``.gitignore`` are excluded, and
+    dotfiles/dot-directories (``.env``, ``.config``, …) are hidden. Pass
+    ``all=True`` to override both — useful when the model needs to inspect
+    configuration that lives in dotfiles. Hardcoded noise directories
+    (``.git``, ``.venv``, ``__pycache__``, ``node_modules``, …) are always
+    excluded regardless of ``all``; their contents never help the model.
+
+    Recursive listings are capped at 500 entries; over-cap listings include
+    a ``truncated`` count so the model knows to narrow its path.
+
+    Args:
+        path: Path to the directory to list. Relative paths are resolved
+            against the current working directory.
+            eg. ".", "src", "./.agents/tools".
+        recursive: If true, list entries recursively (the full subtree).
+            Omit or pass false for a single-level listing.
+        all: If true, include dotfiles and gitignore-excluded entries
+            (hardcoded noise dirs are still skipped). Omit or pass false
+            for the default git-hygienic listing.
+
+    Returns:
+        A list of ``{"name": <rel-path>, "type": "dir"|"file"}`` entries,
+        or an ``"Error: ..."`` string if ``path`` doesn't exist or isn't a
+        directory. Over-cap recursive listings come back as
+        ``{"entries": [...], "truncated": <count>}``.
+    """
+    root = Path(path)
+    if not root.exists():
+        return f"Error: no such directory: {path}"
+    if not root.is_dir():
+        return f"Error: not a directory: {path}"
+
+    gitignore = None if all else _load_gitignore(root)
+
+    def _is_excluded(p: Path) -> bool:
+        """True if ``p`` should be omitted from the listing."""
+        rel = p.relative_to(root)
+        rel_str = rel.as_posix()
+        # Hardcoded noise: always excluded, even with ``all=True``.
+        if any(part in _IGNORED_DIRS for part in rel.parts):
+            return True
+        if all:
+            return False
+        # Dotfiles / dot-directories: hidden by default ("." prefix on any
+        # path component, not just the leaf — so ``.config/foo`` is hidden too).
+        if any(part.startswith(".") for part in rel.parts):
+            return True
+        # ``.gitignore`` patterns.
+        if gitignore is not None and gitignore.match_file(rel_str):
+            return True
+        return False
+
+    if recursive:
+        all_paths = sorted(
+            (p for p in root.rglob("*") if not _is_excluded(p)),
+            key=lambda p: str(p.relative_to(root)),
+        )
+    else:
+        all_paths = sorted(
+            (p for p in root.iterdir() if not _is_excluded(p)),
+            key=lambda p: p.name,
+        )
+
+    truncated_count = len(all_paths) - _MAX_DIR_ENTRIES
+    paths = all_paths[:_MAX_DIR_ENTRIES]
+    entries = [
+        {
+            "name": p.relative_to(root).as_posix(),
+            "type": "dir" if p.is_dir() else "file",
+        }
+        for p in paths
+    ]
+    if truncated_count > 0:
+        return {"entries": entries, "truncated": truncated_count}
+    return entries
+
+
+@tool("fs.write")
 def write(path: str, content: str) -> str:
     """Write text to a file on the filesystem, creating it if needed.
 
@@ -89,7 +417,7 @@ def write(path: str, content: str) -> str:
     return f"Wrote {len(content)} characters to {path}"
 
 
-TOOLS: list[Tool] = [read, write]
+TOOLS: list[Tool] = [read, dir, write]
 
 
 # ====================================================================
@@ -139,9 +467,9 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     Thin wrapper over ``_compile``: compile, gate the executable via
     ``shutil.which``, wrap in ``_ShellTool``. If the executable is not on
     PATH the tool is **silently not registered** — the model never sees a
-    tool it cannot dispatch on this host. cothis ceiling: the skip is silent
-    (no debug log yet); upgrade path: emit a debug log when a logging
-    surface exists.
+    tool it cannot dispatch on this host. The skip is silent at the UI
+    layer but emits a ``logger.debug`` entry under ``cothis.tools`` — enable
+    with ``--debug`` (or ``LOGLEVEL=DEBUG``) to see which tools gated off.
 
     See ``_compile`` for the YAML shape and ``CommandBlock`` for the
     contract. ``preview`` shares the same compile path, so the two cannot
@@ -150,6 +478,7 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     block = _compile(yaml_text, source=source)
     exe = _resolve_executable(block.gate_target)
     if exe is None:
+        logger.debug("tool %r gated off: %s not on PATH", block.name, block.gate_target)
         return []
     return [_ShellTool(block, shell_path=exe if block.shell else None)]
 
