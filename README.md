@@ -3,8 +3,9 @@
 A basic coding agent built on top of
 [`any-llm`](https://github.com/mozilla-ai/any-llm) — talk to any LLM
 provider through a single interface, with a small ReAct-style loop that
-call tools. Built-in tools are `fs.read` and `fs.write`; you can add more
-as YAML shell tools under `.agents/tools/` (see [Custom tools](#custom-tools)).
+call tools. Built-in tools are `fs.read`, `fs.write`, and `fs.dir`; you
+can add more as YAML shell tools or Python `@tool` functions under
+`.agents/tools/` (see [Custom tools](#custom-tools)).
 
 - `cothis ask "..."` — one-shot prompt, plain-text output (pipe-friendly).
 - `cothis chat` — interactive multi-turn session, streamed Markdown output.
@@ -33,7 +34,7 @@ uv run cothis ask -m "meta-llama/llama-3.3-70b-instruct:free" "Hello"
 ## Installation
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/gemone/cothis.git
 cd cothis
 uv sync
 ```
@@ -67,6 +68,12 @@ uv run cothis ask "list three primes" | wc -l
 uv run cothis --debug ask "hi"
 # or
 DEBUG=1 uv run cothis ask "hi"
+
+# Show tool-call I/O (what the model sent, what the tool returned)
+# without the openai/httpx HTTP noise
+uv run cothis -v ask "list the files in src"
+# or
+VERBOSE=1 uv run cothis ask "list the files in src"
 ```
 
 ### `chat` — interactive multi-turn session
@@ -77,8 +84,8 @@ uv run cothis chat
 
 `chat` reuses one agent across turns, so conversation history
 accumulates. Each turn's final answer is streamed token-by-token and
-rendered as Markdown; tool calls (`fs.read`, `fs.write`, and any YAML
-tools you've added) are printed inline as `calling <name>(<args>)`. Exit
+rendered as Markdown; tool calls (`fs.read`, `fs.dir`, `fs.write`, and
+any custom tools you've added) are printed inline as `calling <name>(<args>)`. Exit
 with `Ctrl-D` or `Ctrl-C`.
 
 The same `--provider` / `-p`, `--model` / `-m`, and `--max-iterations`
@@ -137,6 +144,50 @@ platforms:
 Tools whose executable (argv[0] or the declared `shell:`) is not on PATH
 are silently not registered — the LLM never sees a tool it can't run here.
 
+### Python tools (built-in `@tool`)
+
+Built-in tools (`fs.read`, `fs.dir`, `fs.write`) are defined with the
+`@tool` decorator. It reads a Google-style docstring (summary → tool
+description, `Args:` → per-arg descriptions) and `inspect.signature`
+(types + defaults), then pre-builds an OpenAI schema so descriptions
+reach the LLM (bypassing any-llm's lossy `callable_to_tool`).
+
+```python
+from cothis import tool
+
+@tool("greet.name")
+def greet(name: str, formal: bool = False) -> str:
+    """Greet someone by name.
+
+    Args:
+        name: The person to greet.
+        formal: If true, use a formal greeting.
+    """
+    return f"Hello, {name}" if not formal else f"Good day, {name}."
+```
+
+Three forms: `@tool` (name from `__name__`), `@tool("ns.name")`
+(positional name), `@tool(name=…, description=…)`. Per-arg descriptions
+come from the docstring's `Args:` section.
+
+*(Discovery of user-authored `.py` files under `.agents/tools/` is the
+next slice — issue #1, stories 33–35. The decorator is ready; the loader
+isn't.)*
+
+### Tool output format
+
+When a tool returns a `dict` or `list`, cothis serialises it for the tool
+message according to `COTHIS_TOOL_OUTPUT_FORMAT` (default `json`). `str`
+results bypass formatting — text is text.
+
+```bash
+COTHIS_TOOL_OUTPUT_FORMAT=csv cothis ask "list files in src"
+COTHIS_TOOL_OUTPUT_FORMAT=yaml cothis chat
+```
+
+CSV/TSV flatten nested dicts with dotted paths; bare lists of scalars
+fall back to JSON. YAML handles every shape natively.
+
 
 ## Configuration
 
@@ -146,11 +197,13 @@ read automatically by `any-llm` based on the chosen provider.
 
 ### cothis
 
-| Variable           | Purpose                                   | Default                |
-| ------------------ | ----------------------------------------- | ---------------------- |
-| `COTHIS_PROVIDER`  | any-llm provider key (see table below).   | `openrouter`           |
-| `COTHIS_MODEL`     | Model identifier for the chosen provider. | `openai/gpt-oss-120b`  |
-| `DEBUG`            | If truthy (`1`/`true`/`yes`/`on`), show full tracebacks on error. | *(unset)* |
+| Variable                   | Purpose                                   | Default                |
+| -------------------------- | ----------------------------------------- | ---------------------- |
+| `COTHIS_PROVIDER`          | any-llm provider key (see table below).   | `openrouter`           |
+| `COTHIS_MODEL`             | Model identifier for the chosen provider. | `openai/gpt-oss-120b`  |
+| `COTHIS_TOOL_OUTPUT_FORMAT`| How `dict`/`list` tool results are serialised: `json`, `csv`, `tsv`, `yaml`. `str` results bypass this. | `json` |
+| `DEBUG`                    | If truthy, show all debug logs + tracebacks. | *(unset)*           |
+| `VERBOSE`                  | If truthy, show cothis tool-call I/O (no openai/httpx noise). | *(unset)* |
 
 Command-line flags (`-p` / `-m` / `--debug`) take precedence over env
 vars, which take precedence over defaults.
@@ -188,12 +241,17 @@ see the [any-llm providers page](https://docs.mozilla.ai/providers).
 ## Debug
 
 By default, errors print as `Error: <message>` without a traceback.
-Set `DEBUG=1` or pass `--debug` to see the full stack:
+Two logging levels:
+
+- **`-v` / `--verbose`** — shows cothis tool-call I/O (`→ fs.read(path='...')`
+  / `← fs.read: ...`) without openai/httpx noise. The day-to-day way to
+  check what reached the model.
+- **`--debug`** (`DEBUG=1`) — everything at DEBUG level (cothis + openai +
+  httpx + httpcore) + full tracebacks on error.
 
 ```bash
-DEBUG=1 uv run cothis ask "hi"
-# or
-uv run cothis --debug ask "hi"
+uv run cothis -v ask "list files in src"
+DEBUG=1 uv run cothis chat
 ```
 
 ## Development
@@ -211,11 +269,14 @@ uv run pytest                       # unit tests (pure helpers, no network)
 
 Tests cover the silent-breakage surfaces of the project: the
 streaming chat path (by-index merge of streamed tool-call fragments,
-best-effort JSON parse for on-screen display) and the YAML tool loader
-(command rendering, the GitHub-Actions-style `if:` evaluator, per-arg
-description carry-through to the LLM schema, and malformed-YAML error
-paths). Tests run offline — no LLM calls. (YAML-tool tests do spawn
-short-lived subprocesses like `echo`; they never touch the network.)
+best-effort JSON parse for on-screen display), the YAML tool loader
+(command rendering, type-driven execution mode, per-arg description
+carry-through to the LLM schema, malformed-YAML error paths), the
+`@tool` decorator (docstring parsing, schema construction, type mapping),
+the ReAct loop (empty-message retry, tool-crash recovery), and the tool
+output formatter (json/csv/tsv/yaml). Tests run offline — no LLM calls.
+(YAML-tool tests do spawn short-lived subprocesses like `echo`; they
+never touch the network.)
 
 ## License
 

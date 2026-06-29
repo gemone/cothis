@@ -13,13 +13,31 @@ calling with keyword arguments. The single dispatch protocol — there is
 no per-source branching in `_execute`.
 _Avoid_: function (too generic), handler, action.
 
+**`@tool` decorator**:
+The single Python-tool definition API (replaces the dropped pydantic
+base class, issue #1 stories 1–10). Three forms: `@tool`, `@tool("name")`,
+`@tool(name=…, description=…)`. Reads a Google-style docstring via `griffe`
+(summary → tool description, `Args:` → per-arg descriptions) and
+`inspect.signature` (types + required/optional), pre-builds an OpenAI
+schema on `__cothis_schema__`. `fs.read`, `fs.write`, `fs.dir` all use it.
+_Avoid_: tool factory, tool wrapper, tool class.
+
+**Tool output format**:
+How `_execute` serialises a tool's result for the tool message. Controlled
+by `COTHIS_TOOL_OUTPUT_FORMAT` (default `json`). Only `dict`/`list` results
+are formatted; `str` results bypass (text is text). Formats: `json`
+(model-native), `csv` / `tsv` (tabular; nested dicts flattened with dotted
+paths; bare-list-of-scalars falls back to json), `yaml` (native nesting).
+_Avoid_: tool response, tool payload.
+
 **Tool source**:
 A path that yields `Tool` objects. **Currently implemented**: Python
-(hand-written `def` or class) and YAML (declarative shell template).
+(`@tool`-decorated functions) and YAML (declarative shell template).
 **Planned, not yet implemented** (issue #1): MCP (external tool server,
-stories 25–32) and Python dynamic extensions (stories 33–38). The
-pydantic schema base class (stories 1–10) is also planned as the
-universal layer every source compiles down to.
+stories 25–32) and dynamic discovery of user-authored Python files
+(stories 33–35 — the `@tool` decorator is ready, the loader isn't).
+The pydantic schema base class (stories 1–10) was **dropped** — `@tool`
+is the single Python-tool definition API.
 _Avoid_: tool type (collides with `YAMLTool`), tool kind, backend.
 
 **YAMLTool**:
