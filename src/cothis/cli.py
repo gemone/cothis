@@ -56,18 +56,35 @@ def _all_tools() -> list[Tool]:
     for ``ToolDef`` instances (anything ``@tool``-decorated); YAML tools
     follow the ``name:`` / ``command:`` format.
 
+    Detects duplicate tool names across ALL sources (builtins + YAML +
+    Python) and raises ``ValueError`` naming the conflicting sources.
+    Silent shadowing would hide a misconfiguration until the model calls
+    the wrong tool.
+
     cothis: discovery is cwd-relative only today (no ``~/.config/cothis``
     user-global path, no config-file override). The ceiling: a user must
     ``cd`` into the project whose tools they want. Upgrade path: add
     ``~/.config/cothis/tools/`` and let project-local shadow user-global
     by appending after it.
     """
+    from cothis.tools import _check_duplicate_name
+
     tools_dir = Path(".agents/tools")
-    return [
-        *TOOLS,
-        *load_tools_from_dir(tools_dir),
-        *load_python_tools_from_dir(tools_dir),
-    ]
+    all_tools: list[Tool] = []
+    seen: dict[str, str] = {}  # name → source (first occurrence)
+    # Sources in priority order: builtins first, then YAML, then Python.
+    # Each source's internal duplicates are already caught by its loader;
+    # this cross-source check catches e.g. a YAML tool and a Python tool
+    # that declare the same name.
+    for source_name, source_tools in (
+        ("builtins", TOOLS),
+        ("YAML", load_tools_from_dir(tools_dir)),
+        ("Python", load_python_tools_from_dir(tools_dir)),
+    ):
+        for tool in source_tools:
+            _check_duplicate_name(tool, source_name, seen)
+            all_tools.append(tool)
+    return all_tools
 
 
 @app.callback()

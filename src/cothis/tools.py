@@ -1584,6 +1584,23 @@ def _format_tool_output(result: Any) -> str:
     return json.dumps(result)
 
 
+def _check_duplicate_name(tool: Tool, source: str, seen: dict[str, str]) -> None:
+    """Raise ``ValueError`` if ``tool.__name__`` was already declared in another source.
+
+    ``seen`` maps tool names to the first source path that declared them.
+    On conflict, the error names both paths so the author can find and fix
+    the duplication. This is a load-time check — silent shadowing would
+    hide a misconfiguration until the model calls the wrong tool.
+    """
+    name = tool.__name__
+    if name in seen:
+        msg = (
+            f"duplicate tool name {name!r} declared in:\n  - {seen[name]}\n  - {source}"
+        )
+        raise ValueError(msg)
+    seen[name] = source
+
+
 def load_tools_from_dir(dir_path: Path) -> list[Tool]:
     """Load every YAML tool declaration in a directory tree.
 
@@ -1592,10 +1609,10 @@ def load_tools_from_dir(dir_path: Path) -> list[Tool]:
     ``load_yaml_tools``. Non-YAML files are ignored. An empty / missing
     directory yields ``[]``.
 
-    cothis: tool ``name`` still comes from each file's ``name:`` field,
-    not from the filename or path. A file at ``date/current.yaml`` is
-    named whatever its ``name:`` says (typically ``date.current``); the
-    directory layout is pure organisation for the human author.
+    Raises ``ValueError`` if two files declare the same tool ``name:``,
+    naming both source paths so the author can fix the conflict. This is
+    a load-time check — silent shadowing would hide a misconfiguration
+    until the model calls the wrong tool.
     """
     if not dir_path.is_dir():
         return []
@@ -1604,8 +1621,11 @@ def load_tools_from_dir(dir_path: Path) -> list[Tool]:
         key=lambda p: str(p.relative_to(dir_path)),
     )
     tools: list[Tool] = []
+    seen: dict[str, str] = {}  # name → source path (first occurrence)
     for yml in files:
-        tools.extend(load_yaml_tools(yml.read_text(encoding="utf-8"), source=str(yml)))
+        for tool in load_yaml_tools(yml.read_text(encoding="utf-8"), source=str(yml)):
+            _check_duplicate_name(tool, str(yml), seen)
+            tools.append(tool)
     return tools
 
 
@@ -1631,6 +1651,7 @@ def load_python_tools_from_dir(dir_path: Path) -> list[Tool]:
         return []
     files = sorted(dir_path.rglob("*.py"), key=lambda p: str(p.relative_to(dir_path)))
     tools: list[Tool] = []
+    seen: dict[str, str] = {}  # name → source path (first occurrence)
     for py in files:
         # Unique module name so repeated loads don't collide in sys.modules.
         mod_name = f"cothis_user_tools_{py.stem}_{hash(str(py)) & 0xFFFFFFFF:x}"
@@ -1647,6 +1668,7 @@ def load_python_tools_from_dir(dir_path: Path) -> list[Tool]:
         for attr_name in dir(module):
             obj = getattr(module, attr_name)
             if isinstance(obj, ToolDef):
+                _check_duplicate_name(obj, str(py), seen)
                 # Run pre_load / after_load hooks. If pre_load short-circuits
                 # (any callback returns False) or any hook raises, the tool is
                 # silently skipped (``on_error`` fired for audit). See
