@@ -62,34 +62,53 @@ def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
     and ``project_dir`` (project-local). Both are optional; absence is not
     an error. Each directory is one **layer** (see CONTEXT.md "Layer").
 
-    cothis: ceiling — cross-layer name conflicts (user-global vs project-local,
-    or custom vs builtin) currently raise ``ValueError``. #10 and #11 replace
-    this with shadow semantics (project-local shadows user-global shadows
-    builtin, with a ``WARNING`` instead of a raise). The per-layer loader
-    (``load_tools_from_layer``) already catches same-layer conflicts (any
-    format combination in the same directory).
+    Layers resolve in ascending precedence: builtins → user-global →
+    project-local. A higher-precedence tool with the same ``__name__``
+    **shadows** the lower one (dict overwrite). Each shadow emits a
+    ``logger.warning`` naming both layers + source paths. Same-layer
+    conflicts (two YAML files in one directory, or a YAML + Python file in
+    the same directory claiming one name) still raise ``ValueError`` —
+    that's an author error caught by ``load_tools_from_layer``'s shared
+    ``seen`` dict.
 
-    Lifecycle hooks (``pre_load`` / ``after_load``) run AFTER loading, on each
-    tool that survives the duplicate check — a ``pre_load=False`` or hook
-    exception drops the tool (``on_error`` fires for audit, ``WARNING``
-    logged). See ADR-0003.
+    Lifecycle hooks (``pre_load`` / ``after_load``) run AFTER shadow
+    resolution, on the winning tool only. A shadowed tool's hooks never
+    fire. If the winner's ``pre_load`` returns ``False`` or raises, the
+    slot goes **empty — no fallback** to the shadowed tool (shadowing is a
+    replacement, not a try). See ADR-0003.
     """
-    from cothis.tools import _check_duplicate_name
+    layers = [
+        ("builtins", TOOLS),
+        ("user-global", load_tools_from_layer(user_dir)),
+        ("project-local", load_tools_from_layer(project_dir)),
+    ]
+    # Ascending-precedence dict overwrite: later layer wins on name conflict.
+    # Parallel ``layer_of`` tracks which layer produced each winner, so the
+    # shadow warning can name both layers (the tool carries ``_source`` only).
+    registry: dict[str, Tool] = {}
+    layer_of: dict[str, str] = {}
+    for layer_name, layer_tools in layers:
+        for tool in layer_tools:
+            name = tool.__name__
+            if name in registry:
+                prev_src = getattr(registry[name], "_source", None) or "<builtins>"
+                new_src = getattr(tool, "_source", None) or "<builtins>"
+                logger.warning(
+                    "tool %r from %s (%s) shadows %s (%s)",
+                    name,
+                    layer_name,
+                    new_src,
+                    layer_of[name],
+                    prev_src,
+                )
+            registry[name] = tool  # overwrite — higher precedence wins
+            layer_of[name] = layer_name
 
-    user_tools = load_tools_from_layer(user_dir)
-    project_tools = load_tools_from_layer(project_dir)
-    all_tools: list[Tool] = [*TOOLS, *user_tools, *project_tools]
-
-    # Cross-source duplicate check (ceiling — see docstring).
-    seen: dict[str, str] = {}
-    for tool in all_tools:
-        source = getattr(tool, "_source", None) or "builtins"
-        _check_duplicate_name(tool, source, seen)
-
-    # Run load hooks on each surviving tool (post-resolution, pre-registration).
+    # Run load hooks on the merged winners only (ADR-0003 Q3).
     # Bare callables (no ``_run_load_hooks`` attr) skip hooks entirely.
+    # pre_load=False / hook exception empties the slot — no fallback (Q4).
     registered: list[Tool] = []
-    for tool in all_tools:
+    for tool in registry.values():
         run_hooks = getattr(tool, "_run_load_hooks", None)
         if run_hooks is None or run_hooks():
             registered.append(tool)
