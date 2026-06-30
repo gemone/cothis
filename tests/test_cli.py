@@ -205,6 +205,39 @@ def test_shadow_warning_names_both_file_paths(tmp_path: Any, caplog: Any) -> Non
     assert str(user / "dup.yaml") in msg
 
 
+def test_chained_shadow_three_layers_two_warnings(tmp_path: Any, caplog: Any) -> None:
+    """All three layers claim one name → two shadow warnings, project wins.
+
+    Covers the chained-shadow path Copilot flagged: user-global shadows a
+    builtin AND project-local shadows the user-global tool, both in one
+    ``_all_tools`` call. Two distinct warnings must fire, and the final
+    winner must be project-local.
+    """
+    import logging
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "override.yaml").write_text(
+        'name: fs.read\ncommand: ["echo", "proj"]\n', encoding="utf-8"
+    )
+    user = tmp_path / "user"
+    user.mkdir()
+    (user / "override.yaml").write_text(
+        'name: fs.read\ncommand: ["echo", "user"]\n', encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cothis.cli"):
+        tools = _all_tools(project, user)
+
+    # Two shadow warnings: user-global→builtins, then project-local→user-global.
+    shadow_warnings = [r for r in caplog.records if "shadows" in r.message]
+    assert len(shadow_warnings) == 2
+    # Final winner is project-local (its output is "proj", not the builtin
+    # behavior, not the user-global "user").
+    by_name = {t.__name__: t for t in tools}
+    assert by_name["fs.read"]() == "proj\n"
+
+
 def test_no_shadow_loads_both(tmp_path: Any, caplog: Any) -> None:
     """Distinct names across layers → both load, no shadow warning."""
     import logging
