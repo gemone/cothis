@@ -22,10 +22,11 @@ from rich.live import Live
 from rich.markdown import Markdown
 
 from cothis.agent import Agent, ToolCallEvent
-from cothis.tools import TOOLS, Tool, load_python_tools_from_dir, load_tools_from_dir
+from cothis.tools import TOOLS, Tool, load_tools_from_layer
 
 app = typer.Typer()
 console = Console()
+logger = logging.getLogger("cothis.cli")
 
 # cothis: the system prompt is hardcoded (not user-configurable) and identical
 # across ``ask`` and ``chat``. Both commands share the same persona so the
@@ -47,44 +48,54 @@ DEFAULT_SYSTEM_PROMPT = (
 # whether to surface the full traceback.
 _debug = False
 
+# Discovery paths (see CONTEXT.md "Discovery path"). Project-local is
+# cwd-relative; user-global is the XDG-style config directory. Both are
+# optional — ``_all_tools`` handles missing dirs without error.
+_PROJECT_TOOLS_DIR = Path(".agents/tools")
+_USER_TOOLS_DIR = Path.home() / ".config" / "cothis" / "tools"
 
-def _all_tools() -> list[Tool]:
-    """Built-in tools plus any declared in ``./.agents/tools/``.
 
-    Loads both YAML (``*.yaml`` / ``*.yml``) and Python (``*.py``) tool
-    declarations from ``.agents/tools/``. Python tools are auto-scanned
-    for ``ToolDef`` instances (anything ``@tool``-decorated); YAML tools
-    follow the ``name:`` / ``command:`` format.
+def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
+    """Built-in tools plus any declared in the two discovery layers.
 
-    Detects duplicate tool names across ALL sources (builtins + YAML +
-    Python) and raises ``ValueError`` naming the conflicting sources.
-    Silent shadowing would hide a misconfiguration until the model calls
-    the wrong tool.
+    Loads YAML and Python tool declarations from ``user_dir`` (user-global)
+    and ``project_dir`` (project-local). Both are optional; absence is not
+    an error. Each directory is one **layer** (see CONTEXT.md "Layer").
 
-    cothis: discovery is cwd-relative only today (no ``~/.config/cothis``
-    user-global path, no config-file override). The ceiling: a user must
-    ``cd`` into the project whose tools they want. Upgrade path: add
-    ``~/.config/cothis/tools/`` and let project-local shadow user-global
-    by appending after it.
+    cothis: ceiling — cross-layer name conflicts (user-global vs project-local,
+    or custom vs builtin) currently raise ``ValueError``. #10 and #11 replace
+    this with shadow semantics (project-local shadows user-global shadows
+    builtin, with a ``WARNING`` instead of a raise). The per-layer loader
+    (``load_tools_from_layer``) already catches same-layer conflicts (any
+    format combination in the same directory).
+
+    Lifecycle hooks (``pre_load`` / ``after_load``) run AFTER loading, on each
+    tool that survives the duplicate check — a ``pre_load=False`` or hook
+    exception drops the tool (``on_error`` fires for audit, ``WARNING``
+    logged). See ADR-0003.
     """
     from cothis.tools import _check_duplicate_name
 
-    tools_dir = Path(".agents/tools")
-    all_tools: list[Tool] = []
-    seen: dict[str, str] = {}  # name → source (first occurrence)
-    # Sources in priority order: builtins first, then YAML, then Python.
-    # Each source's internal duplicates are already caught by its loader;
-    # this cross-source check catches e.g. a YAML tool and a Python tool
-    # that declare the same name.
-    for source_name, source_tools in (
-        ("builtins", TOOLS),
-        ("YAML", load_tools_from_dir(tools_dir)),
-        ("Python", load_python_tools_from_dir(tools_dir)),
-    ):
-        for tool in source_tools:
-            _check_duplicate_name(tool, source_name, seen)
-            all_tools.append(tool)
-    return all_tools
+    user_tools = load_tools_from_layer(user_dir)
+    project_tools = load_tools_from_layer(project_dir)
+    all_tools: list[Tool] = [*TOOLS, *user_tools, *project_tools]
+
+    # Cross-source duplicate check (ceiling — see docstring).
+    seen: dict[str, str] = {}
+    for tool in all_tools:
+        source = getattr(tool, "_source", None) or "builtins"
+        _check_duplicate_name(tool, source, seen)
+
+    # Run load hooks on each surviving tool (post-resolution, pre-registration).
+    # Bare callables (no ``_run_load_hooks`` attr) skip hooks entirely.
+    registered: list[Tool] = []
+    for tool in all_tools:
+        run_hooks = getattr(tool, "_run_load_hooks", None)
+        if run_hooks is None or run_hooks():
+            registered.append(tool)
+
+    logger.warning("discovery: %d tools active", len(registered))
+    return registered
 
 
 @app.callback()
@@ -154,7 +165,7 @@ def ask(
         agent = Agent(
             model=model,
             provider=provider,
-            tools=_all_tools(),
+            tools=_all_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
         )
@@ -213,7 +224,7 @@ async def _chat_session(
         agent = Agent(
             model=model,
             provider=provider,
-            tools=_all_tools(),
+            tools=_all_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
         )

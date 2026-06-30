@@ -601,14 +601,14 @@ def test_builtin_tools_are_tooldef_instances() -> None:
 
 def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
     """ "A ``.py`` file with a ``@tool`` function is discovered and loaded."""
-    from cothis.tools import load_python_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
     (tmp_path / "greet.py").write_text(
         'from cothis import tool\n\n@tool("test.greet")\n'
         'def greet(name: str) -> str:\n    """Greet."""\n    return f"hi {name}"\n',
         encoding="utf-8",
     )
-    tools = load_python_tools_from_dir(tmp_path)
+    tools = load_tools_from_layer(tmp_path)
     assert len(tools) == 1
     assert tools[0].__name__ == "test.greet"
     assert tools[0](name="x") == "hi x"
@@ -616,7 +616,7 @@ def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
 
 def test_load_python_tools_discovers_package(tmp_path: Any) -> None:
     """ "A package directory with ``__init__.py`` is discovered."""
-    from cothis.tools import load_python_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -625,7 +625,7 @@ def test_load_python_tools_discovers_package(tmp_path: Any) -> None:
         'def t(x: str) -> str:\n    """T."""\n    return x\n',
         encoding="utf-8",
     )
-    tools = load_python_tools_from_dir(tmp_path)
+    tools = load_tools_from_layer(tmp_path)
     assert len(tools) == 1
     assert tools[0].__name__ == "pkg.tool"
 
@@ -636,7 +636,7 @@ def test_load_python_tools_import_failure_doesnt_crash(
     """ "A broken ``.py`` file logs an error but doesn't crash the loader."""
     import logging
 
-    from cothis.tools import load_python_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
     (tmp_path / "broken.py").write_text("import nonexistent_module\n", encoding="utf-8")
     # A valid file alongside the broken one should still load.
@@ -646,7 +646,7 @@ def test_load_python_tools_import_failure_doesnt_crash(
         encoding="utf-8",
     )
     with caplog.at_level(logging.ERROR, logger="cothis.tools"):
-        tools = load_python_tools_from_dir(tmp_path)
+        tools = load_tools_from_layer(tmp_path)
     assert len(tools) == 1  # the broken one was skipped, the good one loaded
     assert tools[0].__name__ == "good"
     # The broken file's error was logged — actionable (file path + exception).
@@ -658,23 +658,23 @@ def test_load_python_tools_import_failure_doesnt_crash(
 
 def test_load_python_tools_empty_dir_returns_empty(tmp_path: Any) -> None:
     """ "An empty directory yields an empty tool list."""
-    from cothis.tools import load_python_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
-    assert load_python_tools_from_dir(tmp_path) == []
+    assert load_tools_from_layer(tmp_path) == []
 
 
 def test_load_python_tools_missing_dir_returns_empty() -> None:
     """ "A non-existent directory yields an empty tool list."""
-    from cothis.tools import load_python_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
-    assert load_python_tools_from_dir(Path("/nonexistent/path")) == []
+    assert load_tools_from_layer(Path("/nonexistent/path")) == []
 
 
 def test_load_python_tools_ignores_non_tooldef_attributes(
     tmp_path: Any,
 ) -> None:
     """ "Module-level constants and plain functions are NOT collected."""
-    from cothis.tools import load_python_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
     (tmp_path / "mixed.py").write_text(
         "from cothis import tool\n\n"
@@ -684,7 +684,7 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
         'def real(x: str) -> str:\n    """Real."""\n    return x\n',
         encoding="utf-8",
     )
-    tools = load_python_tools_from_dir(tmp_path)
+    tools = load_tools_from_layer(tmp_path)
     assert len(tools) == 1  # only the @tool function, not CONSTANT/helper
     assert tools[0].__name__ == "real.tool"
 
@@ -694,9 +694,14 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
 # --------------------------------------------------------------------
 
 
-def test_pre_load_multiple_callbacks_all_pass(tmp_path: Any) -> None:
-    """ "Multiple ``pre_load`` callbacks in registration order; all pass → registers."""
-    from cothis.tools import load_python_tools_from_dir
+def test_loader_discovers_tool_with_pre_load_hooks(tmp_path: Any) -> None:
+    """The loader discovers a tool regardless of its pre_load hooks.
+
+    Hooks are NOT run by the loader — they run later in ``_all_tools``
+    after cross-layer merge (see ADR-0003). The loader returns all
+    discovered candidates.
+    """
+    from cothis.tools import load_tools_from_layer
 
     (tmp_path / "t.py").write_text(
         "from cothis import tool\n\n"
@@ -709,28 +714,35 @@ def test_pre_load_multiple_callbacks_all_pass(tmp_path: Any) -> None:
         "def second():\n    calls.append(2); return True\n",
         encoding="utf-8",
     )
-    tools = load_python_tools_from_dir(tmp_path)
-    assert len(tools) == 1  # both pre_load callbacks passed
+    tools = load_tools_from_layer(tmp_path)
+    assert len(tools) == 1  # discovered (hooks not run yet)
 
 
-def test_pre_load_any_false_skips_tool(tmp_path: Any) -> None:
-    """ "If any ``pre_load`` callback returns False, the tool is skipped."""
-    from cothis.tools import load_python_tools_from_dir
+def test_pre_load_any_false_skips_tool() -> None:
+    """If any ``pre_load`` callback returns False, ``_run_load_hooks`` returns False.
 
-    (tmp_path / "t.py").write_text(
-        "from cothis import tool\n\n"
-        '@tool("t")\n'
-        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
-        "@t.pre_load()\n"
-        "def first():\n    return True\n\n"
-        "@t.pre_load()\n"
-        "def blocker():\n    return False\n\n"
-        "@t.pre_load()\n"
-        "def third():\n    raise AssertionError('should not run')\n",
-        encoding="utf-8",
-    )
-    tools = load_python_tools_from_dir(tmp_path)
-    assert tools == []  # blocker returned False, tool skipped, third didn't run
+    The loader discovers the tool; the skip happens when ``_all_tools`` runs
+    load hooks on it (see ADR-0003). The third callback never runs.
+    """
+
+    @tool("t")
+    def t() -> str:
+        """T."""
+        return "ok"
+
+    @t.pre_load()
+    def first() -> Any:
+        return True
+
+    @t.pre_load()
+    def blocker() -> Any:
+        return False
+
+    @t.pre_load()
+    def third() -> Any:
+        raise AssertionError("should not run")
+
+    assert t._run_load_hooks() is False  # blocker returned False
 
 
 def test_pre_load_exception_skips_and_triggers_on_error() -> None:
@@ -796,28 +808,29 @@ def test_after_load_exception_skips_and_triggers_on_error() -> None:
     assert errors == [("init failed", "after_load")]
 
 
-def test_on_error_self_exception_swallowed(tmp_path: Any) -> None:
-    """ "If ``on_error`` itself raises, the exception is swallowed (debug logged)."""
-    from cothis.tools import load_python_tools_from_dir
+def test_on_error_self_exception_swallowed() -> None:
+    """If ``on_error`` itself raises, the exception is swallowed (warning logged)."""
 
-    (tmp_path / "t.py").write_text(
-        "from cothis import tool\n\n"
-        '@tool("t")\n'
-        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
-        "@t.pre_load()\n"
-        "def boom():\n    raise RuntimeError('orig')\n\n"
-        "@t.on_error()\n"
-        "def broken_observer(exc, phase, args, result):\n    raise ConnectionError('telemetry down')\n",
-        encoding="utf-8",
-    )
+    @tool("t")
+    def t() -> str:
+        """T."""
+        return "ok"
+
+    @t.pre_load()
+    def boom() -> None:
+        raise RuntimeError("orig")
+
+    @t.on_error()
+    def broken_observer(exc: Exception, phase: str, args: Any, result: Any) -> None:
+        raise ConnectionError("telemetry down")
+
     # Should not crash — on_error's own exception is swallowed.
-    tools = load_python_tools_from_dir(tmp_path)
-    assert tools == []  # tool still skipped (pre_load raised), but no crash
+    assert t._run_load_hooks() is False  # tool still skipped (pre_load raised)
 
 
 def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
     """ "A tool with no hooks is discovered and registered as before."""
-    from cothis.tools import load_python_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
     (tmp_path / "t.py").write_text(
         "from cothis import tool\n\n"
@@ -825,7 +838,7 @@ def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
         'def t(x: str) -> str:\n    """Plain."""\n    return x\n',
         encoding="utf-8",
     )
-    tools = load_python_tools_from_dir(tmp_path)
+    tools = load_tools_from_layer(tmp_path)
     assert len(tools) == 1
     assert tools[0].__name__ == "plain"
 
@@ -1128,7 +1141,7 @@ def test_on_error_fire_logged(caplog: Any) -> None:
 
 def test_yaml_duplicate_names_detected(tmp_path: Any) -> None:
     """Two YAML files with the same ``name:`` raise ValueError naming both paths."""
-    from cothis.tools import load_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
     (tmp_path / "a.yaml").write_text(
         'name: dup\ncommand: ["echo", "a"]\n', encoding="utf-8"
@@ -1137,7 +1150,7 @@ def test_yaml_duplicate_names_detected(tmp_path: Any) -> None:
         'name: dup\ncommand: ["echo", "b"]\n', encoding="utf-8"
     )
     with pytest.raises(ValueError, match="duplicate tool name.*dup") as exc_info:
-        load_tools_from_dir(tmp_path)
+        load_tools_from_layer(tmp_path)
     msg = str(exc_info.value)
     assert "a.yaml" in msg
     assert "b.yaml" in msg
@@ -1145,7 +1158,7 @@ def test_yaml_duplicate_names_detected(tmp_path: Any) -> None:
 
 def test_python_duplicate_names_detected(tmp_path: Any) -> None:
     """Two Python tools with the same name raise ValueError naming both paths."""
-    from cothis.tools import load_python_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
     (tmp_path / "a.py").write_text(
         'from cothis import tool\n@tool("dup")\n'
@@ -1158,7 +1171,7 @@ def test_python_duplicate_names_detected(tmp_path: Any) -> None:
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="duplicate tool name.*dup") as exc_info:
-        load_python_tools_from_dir(tmp_path)
+        load_tools_from_layer(tmp_path)
     msg = str(exc_info.value)
     assert "a.py" in msg
     assert "b.py" in msg
@@ -1166,7 +1179,7 @@ def test_python_duplicate_names_detected(tmp_path: Any) -> None:
 
 def test_no_duplicate_names_loads_normally(tmp_path: Any) -> None:
     """Distinct names load without error."""
-    from cothis.tools import load_tools_from_dir
+    from cothis.tools import load_tools_from_layer
 
     (tmp_path / "a.yaml").write_text(
         'name: first\ncommand: ["echo", "a"]\n', encoding="utf-8"
@@ -1174,5 +1187,5 @@ def test_no_duplicate_names_loads_normally(tmp_path: Any) -> None:
     (tmp_path / "b.yaml").write_text(
         'name: second\ncommand: ["echo", "b"]\n', encoding="utf-8"
     )
-    tools = load_tools_from_dir(tmp_path)
+    tools = load_tools_from_layer(tmp_path)
     assert len(tools) == 2

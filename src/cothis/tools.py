@@ -226,6 +226,10 @@ class _HookableTool:
         self._hooks: dict[str, list[Callable[..., Any]]] = {
             stage: [] for stage in _HOOK_STAGES
         }
+        # Source path where this tool was discovered (file path for YAML/Python
+        # tools, ``None`` for builtins). Set by ``load_tools_from_layer`` after
+        # construction; read by ``_all_tools`` for duplicate-name diagnostics.
+        self._source: str | None = None
 
     # --- Hook registration (decorators that append to the chain) --------
     #
@@ -273,7 +277,8 @@ class _HookableTool:
 
     # --- Hook invocation ------------------------------------------------
     #
-    # Load hooks (``_run_load_hooks``) are called by the discovery loader.
+    # Load hooks (``_run_load_hooks``) are called by ``_all_tools`` in cli.py,
+    # AFTER cross-layer shadow resolution, on the winner only (see ADR-0003).
     # Execute hooks (``_run_pre_execute`` / ``_run_after_execute``) are called
     # by ``Agent._execute``. ``_run_on_error`` is called on any stage failure.
 
@@ -287,13 +292,14 @@ class _HookableTool:
         are the context available at the point of failure (``None`` at load
         time — no args/result exist yet). Each callback receives
         ``(exc, phase, args, result)``; exceptions they raise are swallowed
-        and logged at debug (the observer must not manufacture new failures).
+        and logged at warning (the observer must not manufacture new failures —
+        an observer failure is itself a startup decision worth surfacing).
         """
         for cb in self._hooks["on_error"]:
             try:
                 cb(exc, phase, args, result)
             except Exception as cb_exc:  # noqa: BLE001 — observer failure is non-fatal
-                logger.debug(
+                logger.warning(
                     "tool %r on_error callback raised: %s; swallowed",
                     self.__name__,
                     cb_exc,
@@ -306,10 +312,12 @@ class _HookableTool:
     def _run_load_hooks(self) -> bool:
         """Run ``pre_load`` + ``after_load`` chains. Return True if tool registers.
 
-        Called by the discovery loader for each discovered tool. Returns
-        ``True`` when the tool should be added to the result list; ``False``
-        when ``pre_load`` short-circuited (any callback returned ``False``) or
-        any load hook raised.
+        Called by ``_all_tools`` AFTER cross-layer shadow resolution, on the
+        winning tool only (see ADR-0003). Returns ``True`` when the tool should
+        be registered; ``False`` when ``pre_load`` short-circuited (any callback
+        returned ``False``) or any load hook raised. Every skip is logged at
+        ``WARNING`` — no startup decision is silent (see CONTEXT.md "Tool
+        lifecycle").
 
         Chain semantics (see CONTEXT.md "Tool lifecycle"):
         - ``pre_load``: short-circuit AND. Any ``False`` → skip, remaining
@@ -327,14 +335,14 @@ class _HookableTool:
                 # see the error at the point of failure, not after the skip
                 # decision is already logged.
                 self._run_on_error(exc, phase="pre_load")
-                logger.debug(
+                logger.warning(
                     "tool %r pre_load callback raised: %s; skipping",
                     self.__name__,
                     exc,
                 )
                 return False
             if ok is False:
-                logger.debug(
+                logger.warning(
                     "tool %r pre_load callback returned False; skipping",
                     self.__name__,
                 )
@@ -345,7 +353,7 @@ class _HookableTool:
                 cb()
             except Exception as exc:  # noqa: BLE001 — author code
                 self._run_on_error(exc, phase="after_load")
-                logger.debug(
+                logger.warning(
                     "tool %r after_load callback raised: %s; skipping",
                     self.__name__,
                     exc,
@@ -784,10 +792,9 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
 
     Thin wrapper over ``_compile``: compile, gate the executable via
     ``shutil.which``, wrap in ``_ShellTool``. If the executable is not on
-    PATH the tool is **silently not registered** — the model never sees a
-    tool it cannot dispatch on this host. The skip is silent at the UI
-    layer but emits a ``logger.debug`` entry under ``cothis.tools`` — enable
-    with ``--debug`` (or ``LOGLEVEL=DEBUG``) to see which tools gated off.
+    PATH the tool is not registered — the model never sees a tool it cannot
+    dispatch on this host. The skip is logged at ``WARNING`` (every startup
+    decision is observable by default — see CONTEXT.md "Tool lifecycle").
 
     See ``_compile`` for the YAML shape and ``CommandBlock`` for the
     contract. ``preview`` shares the same compile path, so the two cannot
@@ -796,7 +803,9 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     block = _compile(yaml_text, source=source)
     exe = _resolve_executable(block.gate_target)
     if exe is None:
-        logger.debug("tool %r gated off: %s not on PATH", block.name, block.gate_target)
+        logger.warning(
+            "tool %r gated off: %s not on PATH", block.name, block.gate_target
+        )
         return []
     return [_ShellTool(block, shell_path=exe if block.shell else None)]
 
@@ -1299,7 +1308,7 @@ def _require(
     A missing required field must fail with a clear, actionable error (file
     + field), not a bare ``KeyError`` / ``TypeError``. Handles the empty-file
     case (``safe_load`` returns ``None``) too. ``source`` is the file path
-    when known (from ``load_tools_from_dir``) so the error points at the
+    when known (from ``load_tools_from_layer``) so the error points at the
     offending file; ``None`` for direct callers (``preview``).
     """
     where = f" in {source}" if source else ""
@@ -1601,58 +1610,52 @@ def _check_duplicate_name(tool: Tool, source: str, seen: dict[str, str]) -> None
     seen[name] = source
 
 
-def load_tools_from_dir(dir_path: Path) -> list[Tool]:
-    """Load every YAML tool declaration in a directory tree.
+def load_tools_from_layer(dir_path: Path) -> list[Tool]:
+    """Load every tool declaration in a directory tree (one discovery layer).
 
-    Globs ``**/*.yaml`` and ``**/*.yml`` recursively (sorted by path, so
-    load order is stable across platforms) and compiles each via
-    ``load_yaml_tools``. Non-YAML files are ignored. An empty / missing
-    directory yields ``[]``.
+    Globs YAML (``**/*.yaml`` / ``**/*.yml``) and Python (``**/*.py``) files
+    recursively, sorted by path for stable cross-platform load order. YAML
+    files compile via ``load_yaml_tools``; Python files are imported via
+    ``importlib`` and auto-scanned for ``ToolDef`` instances (anything
+    ``@tool``-decorated at module level). No ``TOOLS`` export contract; the
+    author just decorates.
 
-    Raises ``ValueError`` if two files declare the same tool ``name:``,
-    naming both source paths so the author can fix the conflict. This is
-    a load-time check — silent shadowing would hide a misconfiguration
-    until the model calls the wrong tool.
-    """
-    if not dir_path.is_dir():
-        return []
-    files = sorted(
-        {*dir_path.rglob("*.yaml"), *dir_path.rglob("*.yml")},
-        key=lambda p: str(p.relative_to(dir_path)),
-    )
-    tools: list[Tool] = []
-    seen: dict[str, str] = {}  # name → source path (first occurrence)
-    for yml in files:
-        for tool in load_yaml_tools(yml.read_text(encoding="utf-8"), source=str(yml)):
-            _check_duplicate_name(tool, str(yml), seen)
-            tools.append(tool)
-    return tools
+    YAML and Python share a single ``seen`` dict — a YAML file and a Python
+    file in the same directory claiming one ``name:`` is a **same-layer
+    conflict** and raises ``ValueError`` (format is never a layer; see
+    ADR-0003). This is the load-time check that catches author errors.
 
+    Does NOT run lifecycle hooks (``pre_load`` / ``after_load``). Hook gating
+    is ``_all_tools``'s concern — it runs after cross-layer shadow resolution,
+    on the winning tool only (see ADR-0003).
 
-def load_python_tools_from_dir(dir_path: Path) -> list[Tool]:
-    """Load every Python tool module in a directory tree.
-
-    Globs ``**/*.py`` recursively (sorted by path, stable across platforms).
-    Each file is imported via ``importlib`` (no ``sys.path`` mutation), then
-    the module's top-level namespace is scanned for ``ToolDef`` instances —
-    anything decorated with ``@tool`` at module level is auto-discovered.
-    No ``TOOLS`` export contract; the author just decorates.
-
-    Import failures (``ImportError``, ``SyntaxError``, errors raised at
-    module top level) do NOT crash the agent. The failure is logged at
-    ``ERROR`` level with the file path + exception so the author can fix
-    it, and the remaining files still load.
-
-    Empty / missing directory yields ``[]``.
+    Empty / missing directory yields ``[]``. Python import failures
+    (``ImportError``, ``SyntaxError``, module top-level errors) are logged at
+    ``ERROR`` and the remaining files still load.
     """
     import importlib.util
 
     if not dir_path.is_dir():
         return []
-    files = sorted(dir_path.rglob("*.py"), key=lambda p: str(p.relative_to(dir_path)))
+    yaml_files = sorted(
+        {*dir_path.rglob("*.yaml"), *dir_path.rglob("*.yml")},
+        key=lambda p: str(p.relative_to(dir_path)),
+    )
+    py_files = sorted(
+        dir_path.rglob("*.py"), key=lambda p: str(p.relative_to(dir_path))
+    )
     tools: list[Tool] = []
-    seen: dict[str, str] = {}  # name → source path (first occurrence)
-    for py in files:
+    seen: dict[str, str] = {}  # name → source path (first occurrence, any format)
+    # YAML first (matches historical builtins→YAML→Python order), then Python.
+    # Both share ``seen`` so cross-format same-name conflicts raise.
+    for yml in yaml_files:
+        for tool_obj in load_yaml_tools(
+            yml.read_text(encoding="utf-8"), source=str(yml)
+        ):
+            _check_duplicate_name(tool_obj, str(yml), seen)
+            setattr(tool_obj, "_source", str(yml))
+            tools.append(tool_obj)
+    for py in py_files:
         # Unique module name so repeated loads don't collide in sys.modules.
         mod_name = f"cothis_user_tools_{py.stem}_{hash(str(py)) & 0xFFFFFFFF:x}"
         try:
@@ -1669,10 +1672,6 @@ def load_python_tools_from_dir(dir_path: Path) -> list[Tool]:
             obj = getattr(module, attr_name)
             if isinstance(obj, ToolDef):
                 _check_duplicate_name(obj, str(py), seen)
-                # Run pre_load / after_load hooks. If pre_load short-circuits
-                # (any callback returns False) or any hook raises, the tool is
-                # silently skipped (``on_error`` fired for audit). See
-                # ``ToolDef._run_load_hooks`` for the chain semantics.
-                if obj._run_load_hooks():
-                    tools.append(obj)
+                obj._source = str(py)
+                tools.append(obj)
     return tools

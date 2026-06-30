@@ -33,7 +33,7 @@ from cothis.tools import (
     _extract_field_names,
     _merge_arg_specs,
     _ShellTool,
-    load_tools_from_dir,
+    load_tools_from_layer,
     load_yaml_tools,
     preview,
 )
@@ -627,11 +627,11 @@ args:
 
 
 # ====================================================================
-# load_tools_from_dir
+# load_tools_from_layer
 # ====================================================================
 
 
-def test_load_tools_from_dir_finds_yaml_files(tmp_path: Path) -> None:
+def test_load_tools_from_layer_finds_yaml_files(tmp_path: Path) -> None:
     """``.agents/tools/*.yaml`` discovery: every YAML file in the dir loads."""
     tools_dir = tmp_path / "tools"
     tools_dir.mkdir()
@@ -643,14 +643,14 @@ def test_load_tools_from_dir_finds_yaml_files(tmp_path: Path) -> None:
     )
     (tools_dir / "README.md").write_text("not a tool", encoding="utf-8")
 
-    tools = load_tools_from_dir(tools_dir)
+    tools = load_tools_from_layer(tools_dir)
     by_name = {t.__name__: t for t in tools}
     assert set(by_name) == {"hello", "bye"}
     assert by_name["hello"]() == "hello\n"
     assert by_name["bye"]() == "bye\n"
 
 
-def test_load_tools_from_dir_finds_nested_yaml(tmp_path: Path) -> None:
+def test_load_tools_from_layer_finds_nested_yaml(tmp_path: Path) -> None:
     """Discovery walks subdirectories so ``tools/date/current.yaml`` loads."""
     date_dir = tmp_path / "date"
     date_dir.mkdir()
@@ -661,21 +661,21 @@ def test_load_tools_from_dir_finds_nested_yaml(tmp_path: Path) -> None:
         'name: flat\ncommand: ["echo", "flat"]\n', encoding="utf-8"
     )
 
-    names = {t.__name__ for t in load_tools_from_dir(tmp_path)}
+    names = {t.__name__ for t in load_tools_from_layer(tmp_path)}
     assert names == {"date.current", "flat"}
 
 
-def test_load_tools_from_dir_error_names_the_file(tmp_path: Path) -> None:
+def test_load_tools_from_layer_error_names_the_file(tmp_path: Path) -> None:
     """Loading from disk includes the file path in the error."""
     bad = tmp_path / "broken.yaml"
     bad.write_text('command: ["echo", "hi"]\n', encoding="utf-8")  # no name:
     with pytest.raises(ValueError, match="broken.yaml"):
-        load_tools_from_dir(tmp_path)
+        load_tools_from_layer(tmp_path)
 
 
-def test_load_tools_from_dir_missing_dir_returns_empty(tmp_path: Path) -> None:
+def test_load_tools_from_layer_missing_dir_returns_empty(tmp_path: Path) -> None:
     """A missing directory yields ``[]``, not an error."""
-    assert load_tools_from_dir(tmp_path / "nonexistent") == []
+    assert load_tools_from_layer(tmp_path / "nonexistent") == []
 
 
 # ====================================================================
