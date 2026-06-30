@@ -46,12 +46,22 @@ _Avoid_: plugin, filter, interceptor (overloaded).
 
 **Tool lifecycle**:
 The five stages a `ToolDef` passes through, from discovery to dispatch.
-Each stage has a hook chain (see Hook chain). Stages and their semantics:
+Each stage has a hook chain (see Hook chain). The two load stages fire
+**after cross-layer shadow resolution** (see Layer) — on the winning tool
+only. A shadowed tool's load hooks never fire (it is dropped before the
+load phase runs); there is no fallback to the lower layer if the winner's
+`pre_load` returns `False` (the slot goes empty).
+
+Each stage is **observable**: every load/dispatch decision (shadow
+override, `pre_load=False`, hook exception, gating miss, `on_error`
+observer failure) is logged at `WARNING`; HTTP/transport noise and
+per-call I/O stay at `DEBUG` (visible under `-v`). No startup decision
+is silent.
 
 | Stage | When | Input | Return | Chain semantics | Exception → |
 |---|---|---|---|---|---|
-| `pre_load` | discovery, before registration | none | `False` = skip | short-circuit AND | skip tool |
-| `after_load` | discovery, after `pre_load` passes | none | unused (side effect) | all run, no short-circuit | skip tool |
+| `pre_load` | after cross-layer merge, on the winner | none | `False` = skip (no fallback) | short-circuit AND | skip tool |
+| `after_load` | same point as `pre_load`, after it passes | none | unused (side effect) | all run, no short-circuit | skip tool |
 | `pre_execute` | `_execute`, before tool body | `args: dict` | `dict` (modified) | pipeline (A's output → B's input) | short-circuit → on_error → error to LLM |
 | `after_execute` | `_execute`, after tool body, before formatting | `result, args` | `result` (modified) | pipeline | use original result |
 | `on_error` | any prior stage raised | `exc, phase, args, result` (missing = None) | `None` (side effect only — cannot recover) | short-circuit on its own exception | swallowed to `logger.debug` |
@@ -70,8 +80,11 @@ A path that yields `Tool` objects. **Currently implemented**: Python
 stories 25–32) and dynamic discovery of user-authored Python files
 (stories 33–35 — the `@tool` decorator is ready, the loader isn't).
 The pydantic schema base class (stories 1–10) was **dropped** — `@tool`
-is the single Python-tool definition API.
-_Avoid_: tool type (collides with `YAMLTool`), tool kind, backend.
+is the single Python-tool definition API. Tool source is the **format**
+axis only (Python / YAML / MCP) — it is **never** a precedence axis
+(see Layer).
+_Avoid_: tool type (collides with `YAMLTool`), tool kind, backend,
+layer (different axis).
 
 **YAMLTool**:
 A tool produced from a YAML declaration under `.agents/tools/`. The
@@ -119,19 +132,35 @@ _Avoid_: OS (too generic), target, environment.
 **Gating**:
 The load-time check that the executable a tool needs (argv[0] in argv
 mode, the `shell:` interpreter in shell mode) is on PATH. If not found,
-the tool is silently not registered — the model never sees a tool it
-cannot dispatch on this host. Resolution is via `shutil.which`.
+the tool is not registered — the model never sees a tool it cannot
+dispatch on this host. The skip is observable: a `WARNING` is logged
+naming the tool and the missing executable (every load/dispatch decision
+is visible by default — see Tool lifecycle). Resolution is via
+`shutil.which`.
 _Avoid_: filter, guard, condition.
 
 **Discovery path**:
 A directory scanned for YAML tool declarations at startup. **Project
 tools** live under `.agents/tools/` (relative to cwd); **user tools** live
 under `~/.config/cothis/tools/` (global across all projects). Both are
-optional; absence is not an error. User-global loads first, project-local
-loads second, and project-local shadows user-global on name conflict.
-Today only the project-local path is wired into `cli.py`; the
-user-global path is planned (issue #1, stories 20 and 33).
+optional; absence is not an error. Each discovery path is exactly one
+**Layer** (project-local, user-global, or builtin). Today only the
+project-local path is wired into `cli.py`; the user-global path is
+planned (issue #1, stories 20 and 33).
 _Avoid_: config dir, registry root, tools folder.
+
+**Layer**:
+A precedence tier in tool discovery. Three layers, highest precedence
+first: **project-local** (`.agents/tools/`), **user-global**
+(`~/.config/cothis/tools/`), **builtins** (compiled into `TOOLS`).
+Cross-layer name conflicts are resolved by **shadowing** (higher
+precedence wins); same-layer conflicts are an author error (raise
+`ValueError`). Layer is independent of tool source: a project-local
+YAML tool and a project-local Python tool claiming the same name are
+**same-layer** (raise), not cross-source shadow. Format (Python/YAML/
+MCP) is never a precedence axis.
+_Avoid_: source (collides with Tool source, the format axis), level,
+tier (too generic).
 
 **Placeholder**:
 A `{arg_name}` token in a `command:` template, substituted with the
