@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # representation of that constraint.
 from cothis.tools import (
     Tool,  # noqa: TC001
+    _AfterExecuteError,
     _format_tool_output,
     _run_hooks_safe,
     _schema_for,
@@ -444,9 +445,17 @@ class Agent(BaseModel):
         # --- after_execute pipeline (modifies result) ---
         try:
             result = _run_hooks_safe(tool, "_run_after_execute", result, args)
-        except Exception as exc:  # noqa: BLE001 — author hook code
+        except _AfterExecuteError as after_exc:
             logger.debug(
-                "tool %r after_execute raised: %s; using original result", name, exc
+                "← %s after_execute raised: %s; using original result",
+                name,
+                after_exc.__cause__,
+            )
+            logger.debug("tool %r on_error fired (phase=after_execute)", name)
+            result = after_exc.original_result
+        except Exception as exc:  # noqa: BLE001 — bare callable or other edge
+            logger.debug(
+                "← %s after_execute raised: %s; using original result", name, exc
             )
             logger.debug("tool %r on_error fired (phase=after_execute)", name)
 

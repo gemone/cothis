@@ -216,28 +216,52 @@ def commit(message: str, amend: bool = False) -> str:
     """
     ...
 
+# pre_load × 2: environment gates (both must pass — short-circuit AND)
 @commit.pre_load()
-def check_git():
-    """Gate: skip if git isn't on PATH."""
+def check_git_on_path():
+    """Gate 1: skip if git isn't on PATH."""
     import shutil
     return shutil.which("git") is not None
 
+@commit.pre_load()
+def check_repo_initialized():
+    """Gate 2: skip if not inside a git repo."""
+    from pathlib import Path
+    return Path(".git").exists()
+
+# after_load × 1: initialisation (side-effect only)
+@commit.after_load()
+def warm_branch_name():
+    """Init: cache the current branch so commit doesn't re-discover it."""
+    import subprocess
+    _branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+
+# pre_execute × 2: input pipeline (normalize → validate; each sees the previous output)
 @commit.pre_execute()
-def validate_message(args):
-    """Pipeline: reject empty messages before they reach git."""
-    if not args.get("message", "").strip():
+def normalize_message(args):
+    """Pipeline 1: strip trailing whitespace from the message."""
+    args["message"] = args["message"].rstrip()
+    return args
+
+@commit.pre_execute()
+def reject_empty_message(args):
+    """Pipeline 2: reject empty messages (sees normalized output from pipeline 1)."""
+    if not args["message"]:
         raise ValueError("commit message must not be empty")
     return args
 
+# after_execute × 1: output pipeline
 @commit.after_execute()
-def truncate(result, args):
-    """Pipeline: cap verbose git output."""
+def truncate_verbose_output(result, args):
+    """Pipeline: cap git output at 500 chars so it doesn't flood the context."""
     return result[:500] if isinstance(result, str) else result
 
+# on_error × 1: failure observer (side-effect only; cannot recover)
 @commit.on_error()
-def log_failure(exc, phase, args, result):
-    """Side-effect: record what went wrong (cannot recover)."""
+def log_to_telemetry(exc, phase, args, result):
+    """Observer: record failures for debugging. Cannot recover."""
     print(f"git.commit failed at {phase}: {exc}")
+```
 ```
 
 All hooks are optional. A tool with no hooks dispatches exactly as before.

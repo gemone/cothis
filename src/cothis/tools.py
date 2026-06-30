@@ -185,6 +185,20 @@ def tool(
 _HOOK_STAGES = ("pre_load", "after_load", "pre_execute", "after_execute", "on_error")
 
 
+class _AfterExecuteError(Exception):
+    """Sentinel raised by ``_run_after_execute`` when a callback crashes.
+
+    Carries the original tool ``result`` so ``_execute`` can recover it
+    (a broken after_execute must not hide what the tool actually returned).
+    The ``__cause__`` chain preserves the callback's original exception for
+    debug logging.
+    """
+
+    def __init__(self, original_result: Any) -> None:
+        super().__init__("after_execute callback raised; using original result")
+        self.original_result = original_result
+
+
 class _HookableTool:
     """Base for tools that carry lifecycle hooks.
 
@@ -364,8 +378,12 @@ class _HookableTool:
         result flows into ``_format_tool_output`` / ``str()``.
 
         Exception → chain short-circuits, ``on_error`` fires
-        (phase=``"after_execute"``), **original tool result used unchanged**
-        (don't let a broken after_execute hide the actual output).
+        (phase=``"after_execute"``), then the exception **re-raises** so
+        ``_execute`` can log the skip and use the original result. The
+        re-raise carries a sentinel ``_AfterExecuteError`` wrapping the
+        original result, so ``_execute`` knows to use ``result`` (not the
+        pipeline-so-far value) — a broken after_execute must not hide what
+        the tool actually returned.
         """
         current = result
         for cb in self._hooks["after_execute"]:
@@ -375,9 +393,11 @@ class _HookableTool:
                 self._run_on_error(
                     exc, phase="after_execute", args=args, result=current
                 )
-                # Use the original tool result — a broken after_execute must
-                # not hide what the tool actually returned.
-                return result
+                # Re-raise with the original result attached so ``_execute``
+                # can recover it. The sentinel pattern avoids a second return
+                # channel — the exception IS the signal, the attribute IS the
+                # fallback value.
+                raise _AfterExecuteError(result) from exc
         return current
 
 
