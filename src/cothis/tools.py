@@ -294,6 +294,86 @@ class ToolDef:
 
         return decorator
 
+    # --- Hook invocation (load-time stages) -----------------------------
+    #
+    # ``_run_load_hooks`` is called by ``load_python_tools_from_dir`` (#6) for
+    # each discovered ToolDef, before adding it to the result list. Execute-
+    # time hooks (``pre_execute`` / ``after_execute``) are invoked by
+    # ``Agent._execute`` (#7), not here.
+
+    def _run_on_error(
+        self, exc: Exception, phase: str, args: Any = None, result: Any = None
+    ) -> None:
+        """Run the ``on_error`` chain. Pure side-effect; its own errors swallowed.
+
+        ``phase`` names which stage raised (``"pre_load"`` / ``"after_load"`` /
+        ``"pre_execute"`` / ``"tool"`` / ``"after_execute"``). ``args`` / ``result``
+        are the context available at the point of failure (``None`` at load
+        time — no args/result exist yet). Each callback receives
+        ``(exc, phase, args, result)``; exceptions they raise are swallowed
+        and logged at debug (the observer must not manufacture new failures).
+        """
+        for cb in self._hooks["on_error"]:
+            try:
+                cb(exc, phase, args, result)
+            except Exception as cb_exc:  # noqa: BLE001 — observer failure is non-fatal
+                logger.debug(
+                    "tool %r on_error callback raised: %s; swallowed",
+                    self.__name__,
+                    cb_exc,
+                )
+                # Short-circuit the on_error chain: one observer failing means
+                # the rest don't run (same short-circuit rule as other stages).
+                # The original ``exc`` still propagates to the caller.
+                break
+
+    def _run_load_hooks(self) -> bool:
+        """Run ``pre_load`` + ``after_load`` chains. Return True if tool registers.
+
+        Called by ``load_python_tools_from_dir`` for each discovered ToolDef.
+        Returns ``True`` when the tool should be added to the result list;
+        ``False`` when ``pre_load`` short-circuited (any callback returned
+        ``False``) or any load hook raised.
+
+        Chain semantics (see CONTEXT.md "Tool lifecycle"):
+        - ``pre_load``: short-circuit AND. Any ``False`` → skip, remaining
+          callbacks don't run. Any exception → skip, ``on_error`` fires
+          (phase=``"pre_load"``).
+        - ``after_load``: all run in order (no short-circuit). Any exception
+          → skip, ``on_error`` fires (phase=``"after_load"``).
+        """
+        # --- pre_load: short-circuit AND ---
+        for cb in self._hooks["pre_load"]:
+            try:
+                ok = cb()
+            except Exception as exc:  # noqa: BLE001 — author code
+                logger.debug(
+                    "tool %r pre_load callback raised: %s; skipping",
+                    self.__name__,
+                    exc,
+                )
+                self._run_on_error(exc, phase="pre_load")
+                return False
+            if ok is False:
+                logger.debug(
+                    "tool %r pre_load callback returned False; skipping",
+                    self.__name__,
+                )
+                return False
+        # --- after_load: all run, no short-circuit ---
+        for cb in self._hooks["after_load"]:
+            try:
+                cb()
+            except Exception as exc:  # noqa: BLE001 — author code
+                logger.debug(
+                    "tool %r after_load callback raised: %s; skipping",
+                    self.__name__,
+                    exc,
+                )
+                self._run_on_error(exc, phase="after_load")
+                return False
+        return True
+
 
 def _build_schema(
     fn: Any, tool_name: str, description_override: str | None
@@ -1481,8 +1561,11 @@ def load_python_tools_from_dir(dir_path: Path) -> list[Tool]:
         # Auto-scan: collect every module-level ToolDef instance.
         for attr_name in dir(module):
             obj = getattr(module, attr_name)
-            # ``obj is None`` / ``obj is module`` guard avoids False positives
-            # from attributes that shadow builtins or the module itself.
             if isinstance(obj, ToolDef):
-                tools.append(obj)
+                # Run pre_load / after_load hooks. If pre_load short-circuits
+                # (any callback returns False) or any hook raises, the tool is
+                # silently skipped (``on_error`` fired for audit). See
+                # ``ToolDef._run_load_hooks`` for the chain semantics.
+                if obj._run_load_hooks():
+                    tools.append(obj)
     return tools

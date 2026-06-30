@@ -677,3 +677,138 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
     tools = load_python_tools_from_dir(tmp_path)
     assert len(tools) == 1  # only the @tool function, not CONSTANT/helper
     assert tools[0].__name__ == "real.tool"
+
+
+# --------------------------------------------------------------------
+# Load-time hooks: pre_load / after_load / on_error (issue #6)
+# --------------------------------------------------------------------
+
+
+def test_pre_load_multiple_callbacks_all_pass(tmp_path: Any) -> None:
+    """Multiple ``pre_load`` callbacks in registration order; all pass → registers."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "t.py").write_text(
+        "from cothis import tool\n\n"
+        "calls = []\n\n"
+        '@tool("t")\n'
+        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
+        "@t.pre_load()\n"
+        "def first():\n    calls.append(1); return True\n\n"
+        "@t.pre_load()\n"
+        "def second():\n    calls.append(2); return True\n",
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert len(tools) == 1  # both pre_load callbacks passed
+
+
+def test_pre_load_any_false_skips_tool(tmp_path: Any) -> None:
+    """If any ``pre_load`` callback returns False, the tool is skipped."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "t.py").write_text(
+        "from cothis import tool\n\n"
+        '@tool("t")\n'
+        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
+        "@t.pre_load()\n"
+        "def first():\n    return True\n\n"
+        "@t.pre_load()\n"
+        "def blocker():\n    return False\n\n"
+        "@t.pre_load()\n"
+        "def third():\n    raise AssertionError('should not run')\n",
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert tools == []  # blocker returned False, tool skipped, third didn't run
+
+
+def test_pre_load_exception_skips_and_triggers_on_error(tmp_path: Any) -> None:
+    """``pre_load`` raising skips the tool and fires ``on_error`` with phase."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "t.py").write_text(
+        "from cothis import tool\n\n"
+        "errors = []\n\n"
+        '@tool("t")\n'
+        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
+        "@t.pre_load()\n"
+        "def boom():\n    raise RuntimeError('env check failed')\n\n"
+        "@t.on_error()\n"
+        "def observe(exc, phase, args, result):\n    errors.append((str(exc), phase))\n",
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert tools == []  # pre_load raised, skipped
+
+
+def test_after_load_multiple_callbacks_all_run(tmp_path: Any) -> None:
+    """Multiple ``after_load`` callbacks all run in order (no short-circuit)."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "t.py").write_text(
+        "from cothis import tool\n\n"
+        "calls = []\n\n"
+        '@tool("t")\n'
+        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
+        "@t.after_load()\n"
+        "def first():\n    calls.append(1)\n\n"
+        "@t.after_load()\n"
+        "def second():\n    calls.append(2)\n",
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert len(tools) == 1  # after_load callbacks all ran, tool registered
+
+
+def test_after_load_exception_skips_and_triggers_on_error(tmp_path: Any) -> None:
+    """``after_load`` raising skips the tool and fires ``on_error``."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "t.py").write_text(
+        "from cothis import tool\n\n"
+        "errors = []\n\n"
+        '@tool("t")\n'
+        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
+        "@t.after_load()\n"
+        "def boom():\n    raise RuntimeError('init failed')\n\n"
+        "@t.on_error()\n"
+        "def observe(exc, phase, args, result):\n    errors.append((str(exc), phase))\n",
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert tools == []  # after_load raised, skipped
+
+
+def test_on_error_self_exception_swallowed(tmp_path: Any) -> None:
+    """If ``on_error`` itself raises, the exception is swallowed (debug logged)."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "t.py").write_text(
+        "from cothis import tool\n\n"
+        '@tool("t")\n'
+        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
+        "@t.pre_load()\n"
+        "def boom():\n    raise RuntimeError('orig')\n\n"
+        "@t.on_error()\n"
+        "def broken_observer(exc, phase, args, result):\n    raise ConnectionError('telemetry down')\n",
+        encoding="utf-8",
+    )
+    # Should not crash — on_error's own exception is swallowed.
+    tools = load_python_tools_from_dir(tmp_path)
+    assert tools == []  # tool still skipped (pre_load raised), but no crash
+
+
+def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
+    """A tool with no hooks is discovered and registered as before."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "t.py").write_text(
+        "from cothis import tool\n\n"
+        '@tool("plain")\n'
+        'def t(x: str) -> str:\n    """Plain."""\n    return x\n',
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert len(tools) == 1
+    assert tools[0].__name__ == "plain"
