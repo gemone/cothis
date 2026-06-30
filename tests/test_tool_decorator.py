@@ -812,3 +812,237 @@ def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
     tools = load_python_tools_from_dir(tmp_path)
     assert len(tools) == 1
     assert tools[0].__name__ == "plain"
+
+
+# --------------------------------------------------------------------
+# Execute-time hooks: pre_execute / after_execute / on_error (issue #7)
+# --------------------------------------------------------------------
+
+
+def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
+    """Multiple ``pre_execute`` callbacks form a pipeline (A's output feeds B)."""
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    from cothis.agent import Agent
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+
+    @tool("pipe")
+    def echo(x: str) -> str:
+        """Echo."""
+        return x
+
+    @echo.pre_execute()
+    def add_a_suffix(args):
+        args["x"] = args["x"] + "-A"
+        return args
+
+    @echo.pre_execute()
+    def add_b_suffix(args):
+        # Sees A's modification (pipeline).
+        args["x"] = args["x"] + "-B"
+        return args
+
+    agent._tool_map["pipe"] = echo
+    tc = MagicMock()
+    tc.function.name = "pipe"
+    tc.function.arguments = '{"x": "start"}'
+    result = agent._execute(tc)
+    assert result == "start-A-B"  # both pre_execute callbacks ran in order
+
+
+def test_pre_execute_exception_short_circuits_and_returns_error(
+    monkeypatch: Any,
+) -> None:
+    """``pre_execute`` raising short-circuits; error string returned to LLM."""
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    from cothis.agent import Agent
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+
+    @tool("guarded")
+    def guarded(x: str) -> str:
+        """Guarded."""
+        return x
+
+    @guarded.pre_execute()
+    def block(args):
+        raise ValueError("blocked by pre_execute")
+
+    agent._tool_map["guarded"] = guarded
+    tc = MagicMock()
+    tc.function.name = "guarded"
+    tc.function.arguments = '{"x": "hi"}'
+    result = agent._execute(tc)
+    assert result.startswith("Error calling guarded: blocked by pre_execute")
+
+
+def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
+    """Multiple ``after_execute`` callbacks form a pipeline on result."""
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    from cothis.agent import Agent
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+
+    @tool("transform")
+    def base() -> str:
+        """Base."""
+        return "hello"
+
+    @base.after_execute()
+    def upper(result, args):
+        return result.upper()
+
+    @base.after_execute()
+    def add_suffix(result, args):
+        # Sees upper's output (pipeline).
+        return result + "!"
+
+    agent._tool_map["transform"] = base
+    tc = MagicMock()
+    tc.function.name = "transform"
+    tc.function.arguments = "{}"
+    result = agent._execute(tc)
+    assert result == "HELLO!"  # both after_execute callbacks ran in order
+
+
+def test_after_execute_exception_uses_original_result(monkeypatch: Any) -> None:
+    """``after_execute`` raising uses the original result (don't hide output)."""
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    from cothis.agent import Agent
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+
+    @tool("safe")
+    def base() -> str:
+        """Base."""
+        return "real-output"
+
+    @base.after_execute()
+    def broken(result, args):
+        raise RuntimeError("after_execute crashed")
+
+    agent._tool_map["safe"] = base
+    tc = MagicMock()
+    tc.function.name = "safe"
+    tc.function.arguments = "{}"
+    result = agent._execute(tc)
+    # Original result preserved — broken after_execute doesn't hide it.
+    assert result == "real-output"
+
+
+def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
+    """Tool body exception fires ``on_error`` with phase='tool'."""
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    from cothis.agent import Agent
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+
+    errors = []
+
+    @tool("crash")
+    def base() -> str:
+        """Base."""
+        raise RuntimeError("tool body failed")
+
+    @base.on_error()
+    def observe(exc, phase, args, result):
+        errors.append((str(exc), phase))
+
+    agent._tool_map["crash"] = base
+    tc = MagicMock()
+    tc.function.name = "crash"
+    tc.function.arguments = "{}"
+    result = agent._execute(tc)
+    assert result.startswith("Error calling crash")
+    assert errors == [("tool body failed", "tool")]
+
+
+def test_on_error_at_execute_phase_correct(monkeypatch: Any) -> None:
+    """``on_error`` phase is 'pre_execute' when pre_execute raises."""
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    from cothis.agent import Agent
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+
+    errors = []
+
+    @tool("t")
+    def base() -> str:
+        """Base."""
+        return "never"
+
+    @base.pre_execute()
+    def boom(args):
+        raise RuntimeError("pre_execute failed")
+
+    @base.on_error()
+    def observe(exc, phase, args, result):
+        errors.append((str(exc), phase))
+
+    agent._tool_map["t"] = base
+    tc = MagicMock()
+    tc.function.name = "t"
+    tc.function.arguments = "{}"
+    agent._execute(tc)
+    assert errors == [("pre_execute failed", "pre_execute")]
+
+
+def test_no_hooks_execute_baseline_unchanged(monkeypatch: Any) -> None:
+    """A tool with no execute hooks dispatches exactly as before."""
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    from cothis.agent import Agent
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+
+    @tool("plain")
+    def base(x: str) -> str:
+        """Plain."""
+        return f"got {x}"
+
+    agent._tool_map["plain"] = base
+    tc = MagicMock()
+    tc.function.name = "plain"
+    tc.function.arguments = '{"x": "hello"}'
+    assert agent._execute(tc) == "got hello"

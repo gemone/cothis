@@ -374,6 +374,54 @@ class ToolDef:
                 return False
         return True
 
+    # --- Hook invocation (execute-time stages) ---------------------------
+    #
+    # Called by ``Agent._execute`` (#7) around ``tool(**args)``. Unlike the
+    # load hooks (which return a bool), these raise on failure — ``_execute``
+    # catches the exception, fires ``on_error``, and returns an error string
+    # to the LLM. This keeps the control flow in ``_execute`` linear.
+
+    def _run_pre_execute(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Run the ``pre_execute`` pipeline. Returns the (possibly modified) args.
+
+        Each callback receives the previous callback's returned dict; the
+        final dict is what ``tool(**args)`` should receive. Exception → chain
+        short-circuits, ``on_error`` fires (phase=``"pre_execute"``), and the
+        exception re-raises so ``_execute`` can return the error string.
+        """
+        current = args
+        for cb in self._hooks["pre_execute"]:
+            try:
+                current = cb(current)
+            except Exception as exc:  # noqa: BLE001 — author code
+                self._run_on_error(exc, phase="pre_execute", args=current)
+                raise
+        return current
+
+    def _run_after_execute(self, result: Any, args: dict[str, Any]) -> Any:
+        """Run the ``after_execute`` pipeline. Returns the (possibly modified) result.
+
+        Each callback receives ``(previous_result, args)``; ``args`` is the
+        post-pre_execute args dict, carried unchanged for context. The final
+        result flows into ``_format_tool_output`` / ``str()``.
+
+        Exception → chain short-circuits, ``on_error`` fires
+        (phase=``"after_execute"``), **original tool result used unchanged**
+        (don't let a broken after_execute hide the actual output).
+        """
+        current = result
+        for cb in self._hooks["after_execute"]:
+            try:
+                current = cb(current, args)
+            except Exception as exc:  # noqa: BLE001 — author code
+                self._run_on_error(
+                    exc, phase="after_execute", args=args, result=current
+                )
+                # Use the original tool result — a broken after_execute must
+                # not hide what the tool actually returned.
+                return result
+        return current
+
 
 def _build_schema(
     fn: Any, tool_name: str, description_override: str | None

@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # representation of that constraint.
 from cothis.tools import (
     Tool,  # noqa: TC001
+    ToolDef,  # noqa: TC001
     _format_tool_output,
     _schema_for,
 )
@@ -396,12 +397,15 @@ class Agent(BaseModel):
     def _execute(self, tool_call: Any) -> str:
         """Dispatch a single tool call and return its result as a string.
 
-        Return shape depends on the tool's result type:
-        - ``str`` → returned as-is (text output, confirmations, errors, stdout).
-        - ``dict`` / ``list`` → formatted via ``_format_tool_output`` (json by
-          default; csv/tsv/yaml via ``COTHIS_TOOL_OUTPUT_FORMAT``). Structured
-          data is serialised so the model can parse it accurately.
-        - anything else → ``str(result)`` fallback.
+        Lifecycle (for ``ToolDef`` tools — YAML ``_ShellTool`` skips hooks):
+        1. ``pre_execute`` pipeline — callbacks may modify ``args``.
+        2. ``tool(**args)`` — the actual tool body.
+        3. ``after_execute`` pipeline — callbacks may modify ``result``.
+        4. ``_format_tool_output`` — json/csv/tsv/yaml serialisation.
+
+        Any exception in 1–3 fires ``on_error`` (phase names the stage),
+        then returns an error string to the LLM. ``after_execute`` failure
+        uses the original result (don't hide the tool's output).
         """
         name = tool_call.function.name
         raw_args = tool_call.function.arguments or "{}"
@@ -416,16 +420,33 @@ class Agent(BaseModel):
             logger.debug("tool %s not in tool_map (unknown tool)", name)
             return f"Error: unknown tool {name!r}."
 
-        # Debug visibility: log the full input/output of every tool call so
-        # ``--debug`` (or ``LOGLEVEL=DEBUG``) surfaces what the model sent
-        # and what the tool returned.
+        # ``ToolDef`` tools carry lifecycle hooks; ``_ShellTool`` (YAML) and
+        # bare callables don't. ``isinstance`` gate keeps hook invocation
+        # out of the YAML path entirely.
+        is_tooldef = isinstance(tool, ToolDef)
+
+        # --- pre_execute pipeline (modifies args) ---
+        if is_tooldef:
+            try:
+                args = tool._run_pre_execute(args)
+            except Exception as exc:  # noqa: BLE001 — author hook code
+                logger.debug("← %s pre_execute raised: %s", name, exc)
+                return f"Error calling {name}: {exc}"
+
         arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
         logger.debug("→ %s(%s)", name, arg_repr)
         try:
             result = tool(**args)
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             logger.debug("← %s raised: %s", name, exc)
+            if is_tooldef:
+                tool._run_on_error(exc, phase="tool", args=args)
             return f"Error calling {name}: {exc}"
+
+        # --- after_execute pipeline (modifies result) ---
+        if is_tooldef:
+            result = tool._run_after_execute(result, args)
+
         # Structured result → format (json/csv/tsv/yaml). Str → as-is.
         if isinstance(result, (dict, list)):
             rendered = _format_tool_output(result)
