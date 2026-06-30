@@ -15,7 +15,7 @@ import sys
 import typing
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, overload, runtime_checkable
 
 import griffe
 import pathspec
@@ -43,6 +43,20 @@ class Tool(Protocol):
     __name__: str
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+def _run_hooks_safe(tool: Any, method_name: str, *args: Any) -> Any:
+    """Call a ``_run_*`` hook method on ``tool`` if it exists; no-op if not.
+
+    Real tools (``ToolDef``, ``_ShellTool``) inherit from ``_HookableTool``
+    and always have the ``_run_*`` methods. Bare callables (lambdas in tests,
+    legacy ``def`` tools) don't — they skip hooks entirely. This duck-types
+    the hook surface so ``_execute`` doesn't need ``isinstance`` narrowing.
+    """
+    method = getattr(tool, method_name, None)
+    if method is None:
+        return args[0] if args else None
+    return method(*args)
 
 
 # Python type → JSON-Schema type name. Shared with the YAML arg-type map
@@ -106,12 +120,28 @@ def _parse_docstring(doc: str | None) -> tuple[str, dict[str, str]]:
     return summary, arg_descs
 
 
+@overload
+def tool(func: Callable[..., Any], /) -> ToolDef: ...
+
+
+@overload
+def tool(
+    func: str, /, *, name: str | None = None, description: str | None = None
+) -> Callable[[Callable[..., Any]], ToolDef]: ...
+
+
+@overload
+def tool(
+    *, name: str | None = None, description: str | None = None
+) -> Callable[[Callable[..., Any]], ToolDef]: ...
+
+
 def tool(
     func: Callable[..., Any] | str | None = None,
     *,
     name: str | None = None,
     description: str | None = None,
-) -> Any:
+) -> ToolDef | Callable[[Callable[..., Any]], ToolDef]:
     """Decorate a function as a cothis tool with a rich LLM schema.
 
     Three usage forms::
@@ -155,159 +185,91 @@ def tool(
 _HOOK_STAGES = ("pre_load", "after_load", "pre_execute", "after_execute", "on_error")
 
 
-class ToolDef:
-    """A tool definition: a callable + its schema + lifecycle hooks.
+class _HookableTool:
+    """Base for tools that carry lifecycle hooks.
 
-    Produced by the ``@tool`` decorator. Wraps a function with:
-    - ``__name__`` / ``__doc__`` / ``__signature__`` / ``__cothis_schema__`` —
-      the surface the ``Tool`` protocol + any-llm expect.
-    - ``__call__(**args)`` — delegates to the wrapped function.
-    - Five hook-decorator methods (``.pre_load()`` etc.) — register callbacks
-      into an ordered list per stage. Callbacks are stored here but invoked
-      by the discovery loader (#5/#6) and ``_execute`` (#7); this class only
-      owns registration + storage.
+    Owns hook storage (``_hooks``: ordered list per stage) and the four
+    invocation methods (``_run_load_hooks`` / ``_run_pre_execute`` /
+    ``_run_after_execute`` / ``_run_on_error``). Both ``ToolDef`` (Python
+    tools) and ``_ShellTool`` (YAML tools) inherit it so ``_execute`` can
+    run hooks uniformly without per-source branching.
 
-    Hook callbacks are stored in ``self._hooks[stage]`` as a list in
-    registration order. The decorator methods return the callback unchanged
-    so stacking works::
+    YAML ``_ShellTool`` inherits but never registers callbacks (its
+    ``_hooks`` lists stay empty), so the hook chains are no-ops for YAML
+    tools. The shared base is what lets ``_execute`` treat every tool the
+    same — the ``Tool`` protocol's "no per-source branching" promise
+    (CONTEXT.md) holds because the gate is the type itself, not an
+    ``isinstance`` check in the dispatch path.
 
-        @tool("x")
-        def x(arg: str) -> str: ...
-
-        @x.pre_execute()
-        def validate(args): ...
-
-        @x.pre_execute()   # second callback — appended, runs after validate
-        def sanitize(args): ...
+    This base does NOT carry schema, ``__name__``, ``__call__``, or any
+    dispatch logic — those stay on the concrete subclasses. It is purely
+    the hook mechanism.
     """
 
-    __name__: str
-    __doc__: str
-    __signature__: inspect.Signature
-    __cothis_schema__: dict[str, Any]
+    __name__: str  # set by subclasses; used in logger.debug messages
 
-    def __init__(
-        self,
-        fn: Any,
-        *,
-        name: str | None = None,
-        description: str | None = None,
-    ) -> None:
-        self._fn = fn
-        tool_name = name or fn.__name__
-        # Schema construction: parse docstring + signature once, here.
-        # ``__name__`` etc. are set so this object satisfies ``Tool`` Protocol.
-        self.__name__ = tool_name
-        self.__doc__ = description or inspect.getdoc(fn) or f"Python tool: {tool_name}"
-        self.__signature__ = inspect.signature(fn)
-        self.__cothis_schema__ = _build_schema(fn, tool_name, description)
-        # Hook storage: ordered list per stage. Populated lazily by the
-        # decorator methods below; invoked by #6 (load hooks) and #7
-        # (execute hooks). Empty list = no callbacks = current behavior.
+    def __init__(self) -> None:
         self._hooks: dict[str, list[Callable[..., Any]]] = {
             stage: [] for stage in _HOOK_STAGES
         }
 
-    def __call__(self, **kwargs: Any) -> Any:
-        return self._fn(**kwargs)
-
     # --- Hook registration (decorators that append to the chain) --------
     #
-    # Each method takes a callback, appends it to ``self._hooks[stage]`` in
-    # registration order, and returns the callback unchanged (so the decorator
-    # doesn't change the callback's visibility / reference). The callbacks
-    # are NOT invoked here — the discovery loader (#6) and ``_execute`` (#7)
-    # are responsible for running the chains with the right semantics
-    # (pipeline / short-circuit-AND / side-effect).
+    # Each method returns a decorator that appends a callback to the stage's
+    # list in registration order. The decorator returns the callback unchanged
+    # so stacking works::
+    #
+    #     @tool.pre_execute()
+    #     def first(args): ...
+    #
+    #     @tool.pre_execute()   # appended, runs after first
+    #     def second(args): ...
+
+    def _make_hook_decorator(
+        self, stage: str
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Return a decorator that appends to ``self._hooks[stage]``."""
+        chain = self._hooks[stage]
+
+        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
+            chain.append(cb)
+            return cb
+
+        return decorator
 
     def pre_load(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register a ``pre_load`` callback (environment gate, pre-registration).
-
-        Returns a decorator that appends the callback to the chain. The
-        callback is invoked by the discovery loader (#6) — returns ``False``
-        to skip the tool, raises to skip + trigger ``on_error``.
-        """
-        stage = self._hooks["pre_load"]
-
-        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
-            stage.append(cb)
-            return cb
-
-        return decorator
+        """Register a ``pre_load`` callback (environment gate, pre-registration)."""
+        return self._make_hook_decorator("pre_load")
 
     def after_load(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register an ``after_load`` callback (initialisation, post-registration).
-
-        Returns a decorator that appends the callback to the chain. Invoked by
-        the discovery loader (#6) after ``pre_load`` passes — side-effect only.
-        """
-        stage = self._hooks["after_load"]
-
-        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
-            stage.append(cb)
-            return cb
-
-        return decorator
+        """Register an ``after_load`` callback (initialisation, post-registration)."""
+        return self._make_hook_decorator("after_load")
 
     def pre_execute(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register a ``pre_execute`` callback (input interception, pipeline).
-
-        Returns a decorator that appends the callback to the chain. Invoked by
-        ``_execute`` (#7) — receives ``args: dict``, returns the (possibly
-        modified) dict; the final dict reaches ``tool(**args)``.
-        """
-        stage = self._hooks["pre_execute"]
-
-        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
-            stage.append(cb)
-            return cb
-
-        return decorator
+        """Register a ``pre_execute`` callback (input interception, pipeline)."""
+        return self._make_hook_decorator("pre_execute")
 
     def after_execute(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register an ``after_execute`` callback (output interception, pipeline).
-
-        Returns a decorator that appends the callback to the chain. Invoked by
-        ``_execute`` (#7) — receives ``(result, args)``, returns the (possibly
-        modified) result; flows into ``_format_tool_output`` / ``str()``.
-        """
-        stage = self._hooks["after_execute"]
-
-        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
-            stage.append(cb)
-            return cb
-
-        return decorator
+        """Register an ``after_execute`` callback (output interception, pipeline)."""
+        return self._make_hook_decorator("after_execute")
 
     def on_error(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register an ``on_error`` callback (failure observer, side-effect only).
+        """Register an ``on_error`` callback (failure observer, side-effect only)."""
+        return self._make_hook_decorator("on_error")
 
-        Returns a decorator that appends the callback to the chain. Invoked
-        when any prior stage raises — receives ``(exc, phase, args, result)``.
-        Pure side-effect: cannot recover. Its own exceptions are swallowed.
-        """
-        stage = self._hooks["on_error"]
-
-        def decorator(cb: Callable[..., Any]) -> Callable[..., Any]:
-            stage.append(cb)
-            return cb
-
-        return decorator
-
-    # --- Hook invocation (load-time stages) -----------------------------
+    # --- Hook invocation ------------------------------------------------
     #
-    # ``_run_load_hooks`` is called by ``load_python_tools_from_dir`` (#6) for
-    # each discovered ToolDef, before adding it to the result list. Execute-
-    # time hooks (``pre_execute`` / ``after_execute``) are invoked by
-    # ``Agent._execute`` (#7), not here.
+    # Load hooks (``_run_load_hooks``) are called by the discovery loader.
+    # Execute hooks (``_run_pre_execute`` / ``_run_after_execute``) are called
+    # by ``Agent._execute``. ``_run_on_error`` is called on any stage failure.
 
     def _run_on_error(
         self, exc: Exception, phase: str, args: Any = None, result: Any = None
     ) -> None:
         """Run the ``on_error`` chain. Pure side-effect; its own errors swallowed.
 
-        ``phase`` names which stage raised (``"pre_load"`` / ``"after_load"`` /
-        ``"pre_execute"`` / ``"tool"`` / ``"after_execute"``). ``args`` / ``result``
+        ``phase`` names which stage raised (``pre_load`` / ``after_load`` /
+        ``pre_execute`` / ``tool`` / ``after_execute``). ``args`` / ``result``
         are the context available at the point of failure (``None`` at load
         time — no args/result exist yet). Each callback receives
         ``(exc, phase, args, result)``; exceptions they raise are swallowed
@@ -330,29 +292,32 @@ class ToolDef:
     def _run_load_hooks(self) -> bool:
         """Run ``pre_load`` + ``after_load`` chains. Return True if tool registers.
 
-        Called by ``load_python_tools_from_dir`` for each discovered ToolDef.
-        Returns ``True`` when the tool should be added to the result list;
-        ``False`` when ``pre_load`` short-circuited (any callback returned
-        ``False``) or any load hook raised.
+        Called by the discovery loader for each discovered tool. Returns
+        ``True`` when the tool should be added to the result list; ``False``
+        when ``pre_load`` short-circuited (any callback returned ``False``) or
+        any load hook raised.
 
         Chain semantics (see CONTEXT.md "Tool lifecycle"):
         - ``pre_load``: short-circuit AND. Any ``False`` → skip, remaining
-          callbacks don't run. Any exception → skip, ``on_error`` fires
-          (phase=``"pre_load"``).
+          callbacks don't run. Any exception → ``on_error`` fires
+          (phase=``"pre_load"``), then skip.
         - ``after_load``: all run in order (no short-circuit). Any exception
-          → skip, ``on_error`` fires (phase=``"after_load"``).
+          → ``on_error`` fires (phase=``"after_load"``), then skip.
         """
         # --- pre_load: short-circuit AND ---
         for cb in self._hooks["pre_load"]:
             try:
                 ok = cb()
             except Exception as exc:  # noqa: BLE001 — author code
+                # on_error fires BEFORE the debug log — the observer should
+                # see the error at the point of failure, not after the skip
+                # decision is already logged.
+                self._run_on_error(exc, phase="pre_load")
                 logger.debug(
                     "tool %r pre_load callback raised: %s; skipping",
                     self.__name__,
                     exc,
                 )
-                self._run_on_error(exc, phase="pre_load")
                 return False
             if ok is False:
                 logger.debug(
@@ -365,21 +330,14 @@ class ToolDef:
             try:
                 cb()
             except Exception as exc:  # noqa: BLE001 — author code
+                self._run_on_error(exc, phase="after_load")
                 logger.debug(
                     "tool %r after_load callback raised: %s; skipping",
                     self.__name__,
                     exc,
                 )
-                self._run_on_error(exc, phase="after_load")
                 return False
         return True
-
-    # --- Hook invocation (execute-time stages) ---------------------------
-    #
-    # Called by ``Agent._execute`` (#7) around ``tool(**args)``. Unlike the
-    # load hooks (which return a bool), these raise on failure — ``_execute``
-    # catches the exception, fires ``on_error``, and returns an error string
-    # to the LLM. This keeps the control flow in ``_execute`` linear.
 
     def _run_pre_execute(self, args: dict[str, Any]) -> dict[str, Any]:
         """Run the ``pre_execute`` pipeline. Returns the (possibly modified) args.
@@ -421,6 +379,58 @@ class ToolDef:
                 # not hide what the tool actually returned.
                 return result
         return current
+
+
+class ToolDef(_HookableTool):
+    """A Python tool: a callable + its schema + lifecycle hooks.
+
+    Produced by the ``@tool`` decorator. Wraps a function with:
+    - ``__name__`` / ``__doc__`` / ``__signature__`` / ``__cothis_schema__`` —
+      the surface the ``Tool`` protocol + any-llm expect.
+    - ``__call__(**args)`` — delegates to the wrapped function.
+    - Five hook-decorator methods (inherited from ``_HookableTool``) — register
+      callbacks into an ordered list per stage. Callbacks are stored here but
+      invoked by the discovery loader and ``_execute``; this class only owns
+      registration + storage (via the base).
+
+    Hook callbacks are stored in ``self._hooks[stage]`` as a list in
+    registration order. The decorator methods return the callback unchanged
+    so stacking works::
+
+        @tool("x")
+        def x(arg: str) -> str: ...
+
+        @x.pre_execute()
+        def validate(args): ...
+
+        @x.pre_execute()   # second callback — appended, runs after validate
+        def sanitize(args): ...
+    """
+
+    __name__: str
+    __doc__: str
+    __signature__: inspect.Signature
+    __cothis_schema__: dict[str, Any]
+
+    def __init__(
+        self,
+        fn: Any,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._fn = fn
+        tool_name = name or fn.__name__
+        # Schema construction: parse docstring + signature once, here.
+        # ``__name__`` etc. are set so this object satisfies ``Tool`` Protocol.
+        self.__name__ = tool_name
+        self.__doc__ = description or inspect.getdoc(fn) or f"Python tool: {tool_name}"
+        self.__signature__ = inspect.signature(fn)
+        self.__cothis_schema__ = _build_schema(fn, tool_name, description)
+
+    def __call__(self, **kwargs: Any) -> Any:
+        return self._fn(**kwargs)
 
 
 def _build_schema(
@@ -1169,7 +1179,7 @@ def _all_placeholders(command: list[str] | str) -> set[str]:
     return _extract_field_names(command)
 
 
-class _ShellTool:
+class _ShellTool(_HookableTool):
     """A callable shell tool — the Tool-protocol adapter over a CommandBlock.
 
     Holds a ``CommandBlock`` (validated command + args) plus the resolved
@@ -1186,6 +1196,12 @@ class _ShellTool:
     Rendering delegates to ``CommandBlock.render`` — the list-vs-string
     render fork lives there, not here. This class carries only the dispatch
     fork (``subprocess.run``'s argument shape) and the resolved exe path.
+
+    Inherits ``_HookableTool`` so ``_execute`` can run hooks uniformly without
+    per-source branching. YAML tools don't register hooks today (their
+    ``_hooks`` lists stay empty); the hook chains are no-ops. If YAML hook
+    support is added later, it'll be a loader concern (e.g. load a same-name
+    ``.py`` file), not an ``_execute`` change.
     """
 
     __name__: str
@@ -1194,6 +1210,7 @@ class _ShellTool:
     __cothis_schema__: dict[str, Any] | None
 
     def __init__(self, block: CommandBlock, *, shell_path: str | None) -> None:
+        super().__init__()
         self.__name__ = block.name
         self.__doc__ = block.description
         self.__signature__ = _build_signature(block.arg_specs)

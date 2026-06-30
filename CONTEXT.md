@@ -10,7 +10,9 @@ and dynamic Python extensions planned (issue #1).
 **Tool**:
 Any callable object the `Agent` registers by name and dispatches by
 calling with keyword arguments. The single dispatch protocol — there is
-no per-source branching in `_execute`.
+no per-source branching in `_execute`. Every concrete tool class
+(`ToolDef`, `_ShellTool`) inherits `_HookableTool`, so hooks run
+uniformly for all sources (YAML tools' chains are empty no-ops).
 _Avoid_: function (too generic), handler, action.
 
 **`@tool` decorator**:

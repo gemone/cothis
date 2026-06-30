@@ -32,8 +32,8 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # representation of that constraint.
 from cothis.tools import (
     Tool,  # noqa: TC001
-    ToolDef,  # noqa: TC001
     _format_tool_output,
+    _run_hooks_safe,
     _schema_for,
 )
 
@@ -397,7 +397,8 @@ class Agent(BaseModel):
     def _execute(self, tool_call: Any) -> str:
         """Dispatch a single tool call and return its result as a string.
 
-        Lifecycle (for ``ToolDef`` tools — YAML ``_ShellTool`` skips hooks):
+        Lifecycle (all tools carry hooks via ``_HookableTool``; YAML tools'
+        hook chains are empty no-ops):
         1. ``pre_execute`` pipeline — callbacks may modify ``args``.
         2. ``tool(**args)`` — the actual tool body.
         3. ``after_execute`` pipeline — callbacks may modify ``result``.
@@ -420,18 +421,14 @@ class Agent(BaseModel):
             logger.debug("tool %s not in tool_map (unknown tool)", name)
             return f"Error: unknown tool {name!r}."
 
-        # ``ToolDef`` tools carry lifecycle hooks; ``_ShellTool`` (YAML) and
-        # bare callables don't. ``isinstance`` gate keeps hook invocation
-        # out of the YAML path entirely.
-        is_tooldef = isinstance(tool, ToolDef)
-
         # --- pre_execute pipeline (modifies args) ---
-        if is_tooldef:
-            try:
-                args = tool._run_pre_execute(args)
-            except Exception as exc:  # noqa: BLE001 — author hook code
-                logger.debug("← %s pre_execute raised: %s", name, exc)
-                return f"Error calling {name}: {exc}"
+        # Tools inheriting ``_HookableTool`` (ToolDef, _ShellTool) run the
+        # pipeline; bare callables (lambdas, legacy defs) skip via duck-typing.
+        try:
+            args = _run_hooks_safe(tool, "_run_pre_execute", args)
+        except Exception as exc:  # noqa: BLE001 — author hook code
+            logger.debug("← %s pre_execute raised: %s", name, exc)
+            return f"Error calling {name}: {exc}"
 
         arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
         logger.debug("→ %s(%s)", name, arg_repr)
@@ -439,13 +436,11 @@ class Agent(BaseModel):
             result = tool(**args)
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             logger.debug("← %s raised: %s", name, exc)
-            if is_tooldef:
-                tool._run_on_error(exc, phase="tool", args=args)
+            _run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
             return f"Error calling {name}: {exc}"
 
         # --- after_execute pipeline (modifies result) ---
-        if is_tooldef:
-            result = tool._run_after_execute(result, args)
+        result = _run_hooks_safe(tool, "_run_after_execute", result, args)
 
         # Structured result → format (json/csv/tsv/yaml). Str → as-is.
         if isinstance(result, (dict, list)):

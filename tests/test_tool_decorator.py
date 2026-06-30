@@ -632,6 +632,8 @@ def test_load_python_tools_import_failure_doesnt_crash(
     tmp_path: Any, caplog: Any
 ) -> None:
     """A broken ``.py`` file logs an error but doesn't crash the loader."""
+    import logging
+
     from cothis.tools import load_python_tools_from_dir
 
     (tmp_path / "broken.py").write_text("import nonexistent_module\n", encoding="utf-8")
@@ -641,9 +643,15 @@ def test_load_python_tools_import_failure_doesnt_crash(
         'def g() -> str:\n    """G."""\n    return "ok"\n',
         encoding="utf-8",
     )
-    tools = load_python_tools_from_dir(tmp_path)
+    with caplog.at_level(logging.ERROR, logger="cothis.tools"):
+        tools = load_python_tools_from_dir(tmp_path)
     assert len(tools) == 1  # the broken one was skipped, the good one loaded
     assert tools[0].__name__ == "good"
+    # The broken file's error was logged — actionable (file path + exception).
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(error_records) == 1
+    assert "broken.py" in error_records[0].message
+    assert "nonexistent_module" in error_records[0].message
 
 
 def test_load_python_tools_empty_dir_returns_empty(tmp_path: Any) -> None:
@@ -723,61 +731,67 @@ def test_pre_load_any_false_skips_tool(tmp_path: Any) -> None:
     assert tools == []  # blocker returned False, tool skipped, third didn't run
 
 
-def test_pre_load_exception_skips_and_triggers_on_error(tmp_path: Any) -> None:
+def test_pre_load_exception_skips_and_triggers_on_error() -> None:
     """``pre_load`` raising skips the tool and fires ``on_error`` with phase."""
-    from cothis.tools import load_python_tools_from_dir
+    errors: list[tuple[str, str]] = []
 
-    (tmp_path / "t.py").write_text(
-        "from cothis import tool\n\n"
-        "errors = []\n\n"
-        '@tool("t")\n'
-        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
-        "@t.pre_load()\n"
-        "def boom():\n    raise RuntimeError('env check failed')\n\n"
-        "@t.on_error()\n"
-        "def observe(exc, phase, args, result):\n    errors.append((str(exc), phase))\n",
-        encoding="utf-8",
-    )
-    tools = load_python_tools_from_dir(tmp_path)
-    assert tools == []  # pre_load raised, skipped
+    @tool("t")
+    def t() -> str:
+        """T."""
+        return "ok"
+
+    @t.pre_load()
+    def boom() -> None:
+        raise RuntimeError("env check failed")
+
+    @t.on_error()
+    def observe(exc: Exception, phase: str, args: Any, result: Any) -> None:
+        errors.append((str(exc), phase))
+
+    assert t._run_load_hooks() is False
+    assert errors == [("env check failed", "pre_load")]
 
 
-def test_after_load_multiple_callbacks_all_run(tmp_path: Any) -> None:
+def test_after_load_multiple_callbacks_all_run() -> None:
     """Multiple ``after_load`` callbacks all run in order (no short-circuit)."""
-    from cothis.tools import load_python_tools_from_dir
+    calls: list[int] = []
 
-    (tmp_path / "t.py").write_text(
-        "from cothis import tool\n\n"
-        "calls = []\n\n"
-        '@tool("t")\n'
-        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
-        "@t.after_load()\n"
-        "def first():\n    calls.append(1)\n\n"
-        "@t.after_load()\n"
-        "def second():\n    calls.append(2)\n",
-        encoding="utf-8",
-    )
-    tools = load_python_tools_from_dir(tmp_path)
-    assert len(tools) == 1  # after_load callbacks all ran, tool registered
+    @tool("t")
+    def t() -> str:
+        """T."""
+        return "ok"
+
+    @t.after_load()
+    def first() -> None:
+        calls.append(1)
+
+    @t.after_load()
+    def second() -> None:
+        calls.append(2)
+
+    assert t._run_load_hooks() is True
+    assert calls == [1, 2]
 
 
-def test_after_load_exception_skips_and_triggers_on_error(tmp_path: Any) -> None:
+def test_after_load_exception_skips_and_triggers_on_error() -> None:
     """``after_load`` raising skips the tool and fires ``on_error``."""
-    from cothis.tools import load_python_tools_from_dir
+    errors: list[tuple[str, str]] = []
 
-    (tmp_path / "t.py").write_text(
-        "from cothis import tool\n\n"
-        "errors = []\n\n"
-        '@tool("t")\n'
-        'def t() -> str:\n    """T."""\n    return "ok"\n\n'
-        "@t.after_load()\n"
-        "def boom():\n    raise RuntimeError('init failed')\n\n"
-        "@t.on_error()\n"
-        "def observe(exc, phase, args, result):\n    errors.append((str(exc), phase))\n",
-        encoding="utf-8",
-    )
-    tools = load_python_tools_from_dir(tmp_path)
-    assert tools == []  # after_load raised, skipped
+    @tool("t")
+    def t() -> str:
+        """T."""
+        return "ok"
+
+    @t.after_load()
+    def boom() -> None:
+        raise RuntimeError("init failed")
+
+    @t.on_error()
+    def observe(exc: Exception, phase: str, args: Any, result: Any) -> None:
+        errors.append((str(exc), phase))
+
+    assert t._run_load_hooks() is False
+    assert errors == [("init failed", "after_load")]
 
 
 def test_on_error_self_exception_swallowed(tmp_path: Any) -> None:
