@@ -54,7 +54,7 @@ def test_summary_from_first_paragraph() -> None:
 
 
 def test_per_arg_description_from_args_section() -> None:
-    """ "The ``Args:`` section's per-line descriptions reach the schema."""
+    """" "The ``Args:`` section's per-line descriptions reach the schema."""
 
     @tool
     def add(a: int, b: int) -> int:
@@ -73,7 +73,7 @@ def test_per_arg_description_from_args_section() -> None:
 
 
 def test_type_mapping_from_annotation() -> None:
-    """ "Python annotations map to JSON-Schema types."""
+    """" "Python annotations map to JSON-Schema types."""
 
     @tool
     def typed(n: int, s: str, f: float, b: bool, items: list) -> str:
@@ -97,7 +97,7 @@ def test_type_mapping_from_annotation() -> None:
 
 
 def test_unknown_annotation_falls_back_to_string() -> None:
-    """ "An annotation not in the type map defaults to ``string``."""
+    """" "An annotation not in the type map defaults to ``string``."""
 
     @tool
     def custom(x: Any) -> str:
@@ -113,7 +113,7 @@ def test_unknown_annotation_falls_back_to_string() -> None:
 
 
 def test_required_vs_optional_from_defaults() -> None:
-    """ "Args with defaults are optional; args without are required."""
+    """" "Args with defaults are optional; args without are required."""
 
     @tool
     def f(req: str, opt: str = "x") -> str:
@@ -130,7 +130,7 @@ def test_required_vs_optional_from_defaults() -> None:
 
 
 def test_multiline_description_collapsed() -> None:
-    """ "Multi-line arg descriptions are collapsed to single-line."""
+    """" "Multi-line arg descriptions are collapsed to single-line."""
 
     @tool
     def read(path: str) -> str:
@@ -172,7 +172,7 @@ def test_tool_with_positional_name() -> None:
 
 
 def test_tool_with_keyword_name_and_description() -> None:
-    """ "``@tool(name=..., description=...)`` overrides both fields."""
+    """" "``@tool(name=..., description=...)`` overrides both fields."""
 
     @tool(name="custom.tool", description="Override description.")
     def f(x: str) -> str:
@@ -186,7 +186,7 @@ def test_tool_with_keyword_name_and_description() -> None:
 
 
 def test_tool_no_parens_uses_dunder_name() -> None:
-    """ "``@tool`` (no parens) uses ``__name__`` as the tool name."""
+    """" "``@tool`` (no parens) uses ``__name__`` as the tool name."""
 
     @tool
     def bare(x: str) -> str:
@@ -197,7 +197,7 @@ def test_tool_no_parens_uses_dunder_name() -> None:
 
 
 def test_no_docstring_yields_default_description() -> None:
-    """ "A function without a docstring falls back to a derived description."""
+    """" "A function without a docstring falls back to a derived description."""
 
     @tool
     def bare(x: str) -> str:
@@ -209,7 +209,7 @@ def test_no_docstring_yields_default_description() -> None:
 
 
 def test_no_args_section_yields_no_descriptions() -> None:
-    """ "A docstring without ``Args:`` produces no per-arg descriptions."""
+    """" "A docstring without ``Args:`` produces no per-arg descriptions."""
 
     @tool
     def f(x: str) -> str:
@@ -222,7 +222,7 @@ def test_no_args_section_yields_no_descriptions() -> None:
 
 
 def test_var_args_dropped_from_schema() -> None:
-    """ "``*args`` and ``**kwargs`` are excluded from the schema."""
+    """" "``*args`` and ``**kwargs`` are excluded from the schema."""
 
     @tool
     def f(a: str, *args: Any, **kwargs: Any) -> str:
@@ -238,7 +238,7 @@ def test_var_args_dropped_from_schema() -> None:
 
 
 def test_parse_docstring_helper_directly() -> None:
-    """ "``_parse_docstring`` returns (first-paragraph summary, {arg: description})."""
+    """" "``_parse_docstring`` returns (first-paragraph summary, {arg: description})."""
     summary, args = _parse_docstring(
         """Summary line.
 
@@ -254,13 +254,13 @@ def test_parse_docstring_helper_directly() -> None:
 
 
 def test_parse_docstring_empty() -> None:
-    """ "An empty/None docstring yields empty summary + empty args."""
+    """" "An empty/None docstring yields empty summary + empty args."""
     assert _parse_docstring(None) == ("", {})
     assert _parse_docstring("") == ("", {})
 
 
 def test_tool_returns_same_callable_type() -> None:
-    """ "``@tool`` returns the function itself (not a wrapper), with attributes."""
+    """" "``@tool`` returns the function itself (not a wrapper), with attributes."""
 
     @tool
     def f(x: str) -> str:
@@ -312,7 +312,7 @@ def test_load_gitignore_returns_none_when_absent(tmp_path: Any) -> None:
 
 
 def test_load_gitignore_parses_patterns(tmp_path: Any) -> None:
-    """ "``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
+    """" "``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
     from cothis.tools import _load_gitignore
 
     (tmp_path / ".gitignore").write_text("*.log\nbuild/\n")
@@ -371,7 +371,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
 
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
-    """ "Recursive listing yields entries with nested relative paths."""
+    """" "Recursive listing yields entries with nested relative paths."""
     from cothis.tools import _list_dir
 
     (tmp_path / "pkg").mkdir()
@@ -388,7 +388,7 @@ def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
 
 
 def test_format_default_is_json(monkeypatch: Any) -> None:
-    """ "Without ``COTHIS_TOOL_OUTPUT_FORMAT``, structured output is JSON."""
+    """" "Without ``COTHIS_TOOL_OUTPUT_FORMAT``, structured output is JSON."""
     from cothis.tools import _format_tool_output
 
     monkeypatch.delenv("COTHIS_TOOL_OUTPUT_FORMAT", raising=False)
@@ -397,7 +397,7 @@ def test_format_default_is_json(monkeypatch: Any) -> None:
 
 
 def test_format_csv_table(monkeypatch: Any) -> None:
-    """``list[dict]`` renders as a CSV table with header + rows."""
+    """"``list[dict]`` renders as a CSV table with header + rows."""
     from cothis.tools import _format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
@@ -411,7 +411,7 @@ def test_format_csv_table(monkeypatch: Any) -> None:
 
 
 def test_format_tsv_uses_tab_delimiter(monkeypatch: Any) -> None:
-    """``tsv`` is the same as csv but with tab separators."""
+    """"``tsv`` is the same as csv but with tab separators."""
     from cothis.tools import _format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "tsv")
@@ -421,7 +421,7 @@ def test_format_tsv_uses_tab_delimiter(monkeypatch: Any) -> None:
 
 
 def test_format_csv_flattens_nested_dict(monkeypatch: Any) -> None:
-    """``csv`` flattens nested dicts with dotted key paths."""
+    """"``csv`` flattens nested dicts with dotted key paths."""
     from cothis.tools import _format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
@@ -433,7 +433,7 @@ def test_format_csv_flattens_nested_dict(monkeypatch: Any) -> None:
 
 
 def test_format_csv_bare_list_falls_back_to_json(monkeypatch: Any) -> None:
-    """A bare list of scalars isn't tabular → CSV falls back to JSON."""
+    """"A bare list of scalars isn't tabular → CSV falls back to JSON."""
     from cothis.tools import _format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
@@ -444,7 +444,7 @@ def test_format_csv_bare_list_falls_back_to_json(monkeypatch: Any) -> None:
 
 
 def test_format_yaml_handles_nested(monkeypatch: Any) -> None:
-    """YAML renders nested structures natively (no flattening)."""
+    """"YAML renders nested structures natively (no flattening)."""
     from cothis.tools import _format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "yaml")
@@ -455,7 +455,7 @@ def test_format_yaml_handles_nested(monkeypatch: Any) -> None:
 
 
 def test_format_unknown_value_defaults_to_json(monkeypatch: Any) -> None:
-    """An unrecognised ``COTHIS_TOOL_OUTPUT_FORMAT`` value falls back to JSON."""
+    """"An unrecognised ``COTHIS_TOOL_OUTPUT_FORMAT`` value falls back to JSON."""
     from cothis.tools import _format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "xml")
@@ -471,7 +471,7 @@ def test_format_unknown_value_defaults_to_json(monkeypatch: Any) -> None:
 
 
 def test_tool_returns_tooldef_instance() -> None:
-    """``@tool`` returns a ``ToolDef``, not a bare function."""
+    """"``@tool`` returns a ``ToolDef``, not a bare function."""
 
     @tool
     def f(x: str) -> str:
@@ -483,7 +483,7 @@ def test_tool_returns_tooldef_instance() -> None:
 
 
 def test_tooldef_satisfies_tool_protocol() -> None:
-    """A ``ToolDef`` has ``__name__``, ``__call__``, and ``__cothis_schema__``."""
+    """"A ``ToolDef`` has ``__name__``, ``__call__``, and ``__cothis_schema__``."""
 
     @tool("ns.name")
     def my_tool(x: str) -> str:
@@ -536,7 +536,7 @@ def test_hook_registration_appends_to_ordered_list() -> None:
 
 
 def test_hook_decorator_returns_callback_unchanged() -> None:
-    """The hook decorator returns the callback so it stays referenceable."""
+    """"The hook decorator returns the callback so it stays referenceable."""
 
     @tool("x")
     def x(arg: str) -> str:
@@ -552,7 +552,7 @@ def test_hook_decorator_returns_callback_unchanged() -> None:
 
 
 def test_all_five_hook_stages_exist() -> None:
-    """``ToolDef`` exposes all five lifecycle stages as decorator methods."""
+    """"``ToolDef`` exposes all five lifecycle stages as decorator methods."""
 
     @tool("x")
     def x(arg: str) -> str:
@@ -598,7 +598,7 @@ def test_builtin_tools_are_tooldef_instances() -> None:
 
 
 def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
-    """A ``.py`` file with a ``@tool`` function is discovered and loaded."""
+    """"A ``.py`` file with a ``@tool`` function is discovered and loaded."""
     from cothis.tools import load_python_tools_from_dir
 
     (tmp_path / "greet.py").write_text(
@@ -613,7 +613,7 @@ def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
 
 
 def test_load_python_tools_discovers_package(tmp_path: Any) -> None:
-    """A package directory with ``__init__.py`` is discovered."""
+    """"A package directory with ``__init__.py`` is discovered."""
     from cothis.tools import load_python_tools_from_dir
 
     pkg = tmp_path / "mypkg"
@@ -631,7 +631,7 @@ def test_load_python_tools_discovers_package(tmp_path: Any) -> None:
 def test_load_python_tools_import_failure_doesnt_crash(
     tmp_path: Any, caplog: Any
 ) -> None:
-    """A broken ``.py`` file logs an error but doesn't crash the loader."""
+    """"A broken ``.py`` file logs an error but doesn't crash the loader."""
     import logging
 
     from cothis.tools import load_python_tools_from_dir
@@ -655,14 +655,14 @@ def test_load_python_tools_import_failure_doesnt_crash(
 
 
 def test_load_python_tools_empty_dir_returns_empty(tmp_path: Any) -> None:
-    """An empty directory yields an empty tool list."""
+    """"An empty directory yields an empty tool list."""
     from cothis.tools import load_python_tools_from_dir
 
     assert load_python_tools_from_dir(tmp_path) == []
 
 
 def test_load_python_tools_missing_dir_returns_empty() -> None:
-    """A non-existent directory yields an empty tool list."""
+    """"A non-existent directory yields an empty tool list."""
     from cothis.tools import load_python_tools_from_dir
 
     assert load_python_tools_from_dir(Path("/nonexistent/path")) == []
@@ -671,7 +671,7 @@ def test_load_python_tools_missing_dir_returns_empty() -> None:
 def test_load_python_tools_ignores_non_tooldef_attributes(
     tmp_path: Any,
 ) -> None:
-    """Module-level constants and plain functions are NOT collected."""
+    """"Module-level constants and plain functions are NOT collected."""
     from cothis.tools import load_python_tools_from_dir
 
     (tmp_path / "mixed.py").write_text(
@@ -693,7 +693,7 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
 
 
 def test_pre_load_multiple_callbacks_all_pass(tmp_path: Any) -> None:
-    """Multiple ``pre_load`` callbacks in registration order; all pass → registers."""
+    """"Multiple ``pre_load`` callbacks in registration order; all pass → registers."""
     from cothis.tools import load_python_tools_from_dir
 
     (tmp_path / "t.py").write_text(
@@ -712,7 +712,7 @@ def test_pre_load_multiple_callbacks_all_pass(tmp_path: Any) -> None:
 
 
 def test_pre_load_any_false_skips_tool(tmp_path: Any) -> None:
-    """If any ``pre_load`` callback returns False, the tool is skipped."""
+    """"If any ``pre_load`` callback returns False, the tool is skipped."""
     from cothis.tools import load_python_tools_from_dir
 
     (tmp_path / "t.py").write_text(
@@ -732,7 +732,7 @@ def test_pre_load_any_false_skips_tool(tmp_path: Any) -> None:
 
 
 def test_pre_load_exception_skips_and_triggers_on_error() -> None:
-    """``pre_load`` raising skips the tool and fires ``on_error`` with phase."""
+    """"``pre_load`` raising skips the tool and fires ``on_error`` with phase."""
     errors: list[tuple[str, str]] = []
 
     @tool("t")
@@ -753,7 +753,7 @@ def test_pre_load_exception_skips_and_triggers_on_error() -> None:
 
 
 def test_after_load_multiple_callbacks_all_run() -> None:
-    """Multiple ``after_load`` callbacks all run in order (no short-circuit)."""
+    """"Multiple ``after_load`` callbacks all run in order (no short-circuit)."""
     calls: list[int] = []
 
     @tool("t")
@@ -774,7 +774,7 @@ def test_after_load_multiple_callbacks_all_run() -> None:
 
 
 def test_after_load_exception_skips_and_triggers_on_error() -> None:
-    """``after_load`` raising skips the tool and fires ``on_error``."""
+    """"``after_load`` raising skips the tool and fires ``on_error``."""
     errors: list[tuple[str, str]] = []
 
     @tool("t")
@@ -795,7 +795,7 @@ def test_after_load_exception_skips_and_triggers_on_error() -> None:
 
 
 def test_on_error_self_exception_swallowed(tmp_path: Any) -> None:
-    """If ``on_error`` itself raises, the exception is swallowed (debug logged)."""
+    """"If ``on_error`` itself raises, the exception is swallowed (debug logged)."""
     from cothis.tools import load_python_tools_from_dir
 
     (tmp_path / "t.py").write_text(
@@ -814,7 +814,7 @@ def test_on_error_self_exception_swallowed(tmp_path: Any) -> None:
 
 
 def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
-    """A tool with no hooks is discovered and registered as before."""
+    """"A tool with no hooks is discovered and registered as before."""
     from cothis.tools import load_python_tools_from_dir
 
     (tmp_path / "t.py").write_text(
@@ -834,7 +834,7 @@ def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
 
 
 def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
-    """Multiple ``pre_execute`` callbacks form a pipeline (A's output feeds B)."""
+    """"Multiple ``pre_execute`` callbacks form a pipeline (A's output feeds B)."""
     from unittest.mock import MagicMock
 
     import any_llm
@@ -873,7 +873,7 @@ def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
 def test_pre_execute_exception_short_circuits_and_returns_error(
     monkeypatch: Any,
 ) -> None:
-    """``pre_execute`` raising short-circuits; error string returned to LLM."""
+    """"``pre_execute`` raising short-circuits; error string returned to LLM."""
     from unittest.mock import MagicMock
 
     import any_llm
@@ -903,7 +903,7 @@ def test_pre_execute_exception_short_circuits_and_returns_error(
 
 
 def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
-    """Multiple ``after_execute`` callbacks form a pipeline on result."""
+    """"Multiple ``after_execute`` callbacks form a pipeline on result."""
     from unittest.mock import MagicMock
 
     import any_llm
@@ -938,7 +938,7 @@ def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
 
 
 def test_after_execute_exception_uses_original_result(monkeypatch: Any) -> None:
-    """``after_execute`` raising uses the original result (don't hide output)."""
+    """"``after_execute`` raising uses the original result (don't hide output)."""
     from unittest.mock import MagicMock
 
     import any_llm
@@ -969,7 +969,7 @@ def test_after_execute_exception_uses_original_result(monkeypatch: Any) -> None:
 
 
 def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
-    """Tool body exception fires ``on_error`` with phase='tool'."""
+    """"Tool body exception fires ``on_error`` with phase='tool'."""
     from unittest.mock import MagicMock
 
     import any_llm
@@ -1002,7 +1002,7 @@ def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
 
 
 def test_on_error_at_execute_phase_correct(monkeypatch: Any) -> None:
-    """``on_error`` phase is 'pre_execute' when pre_execute raises."""
+    """"``on_error`` phase is 'pre_execute' when pre_execute raises."""
     from unittest.mock import MagicMock
 
     import any_llm
@@ -1038,7 +1038,7 @@ def test_on_error_at_execute_phase_correct(monkeypatch: Any) -> None:
 
 
 def test_no_hooks_execute_baseline_unchanged(monkeypatch: Any) -> None:
-    """A tool with no execute hooks dispatches exactly as before."""
+    """"A tool with no execute hooks dispatches exactly as before."""
     from unittest.mock import MagicMock
 
     import any_llm
@@ -1060,3 +1060,60 @@ def test_no_hooks_execute_baseline_unchanged(monkeypatch: Any) -> None:
     tc.function.name = "plain"
     tc.function.arguments = '{"x": "hello"}'
     assert agent._execute(tc) == "got hello"
+
+
+# --------------------------------------------------------------------
+# Hook observability (issue #8): logger.debug covers hook lifecycle
+# --------------------------------------------------------------------
+
+
+def test_pre_load_skip_logged(caplog: Any) -> None:
+    """``pre_load`` returning False emits a debug log naming the tool + reason."""
+    import logging
+
+    from cothis.tools import tool
+
+    @tool("skipme")
+    def t() -> str:
+        """T."""
+        return "never"
+
+    @t.pre_load()
+    def block() -> bool:
+        return False
+
+    with caplog.at_level(logging.DEBUG, logger="cothis.tools"):
+        result = t._run_load_hooks()
+    assert result is False
+    skip_records = [
+        r for r in caplog.records if "pre_load" in r.message and "False" in r.message
+    ]
+    assert len(skip_records) == 1
+    assert "skipme" in skip_records[0].message
+
+
+def test_on_error_fire_logged(caplog: Any) -> None:
+    """``on_error`` fires when pre_load raises, and its debug log names the phase."""
+    import logging
+
+    from cothis.tools import tool
+
+    @tool("boom")
+    def t() -> str:
+        """T."""
+        return "never"
+
+    @t.pre_load()
+    def explode() -> None:
+        raise RuntimeError("env gone")
+
+    @t.on_error()
+    def observe(exc: Exception, phase: str, args: Any, result: Any) -> None:
+        pass
+
+    with caplog.at_level(logging.DEBUG, logger="cothis.tools"):
+        result = t._run_load_hooks()
+    assert result is False
+    # The skip message should name the tool + the exception.
+    skip_msgs = [r.message for r in caplog.records if "pre_load" in r.message]
+    assert any("boom" in m and "env gone" in m for m in skip_msgs)

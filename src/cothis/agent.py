@@ -428,6 +428,7 @@ class Agent(BaseModel):
             args = _run_hooks_safe(tool, "_run_pre_execute", args)
         except Exception as exc:  # noqa: BLE001 — author hook code
             logger.debug("← %s pre_execute raised: %s", name, exc)
+            logger.debug("tool %r on_error fired (phase=pre_execute)", name)
             return f"Error calling {name}: {exc}"
 
         arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
@@ -436,11 +437,18 @@ class Agent(BaseModel):
             result = tool(**args)
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             logger.debug("← %s raised: %s", name, exc)
+            logger.debug("tool %r on_error fired (phase=tool)", name)
             _run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
             return f"Error calling {name}: {exc}"
 
         # --- after_execute pipeline (modifies result) ---
-        result = _run_hooks_safe(tool, "_run_after_execute", result, args)
+        try:
+            result = _run_hooks_safe(tool, "_run_after_execute", result, args)
+        except Exception as exc:  # noqa: BLE001 — author hook code
+            logger.debug(
+                "tool %r after_execute raised: %s; using original result", name, exc
+            )
+            logger.debug("tool %r on_error fired (phase=after_execute)", name)
 
         # Structured result → format (json/csv/tsv/yaml). Str → as-is.
         if isinstance(result, (dict, list)):

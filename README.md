@@ -188,6 +188,60 @@ COTHIS_TOOL_OUTPUT_FORMAT=yaml cothis chat
 CSV/TSV flatten nested dicts with dotted paths; bare lists of scalars
 fall back to JSON. YAML handles every shape natively.
 
+### Tool lifecycle hooks
+
+Every tool passes through five lifecycle stages, from discovery to
+dispatch. Register callbacks via decorator methods on the `ToolDef`
+returned by `@tool`. Multiple callbacks per stage form a chain (see
+`CONTEXT.md` "Tool lifecycle" for the full semantics):
+
+| Stage | When | Input | Return | Chain | Exception → |
+|---|---|---|---|---|---|
+| `pre_load` | discovery, before registration | none | `False` = skip | short-circuit AND | skip, `on_error` |
+| `after_load` | discovery, after `pre_load` passes | none | unused | all run | skip, `on_error` |
+| `pre_execute` | `_execute`, before tool body | `args: dict` | `dict` (modified) | pipeline | error to LLM, `on_error` |
+| `after_execute` | `_execute`, after tool body | `result, args` | `result` (modified) | pipeline | use original result, `on_error` |
+| `on_error` | any prior stage raised | `exc, phase, args, result` | `None` (side-effect) | short-circuit on own exc | swallowed to `logger.debug` |
+
+```python
+from cothis import tool
+
+@tool("git.commit")
+def commit(message: str, amend: bool = False) -> str:
+    """Create a git commit.
+
+    Args:
+        message: The commit message.
+        amend: Whether to amend the previous commit.
+    """
+    ...
+
+@commit.pre_load()
+def check_git():
+    """Gate: skip if git isn't on PATH."""
+    import shutil
+    return shutil.which("git") is not None
+
+@commit.pre_execute()
+def validate_message(args):
+    """Pipeline: reject empty messages before they reach git."""
+    if not args.get("message", "").strip():
+        raise ValueError("commit message must not be empty")
+    return args
+
+@commit.after_execute()
+def truncate(result, args):
+    """Pipeline: cap verbose git output."""
+    return result[:500] if isinstance(result, str) else result
+
+@commit.on_error()
+def log_failure(exc, phase, args, result):
+    """Side-effect: record what went wrong (cannot recover)."""
+    print(f"git.commit failed at {phase}: {exc}")
+```
+
+All hooks are optional. A tool with no hooks dispatches exactly as before.
+
 
 ## Configuration
 
