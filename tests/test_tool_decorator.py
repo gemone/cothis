@@ -22,6 +22,7 @@ Covers:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from cothis.tools import Tool, ToolDef, _parse_docstring, tool
@@ -346,11 +347,11 @@ def test_dir_returns_structured_entries(tmp_path: Any) -> None:
     Structured output lets ``_execute`` serialise it as JSON (the model-native
     shape) instead of a bespoke text format the model has to parse.
     """
-    from cothis.tools import dir
+    from cothis.tools import _list_dir
 
     (tmp_path / "src").mkdir()
     (tmp_path / "README.md").write_text("hi")
-    result = dir(path=str(tmp_path))
+    result = _list_dir(path=str(tmp_path))
     assert isinstance(result, list)
     by_name = {e["name"]: e["type"] for e in result}
     assert by_name == {"src": "dir", "README.md": "file"}
@@ -362,20 +363,20 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
     Error paths stay as strings (not structured) — ``_execute`` passes them
     through unchanged so the model sees an actionable message.
     """
-    from cothis.tools import dir
+    from cothis.tools import _list_dir
 
-    result = dir(path=str(tmp_path / "nonexistent"))
+    result = _list_dir(path=str(tmp_path / "nonexistent"))
     assert isinstance(result, str)
     assert result.startswith("Error: no such directory")
 
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
     """ "Recursive listing yields entries with nested relative paths."""
-    from cothis.tools import dir
+    from cothis.tools import _list_dir
 
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "mod.py").write_text("")
-    result = dir(path=str(tmp_path), recursive=True)
+    result = _list_dir(path=str(tmp_path), recursive=True)
     names = {e["name"] for e in result}
     assert "pkg" in names
     assert "pkg/mod.py" in names
@@ -583,9 +584,96 @@ def test_builtin_tools_are_tooldef_instances() -> None:
     Regression check: the migration from bare decorated functions to
     ``ToolDef`` must not break the built-in tools.
     """
-    from cothis.tools import dir, read, write
+    from cothis.tools import _list_dir, read, write
 
-    for t in (read, dir, write):
+    for t in (read, _list_dir, write):
         assert isinstance(t, ToolDef)
         assert isinstance(t, Tool)
         assert t.__cothis_schema__ is not None
+
+
+# --------------------------------------------------------------------
+# Python tool discovery (issue #5)
+# --------------------------------------------------------------------
+
+
+def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
+    """A ``.py`` file with a ``@tool`` function is discovered and loaded."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "greet.py").write_text(
+        'from cothis import tool\n\n@tool("test.greet")\n'
+        'def greet(name: str) -> str:\n    """Greet."""\n    return f"hi {name}"\n',
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert len(tools) == 1
+    assert tools[0].__name__ == "test.greet"
+    assert tools[0](name="x") == "hi x"
+
+
+def test_load_python_tools_discovers_package(tmp_path: Any) -> None:
+    """A package directory with ``__init__.py`` is discovered."""
+    from cothis.tools import load_python_tools_from_dir
+
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        'from cothis import tool\n\n@tool("pkg.tool")\n'
+        'def t(x: str) -> str:\n    """T."""\n    return x\n',
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert len(tools) == 1
+    assert tools[0].__name__ == "pkg.tool"
+
+
+def test_load_python_tools_import_failure_doesnt_crash(
+    tmp_path: Any, caplog: Any
+) -> None:
+    """A broken ``.py`` file logs an error but doesn't crash the loader."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "broken.py").write_text("import nonexistent_module\n", encoding="utf-8")
+    # A valid file alongside the broken one should still load.
+    (tmp_path / "good.py").write_text(
+        'from cothis import tool\n\n@tool("good")\n'
+        'def g() -> str:\n    """G."""\n    return "ok"\n',
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert len(tools) == 1  # the broken one was skipped, the good one loaded
+    assert tools[0].__name__ == "good"
+
+
+def test_load_python_tools_empty_dir_returns_empty(tmp_path: Any) -> None:
+    """An empty directory yields an empty tool list."""
+    from cothis.tools import load_python_tools_from_dir
+
+    assert load_python_tools_from_dir(tmp_path) == []
+
+
+def test_load_python_tools_missing_dir_returns_empty() -> None:
+    """A non-existent directory yields an empty tool list."""
+    from cothis.tools import load_python_tools_from_dir
+
+    assert load_python_tools_from_dir(Path("/nonexistent/path")) == []
+
+
+def test_load_python_tools_ignores_non_tooldef_attributes(
+    tmp_path: Any,
+) -> None:
+    """Module-level constants and plain functions are NOT collected."""
+    from cothis.tools import load_python_tools_from_dir
+
+    (tmp_path / "mixed.py").write_text(
+        "from cothis import tool\n\n"
+        "CONSTANT = 42\n"
+        "def helper():\n    pass\n\n"
+        '@tool("real.tool")\n'
+        'def real(x: str) -> str:\n    """Real."""\n    return x\n',
+        encoding="utf-8",
+    )
+    tools = load_python_tools_from_dir(tmp_path)
+    assert len(tools) == 1  # only the @tool function, not CONSTANT/helper
+    assert tools[0].__name__ == "real.tool"

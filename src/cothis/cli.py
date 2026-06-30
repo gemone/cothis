@@ -22,7 +22,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 
 from cothis.agent import Agent, ToolCallEvent
-from cothis.tools import TOOLS, Tool, load_tools_from_dir
+from cothis.tools import TOOLS, Tool, load_python_tools_from_dir, load_tools_from_dir
 
 app = typer.Typer()
 console = Console()
@@ -49,7 +49,12 @@ _debug = False
 
 
 def _all_tools() -> list[Tool]:
-    """Built-in tools plus any declared in ``./.agents/tools/*.yaml``.
+    """Built-in tools plus any declared in ``./.agents/tools/``.
+
+    Loads both YAML (``*.yaml`` / ``*.yml``) and Python (``*.py``) tool
+    declarations from ``.agents/tools/``. Python tools are auto-scanned
+    for ``ToolDef`` instances (anything ``@tool``-decorated); YAML tools
+    follow the ``name:`` / ``command:`` format.
 
     cothis: discovery is cwd-relative only today (no ``~/.config/cothis``
     user-global path, no config-file override). The ceiling: a user must
@@ -57,7 +62,12 @@ def _all_tools() -> list[Tool]:
     ``~/.config/cothis/tools/`` and let project-local shadow user-global
     by appending after it.
     """
-    return [*TOOLS, *load_tools_from_dir(Path(".agents/tools"))]
+    tools_dir = Path(".agents/tools")
+    return [
+        *TOOLS,
+        *load_tools_from_dir(tools_dir),
+        *load_python_tools_from_dir(tools_dir),
+    ]
 
 
 @app.callback()

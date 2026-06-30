@@ -467,7 +467,7 @@ def _load_gitignore(root: Path) -> pathspec.PathSpec | None:
 
 
 @tool("fs.dir")
-def dir(
+def _list_dir(
     path: str, recursive: bool = False, all: bool = False
 ) -> list[dict[str, str]] | dict[str, Any] | str:
     """List the contents of a directory.
@@ -577,7 +577,7 @@ def write(path: str, content: str) -> str:
     return f"Wrote {len(content)} characters to {path}"
 
 
-TOOLS: list[Tool] = [read, dir, write]
+TOOLS: list[Tool] = [read, _list_dir, write]
 
 
 # ====================================================================
@@ -1441,4 +1441,48 @@ def load_tools_from_dir(dir_path: Path) -> list[Tool]:
     tools: list[Tool] = []
     for yml in files:
         tools.extend(load_yaml_tools(yml.read_text(encoding="utf-8"), source=str(yml)))
+    return tools
+
+
+def load_python_tools_from_dir(dir_path: Path) -> list[Tool]:
+    """Load every Python tool module in a directory tree.
+
+    Globs ``**/*.py`` recursively (sorted by path, stable across platforms).
+    Each file is imported via ``importlib`` (no ``sys.path`` mutation), then
+    the module's top-level namespace is scanned for ``ToolDef`` instances —
+    anything decorated with ``@tool`` at module level is auto-discovered.
+    No ``TOOLS`` export contract; the author just decorates.
+
+    Import failures (``ImportError``, ``SyntaxError``, errors raised at
+    module top level) do NOT crash the agent. The failure is logged at
+    ``ERROR`` level with the file path + exception so the author can fix
+    it, and the remaining files still load.
+
+    Empty / missing directory yields ``[]``.
+    """
+    import importlib.util
+
+    if not dir_path.is_dir():
+        return []
+    files = sorted(dir_path.rglob("*.py"), key=lambda p: str(p.relative_to(dir_path)))
+    tools: list[Tool] = []
+    for py in files:
+        # Unique module name so repeated loads don't collide in sys.modules.
+        mod_name = f"cothis_user_tools_{py.stem}_{hash(str(py)) & 0xFFFFFFFF:x}"
+        try:
+            spec = importlib.util.spec_from_file_location(mod_name, py)
+            if spec is None or spec.loader is None:
+                continue  # not a real module (e.g. namespace package)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001 — author code, any failure is non-fatal
+            logger.error("failed to import Python tool module %s: %s", py, exc)
+            continue
+        # Auto-scan: collect every module-level ToolDef instance.
+        for attr_name in dir(module):
+            obj = getattr(module, attr_name)
+            # ``obj is None`` / ``obj is module`` guard avoids False positives
+            # from attributes that shadow builtins or the module itself.
+            if isinstance(obj, ToolDef):
+                tools.append(obj)
     return tools
