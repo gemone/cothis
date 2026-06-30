@@ -170,6 +170,41 @@ def test_shadow_emits_warning_both_layers(tmp_path: Any, caplog: Any) -> None:
     assert "fs_read.yaml" in msg
 
 
+def test_shadow_warning_names_both_file_paths(tmp_path: Any, caplog: Any) -> None:
+    """user-global vs project-local shadow — warning names BOTH file paths.
+
+    The builtin-case test (test_shadow_emits_warning_both_layers) can't
+    distinguish the layer name from the source fallback (both contain
+    "builtins"). This test uses two real file paths so a regression to
+    single-path warnings would fail it.
+    """
+    import logging
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "dup.yaml").write_text(
+        'name: shared.tool\ncommand: ["echo", "proj"]\n', encoding="utf-8"
+    )
+    user = tmp_path / "user"
+    user.mkdir()
+    (user / "dup.yaml").write_text(
+        'name: shared.tool\ncommand: ["echo", "user"]\n', encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cothis.cli"):
+        _all_tools(project, user)
+
+    shadow_warnings = [r for r in caplog.records if "shadows" in r.message]
+    assert len(shadow_warnings) == 1
+    msg = shadow_warnings[0].message
+    # Both layer names appear.
+    assert "project-local" in msg
+    assert "user-global" in msg
+    # Both file paths appear (the winner's AND the shadowed tool's).
+    assert str(project / "dup.yaml") in msg
+    assert str(user / "dup.yaml") in msg
+
+
 def test_no_shadow_loads_both(tmp_path: Any, caplog: Any) -> None:
     """Distinct names across layers → both load, no shadow warning."""
     import logging
@@ -225,8 +260,20 @@ def test_pre_load_false_on_winner_empties_slot_no_fallback(
         'name: shared.tool\ncommand: ["echo", "user"]\n', encoding="utf-8"
     )
 
-    with caplog.at_level(logging.WARNING, logger="cothis.cli"):
+    with caplog.at_level(logging.WARNING, logger="cothis"):
         tools = _all_tools(project, user)
 
     names = {t.__name__ for t in tools}
     assert "shared.tool" not in names  # winner dropped, no fallback to user-global
+    # Observability (ADR-0003 + grilling #10): the pre_load=False skip must be
+    # logged at WARNING so it's visible by default. Filter on the tools logger
+    # (the skip is emitted from ``_run_load_hooks`` in tools.py, not cli.py).
+    pre_load_skips = [
+        r
+        for r in caplog.records
+        if r.name == "cothis.tools"
+        and r.levelno == logging.WARNING
+        and "pre_load" in r.message
+    ]
+    assert len(pre_load_skips) == 1
+    assert "shared.tool" in pre_load_skips[0].message

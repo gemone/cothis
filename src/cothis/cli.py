@@ -87,6 +87,7 @@ def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
     # shadow warning can name both layers (the tool carries ``_source`` only).
     registry: dict[str, Tool] = {}
     layer_of: dict[str, str] = {}
+    shadow_count = 0
     for layer_name, layer_tools in layers:
         for tool in layer_tools:
             name = tool.__name__
@@ -101,7 +102,8 @@ def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
                     layer_of[name],
                     prev_src,
                 )
-            registry[name] = tool  # overwrite — higher precedence wins
+                shadow_count += 1
+            registry[name] = tool  # higher precedence wins on name conflict
             layer_of[name] = layer_name
 
     # Run load hooks on the merged winners only (ADR-0003 Q3).
@@ -113,7 +115,11 @@ def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
         if run_hooks is None or run_hooks():
             registered.append(tool)
 
-    logger.warning("discovery: %d tools active", len(registered))
+    logger.warning(
+        "discovery: %d tools active (%d shadowed)",
+        len(registered),
+        shadow_count,
+    )
     return registered
 
 
