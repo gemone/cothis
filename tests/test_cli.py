@@ -310,3 +310,48 @@ def test_pre_load_false_on_winner_empties_slot_no_fallback(
     ]
     assert len(pre_load_skips) == 1
     assert "shared.tool" in pre_load_skips[0].message
+
+
+def test_shadowed_tool_load_hooks_never_fire(tmp_path: Any, monkeypatch: Any) -> None:
+    """A shadowed tool's load hooks never fire (ADR-0003 Q3).
+
+    The guarantee is structural — load hooks run in the post-merge loop on
+    winners only, so a shadowed loser never reaches ``_run_load_hooks``.
+    This test pins the negative case: if a regression re-added hook calls
+    to the loader, the loser's ``after_load`` side effect would happen.
+    The loser is a Python tool (YAML tools can't register hooks); the
+    winner is a YAML tool shadowing it — format is never a layer (Q1).
+    """
+    marker = tmp_path / "loser_hook_fired"
+    monkeypatch.setenv("COTHIS_TEST_HOOK_MARKER", str(marker))
+
+    project = tmp_path / "project"
+    project.mkdir()
+    # Winner: project-local YAML tool shadows the user-global Python tool.
+    (project / "winner.yaml").write_text(
+        'name: shared.tool\ncommand: ["echo", "proj"]\n', encoding="utf-8"
+    )
+    user = tmp_path / "user"
+    user.mkdir()
+    # Loser: user-global Python tool with a side-effecting after_load hook.
+    # If its hook fires, it touches the marker file.
+    (user / "loser.py").write_text(
+        "import os\n\n"
+        "from cothis import tool\n\n"
+        '@tool("shared.tool")\n'
+        'def t() -> str:\n    """T."""\n    return "user"\n\n'
+        "@t.after_load()\n"
+        "def mark():\n"
+        '    path = os.environ.get("COTHIS_TEST_HOOK_MARKER")\n'
+        "    if path:\n"
+        '        open(path, "w").close()\n',
+        encoding="utf-8",
+    )
+
+    tools = _all_tools(project, user)
+
+    # Winner is registered (project-local YAML), loser is not.
+    by_name = {t.__name__: t for t in tools}
+    assert by_name["shared.tool"]() == "proj\n"
+    # The loser's after_load hook must NOT have fired — no marker file.
+    assert not marker.exists()
