@@ -195,8 +195,20 @@ def ask(
             max_iterations=max_iterations,
         )
     with console.status("thinking...", spinner="dots"):
-        answer = asyncio.run(agent.run(prompt))
+        answer = asyncio.run(_run_and_close(agent, prompt))
     typer.echo(answer)
+
+
+async def _run_and_close(agent: Agent, prompt: str) -> str:
+    """Run one ``ask`` turn and close MCP sessions afterwards.
+
+    ``ask`` discards the Agent after a single run, so any MCP subprocesses it
+    started must be shut down here (no long-lived session to reuse them).
+    """
+    try:
+        return await agent.run(prompt)
+    finally:
+        await agent.aclose()
 
 
 @app.command()
@@ -279,18 +291,22 @@ async def _chat_session(
     # ``prompt_async`` lets SIGINT route through the loop's own signal
     # handling, which prompt_toolkit handles cleanly.
     session = PromptSession()
-    while True:
-        try:
-            prompt_text = await session.prompt_async(">>> ")
-        except EOFError, KeyboardInterrupt:
-            # Ctrl-D / Ctrl-C at the prompt: end the session quietly.
-            # Execution-mid Ctrl-C still bubbles up through main().
-            console.print()
-            break
-        if not prompt_text.strip():
-            continue
+    try:
+        while True:
+            try:
+                prompt_text = await session.prompt_async(">>> ")
+            except EOFError, KeyboardInterrupt:
+                # Ctrl-D / Ctrl-C at the prompt: end the session quietly.
+                # Execution-mid Ctrl-C still bubbles up through main().
+                console.print()
+                break
+            if not prompt_text.strip():
+                continue
 
-        await _stream_answer(agent, prompt_text)
+            await _stream_answer(agent, prompt_text)
+    finally:
+        # Shut down any MCP subprocesses the session opened before returning.
+        await agent.aclose()
 
 
 async def _stream_answer(agent: Agent, prompt: str) -> None:

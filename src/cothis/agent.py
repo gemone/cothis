@@ -35,6 +35,8 @@ from cothis.tools import (
     Tool,  # noqa: TC001
     _AfterExecuteError,
     _format_tool_output,
+    _MCPClientTool,
+    _MCPServer,
     _run_hooks_safe,
     _schema_for,
 )
@@ -143,6 +145,12 @@ class Agent(BaseModel):
     _messages: list[dict[str, Any] | ChatCompletionMessage] = PrivateAttr(
         default_factory=list
     )
+    # MCP servers (``type: mcp.stdio`` declarations) separated from callable
+    # tools at construction. Resolved lazily on first ``run`` (event loop
+    # ready) into ``_MCPClientTool`` instances that join ``_tool_map`` — see
+    # ``_ensure_mcp`` and ADR-0005. Held here so ``aclose`` can shut them down.
+    _mcp_servers: list[_MCPServer] = PrivateAttr(default_factory=list)
+    _mcp_started: bool = PrivateAttr(default=False)
 
     def model_post_init(self, __context: Any) -> None:
         # cothis: lazy-import any_llm here (not at module top level) so
@@ -157,7 +165,17 @@ class Agent(BaseModel):
             api_key=self.api_key,
             api_base=self.api_base,
         )
-        self._tool_map = {tool.__name__: tool for tool in self.tools}
+        # MCP servers are producers of tools, not tools — split them out so
+        # ``_tool_map`` / ``_tool_schemas`` never treat a server handle as a
+        # dispatchable tool. This is startup-time branching, not per-dispatch
+        # branching: ``_execute`` still treats every registered tool uniformly
+        # (CONTEXT.md "no per-source branching in ``_execute``").
+        self._mcp_servers = [t for t in self.tools if isinstance(t, _MCPServer)]
+        self._tool_map = {
+            tool.__name__: tool
+            for tool in self.tools
+            if not isinstance(tool, _MCPServer)
+        }
 
     async def run(self, user_input: str) -> str:
         """Run the agent loop to completion and return the final answer.
@@ -174,6 +192,7 @@ class Agent(BaseModel):
         single call.
         """
         self._ensure_messages(user_input)
+        await self._ensure_mcp()
 
         for _turn in range(self.max_iterations):
             response = await self._llm.acompletion(
@@ -234,6 +253,7 @@ class Agent(BaseModel):
         yield only if no tool_calls arrived (costs one turn of latency).
         """
         self._ensure_messages(user_input)
+        await self._ensure_mcp()
 
         tool_schemas = self._tool_schemas()
         messages = self._messages
@@ -313,19 +333,73 @@ class Agent(BaseModel):
 
     # --- internals -----------------------------------------------------
 
+    async def _ensure_mcp(self) -> None:
+        """Resolve MCP servers into callable tools once, on first run.
+
+        Deferred out of ``model_post_init`` because connecting is async and
+        needs a running event loop (ADR-0005). For each declared server:
+        connect, ``tools/list``, and register each remote tool into
+        ``_tool_map`` so it reaches the model via ``_tool_schemas`` and is
+        dispatchable by ``_execute`` like any other tool. A server that fails
+        to start contributes no tools (it logs a WARNING itself) and does not
+        block the others.
+
+        Runs at most once (``_mcp_started`` guard): the sessions it opens are
+        persistent for the Agent's lifetime, reused across every ``run`` /
+        ``run_stream`` call. ``aclose`` tears them down.
+        """
+        if self._mcp_started:
+            return
+        self._mcp_started = True
+        for server in self._mcp_servers:
+            for mcp_tool in await server.start():
+                # cothis: ceiling — an MCP tool whose name collides with an
+                # already-registered tool silently overwrites it here. MCP
+                # tools resolve after ``_all_tools``' cross-layer merge, so
+                # they bypass the shadow-warning that YAML/Python tools get.
+                # (The server *handle* can't collide — its name is
+                # ``mcp:``-prefixed; only the tools it produces can.) Upgrade
+                # path: run MCP tool names through the same shadow detection
+                # as the other sources — issue #18 (MCP+shell integration).
+                self._tool_map[mcp_tool.__name__] = mcp_tool
+
+    async def aclose(self) -> None:
+        """Close every MCP session/subprocess and reset for safe reuse.
+
+        ``ask`` calls this after its single ``run``; ``chat`` calls it when
+        the session ends. Besides closing each server (idempotent —
+        ``_MCPServer.aclose`` no-ops if never started), it drops the resolved
+        ``_MCPClientTool`` entries from ``_tool_map`` and clears the
+        ``_mcp_started`` guard, so a later ``run`` on the same Agent
+        reconnects with fresh sessions instead of dispatching against closed
+        ones. Safe to call more than once.
+        """
+        for server in self._mcp_servers:
+            await server.aclose()
+        # Remove tools whose sessions are now closed and re-arm resolution.
+        self._tool_map = {
+            name: tool
+            for name, tool in self._tool_map.items()
+            if not isinstance(tool, _MCPClientTool)
+        }
+        self._mcp_started = False
+
     def _tool_schemas(self) -> list[Any] | None:
         """Tools in the form any-llm's ``acompletion`` expects.
 
-        Delegates to ``tools._schema_for`` so the schema-serialisation rule
-        (pre-built dict vs callable) lives next to the Tool definitions,
-        not here.
+        Built from ``_tool_map`` (not ``self.tools``) so it reflects the
+        resolved set: MCP server handles are excluded and the
+        ``_MCPClientTool`` instances they produced (added by ``_ensure_mcp``)
+        are included. Delegates each entry to ``tools._schema_for`` so the
+        schema-serialisation rule (pre-built dict vs callable) lives next to
+        the Tool definitions, not here.
 
         Returns ``None`` when there are no tools, matching the prior
         ``list(self.tools) or None`` behaviour.
         """
-        if not self.tools:
+        if not self._tool_map:
             return None
-        return [_schema_for(tool) for tool in self.tools]
+        return [_schema_for(tool) for tool in self._tool_map.values()]
 
     def _ensure_messages(self, user_input: str) -> None:
         """Populate ``self._messages`` for this turn.

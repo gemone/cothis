@@ -14,6 +14,7 @@ import subprocess
 import sys
 import typing
 import warnings
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast, overload, runtime_checkable
 
@@ -22,7 +23,7 @@ import pathspec
 import yaml
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
 logger = logging.getLogger("cothis.tools")
 
@@ -790,16 +791,27 @@ TOOLS: list[Tool] = [read, _list_dir, write]
 def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     """Compile a YAML tool declaration into a callable.
 
-    Thin wrapper over ``_compile``: compile, gate the executable via
-    ``shutil.which``, wrap in ``_ShellTool``. If the executable is not on
-    PATH the tool is not registered — the model never sees a tool it cannot
-    dispatch on this host. The skip is logged at ``WARNING`` (every startup
-    decision is observable by default — see CONTEXT.md "Tool lifecycle").
+    Routes on ``type:``. A declaration with ``type: mcp.stdio`` is an MCP
+    server (an ``_MCPServer`` handle producing many tools at Agent startup,
+    not one shell tool) — see ``_build_mcp_stdio_server`` and ADR-0005. Any
+    other declaration (``type:`` absent) is a shell-template tool: compile,
+    gate the executable via ``shutil.which``, wrap in ``_ShellTool``. If the
+    executable is not on PATH the tool is not registered — the model never
+    sees a tool it cannot dispatch on this host. The skip is logged at
+    ``WARNING`` (every startup decision is observable by default — see
+    CONTEXT.md "Tool lifecycle").
 
-    See ``_compile`` for the YAML shape and ``CommandBlock`` for the
+    See ``_compile`` for the shell-YAML shape and ``CommandBlock`` for the
     contract. ``preview`` shares the same compile path, so the two cannot
     drift on what a valid YAMLTool is.
     """
+    # Peek at ``type:`` before ``_compile`` (which is shell-only and would
+    # reject the MCP-specific keys). MCP tools carry a different schema
+    # (``command`` is the server executable, ``args``/``env`` configure the
+    # subprocess) so they route to their own builder, not ``_compile``.
+    spec = yaml.safe_load(yaml_text)
+    if isinstance(spec, dict) and spec.get("type") == "mcp.stdio":
+        return [_build_mcp_stdio_server(spec, source)]
     block = _compile(yaml_text, source=source)
     exe = _resolve_executable(block.gate_target)
     if exe is None:
@@ -1268,6 +1280,263 @@ class _ShellTool(_HookableTool):
         if proc.returncode != 0:
             return f"Error: exit code {proc.returncode}: {proc.stderr}"
         return proc.stdout
+
+
+# Known keys on a ``type: mcp.stdio`` declaration. ``command`` is the server
+# executable (a string), ``args`` its CLI arguments (a list), ``env`` the
+# subprocess environment (a mapping). Disjoint from the shell-tool schema
+# (``_TOOL_KEYS``) — MCP is a different ``type:``, routed before ``_compile``.
+_MCP_STDIO_KEYS = {"type", "name", "description", "command", "args", "env"}
+
+
+def _normalize_mcp_result(result: Any) -> str:
+    """Flatten an MCP ``CallToolResult`` into a single string for the LLM.
+
+    Rules (issue #16, story 31):
+    - Join every content block's ``.text`` with newlines.
+    - Empty content list → ``"(no output)"`` (the tool ran but said nothing).
+    - ``isError`` true → prefix ``"Error: "`` so the model sees it as a
+      failure it can act on, not a normal result.
+
+    Non-text content blocks (images, embedded resources) are skipped — cothis
+    surfaces text to the model today.
+    cothis: ceiling — image/resource blocks are dropped, not base64-inlined,
+    so ``"(no output)"`` covers *two* cases the spec names as one: a truly
+    empty content list, AND a non-empty list that carries only non-text
+    blocks (both look like "nothing to say" to a text-only agent). Upgrade
+    path: map non-text blocks into the message content array once the agent
+    loop carries multimodal tool results — then the two cases diverge and
+    text-less-but-non-empty results stop collapsing to ``"(no output)"``.
+    """
+    parts = [
+        block.text
+        for block in result.content
+        if getattr(block, "text", None) is not None
+    ]
+    body = "\n".join(parts) if parts else "(no output)"
+    # ``isError`` is camelCase on the MCP pydantic model (verified against
+    # mcp 1.28.1 — ``CallToolResult`` fields: content/structuredContent/isError).
+    if result.isError:
+        return f"Error: {body}"
+    return body
+
+
+class _MCPClientTool(_HookableTool):
+    """A single remote MCP tool, dispatched over a shared server session.
+
+    Produced by ``_MCPServer.start`` — one instance per remote tool returned
+    by ``tools/list``. Inherits ``_HookableTool`` so ``_execute`` runs its
+    hook chains uniformly with every other tool (CONTEXT.md "no per-source
+    branching in ``_execute``"). Carries a pre-built ``__cothis_schema__``
+    from the server's ``inputSchema`` (already OpenAI-compatible JSON Schema),
+    so the rich per-parameter descriptions reach the model unchanged.
+
+    ``__call__`` is ``async`` (ADR-0004): it awaits ``session.call_tool`` and
+    normalizes the result. The session lives on the shared ``_MCPServer``
+    (``_server._session``), set once at Agent startup and reused across every
+    call (persistent session — ADR-0005).
+    """
+
+    __name__: str
+    __doc__: str
+    __cothis_schema__: dict[str, Any]
+
+    def __init__(
+        self,
+        server: _MCPServer,
+        name: str,
+        description: str,
+        input_schema: dict[str, Any] | None,
+    ) -> None:
+        super().__init__()
+        self.__name__ = name
+        self.__doc__ = description or f"MCP tool: {name}"
+        self.__cothis_schema__ = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": self.__doc__,
+                # ``inputSchema`` from the MCP server is already an OpenAI-
+                # compatible JSON Schema object; pass it straight through.
+                "parameters": input_schema or {"type": "object", "properties": {}},
+            },
+        }
+        self._server = server
+        # Diagnostics parity with YAML/Python tools (``_all_tools`` reads it).
+        self._source = server._source
+
+    async def __call__(self, **kwargs: Any) -> str:
+        session = self._server._session
+        if session is None:
+            # The server failed to start (its tools shouldn't have been
+            # registered) or was closed. Surface as an error the model sees.
+            raise RuntimeError(
+                f"MCP tool {self.__name__!r}: server session is not active"
+            )
+        result = await session.call_tool(self.__name__, kwargs)
+        return _normalize_mcp_result(result)
+
+
+class _MCPServer(_HookableTool):
+    """A handle to an MCP server declared via ``type: mcp.stdio`` YAML.
+
+    Not a callable tool itself — it's a *producer* of tools. Flows through
+    discovery (``load_tools_from_layer``) and ``_all_tools`` as an opaque
+    item (it satisfies the ``Tool`` protocol minimally: ``__name__`` +
+    ``__call__``), then the Agent resolves it at startup: connect the
+    server, ``tools/list``, expand into one ``_MCPClientTool`` per remote
+    tool (ADR-0005). ``__name__`` is a diagnostic label (``mcp:`` + ``name:``
+    or the file stem), prefixed so it can never collide with the names of the
+    tools it produces — or with any other dispatchable tool in the registry.
+
+    Session lifecycle is manual (``start`` / ``aclose``) because it spans
+    methods: ``async with`` sugar can't hold a context open from one call to
+    the next. ``start`` enters the connection context; ``aclose`` exits it.
+    Both must run in the same task (anyio cancel-scope rule) — the Agent
+    awaits both from its own event loop, so this holds. See ADR-0005.
+
+    ``connect`` is an injection seam for tests: a zero-arg callable returning
+    an async context manager that yields an initialized ``ClientSession``.
+    Production leaves it ``None`` and uses ``_default_connect`` (stdio
+    subprocess); tests pass the SDK's in-memory transport.
+    """
+
+    __name__: str
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        params: Any = None,
+        connect: Callable[[], Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.__name__ = name
+        # ``StdioServerParameters`` (production) or ``None`` (test, when a
+        # ``connect`` seam supplies the transport instead).
+        self._params = params
+        self._connect = connect
+        # Live connection context + session, set by ``start``, cleared by
+        # ``aclose``. ``None`` until started / after close.
+        self._cm: Any = None
+        self._session: Any = None
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # Satisfies the ``Tool`` protocol structurally but must never be
+        # dispatched: the Agent filters ``_MCPServer`` out of ``_tool_map``
+        # and only registers the ``_MCPClientTool`` instances it produces.
+        raise RuntimeError(
+            f"MCP server {self.__name__!r} is a server handle, not a callable tool"
+        )
+
+    @asynccontextmanager
+    async def _default_connect(self) -> AsyncIterator[Any]:
+        """Production transport: spawn the stdio subprocess, open a session.
+
+        Lazy MCP imports keep ``import cothis.tools`` cheap (the SDK pulls
+        anyio + pydantic-settings + starlette); only a real MCP server pays.
+        """
+        from mcp import ClientSession
+        from mcp.client.stdio import stdio_client
+
+        async with stdio_client(self._params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+    async def start(self) -> list[_MCPClientTool]:
+        """Connect, list remote tools, return them wrapped as ``_MCPClientTool``.
+
+        Enters the connection context (held open on ``self._cm`` until
+        ``aclose``), initializes the session, and calls ``tools/list``. On any
+        failure (command not found, subprocess crash, protocol error) logs at
+        ``WARNING`` naming the server + command/args — never ``env`` (story
+        32) — unwinds any partial context, and returns ``[]`` so the rest of
+        the agent's tools still load (story 30).
+        """
+        cm = self._connect() if self._connect is not None else self._default_connect()
+        try:
+            self._session = await cm.__aenter__()
+            listed = await self._session.list_tools()
+        except Exception as exc:  # noqa: BLE001 — any startup failure is non-fatal
+            # ``env`` is deliberately excluded from the log (secrets, story 32).
+            detail = ""
+            if self._params is not None:
+                detail = (
+                    f" (command={self._params.command!r} args={self._params.args!r})"
+                )
+            logger.warning(
+                "MCP server %r failed to start%s: %s", self.__name__, detail, exc
+            )
+            # Unwind whatever context was entered before the failure.
+            try:
+                await cm.__aexit__(type(exc), exc, exc.__traceback__)
+            except Exception as close_exc:  # noqa: BLE001 — best-effort cleanup
+                logger.debug(
+                    "MCP server %r cleanup after failed start: %s",
+                    self.__name__,
+                    close_exc,
+                )
+            self._cm = None
+            self._session = None
+            return []
+        self._cm = cm
+        return [
+            _MCPClientTool(
+                self, remote.name, remote.description or "", remote.inputSchema
+            )
+            for remote in listed.tools
+        ]
+
+    async def aclose(self) -> None:
+        """Close the session + subprocess. Idempotent; safe if never started."""
+        if self._cm is None:
+            return
+        try:
+            await self._cm.__aexit__(None, None, None)
+        except Exception as exc:  # noqa: BLE001 — teardown must not raise
+            logger.debug("MCP server %r close error: %s", self.__name__, exc)
+        finally:
+            self._cm = None
+            self._session = None
+
+
+def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> _MCPServer:
+    """Build an ``_MCPServer`` from a ``type: mcp.stdio`` YAML mapping.
+
+    ``command`` (required) is the server executable; ``args`` its CLI
+    arguments; ``env`` the subprocess environment (secrets — never logged,
+    story 32). The handle name is ``mcp:`` + ``name`` (or the file stem) —
+    prefixed so it can't collide with a real tool name. Does NOT connect —
+    that's deferred to Agent startup (ADR-0005). Raises ``ValueError`` on a
+    malformed declaration, naming the field + source.
+    """
+    from mcp import StdioServerParameters
+
+    _check_unknown_keys(spec, _MCP_STDIO_KEYS, source, what="MCP stdio tool")
+    command = str(_require(spec, "command", source, what="MCP stdio tool"))
+    where = f" in {source}" if source else ""
+    raw_args = spec.get("args") or []
+    if not isinstance(raw_args, list):
+        msg = f"MCP stdio tool: 'args' must be a list{where}"
+        raise ValueError(msg)
+    args = [str(a) for a in raw_args]
+    raw_env = spec.get("env") or {}
+    if not isinstance(raw_env, dict):
+        msg = f"MCP stdio tool: 'env' must be a mapping{where}"
+        raise ValueError(msg)
+    env = {str(k): str(v) for k, v in raw_env.items()}
+    label = str(spec.get("name") or (Path(source).stem if source else "mcp"))
+    params = StdioServerParameters(command=command, args=args, env=env or None)
+    # Prefix the handle name with ``mcp:`` so a server label can never collide
+    # with a real tool name in the discovery registry (``_all_tools``). The
+    # colon is not a valid character in a dotted tool name, so a server handle
+    # can't shadow — or be shadowed by — a dispatchable tool. Purely a
+    # diagnostic label (the server is never dispatched); the tools it produces
+    # keep their own bare names.
+    server = _MCPServer(name=f"mcp:{label}", params=params)
+    server._source = source
+    return server
 
 
 def preview(

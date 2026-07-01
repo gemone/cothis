@@ -1,7 +1,7 @@
 [project]
 name = "cothis"
 version = "0.1.0"
-description = "A basic coding agent."
+description = "A complete coding agent."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -12,6 +12,7 @@ requires-python = ">=3.14"
 dependencies = [
     "any-llm-sdk[all]>=1.17.0",
     "griffe>=2.1.0",
+    "mcp>=1.28.1",
     "pathspec>=0.12.1",
     "prompt-toolkit>=3.0",
     "pydantic>=2.13.4",
