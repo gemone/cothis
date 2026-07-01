@@ -211,7 +211,10 @@ def test_run_raises_on_persistent_empty_messages(
         asyncio.run(agent.run("hi"))
 
 
-def test_execute_str_result_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_execute_str_result_passed_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A tool returning ``str`` gets passed through to the tool message as-is.
 
     Str output (file contents, confirmations, stdout, error strings) is the
@@ -229,10 +232,11 @@ def test_execute_str_result_passed_through(monkeypatch: pytest.MonkeyPatch) -> N
     tc.id = "c1"
     tc.function.name = "str_tool"
     tc.function.arguments = "{}"
-    assert agent._execute(tc) == "plain text"
+    assert await agent._execute(tc) == "plain text"
 
 
-def test_execute_dict_result_serialised_as_json(
+@pytest.mark.asyncio
+async def test_execute_dict_result_serialised_as_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A tool returning ``dict`` is serialised as JSON, not ``str(dict)``.
@@ -253,7 +257,7 @@ def test_execute_dict_result_serialised_as_json(
     tc.id = "c1"
     tc.function.name = "dict_tool"
     tc.function.arguments = "{}"
-    rendered = agent._execute(tc)
+    rendered = await agent._execute(tc)
     # Round-trips through json.loads → model sees accurate structure.
     assert json.loads(rendered) == payload
     # Uses JSON double-quoted form, not Python repr single-quoted.
@@ -261,7 +265,8 @@ def test_execute_dict_result_serialised_as_json(
     assert "'name'" not in rendered
 
 
-def test_execute_list_result_serialised_as_json(
+@pytest.mark.asyncio
+async def test_execute_list_result_serialised_as_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A tool returning ``list`` is serialised as JSON (same rationale as dict)."""
@@ -278,11 +283,12 @@ def test_execute_list_result_serialised_as_json(
     tc.id = "c1"
     tc.function.name = "list_tool"
     tc.function.arguments = "{}"
-    rendered = agent._execute(tc)
+    rendered = await agent._execute(tc)
     assert json.loads(rendered) == payload
 
 
-def test_execute_non_str_non_collection_falls_back_to_str(
+@pytest.mark.asyncio
+async def test_execute_non_str_non_collection_falls_back_to_str(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A tool returning an int (or other non-collection) falls back to ``str()``."""
@@ -298,4 +304,35 @@ def test_execute_non_str_non_collection_falls_back_to_str(
     tc.id = "c1"
     tc.function.name = "int_tool"
     tc.function.arguments = "{}"
-    assert agent._execute(tc) == "42"
+    assert await agent._execute(tc) == "42"
+
+
+@pytest.mark.asyncio
+async def test_execute_async_tool_coroutine_awaited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool returning a coroutine has its result awaited (ADR-0004).
+
+    Sync tools return plain values; the ``isawaitable`` check skips the
+    await. Async tools (MCP) return coroutines; the await activates. This
+    test proves the async path works — without it, a regression removing
+    the ``isawaitable`` bridge would silently break MCP tools while all
+    sync-tool tests still pass.
+    """
+    import any_llm
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    agent = Agent(model="x", provider="openrouter", tools=[])
+
+    async def async_echo(**kw: Any) -> str:
+        return "from coroutine"
+
+    agent._tool_map["async_tool"] = async_echo
+
+    tc = MagicMock()
+    tc.id = "c1"
+    tc.function.name = "async_tool"
+    tc.function.arguments = "{}"
+    assert await agent._execute(tc) == "from coroutine"

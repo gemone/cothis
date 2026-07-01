@@ -1,6 +1,6 @@
 # cothis
 
-A basic coding agent built on `any-llm`. The agent loop is a small
+A complete coding agent built on `any-llm`. The agent loop is a
 ReAct cycle; its capability is extended through tools discovered at
 startup — today from Python callables and YAML declarations, with MCP
 and dynamic Python extensions planned (issue #1).

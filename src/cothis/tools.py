@@ -585,8 +585,8 @@ def read(
 
 # Directories ``fs.dir`` never descends into, even with ``all=True`` — they're
 # either huge (``.venv``, ``node_modules``), not source (``.git``), or build
-# artifacts (``__pycache__``). Hardcoded, not configurable: cothis is basic,
-# and every entry here is a directory whose contents would never help the
+# artifacts (``__pycache__``). Hardcoded, not configurable: every entry here
+# is a directory whose contents would never help the
 # model understand a project. Listed as a module constant so future noise
 # sources are added in one place.
 _IGNORED_DIRS = frozenset(

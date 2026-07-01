@@ -1,4 +1,4 @@
-"""cothis — a basic coding agent."""
+"""cothis — a complete coding agent."""
 
 from cothis.tools import Tool, tool
 
