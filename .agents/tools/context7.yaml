@@ -1,0 +1,14 @@
+# Context7 — up-to-date library documentation and code examples, exposed as
+# an MCP server over HTTP. One declaration registers all of Context7's tools
+# (resolve-library-id, query-docs) so the agent can look up current API
+# docs for any library instead of relying on stale training data.
+#
+# The remote works anonymously at a lower rate limit. For higher limits, get a
+# free key at https://context7.com/dashboard and add it under `headers:` (see
+# the commented line below). Header values are secrets — cothis never logs
+# them, and the url is scrubbed (userinfo/query stripped) before logging.
+type: mcp.http
+name: context7
+url: https://mcp.context7.com/mcp
+# headers:
+#   CONTEXT7_API_KEY: your-api-key-here

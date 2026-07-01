@@ -79,26 +79,40 @@ _Avoid_: pipeline stage, middleware (both too generic).
 **Tool source**:
 A path that yields `Tool` objects. **Currently implemented**: Python
 (`@tool`-decorated functions), YAML (declarative shell template), and MCP
-(external tool server, `type: mcp.stdio` — issue #16). **Planned, not yet
-implemented** (issue #1): MCP over HTTP (issue #17) and dynamic discovery
-of user-authored Python files. The pydantic schema base class (stories
-1–10) was **dropped** — `@tool` is the single Python-tool definition API.
-Tool source is the **format** axis only (Python / YAML / MCP) — it is
-**never** a precedence axis (see Layer).
+(external tool server, `type: mcp.stdio` — issue #16 — or `type: mcp.http`
+— issue #17). **Planned, not yet implemented** (issue #1): dynamic
+discovery of user-authored Python files. The pydantic schema base class
+(stories 1–10) was **dropped** — `@tool` is the single Python-tool
+definition API. Tool source is the **format** axis only (Python / YAML /
+MCP) — it is **never** a precedence axis (see Layer).
 _Avoid_: tool type (collides with `YAMLTool`), tool kind, backend,
 layer (different axis).
 
 **MCP server**:
-An external tool server declared by a `type: mcp.stdio` YAML file — the
-`_MCPServer` handle. Not a `Tool` itself but a *producer* of tools: one
-server declaration expands into many tools, discovered at runtime via the
-MCP `tools/list` call. Its `__name__` is a diagnostic label (`mcp:` +
-`name:` or the file stem), prefixed so it can never collide with a
-dispatchable tool's name in the discovery registry. The session it opens
-is **persistent** — connected once at Agent startup, held across every
-dispatch, closed at teardown (see ADR-0005).
+An external tool server declared by a `type: mcp.stdio` or `type: mcp.http`
+YAML file — the `_MCPServer` handle. Not a `Tool` itself but a *producer*
+of tools: one server declaration expands into many tools, discovered at
+runtime via the MCP `tools/list` call. Its `__name__` is a diagnostic label
+(`mcp:` + `name:` or the file stem), prefixed so it can never collide with a
+dispatchable tool's name in the discovery registry. The stdio and http
+variants differ only in their **transport**; everything downstream (session,
+discovery, dispatch, normalisation) is shared. The session it opens is
+**persistent** — connected once at Agent startup, held across every dispatch,
+closed at teardown (see ADR-0005).
 _Avoid_: MCP tool (that's the produced `_MCPClientTool`), MCP client,
 plugin.
+
+**Transport**:
+The wire an `_MCPServer` speaks over — a stdio subprocess (`type: mcp.stdio`,
+`stdio_client`) or an HTTP connection (`type: mcp.http`,
+`streamablehttp_client`). It is the **only** thing that differs between MCP
+kinds, so it is the only injected piece: each builder supplies an
+`open_transport` factory yielding a `(read, write)` stream pair, and
+`_default_connect` wraps those streams in a `ClientSession` uniformly. A
+secret-free `diagnostic` string (url scrubbed of userinfo/query, or
+command — never `env`/`headers`)
+travels alongside for failure logs.
+_Avoid_: protocol (that's MCP itself), connection (too vague), channel.
 
 **MCP tool**:
 A single remote tool produced by an MCP server — the `_MCPClientTool`. One

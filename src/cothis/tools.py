@@ -791,9 +791,10 @@ TOOLS: list[Tool] = [read, _list_dir, write]
 def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     """Compile a YAML tool declaration into a callable.
 
-    Routes on ``type:``. A declaration with ``type: mcp.stdio`` is an MCP
-    server (an ``_MCPServer`` handle producing many tools at Agent startup,
-    not one shell tool) — see ``_build_mcp_stdio_server`` and ADR-0005. Any
+    Routes on ``type:``. A declaration with ``type: mcp.stdio`` (or
+    ``type: mcp.http``) is an MCP server (an ``_MCPServer`` handle producing
+    many tools at Agent startup, not one shell tool) — see
+    ``_build_mcp_stdio_server`` / ``_build_mcp_http_server`` and ADR-0005. Any
     other declaration (``type:`` absent) is a shell-template tool: compile,
     gate the executable via ``shutil.which``, wrap in ``_ShellTool``. If the
     executable is not on PATH the tool is not registered — the model never
@@ -806,12 +807,15 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     drift on what a valid YAMLTool is.
     """
     # Peek at ``type:`` before ``_compile`` (which is shell-only and would
-    # reject the MCP-specific keys). MCP tools carry a different schema
-    # (``command`` is the server executable, ``args``/``env`` configure the
-    # subprocess) so they route to their own builder, not ``_compile``.
+    # reject the MCP-specific keys). MCP tools carry a different schema (the
+    # transport config — ``command``/``args``/``env`` for stdio, ``url``/
+    # ``headers`` for http) so they route to their own builder, not
+    # ``_compile``.
     spec = yaml.safe_load(yaml_text)
     if isinstance(spec, dict) and spec.get("type") == "mcp.stdio":
         return [_build_mcp_stdio_server(spec, source)]
+    if isinstance(spec, dict) and spec.get("type") == "mcp.http":
+        return [_build_mcp_http_server(spec, source)]
     block = _compile(yaml_text, source=source)
     exe = _resolve_executable(block.gate_target)
     if exe is None:
@@ -1288,6 +1292,11 @@ class _ShellTool(_HookableTool):
 # (``_TOOL_KEYS``) — MCP is a different ``type:``, routed before ``_compile``.
 _MCP_STDIO_KEYS = {"type", "name", "description", "command", "args", "env"}
 
+# Known keys on a ``type: mcp.http`` declaration. ``url`` is the remote server
+# endpoint (a string), ``headers`` the HTTP headers sent on every request (a
+# mapping — may carry secrets like ``Authorization``, so never logged).
+_MCP_HTTP_KEYS = {"type", "name", "description", "url", "headers"}
+
 
 def _normalize_mcp_result(result: Any) -> str:
     """Flatten an MCP ``CallToolResult`` into a single string for the LLM.
@@ -1377,8 +1386,43 @@ class _MCPClientTool(_HookableTool):
         return _normalize_mcp_result(result)
 
 
+def _flatten_exc(exc: BaseException) -> str:
+    """Describe an exception, unwrapping ``ExceptionGroup``s to the real cause.
+
+    anyio runs the MCP transport inside a task group, so a connection/protocol
+    failure surfaces as an ``ExceptionGroup`` whose own message — ``"unhandled
+    errors in a TaskGroup (1 sub-exception)"`` — hides what actually went
+    wrong. Recurse into ``.exceptions`` and join the leaf messages so the
+    startup warning names something the operator (and the model) can act on.
+    """
+    subs = getattr(exc, "exceptions", None)
+    if subs:
+        return "; ".join(_flatten_exc(s) for s in subs)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _scrub_url(url: str) -> str:
+    """Strip userinfo and query from a url for safe logging.
+
+    A url may carry credentials in the userinfo (``https://token@host``) or
+    in the query string (``?api_key=secret``); both are dropped so the
+    diagnostic keeps only ``scheme://host:port/path`` (story 32 — the
+    ``diagnostic`` is the only url-derived string that reaches a log).
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    # Drop userinfo (everything before the last ``@``) from the netloc, but
+    # keep the netloc string itself — rebuilding from ``parts.hostname`` would
+    # lose IPv6 brackets (``hostname`` returns ``::1`` for ``[::1]:8000``),
+    # producing a malformed url in the log. Query/fragment are stripped too.
+    netloc = parts.netloc.rsplit("@", 1)[-1] if "@" in parts.netloc else parts.netloc
+    return urlunsplit(parts._replace(netloc=netloc, query="", fragment=""))
+
+
 class _MCPServer(_HookableTool):
-    """A handle to an MCP server declared via ``type: mcp.stdio`` YAML.
+    """A handle to an MCP server declared via ``type: mcp.stdio`` or
+    ``type: mcp.http`` YAML.
 
     Not a callable tool itself — it's a *producer* of tools. Flows through
     discovery (``load_tools_from_layer``) and ``_all_tools`` as an opaque
@@ -1395,10 +1439,20 @@ class _MCPServer(_HookableTool):
     Both must run in the same task (anyio cancel-scope rule) — the Agent
     awaits both from its own event loop, so this holds. See ADR-0005.
 
+    The *transport* is the only thing that differs between MCP kinds, so it's
+    the only injected piece: ``open_transport`` is a zero-arg callable
+    returning an async context manager that yields a ``(read, write)`` stream
+    pair; ``_default_connect`` wraps those streams in a ``ClientSession``
+    uniformly. The stdio and http builders each supply the matching
+    ``open_transport``; everything downstream (session, discovery, dispatch,
+    normalization) is shared. ``diagnostic`` is a secret-free string (command
+    + args, or url — never ``env``/``headers``) logged if the server fails to
+    start.
+
     ``connect`` is an injection seam for tests: a zero-arg callable returning
-    an async context manager that yields an initialized ``ClientSession``.
-    Production leaves it ``None`` and uses ``_default_connect`` (stdio
-    subprocess); tests pass the SDK's in-memory transport.
+    an async context manager that yields an *initialized* ``ClientSession``,
+    bypassing ``open_transport`` entirely. Production leaves it ``None``;
+    tests pass the SDK's in-memory transport.
     """
 
     __name__: str
@@ -1407,14 +1461,17 @@ class _MCPServer(_HookableTool):
         self,
         *,
         name: str,
-        params: Any = None,
+        open_transport: Callable[[], Any] | None = None,
+        diagnostic: str = "",
         connect: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__()
         self.__name__ = name
-        # ``StdioServerParameters`` (production) or ``None`` (test, when a
-        # ``connect`` seam supplies the transport instead).
-        self._params = params
+        # Production transport factory (async CM yielding ``(read, write)``);
+        # ``None`` in pure-seam tests, where ``connect`` supplies the session.
+        self._open_transport = open_transport
+        # Secret-free detail for the failure log (never ``env``/``headers``).
+        self._diagnostic = diagnostic
         self._connect = connect
         # Live connection context + session, set by ``start``, cleared by
         # ``aclose``. ``None`` until started / after close.
@@ -1431,15 +1488,21 @@ class _MCPServer(_HookableTool):
 
     @asynccontextmanager
     async def _default_connect(self) -> AsyncIterator[Any]:
-        """Production transport: spawn the stdio subprocess, open a session.
+        """Production transport: open ``open_transport``, wrap in a session.
 
-        Lazy MCP imports keep ``import cothis.tools`` cheap (the SDK pulls
-        anyio + pydantic-settings + starlette); only a real MCP server pays.
+        Transport-agnostic: ``open_transport`` yields the ``(read, write)``
+        streams (stdio subprocess or http connection); this method wraps them
+        in a ``ClientSession`` and initializes it. The lazy ``ClientSession``
+        import keeps ``import cothis.tools`` cheap (the SDK pulls anyio +
+        pydantic-settings + starlette); only a real MCP server pays.
         """
         from mcp import ClientSession
-        from mcp.client.stdio import stdio_client
 
-        async with stdio_client(self._params) as (read, write):
+        # Only reached when there's no ``connect`` seam, in which case the
+        # builders always supply ``open_transport``. Assert it for the type
+        # checker (and to fail loudly if a future caller forgets both).
+        assert self._open_transport is not None
+        async with self._open_transport() as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 yield session
@@ -1449,24 +1512,27 @@ class _MCPServer(_HookableTool):
 
         Enters the connection context (held open on ``self._cm`` until
         ``aclose``), initializes the session, and calls ``tools/list``. On any
-        failure (command not found, subprocess crash, protocol error) logs at
-        ``WARNING`` naming the server + command/args — never ``env`` (story
-        32) — unwinds any partial context, and returns ``[]`` so the rest of
-        the agent's tools still load (story 30).
+        failure (command not found, subprocess crash, connection refused,
+        protocol error) logs at ``WARNING`` naming the server + its
+        ``diagnostic`` — never ``env``/``headers`` secrets (story 32) —
+        unwinds any partial context, and returns ``[]`` so the rest of the
+        agent's tools still load (story 30).
         """
         cm = self._connect() if self._connect is not None else self._default_connect()
         try:
             self._session = await cm.__aenter__()
             listed = await self._session.list_tools()
         except Exception as exc:  # noqa: BLE001 — any startup failure is non-fatal
-            # ``env`` is deliberately excluded from the log (secrets, story 32).
-            detail = ""
-            if self._params is not None:
-                detail = (
-                    f" (command={self._params.command!r} args={self._params.args!r})"
-                )
+            # ``diagnostic`` is secret-free by construction (built without
+            # ``env``/``headers``), so it's safe to log (story 32). Unwrap
+            # ExceptionGroups so the message names the real cause, not the
+            # anyio TaskGroup wrapper.
+            detail = f" ({self._diagnostic})" if self._diagnostic else ""
             logger.warning(
-                "MCP server %r failed to start%s: %s", self.__name__, detail, exc
+                "MCP server %r failed to start%s: %s",
+                self.__name__,
+                detail,
+                _flatten_exc(exc),
             )
             # Unwind whatever context was entered before the failure.
             try:
@@ -1489,7 +1555,7 @@ class _MCPServer(_HookableTool):
         ]
 
     async def aclose(self) -> None:
-        """Close the session + subprocess. Idempotent; safe if never started."""
+        """Close the session + transport. Idempotent; safe if never started."""
         if self._cm is None:
             return
         try:
@@ -1499,6 +1565,31 @@ class _MCPServer(_HookableTool):
         finally:
             self._cm = None
             self._session = None
+
+
+def _make_mcp_server(
+    label: str,
+    *,
+    open_transport: Callable[[], Any],
+    diagnostic: str,
+    source: str | None,
+) -> _MCPServer:
+    """Wrap a transport factory in a named ``_MCPServer`` handle.
+
+    Shared by the stdio and http builders — only ``open_transport`` and
+    ``diagnostic`` differ between them.
+    """
+    # Prefix the handle name with ``mcp:`` so a server label can never collide
+    # with a real tool name in the discovery registry (``_all_tools``). The
+    # colon is not a valid character in a dotted tool name, so a server handle
+    # can't shadow — or be shadowed by — a dispatchable tool. Purely a
+    # diagnostic label (the server is never dispatched); the tools it produces
+    # keep their own bare names.
+    server = _MCPServer(
+        name=f"mcp:{label}", open_transport=open_transport, diagnostic=diagnostic
+    )
+    server._source = source
+    return server
 
 
 def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> _MCPServer:
@@ -1528,15 +1619,76 @@ def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> _MCPSer
     env = {str(k): str(v) for k, v in raw_env.items()}
     label = str(spec.get("name") or (Path(source).stem if source else "mcp"))
     params = StdioServerParameters(command=command, args=args, env=env or None)
-    # Prefix the handle name with ``mcp:`` so a server label can never collide
-    # with a real tool name in the discovery registry (``_all_tools``). The
-    # colon is not a valid character in a dotted tool name, so a server handle
-    # can't shadow — or be shadowed by — a dispatchable tool. Purely a
-    # diagnostic label (the server is never dispatched); the tools it produces
-    # keep their own bare names.
-    server = _MCPServer(name=f"mcp:{label}", params=params)
-    server._source = source
-    return server
+
+    @asynccontextmanager
+    async def open_transport() -> AsyncIterator[Any]:
+        # Lazy import: the stdio client pulls the full SDK transport stack;
+        # only a real stdio server started at Agent runtime pays for it.
+        from mcp.client.stdio import stdio_client
+
+        async with stdio_client(params) as (read, write):
+            yield (read, write)
+
+    # ``env`` is deliberately excluded from ``diagnostic`` — secrets (story 32).
+    return _make_mcp_server(
+        label,
+        open_transport=open_transport,
+        diagnostic=f"command={command!r} args={args!r}",
+        source=source,
+    )
+
+
+def _build_mcp_http_server(spec: dict[str, Any], source: str | None) -> _MCPServer:
+    """Build an ``_MCPServer`` from a ``type: mcp.http`` YAML mapping.
+
+    ``url`` (required) is the remote server endpoint; ``headers`` an optional
+    mapping sent on every request (secrets like ``Authorization`` — never
+    logged, story 32). The handle name is ``mcp:`` + ``name`` (or the file
+    stem). Does NOT connect — deferred to Agent startup (ADR-0005). Reuses the
+    stdio path's session lifecycle, discovery, dispatch, and normalization;
+    only the transport (``streamablehttp_client``) differs. Raises
+    ``ValueError`` on a malformed declaration, naming the field + source.
+    """
+    _check_unknown_keys(spec, _MCP_HTTP_KEYS, source, what="MCP HTTP tool")
+    url = str(_require(spec, "url", source, what="MCP HTTP tool"))
+    where = f" in {source}" if source else ""
+    raw_headers = spec.get("headers") or {}
+    if not isinstance(raw_headers, dict):
+        msg = f"MCP HTTP tool: 'headers' must be a mapping{where}"
+        raise ValueError(msg)
+    headers = {str(k): str(v) for k, v in raw_headers.items()}
+    label = str(spec.get("name") or (Path(source).stem if source else "mcp"))
+
+    @asynccontextmanager
+    async def open_transport() -> AsyncIterator[Any]:
+        # Lazy import (see the stdio builder). ``streamablehttp_client`` yields
+        # a 3-tuple ``(read, write, get_session_id)``; the session-id callback
+        # isn't needed here, so drop it and yield the same ``(read, write)``
+        # pair the stdio transport does — keeping ``_default_connect`` uniform.
+        # cothis: ceiling — dropping ``get_session_id`` forecloses HTTP session
+        # resumption/reconnect after a dropped connection. Each ``Agent.run``
+        # opens a fresh HTTP transport; there's no way to resume a previous
+        # server-assigned session id. Upgrade path: thread ``get_session_id``
+        # through ``_default_connect`` and reconnect with it if the transport
+        # drops mid-session.
+        from mcp.client.streamable_http import streamablehttp_client
+
+        async with streamablehttp_client(url, headers=headers or None) as (
+            read,
+            write,
+            _get_session_id,
+        ):
+            yield (read, write)
+
+    # ``headers`` is excluded from ``diagnostic`` (secrets). The url itself
+    # is scrubbed — userinfo (``token@host``) and query (``?key=…``) carry
+    # credentials that must never reach a log (story 32).
+    return _make_mcp_server(
+        label,
+        open_transport=open_transport,
+        diagnostic=f"url={_scrub_url(url)!r}",
+        source=source,
+    )
 
 
 def preview(
