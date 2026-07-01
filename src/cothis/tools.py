@@ -1593,13 +1593,21 @@ def _format_tool_output(result: Any) -> str:
     return json.dumps(result)
 
 
-def _check_duplicate_name(tool: Tool, source: str, seen: dict[str, str]) -> None:
-    """Raise ``ValueError`` if ``tool.__name__`` was already declared in another source.
+def _check_same_layer_duplicate(tool: Tool, source: str, seen: dict[str, str]) -> None:
+    """Raise ``ValueError`` if ``tool.__name__`` is already in ``seen``.
 
-    ``seen`` maps tool names to the first source path that declared them.
-    On conflict, the error names both paths so the author can find and fix
-    the duplication. This is a load-time check — silent shadowing would
-    hide a misconfiguration until the model calls the wrong tool.
+    **Same-layer** duplicate detection — called by ``load_tools_from_layer``
+    with a single shared ``seen`` dict spanning both YAML and Python files
+    in one directory. A YAML file and a Python file in the same layer
+    claiming one name raise here (format is never a layer; see ADR-0003).
+    This is an author error, not an intentional override.
+
+    **Cross-layer** conflicts (project-local vs user-global, custom vs
+    builtin) do NOT raise — they shadow. That's ``_all_tools``'s concern
+    (ascending-precedence dict overwrite + ``WARNING``), not this check.
+
+    ``seen`` maps tool names to the first source path that declared them;
+    on conflict the error names both paths so the author can fix it.
     """
     name = tool.__name__
     if name in seen:
@@ -1652,7 +1660,7 @@ def load_tools_from_layer(dir_path: Path) -> list[Tool]:
         for tool_obj in load_yaml_tools(
             yml.read_text(encoding="utf-8"), source=str(yml)
         ):
-            _check_duplicate_name(tool_obj, str(yml), seen)
+            _check_same_layer_duplicate(tool_obj, str(yml), seen)
             setattr(tool_obj, "_source", str(yml))
             tools.append(tool_obj)
     for py in py_files:
@@ -1671,7 +1679,7 @@ def load_tools_from_layer(dir_path: Path) -> list[Tool]:
         for attr_name in dir(module):
             obj = getattr(module, attr_name)
             if isinstance(obj, ToolDef):
-                _check_duplicate_name(obj, str(py), seen)
+                _check_same_layer_duplicate(obj, str(py), seen)
                 obj._source = str(py)
                 tools.append(obj)
     return tools

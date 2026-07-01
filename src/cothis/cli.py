@@ -92,8 +92,8 @@ def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
         for tool in layer_tools:
             name = tool.__name__
             if name in registry:
-                prev_src = getattr(registry[name], "_source", None) or "<builtins>"
-                new_src = getattr(tool, "_source", None) or "<builtins>"
+                prev_src = getattr(registry[name], "_source", None) or "builtins"
+                new_src = getattr(tool, "_source", None) or "builtins"
                 logger.warning(
                     "tool %r from %s (%s) shadows %s (%s)",
                     name,
@@ -103,7 +103,7 @@ def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
                     prev_src,
                 )
                 shadow_count += 1
-            registry[name] = tool  # higher precedence wins on name conflict
+            registry[name] = tool
             layer_of[name] = layer_name
 
     # Run load hooks on the merged winners only (ADR-0003 Q3).
