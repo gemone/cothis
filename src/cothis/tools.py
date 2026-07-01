@@ -1598,7 +1598,8 @@ def _check_same_layer_duplicate(tool: Tool, source: str, seen: dict[str, str]) -
 
     **Same-layer** duplicate detection — called by ``load_tools_from_layer``
     with a single shared ``seen`` dict spanning both YAML and Python files
-    in one directory. A YAML file and a Python file in the same layer
+    across the entire layer directory tree (``rglob``, including
+    subdirectories). A YAML file and a Python file in the same layer
     claiming one name raise here (format is never a layer; see ADR-0003).
     This is an author error, not an intentional override.
 
