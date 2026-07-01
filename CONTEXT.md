@@ -2,8 +2,8 @@
 
 A complete coding agent built on `any-llm`. The agent loop is a
 ReAct cycle; its capability is extended through tools discovered at
-startup — today from Python callables and YAML declarations, with MCP
-and dynamic Python extensions planned (issue #1).
+startup — from Python callables, YAML declarations, and MCP servers
+(issue #1).
 
 ## Language
 
@@ -11,8 +11,11 @@ and dynamic Python extensions planned (issue #1).
 Any callable object the `Agent` registers by name and dispatches by
 calling with keyword arguments. The single dispatch protocol — there is
 no per-source branching in `_execute`. Every concrete tool class
-(`ToolDef`, `_ShellTool`) inherits `_HookableTool`, so hooks run
-uniformly for all sources (YAML tools' chains are empty no-ops).
+(`ToolDef`, `_ShellTool`, `_MCPClientTool`) inherits `_HookableTool`, so
+hooks run uniformly for all sources (YAML tools' chains are empty no-ops).
+A tool may be sync or async: `_execute` awaits the return value only if it
+is awaitable (ADR-0004), so MCP's async tools and sync Python/shell tools
+share one dispatch path.
 _Avoid_: function (too generic), handler, action.
 
 **`@tool` decorator**:
@@ -75,16 +78,36 @@ _Avoid_: pipeline stage, middleware (both too generic).
 
 **Tool source**:
 A path that yields `Tool` objects. **Currently implemented**: Python
-(`@tool`-decorated functions) and YAML (declarative shell template).
-**Planned, not yet implemented** (issue #1): MCP (external tool server,
-stories 25–32) and dynamic discovery of user-authored Python files
-(stories 33–35 — the `@tool` decorator is ready, the loader isn't).
-The pydantic schema base class (stories 1–10) was **dropped** — `@tool`
-is the single Python-tool definition API. Tool source is the **format**
-axis only (Python / YAML / MCP) — it is **never** a precedence axis
-(see Layer).
+(`@tool`-decorated functions), YAML (declarative shell template), and MCP
+(external tool server, `type: mcp.stdio` — issue #16). **Planned, not yet
+implemented** (issue #1): MCP over HTTP (issue #17) and dynamic discovery
+of user-authored Python files. The pydantic schema base class (stories
+1–10) was **dropped** — `@tool` is the single Python-tool definition API.
+Tool source is the **format** axis only (Python / YAML / MCP) — it is
+**never** a precedence axis (see Layer).
 _Avoid_: tool type (collides with `YAMLTool`), tool kind, backend,
 layer (different axis).
+
+**MCP server**:
+An external tool server declared by a `type: mcp.stdio` YAML file — the
+`_MCPServer` handle. Not a `Tool` itself but a *producer* of tools: one
+server declaration expands into many tools, discovered at runtime via the
+MCP `tools/list` call. Its `__name__` is a diagnostic label (`mcp:` +
+`name:` or the file stem), prefixed so it can never collide with a
+dispatchable tool's name in the discovery registry. The session it opens
+is **persistent** — connected once at Agent startup, held across every
+dispatch, closed at teardown (see ADR-0005).
+_Avoid_: MCP tool (that's the produced `_MCPClientTool`), MCP client,
+plugin.
+
+**MCP tool**:
+A single remote tool produced by an MCP server — the `_MCPClientTool`. One
+per entry returned by `tools/list`. Carries a pre-built `__cothis_schema__`
+from the server's `inputSchema` (already OpenAI-compatible JSON Schema).
+Dispatch is async: `__call__` awaits `session.call_tool` on the shared
+server session and normalises the `CallToolResult` to a string (text
+blocks joined; empty → `"(no output)"`; errors → `"Error: "` prefix).
+_Avoid_: MCP server (that's the `_MCPServer` producer), remote function.
 
 **YAMLTool**:
 A tool produced from a YAML declaration under `.agents/tools/`. The

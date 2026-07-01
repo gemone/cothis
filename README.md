@@ -4,8 +4,8 @@ A complete coding agent built on top of
 [`any-llm`](https://github.com/mozilla-ai/any-llm) — talk to any LLM
 provider through a single interface, with a small ReAct-style loop that
 call tools. Built-in tools are `fs.read`, `fs.write`, and `fs.dir`; you
-can add more as YAML shell tools or Python `@tool` functions under
-`.agents/tools/` (see [Custom tools](#custom-tools)).
+can add more as YAML shell tools, Python `@tool` functions, or MCP servers
+under `.agents/tools/` (see [Custom tools](#custom-tools)).
 
 - `cothis ask "..."` — one-shot prompt, plain-text output (pipe-friendly).
 - `cothis chat` — interactive multi-turn session, streamed Markdown output.
@@ -173,6 +173,31 @@ come from the docstring's `Args:` section.
 *(Discovery of user-authored `.py` files under `.agents/tools/` is the
 next slice — issue #1, stories 33–35. The decorator is ready; the loader
 isn't.)*
+
+### MCP servers (`type: mcp.stdio`)
+
+An [MCP](https://modelcontextprotocol.io) server is another YAML tool
+type. One declaration exposes *all* of the server's tools to the agent —
+discovered at startup via the MCP protocol, dispatched over a persistent
+stdio session:
+
+```yaml
+# .agents/tools/browser.yaml
+type: mcp.stdio
+name: browser              # optional label (defaults to the file stem)
+command: uvx               # the server executable
+args: [browser-use, --mcp] # its arguments
+env:                       # subprocess environment (secrets — never logged)
+  BROWSER_USE_API_KEY: sk-...
+```
+
+cothis launches the server as a subprocess, lists its tools, and registers
+each one so the model can call it like any built-in. The session is opened
+once and reused across the whole run; it is closed when the agent exits. A
+server that fails to launch logs a warning (naming the command, never the
+`env` secrets) and is skipped — the rest of your tools still load.
+
+*(stdio transport lands in issue #16; HTTP transport is issue #17.)*
 
 ### Tool output format
 
@@ -350,11 +375,13 @@ streaming chat path (by-index merge of streamed tool-call fragments,
 best-effort JSON parse for on-screen display), the YAML tool loader
 (command rendering, type-driven execution mode, per-arg description
 carry-through to the LLM schema, malformed-YAML error paths), the
-`@tool` decorator (docstring parsing, schema construction, type mapping),
-the ReAct loop (empty-message retry, tool-crash recovery), and the tool
-output formatter (json/csv/tsv/yaml). Tests run offline — no LLM calls.
-(YAML-tool tests do spawn short-lived subprocesses like `echo`; they
-never touch the network.)
+the `@tool` decorator (docstring parsing, schema construction, type mapping),
+the ReAct loop (empty-message retry, tool-crash recovery), the tool
+output formatter (json/csv/tsv/yaml), and the MCP stdio adapter (tool
+discovery, result normalisation, persistent-session lifecycle, secret
+redaction). Tests run offline — no LLM calls. (YAML-tool tests do spawn
+short-lived subprocesses like `echo`, and MCP tests run an in-memory
+server; they never touch the network.)
 
 ## License
 
