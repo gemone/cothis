@@ -1,6 +1,6 @@
 # cothis
 
-A basic coding agent built on top of
+A complete coding agent built on top of
 [`any-llm`](https://github.com/mozilla-ai/any-llm) — talk to any LLM
 provider through a single interface, with a small ReAct-style loop that
 call tools. Built-in tools are `fs.read`, `fs.write`, and `fs.dir`; you

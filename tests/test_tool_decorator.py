@@ -848,7 +848,8 @@ def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
 # --------------------------------------------------------------------
 
 
-def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
+@pytest.mark.asyncio
+async def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
     """ "Multiple ``pre_execute`` callbacks form a pipeline (A's output feeds B)."""
     from unittest.mock import MagicMock
 
@@ -881,11 +882,12 @@ def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
     tc = MagicMock()
     tc.function.name = "pipe"
     tc.function.arguments = '{"x": "start"}'
-    result = agent._execute(tc)
+    result = await agent._execute(tc)
     assert result == "start-A-B"  # both pre_execute callbacks ran in order
 
 
-def test_pre_execute_exception_short_circuits_and_returns_error(
+@pytest.mark.asyncio
+async def test_pre_execute_exception_short_circuits_and_returns_error(
     monkeypatch: Any,
 ) -> None:
     """ "``pre_execute`` raising short-circuits; error string returned to LLM."""
@@ -913,11 +915,12 @@ def test_pre_execute_exception_short_circuits_and_returns_error(
     tc = MagicMock()
     tc.function.name = "guarded"
     tc.function.arguments = '{"x": "hi"}'
-    result = agent._execute(tc)
+    result = await agent._execute(tc)
     assert result.startswith("Error calling guarded: blocked by pre_execute")
 
 
-def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
+@pytest.mark.asyncio
+async def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
     """ "Multiple ``after_execute`` callbacks form a pipeline on result."""
     from unittest.mock import MagicMock
 
@@ -948,11 +951,12 @@ def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None:
     tc = MagicMock()
     tc.function.name = "transform"
     tc.function.arguments = "{}"
-    result = agent._execute(tc)
+    result = await agent._execute(tc)
     assert result == "HELLO!"  # both after_execute callbacks ran in order
 
 
-def test_after_execute_exception_uses_original_result(monkeypatch: Any) -> None:
+@pytest.mark.asyncio
+async def test_after_execute_exception_uses_original_result(monkeypatch: Any) -> None:
     """ "``after_execute`` raising uses the original result (don't hide output)."""
     from unittest.mock import MagicMock
 
@@ -978,12 +982,13 @@ def test_after_execute_exception_uses_original_result(monkeypatch: Any) -> None:
     tc = MagicMock()
     tc.function.name = "safe"
     tc.function.arguments = "{}"
-    result = agent._execute(tc)
+    result = await agent._execute(tc)
     # Original result preserved — broken after_execute doesn't hide it.
     assert result == "real-output"
 
 
-def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
+@pytest.mark.asyncio
+async def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
     """ "Tool body exception fires ``on_error`` with phase='tool'."""
     from unittest.mock import MagicMock
 
@@ -1011,12 +1016,13 @@ def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
     tc = MagicMock()
     tc.function.name = "crash"
     tc.function.arguments = "{}"
-    result = agent._execute(tc)
+    result = await agent._execute(tc)
     assert result.startswith("Error calling crash")
     assert errors == [("tool body failed", "tool")]
 
 
-def test_on_error_at_execute_phase_correct(monkeypatch: Any) -> None:
+@pytest.mark.asyncio
+async def test_on_error_at_execute_phase_correct(monkeypatch: Any) -> None:
     """ "``on_error`` phase is 'pre_execute' when pre_execute raises."""
     from unittest.mock import MagicMock
 
@@ -1048,11 +1054,12 @@ def test_on_error_at_execute_phase_correct(monkeypatch: Any) -> None:
     tc = MagicMock()
     tc.function.name = "t"
     tc.function.arguments = "{}"
-    agent._execute(tc)
+    await agent._execute(tc)
     assert errors == [("pre_execute failed", "pre_execute")]
 
 
-def test_no_hooks_execute_baseline_unchanged(monkeypatch: Any) -> None:
+@pytest.mark.asyncio
+async def test_no_hooks_execute_baseline_unchanged(monkeypatch: Any) -> None:
     """ "A tool with no execute hooks dispatches exactly as before."""
     from unittest.mock import MagicMock
 
@@ -1074,7 +1081,7 @@ def test_no_hooks_execute_baseline_unchanged(monkeypatch: Any) -> None:
     tc = MagicMock()
     tc.function.name = "plain"
     tc.function.arguments = '{"x": "hello"}'
-    assert agent._execute(tc) == "got hello"
+    assert await agent._execute(tc) == "got hello"
 
 
 # --------------------------------------------------------------------

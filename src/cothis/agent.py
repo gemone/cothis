@@ -1,4 +1,4 @@
-"""A basic agent loop built on top of any-llm.
+"""An agent loop built on top of any-llm.
 
 The loop is the standard ReAct-style cycle:
 
@@ -15,6 +15,7 @@ Example
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from dataclasses import dataclass
@@ -184,7 +185,7 @@ class Agent(BaseModel):
             self._messages.append(message)
 
             if message.tool_calls:
-                for tool_msg in self._execute_tool_calls(message.tool_calls):
+                for tool_msg in await self._execute_tool_calls(message.tool_calls):
                     self._messages.append(tool_msg)
                 continue
 
@@ -301,7 +302,7 @@ class Agent(BaseModel):
                     {
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": self._execute(tc),
+                        "content": await self._execute(tc),
                     }
                 )
 
@@ -339,7 +340,7 @@ class Agent(BaseModel):
             self._messages.append({"role": "system", "content": self.system_prompt})
         self._messages.append({"role": "user", "content": user_input})
 
-    def _execute_tool_calls(self, tool_calls: list[Any]) -> list[dict[str, Any]]:
+    async def _execute_tool_calls(self, tool_calls: list[Any]) -> list[dict[str, Any]]:
         """Dispatch every tool call and return ready-to-append ``tool`` dicts.
 
         Accepts any object exposing ``.id``, ``.function.name`` and
@@ -354,7 +355,7 @@ class Agent(BaseModel):
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": self._execute(tool_call),
+                    "content": await self._execute(tool_call),
                 }
             )
         return results
@@ -395,7 +396,7 @@ class Agent(BaseModel):
             for i in sorted(by_index)
         ]
 
-    def _execute(self, tool_call: Any) -> str:
+    async def _execute(self, tool_call: Any) -> str:
         """Dispatch a single tool call and return its result as a string.
 
         Lifecycle (all tools carry hooks via ``_HookableTool``; YAML tools'
@@ -408,6 +409,11 @@ class Agent(BaseModel):
         Any exception in 1–3 fires ``on_error`` (phase names the stage),
         then returns an error string to the LLM. ``after_execute`` failure
         uses the original result (don't hide the tool's output).
+
+        Dispatch is async (ADR-0004) to support async tools (MCP). Sync
+        tools (ToolDef, ``_ShellTool``, bare callables) return non-coroutine
+        values; the ``isawaitable`` check skips the await for them, so their
+        behavior is unchanged.
         """
         name = tool_call.function.name
         raw_args = tool_call.function.arguments or "{}"
@@ -436,6 +442,8 @@ class Agent(BaseModel):
         logger.debug("→ %s(%s)", name, arg_repr)
         try:
             result = tool(**args)
+            if inspect.isawaitable(result):
+                result = await result
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             logger.debug("← %s raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=tool)", name)

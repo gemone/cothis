@@ -139,7 +139,7 @@ def _root(
         help="Show cothis tool-call I/O (without openai/httpx noise). Implied by --debug.",
     ),
 ) -> None:
-    """cothis — a basic any-llm agent loop."""
+    """cothis — an any-llm agent loop."""
     global _debug
     _debug = debug
     # ``--debug`` = everything (cothis + openai + httpx + traceback).
