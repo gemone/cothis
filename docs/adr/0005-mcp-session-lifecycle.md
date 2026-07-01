@@ -1,10 +1,12 @@
 # MCP session lifecycle: lazy connect, Agent-held, manual context
 
-An MCP server is declared via `type: mcp.stdio` YAML. It is **not** a tool
-but a *producer* of tools: one server declaration expands into many tools,
-discovered at runtime via the MCP `tools/list` call and dispatched via
-`tools/call`. The MCP Python SDK is async-only, and its `ClientSession` +
-`stdio_client` are `async with` context managers that close on exit.
+An MCP server is declared via `type: mcp.stdio` or `type: mcp.http` YAML.
+It is **not** a tool but a *producer* of tools: one server declaration
+expands into many tools, discovered at runtime via the MCP `tools/list` call
+and dispatched via `tools/call`. The MCP Python SDK is async-only, and its
+`ClientSession` + transport clients (`stdio_client`,
+`streamablehttp_client`) are `async with` context managers that close on
+exit.
 
 The tension: discovery (`load_tools_from_layer`) is **synchronous** and runs
 before the Agent exists, but a session must be **connected asynchronously**
@@ -16,9 +18,13 @@ calls in one `chat` session.
 **Discovery stores server params; the Agent connects lazily and holds the
 session; teardown closes it.**
 
-- **Discovery** (`_build_mcp_stdio_server`): parse the YAML, store
-  `StdioServerParameters`, return one `_MCPServer` handle. No connection —
-  the loader is sync and has no event loop to own a persistent session.
+- **Discovery** (`_build_mcp_stdio_server` / `_build_mcp_http_server`):
+  parse the YAML, build an `open_transport` factory (async CM yielding a
+  `(read, write)` stream pair) and a secret-free `diagnostic` string, return
+  one `_MCPServer` handle. No connection — the loader is sync and has no
+  event loop to own a persistent session. The **transport** is the only
+  thing that differs between the two kinds; everything downstream
+  (`_default_connect` → `ClientSession` → `tools/list`) is shared.
 - **Resolution** (`Agent._ensure_mcp`, first `run`): for each `_MCPServer`,
   `start()` the session (connect, `initialize`, `tools/list`), wrap each
   remote tool in an `_MCPClientTool`, and register those in `_tool_map`.
@@ -26,8 +32,8 @@ session; teardown closes it.**
 - **Dispatch** (`_MCPClientTool.__call__`): `await session.call_tool(...)`
   on the shared session held by the `_MCPServer`. No per-call reconnect.
 - **Teardown** (`Agent.aclose`): `aclose()` every server, closing its
-  session and subprocess. `ask` calls this after its single `run`; `chat`
-  calls it when the session ends.
+  session and transport (subprocess or HTTP connection). `ask` calls this
+  after its single `run`; `chat` calls it when the session ends.
 
 **The session is held open with manual `__aenter__` / `__aexit__`, not
 `async with`.** The connection context is entered in `start()` and exited in
@@ -79,9 +85,10 @@ every other tool), preserving CONTEXT.md's "no per-source branching in
   (e.g. a background cleanup coroutine) would break it.
 
 - **A failed `start` is non-fatal.** Bad command, connection refused, or a
-  protocol error logs at `WARNING` (naming the server + `command`/`args`,
-  never `env` — secrets), unwinds any partial context, and returns `[]`. The
-  server contributes no tools; the rest of the agent's tools still load.
+  protocol error logs at `WARNING` (naming the server + its `diagnostic` —
+  command/args for stdio, url for http; never `env`/`headers` — secrets),
+  unwinds any partial context, and returns `[]`. The server contributes no
+  tools; the rest of the agent's tools still load.
 
 - **MCP tools bypass cross-layer shadow resolution.** They are added to
   `_tool_map` at Agent startup, after `_all_tools` has already merged the
@@ -100,8 +107,18 @@ every other tool), preserving CONTEXT.md's "no per-source branching in
   session end) don't exercise reuse, but the reset makes it safe by
   construction rather than by caller discipline.
 
-- **The injection seam (`_MCPServer.connect`) exists for tests.** Production
-  leaves it `None` and uses `_default_connect` (real stdio subprocess);
-  tests pass the SDK's in-memory `create_connected_server_and_client_session`
-  transport, so the adapter code under test is exactly production — only the
-  transport differs. No subprocess, no network, deterministic.
+- **The transport seam (`open_transport`) and the test seam (`connect`)
+  both exist for testability.** `open_transport` is injected per kind by the
+  builder so the transport choice is isolated; `connect` bypasses
+  `open_transport` entirely, letting tests pass the SDK's in-memory
+  `create_connected_server_and_client_session` transport so the adapter
+  code under test is exactly production — only the transport differs. No
+  subprocess, no network, deterministic.
+
+- **The HTTP transport cannot resume a dropped server session.**
+  `streamablehttp_client` yields a 3-tuple `(read, write, get_session_id)`;
+  the session-id callback is dropped to match stdio's 2-tuple contract (see
+  the `cothis:` ceiling comment in `_build_mcp_http_server`). If the HTTP
+  connection drops mid-session, cothis has no way to reconnect with the
+  server-assigned session id; each `run` opens a fresh transport. Threading
+  `get_session_id` through `_default_connect` is the upgrade path.

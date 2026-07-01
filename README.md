@@ -174,15 +174,15 @@ come from the docstring's `Args:` section.
 next slice — issue #1, stories 33–35. The decorator is ready; the loader
 isn't.)*
 
-### MCP servers (`type: mcp.stdio`)
+### MCP servers (`type: mcp.stdio` / `type: mcp.http`)
 
 An [MCP](https://modelcontextprotocol.io) server is another YAML tool
 type. One declaration exposes *all* of the server's tools to the agent —
 discovered at startup via the MCP protocol, dispatched over a persistent
-stdio session:
+session:
 
 ```yaml
-# .agents/tools/browser.yaml
+# .agents/tools/browser.yaml — stdio: cothis spawns a subprocess
 type: mcp.stdio
 name: browser              # optional label (defaults to the file stem)
 command: uvx               # the server executable
@@ -191,13 +191,23 @@ env:                       # subprocess environment (secrets — never logged)
   BROWSER_USE_API_KEY: sk-...
 ```
 
-cothis launches the server as a subprocess, lists its tools, and registers
-each one so the model can call it like any built-in. The session is opened
-once and reused across the whole run; it is closed when the agent exits. A
-server that fails to launch logs a warning (naming the command, never the
-`env` secrets) and is skipped — the rest of your tools still load.
+```yaml
+# .agents/tools/context7.yaml — http: cothis connects to a remote server
+type: mcp.http
+name: context7
+url: https://mcp.context7.com/mcp
+headers:                   # HTTP headers (secrets — never logged)
+  Authorization: Bearer ...
+```
 
-*(stdio transport lands in issue #16; HTTP transport is issue #17.)*
+cothis connects, lists the server's tools, and registers each one so the
+model can call it like any built-in. The session is opened once and reused
+across the whole run; it is closed when the agent exits. Only the
+**transport** differs between `mcp.stdio` (subprocess) and `mcp.http`
+(remote); discovery, dispatch, and result handling are shared. A server
+that fails to connect logs a warning (naming the command/url — never the
+`env`/`headers` secrets) and is skipped — the rest of your tools still
+load.
 
 ### Tool output format
 
@@ -377,9 +387,9 @@ best-effort JSON parse for on-screen display), the YAML tool loader
 carry-through to the LLM schema, malformed-YAML error paths), the
 the `@tool` decorator (docstring parsing, schema construction, type mapping),
 the ReAct loop (empty-message retry, tool-crash recovery), the tool
-output formatter (json/csv/tsv/yaml), and the MCP stdio adapter (tool
-discovery, result normalisation, persistent-session lifecycle, secret
-redaction). Tests run offline — no LLM calls. (YAML-tool tests do spawn
+output formatter (json/csv/tsv/yaml), and the MCP adapter, stdio and
+http transports (tool discovery, result normalisation, persistent-session
+lifecycle, secret redaction). Tests run offline — no LLM calls. (YAML-tool tests do spawn
 short-lived subprocesses like `echo`, and MCP tests run an in-memory
 server; they never touch the network.)
 
