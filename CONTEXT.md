@@ -146,7 +146,7 @@ under `~/.config/cothis/tools/` (global across all projects). Both are
 optional; absence is not an error. Each discovery path is exactly one
 **Layer** (project-local or user-global); builtins are a third layer
 with no directory. Cross-layer conflicts shadow (project-local >
-user-global > builtin); same-layer conflicts raise (see Layer).
+user-global > builtins); same-layer conflicts raise (see Layer).
 _Avoid_: config dir, registry root, tools folder.
 
 **Layer**:
