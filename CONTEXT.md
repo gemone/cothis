@@ -144,9 +144,9 @@ A directory scanned for YAML tool declarations at startup. **Project
 tools** live under `.agents/tools/` (relative to cwd); **user tools** live
 under `~/.config/cothis/tools/` (global across all projects). Both are
 optional; absence is not an error. Each discovery path is exactly one
-**Layer** (project-local, user-global, or builtin). Today only the
-project-local path is wired into `cli.py`; the user-global path is
-planned (issue #1, stories 20 and 33).
+**Layer** (project-local or user-global); builtins are a third layer
+with no directory. Cross-layer conflicts shadow (project-local >
+user-global > builtin); same-layer conflicts raise (see Layer).
 _Avoid_: config dir, registry root, tools folder.
 
 **Layer**:

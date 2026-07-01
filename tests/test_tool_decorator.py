@@ -1135,7 +1135,13 @@ def test_on_error_fire_logged(caplog: Any) -> None:
 
 
 # --------------------------------------------------------------------
-# Duplicate tool name detection (issue #3, story 44)
+# Duplicate tool name detection (issue #3, story 44; issue #12)
+# Three behaviors coexist (ADR-0003):
+#   - same-layer duplicate (any format combo) → raise
+#   - cross-layer (project vs user, custom vs builtin) → shadow
+#   - builtin override → shadow
+# These tests pin the first (raise); cross-layer shadow + builtin override
+# live in tests/test_cli.py.
 # --------------------------------------------------------------------
 
 
@@ -1175,6 +1181,30 @@ def test_python_duplicate_names_detected(tmp_path: Any) -> None:
     msg = str(exc_info.value)
     assert "a.py" in msg
     assert "b.py" in msg
+
+
+def test_cross_format_same_layer_duplicate_raises(tmp_path: Any) -> None:
+    """YAML + Python in the SAME directory claiming one name → raise.
+
+    Format is never a layer (ADR-0003 Q1): a YAML file and a Python file
+    in the same directory are same-layer, so they raise — not shadow.
+    This is the case the pre-#12 per-format ``seen`` dicts couldn't catch.
+    """
+    from cothis.tools import load_tools_from_layer
+
+    (tmp_path / "y.yaml").write_text(
+        'name: dup\ncommand: ["echo", "yaml"]\n', encoding="utf-8"
+    )
+    (tmp_path / "p.py").write_text(
+        'from cothis import tool\n@tool("dup")\n'
+        'def p() -> str:\n    """P."""\n    return "py"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate tool name.*dup") as exc_info:
+        load_tools_from_layer(tmp_path)
+    msg = str(exc_info.value)
+    assert "y.yaml" in msg
+    assert "p.py" in msg
 
 
 def test_no_duplicate_names_loads_normally(tmp_path: Any) -> None:
