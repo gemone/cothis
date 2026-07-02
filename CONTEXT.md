@@ -184,23 +184,24 @@ _Avoid_: filter, guard, condition.
 **Discovery path**:
 A directory scanned for YAML tool declarations at startup. **Project
 tools** live under `.agents/tools/` (relative to cwd); **user tools** live
-under `~/.config/cothis/tools/` (global across all projects). Both are
-optional; absence is not an error. Each discovery path is exactly one
-**Layer** (project-local or user-global); builtins are a third layer
-with no directory. Cross-layer conflicts shadow (project-local >
-user-global > builtins); same-layer conflicts raise (see Layer).
+under `$COTHIS_HOME/tools/` (default `~/.cothis/tools/`, overridable via
+the `COTHIS_HOME` environment variable). Both are optional; absence is not
+an error. Each discovery path is exactly one **Layer** (project-local or
+user-global); builtins are a third layer with no directory. Cross-layer
+conflicts shadow (project-local > user-global > builtins); same-layer
+conflicts raise (see Layer).
 _Avoid_: config dir, registry root, tools folder.
 
 **Layer**:
 A precedence tier in tool discovery. Three layers, highest precedence
 first: **project-local** (`.agents/tools/`), **user-global**
-(`~/.config/cothis/tools/`), **builtins** (compiled into `TOOLS`).
-Cross-layer name conflicts are resolved by **shadowing** (higher
-precedence wins); same-layer conflicts are an author error (raise
-`ValueError`). Layer is independent of tool source: a project-local
-YAML tool and a project-local Python tool claiming the same name are
-**same-layer** (raise), not cross-source shadow. Format (Python/YAML/
-MCP) is never a precedence axis.
+(`$COTHIS_HOME/tools/`, default `~/.cothis/tools/`), **builtins**
+(compiled into `TOOLS`). Cross-layer name conflicts are resolved by
+**shadowing** (higher precedence wins); same-layer conflicts are an
+author error (raise `ValueError`). Layer is independent of tool source:
+a project-local YAML tool and a project-local Python tool claiming the
+same name are **same-layer** (raise), not cross-source shadow. Format
+(Python/YAML/MCP) is never a precedence axis.
 _Avoid_: source (collides with Tool source, the format axis), level,
 tier (too generic).
 

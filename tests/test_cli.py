@@ -11,6 +11,7 @@ user-global) and the cross-layer ceiling (raises until #10/#11 land).
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from cothis.agent import ToolCallEvent
@@ -78,7 +79,7 @@ def test_all_tools_user_global_absent_no_error(tmp_path: Any) -> None:
 
 
 def test_all_tools_user_global_loads_tools(tmp_path: Any) -> None:
-    """Tools from ``~/.config/cothis/tools/`` appear in the tool list."""
+    """Tools from ``$COTHIS_HOME/tools/`` appear in the tool list."""
     project = tmp_path / "project"
     project.mkdir()
     user = tmp_path / "user"
@@ -355,3 +356,47 @@ def test_shadowed_tool_load_hooks_never_fire(tmp_path: Any, monkeypatch: Any) ->
     assert by_name["shared.tool"]() == "proj\n"
     # The loser's after_load hook must NOT have fired — no marker file.
     assert not marker.exists()
+
+
+def test_cothis_home_env_var_overrides_default(monkeypatch: Any) -> None:
+    """``COTHIS_HOME`` overrides the default ``~/.cothis`` for user tools."""
+    import importlib
+    from pathlib import Path
+
+    import cothis.cli
+
+    orig = os.environ.get("COTHIS_HOME")
+    monkeypatch.setenv("COTHIS_HOME", "/custom/cothis-home")
+    try:
+        importlib.reload(cothis.cli)
+        assert cothis.cli._COTHIS_HOME == Path("/custom/cothis-home")
+        assert cothis.cli._USER_TOOLS_DIR == Path("/custom/cothis-home/tools")
+    finally:
+        # Restore env + reload so module constants match (monkeypatch restores
+        # the env var but NOT the already-reloaded module constants).
+        if orig is not None:
+            monkeypatch.setenv("COTHIS_HOME", orig)
+        else:
+            monkeypatch.delenv("COTHIS_HOME", raising=False)
+        importlib.reload(cothis.cli)
+
+
+def test_cothis_home_defaults_to_home_dotcothis(monkeypatch: Any) -> None:
+    """Without ``COTHIS_HOME``, the default is ``~/.cothis``."""
+    import importlib
+    from pathlib import Path
+
+    import cothis.cli
+
+    orig = os.environ.get("COTHIS_HOME")
+    monkeypatch.delenv("COTHIS_HOME", raising=False)
+    try:
+        importlib.reload(cothis.cli)
+        assert cothis.cli._COTHIS_HOME == Path.home() / ".cothis"
+        assert cothis.cli._USER_TOOLS_DIR == Path.home() / ".cothis" / "tools"
+    finally:
+        if orig is not None:
+            monkeypatch.setenv("COTHIS_HOME", orig)
+        else:
+            monkeypatch.delenv("COTHIS_HOME", raising=False)
+        importlib.reload(cothis.cli)
