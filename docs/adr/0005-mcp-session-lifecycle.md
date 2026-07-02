@@ -90,14 +90,15 @@ every other tool), preserving CONTEXT.md's "no per-source branching in
   unwinds any partial context, and returns `[]`. The server contributes no
   tools; the rest of the agent's tools still load.
 
-- **MCP tools bypass cross-layer shadow resolution.** They are added to
-  `_tool_map` at Agent startup, after `_all_tools` has already merged the
-  YAML/Python/builtin layers. An MCP tool whose name collides with an
-  existing tool silently overwrites it in `_tool_map` today. Hardening this
-  (shadow warnings for MCP tool names) is deferred to the MCP+shell
-  integration work (issue #18). The server *handle* itself cannot collide:
-  its `__name__` is prefixed `mcp:`, which is not a valid dotted tool name,
-  so a server label can neither shadow nor be shadowed by a real tool.
+- **MCP tool names are prefixed and de-duplicated at registration.** Each
+  produced tool's `__name__` is `{label}.{remote_name}` (ADR-0006), so it
+  normally can't collide with a builtin or user tool (which use bare names).
+  Any residual clash (e.g. a user tool named exactly `{label}.{remote}`) is
+  caught at registration in `_ensure_mcp`: first-write-wins keeps the
+  already-registered tool, logs the clash at ERROR. The server *handle*
+  itself cannot collide: its `__name__` is prefixed `mcp:`, which is not a
+  valid dotted tool name, so a server label can neither shadow nor be
+  shadowed by a real tool.
 
 - **`aclose` is a full reset, not just a close.** It closes every server,
   drops the resolved `_MCPClientTool` entries from `_tool_map`, and clears

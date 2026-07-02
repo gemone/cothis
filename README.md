@@ -200,14 +200,18 @@ headers:                   # HTTP headers (secrets — never logged)
   Authorization: Bearer ...
 ```
 
-cothis connects, lists the server's tools, and registers each one so the
-model can call it like any built-in. The session is opened once and reused
-across the whole run; it is closed when the agent exits. Only the
-**transport** differs between `mcp.stdio` (subprocess) and `mcp.http`
-(remote); discovery, dispatch, and result handling are shared. A server
-that fails to connect logs a warning (naming the command/url — never the
-`env`/`headers` secrets) and is skipped — the rest of your tools still
-load.
+cothis connects, lists the server's tools, and registers each one with a
+**prefixed name**: a server `name: context7` exposing a `query-docs` tool
+registers it as `context7.query-docs` (not the bare `query-docs`), so it
+can't collide with a builtin or user tool of the same remote name. The
+model sees and calls `context7.query-docs`; cothis strips the prefix back
+to the bare name when dispatching to the server. The session is opened
+once and reused across the whole run; it is closed when the agent exits.
+Only the **transport** differs between `mcp.stdio` (subprocess) and
+`mcp.http` (remote); discovery, dispatch, and result handling are shared.
+A server that fails to connect logs a warning (naming the command/url —
+never the `env`/`headers` secrets) and is skipped — the rest of your tools
+still load.
 
 ### Tool output format
 

@@ -31,6 +31,7 @@ from cothis.tools import (
     _MCPServer,
     _normalize_mcp_result,
     _ShellTool,
+    load_tools_from_layer,
     load_yaml_tools,
     tool,
 )
@@ -65,7 +66,10 @@ def _in_memory(server: FastMCP) -> Callable[[], Any]:
 
 
 def _mcp_server(server: FastMCP | None = None) -> _MCPServer:
-    return _MCPServer(name="test", connect=_in_memory(server or _make_server()))
+    # ``mcp:`` prefix matches production handles (``_make_mcp_server``);
+    # ``start()`` strips it to get the label ``test``, so produced tools are
+    # ``test.add`` / ``test.boom`` (ADR-0006 prefix).
+    return _MCPServer(name="mcp:test", connect=_in_memory(server or _make_server()))
 
 
 class _FailingCM:
@@ -185,13 +189,67 @@ def test_yaml_mcp_unknown_key_rejected() -> None:
 
 
 def test_yaml_mcp_missing_command_rejected() -> None:
-    with pytest.raises(ValueError, match="must define 'command'"):
-        load_yaml_tools("type: mcp.stdio\nname: x\n")
+    with pytest.raises(ValueError, match="must define 'command'") as exc_info:
+        load_yaml_tools("type: mcp.stdio\nname: x\n", source="srv.yaml")
+    assert "srv.yaml" in str(exc_info.value)
 
 
 def test_yaml_mcp_args_must_be_list() -> None:
     with pytest.raises(ValueError, match="'args' must be a list"):
         load_yaml_tools("type: mcp.stdio\ncommand: foo\nargs: nope\n")
+
+
+def test_yaml_mcp_env_non_string_value_rejected() -> None:
+    """A non-string ``env`` value is rejected with file + field + type (AC #9,
+    story 30) — not silently coerced to str."""
+    with pytest.raises(ValueError, match="'env.API_KEY' must be a string") as exc_info:
+        load_yaml_tools(
+            "type: mcp.stdio\ncommand: foo\nenv:\n  API_KEY: 123\n",
+            source="srv.yaml",
+        )
+    msg = str(exc_info.value)
+    assert "srv.yaml" in msg
+    assert "int" in msg
+
+
+def test_yaml_mcp_stdio_warns_when_command_not_on_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stdio server whose ``command`` is not on PATH logs a WARNING (story 30)."""
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        server = load_yaml_tools(
+            "type: mcp.stdio\nname: ghost\ncommand: definitely-not-on-path-xyz\n"
+        )[0]
+    assert isinstance(server, _MCPServer)
+    assert "definitely-not-on-path-xyz" in caplog.text
+    assert "not on PATH" in caplog.text
+
+
+def test_yaml_mcp_stdio_no_warning_when_command_on_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stdio server whose ``command`` IS on PATH emits no PATH warning."""
+    import sys
+
+    exe = sys.executable  # always resolvable by shutil.which
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        load_yaml_tools(f"type: mcp.stdio\nname: ok\ncommand: {exe}\n")
+    assert "not on PATH" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "yaml_text",
+    [
+        "type: mcp.stdio\nname: a:b\ncommand: foo\n",
+        "type: mcp.http\nname: a:b\nurl: https://x/mcp\n",
+    ],
+    ids=["stdio", "http"],
+)
+def test_yaml_mcp_label_with_colon_rejected(yaml_text: str) -> None:
+    """A label containing ``:`` would break the ``:``-is-not-valid-in-tool-names
+    invariant — refused at build time for both transports."""
+    with pytest.raises(ValueError, match="contains ':'"):
+        load_yaml_tools(yaml_text, source="bad.yaml")
 
 
 # --- YAML routing: http transport --------------------------------------
@@ -230,8 +288,9 @@ def test_yaml_mcp_http_headers_absent_from_diagnostic() -> None:
 
 
 def test_yaml_mcp_http_missing_url_rejected() -> None:
-    with pytest.raises(ValueError, match="must define 'url'"):
+    with pytest.raises(ValueError, match="must define 'url'") as exc_info:
         load_yaml_tools("type: mcp.http\nname: x\n", source="remote.yaml")
+    assert "remote.yaml" in str(exc_info.value)
 
 
 def test_yaml_mcp_http_unknown_key_rejected() -> None:
@@ -275,6 +334,52 @@ def test_http_url_ipv6_brackets_preserved_in_diagnostic() -> None:
     assert "https://::1" not in server._diagnostic  # not the malformed form
 
 
+def test_unknown_type_rejected_with_valid_options() -> None:
+    """An unknown ``type:`` value names the file + the bad value + valid
+    options (story 30), instead of falling through to shell-tool compile."""
+    with pytest.raises(ValueError, match="unknown tool type") as exc_info:
+        load_yaml_tools("type: bogus\nname: x\ncommand: echo\n", source="bad.yaml")
+    msg = str(exc_info.value)
+    assert "'bogus'" in msg
+    assert "bad.yaml" in msg
+    assert "mcp.stdio" in msg
+    assert "mcp.http" in msg
+
+
+def test_no_type_falls_through_to_shell_tool() -> None:
+    """A declaration with no ``type:`` is a shell-template tool — unchanged
+    backward-compatible behavior (#18 AC)."""
+    tools = load_yaml_tools("name: hi\ncommand: [echo, hello]\n", source="ok.yaml")
+    assert len(tools) == 1
+    assert isinstance(tools[0], _ShellTool)
+    assert tools[0].__name__ == "hi"
+
+
+def test_mixed_directory_loads_all_three_types(tmp_path: Any) -> None:
+    """A single discovery directory loads shell, mcp.stdio, and mcp.http tools
+    side by side (#18 AC: mixed declarations)."""
+    (tmp_path / "shell.yaml").write_text(
+        'name: my.shell\ncommand: ["echo", "hi"]\n', encoding="utf-8"
+    )
+    (tmp_path / "stdio.yaml").write_text(
+        "type: mcp.stdio\nname: local\ncommand: echo\n", encoding="utf-8"
+    )
+    (tmp_path / "http.yaml").write_text(
+        "type: mcp.http\nname: remote\nurl: https://example.com/mcp\n",
+        encoding="utf-8",
+    )
+    tools = load_tools_from_layer(tmp_path)
+    by_name = {t.__name__: t for t in tools}
+    # Shell tool is a dispatchable _ShellTool.
+    assert "my.shell" in by_name
+    assert isinstance(by_name["my.shell"], _ShellTool)
+    # Both MCP kinds are _MCPServer handles (mcp: prefixed, not yet connected).
+    assert "mcp:local" in by_name
+    assert isinstance(by_name["mcp:local"], _MCPServer)
+    assert "mcp:remote" in by_name
+    assert isinstance(by_name["mcp:remote"], _MCPServer)
+
+
 # --- normalization (pure) ----------------------------------------------
 
 
@@ -315,17 +420,20 @@ def test_normalize_nontext_only_content_is_no_output() -> None:
 
 @pytest.mark.asyncio
 async def test_start_discovers_tools_with_schema() -> None:
-    """``start`` lists remote tools, each wrapped with its ``inputSchema``."""
+    """``start`` lists remote tools, each wrapped with its ``inputSchema``, with
+    a label-prefixed ``__name__`` and a bare ``_remote_name`` (ADR-0006)."""
     server = _mcp_server()
     tools = await server.start()
     try:
         by_name = {t.__name__: t for t in tools}
-        assert "add" in by_name
-        add = by_name["add"]
+        assert "test.add" in by_name
+        add = by_name["test.add"]
         assert isinstance(add, _MCPClientTool)
         assert isinstance(add, _HookableTool)
+        assert add.__name__ == "test.add"
+        assert add._remote_name == "add"  # bare server-side name for call_tool
         params = add.__cothis_schema__["function"]["parameters"]
-        assert add.__cothis_schema__["function"]["name"] == "add"
+        assert add.__cothis_schema__["function"]["name"] == "test.add"
         assert "a" in params["properties"]
         assert "b" in params["properties"]
     finally:
@@ -333,11 +441,34 @@ async def test_start_discovers_tools_with_schema() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_tool_call_uses_bare_remote_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``call_tool`` receives the bare ``_remote_name``, not the prefixed name."""
+    server = _mcp_server()
+    tools = {t.__name__: t for t in await server.start()}
+    add = tools["test.add"]
+    captured: dict[str, Any] = {}
+    orig_call = server._session.call_tool
+
+    async def spy_call(name: str, args: Any) -> Any:
+        captured["name"] = name
+        return await orig_call(name, args)
+
+    monkeypatch.setattr(server._session, "call_tool", spy_call)
+    try:
+        assert await add(a=2, b=3) == "5"
+    finally:
+        await server.aclose()
+    assert captured["name"] == "add"  # bare, not "test.add"
+
+
+@pytest.mark.asyncio
 async def test_call_returns_normalized_string() -> None:
     server = _mcp_server()
     tools = {t.__name__: t for t in await server.start()}
     try:
-        assert await tools["add"](a=3, b=4) == "7"
+        assert await tools["test.add"](a=3, b=4) == "7"
     finally:
         await server.aclose()
 
@@ -348,7 +479,7 @@ async def test_call_error_prefixed() -> None:
     server = _mcp_server()
     tools = {t.__name__: t for t in await server.start()}
     try:
-        result = await tools["boom"]()
+        result = await tools["test.boom"]()
         assert result.startswith("Error:")
         assert "kaboom" in result
     finally:
@@ -365,12 +496,12 @@ async def test_session_persistent_no_reconnect() -> None:
         connect_calls.append(1)
         return create_connected_server_and_client_session(server_obj)
 
-    server = _MCPServer(name="t", connect=connect)
+    server = _MCPServer(name="mcp:t", connect=connect)
     tools = {t.__name__: t for t in await server.start()}
     try:
         first_session = server._session
-        assert await tools["add"](a=1, b=1) == "2"
-        assert await tools["add"](a=2, b=2) == "4"
+        assert await tools["t.add"](a=1, b=1) == "2"
+        assert await tools["t.add"](a=2, b=2) == "4"
         assert server._session is first_session
         assert len(connect_calls) == 1
     finally:
@@ -385,7 +516,7 @@ async def test_aclose_clears_session_and_tools_fail_after() -> None:
     assert server._session is None
     assert server._cm is None
     with pytest.raises(RuntimeError, match="session is not active"):
-        await tools["add"](a=1, b=1)
+        await tools["test.add"](a=1, b=1)
 
 
 @pytest.mark.asyncio
@@ -600,7 +731,7 @@ async def test_pre_and_after_execute_hooks_run() -> None:
     """pre_execute/after_execute pipelines wrap the async MCP call."""
     server = _mcp_server()
     tools = {t.__name__: t for t in await server.start()}
-    add = tools["add"]
+    add = tools["test.add"]
     seen: dict[str, bool] = {}
 
     @add.pre_execute()
@@ -628,7 +759,7 @@ async def test_pre_and_after_execute_hooks_run() -> None:
 async def test_on_error_hook_fires() -> None:
     server = _mcp_server()
     tools = {t.__name__: t for t in await server.start()}
-    add = tools["add"]
+    add = tools["test.add"]
     observed: list[tuple[str, str]] = []
 
     @add.on_error()
@@ -661,11 +792,11 @@ async def test_agent_separates_server_and_resolves_tools(
 
     await agent._ensure_mcp()
     try:
-        assert "add" in agent._tool_map
+        assert "test.add" in agent._tool_map
         schemas = agent._tool_schemas()
         assert schemas is not None
         names = [s["function"]["name"] for s in schemas]
-        assert "add" in names
+        assert "test.add" in names
     finally:
         await agent.aclose()
     assert server._session is None
@@ -680,7 +811,7 @@ async def test_agent_dispatches_mcp_tool_via_execute(
     agent = Agent(model="x", provider="openrouter", tools=[_mcp_server()])
     await agent._ensure_mcp()
     tc = SimpleNamespace(
-        id="c1", function=SimpleNamespace(name="add", arguments='{"a": 5, "b": 6}')
+        id="c1", function=SimpleNamespace(name="test.add", arguments='{"a": 5, "b": 6}')
     )
     try:
         assert await agent._execute(tc) == "11"
@@ -705,7 +836,7 @@ async def test_agent_mcp_failure_keeps_other_tools(
     await agent._ensure_mcp()
     try:
         assert "noop" in agent._tool_map
-        assert "add" not in agent._tool_map
+        assert "test.add" not in agent._tool_map
     finally:
         await agent.aclose()
 
@@ -750,24 +881,72 @@ async def test_agent_reconnects_after_aclose(monkeypatch: pytest.MonkeyPatch) ->
         return create_connected_server_and_client_session(server_obj)
 
     agent = Agent(
-        model="x", provider="openrouter", tools=[_MCPServer(name="t", connect=connect)]
+        model="x",
+        provider="openrouter",
+        tools=[_MCPServer(name="mcp:t", connect=connect)],
     )
     tc = SimpleNamespace(
-        id="c1", function=SimpleNamespace(name="add", arguments='{"a": 1, "b": 2}')
+        id="c1", function=SimpleNamespace(name="t.add", arguments='{"a": 1, "b": 2}')
     )
 
     await agent._ensure_mcp()
     assert await agent._execute(tc) == "3"
     await agent.aclose()
     # State is reset: no stale MCP tools, guard re-armed.
-    assert "add" not in agent._tool_map
+    assert "t.add" not in agent._tool_map
     assert agent._mcp_started is False
 
     # Second cycle reconnects and works again.
     await agent._ensure_mcp()
     try:
-        assert "add" in agent._tool_map
+        assert "t.add" in agent._tool_map
         assert await agent._execute(tc) == "3"
         assert len(connect_calls) == 2
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_same_server_duplicate_tool_names_first_wins(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same-remote-name duplicates from one server: first-write-wins + ERROR."""
+    _mock_llm(monkeypatch)
+
+    # Build a server that lists two tools both named "dup".
+    from mcp.server.fastmcp import FastMCP
+
+    dup_server = FastMCP("dup-server")
+
+    @dup_server.tool()
+    def dup() -> str:
+        """First definition."""
+        return "first"
+
+    # Inject a second tool of the same name by patching start to return a
+    # duplicate of the first tool (same prefixed name).
+    agent = Agent(
+        model="x",
+        provider="openrouter",
+        tools=[_MCPServer(name="mcp:dup", connect=_in_memory(dup_server))],
+    )
+
+    orig_start = type(agent._mcp_servers[0]).start
+
+    async def patched_start(self: Any) -> Any:
+        tools = await orig_start(self)
+        return tools + tools[:1]  # duplicate the first tool (same prefixed name)
+
+    monkeypatch.setattr(type(agent._mcp_servers[0]), "start", patched_start)
+
+    with caplog.at_level(logging.ERROR, logger="cothis.agent"):
+        await agent._ensure_mcp()
+    try:
+        # Only one "dup" tool registered (first-write-wins).
+        assert "dup.dup" in agent._tool_map
+        # The duplicate was logged at ERROR.
+        assert "already registered" in caplog.text
+        assert "dup.dup" in caplog.text
     finally:
         await agent.aclose()

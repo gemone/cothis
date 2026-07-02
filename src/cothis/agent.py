@@ -353,14 +353,15 @@ class Agent(BaseModel):
         self._mcp_started = True
         for server in self._mcp_servers:
             for mcp_tool in await server.start():
-                # cothis: ceiling — an MCP tool whose name collides with an
-                # already-registered tool silently overwrites it here. MCP
-                # tools resolve after ``_all_tools``' cross-layer merge, so
-                # they bypass the shadow-warning that YAML/Python tools get.
-                # (The server *handle* can't collide — its name is
-                # ``mcp:``-prefixed; only the tools it produces can.) Upgrade
-                # path: run MCP tool names through the same shadow detection
-                # as the other sources — issue #18 (MCP+shell integration).
+                # First-write-wins on the rare prefixed-name clash (ADR-0006).
+                if mcp_tool.__name__ in self._tool_map:
+                    logger.error(
+                        "MCP tool %r skipped: name already registered "
+                        "(server %r); keeping the existing tool",
+                        mcp_tool.__name__,
+                        server.__name__,
+                    )
+                    continue
                 self._tool_map[mcp_tool.__name__] = mcp_tool
 
     async def aclose(self) -> None:
