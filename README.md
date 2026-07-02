@@ -102,7 +102,9 @@ the full list of flags.
 ## Custom tools
 
 cothis discovers shell tools as YAML files under `.agents/tools/` (relative
-to the current working directory). Each file declares a `name`, a
+to the current working directory) or under `$COTHIS_HOME/tools/` (default
+`~/.cothis/tools/`, overridable via the `COTHIS_HOME` environment variable)
+for tools shared across all projects. Each file declares a `name`, a
 `description` (shown to the LLM), and a `command:`. Two execution modes,
 driven by the type of `command:`:
 

@@ -49,10 +49,16 @@ DEFAULT_SYSTEM_PROMPT = (
 _debug = False
 
 # Discovery paths (see CONTEXT.md "Discovery path"). Project-local is
-# cwd-relative; user-global is the XDG-style config directory. Both are
-# optional — ``_all_tools`` handles missing dirs without error.
+# cwd-relative; user-global lives under the cothis home directory
+# (``$COTHIS_HOME`` or ``~/.cothis``). Both are optional — ``_all_tools``
+# handles missing dirs without error.
 _PROJECT_TOOLS_DIR = Path(".agents/tools")
-_USER_TOOLS_DIR = Path.home() / ".config" / "cothis" / "tools"
+# Empty/unset ``COTHIS_HOME`` → default ``~/.cothis``. ``expanduser`` so
+# ``COTHIS_HOME=~/my-cothis`` works (``Path`` doesn't expand ``~`` itself).
+_COTHIS_HOME = Path(
+    os.environ.get("COTHIS_HOME") or Path.home() / ".cothis"
+).expanduser()
+_USER_TOOLS_DIR = _COTHIS_HOME / "tools"
 
 
 def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:

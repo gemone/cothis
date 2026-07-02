@@ -2,7 +2,8 @@
 
 Tools are discovered from three **layers** in ascending precedence:
 **builtins** (`TOOLS`, compiled in) < **user-global**
-(`~/.config/cothis/tools/`) < **project-local** (`.agents/tools/`). A
+(`$COTHIS_HOME/tools/`, default `~/.cothis/tools/`) < **project-local**
+(`.agents/tools/`). A
 name conflict across layers is resolved by **shadowing** — the higher
 precedence layer wins, the lower is dropped. The shadowed tool's load
 hooks never fire; the winner's load hooks fire after merge; if the
@@ -84,4 +85,4 @@ restored. Shadowing is a replacement, not a try.
   (pure function of inputs); cli.py supplies the literal paths. No
   upward directory search for a project root — discovery is
   cwd-relative (`.agents/tools/`) plus the fixed user-global path
-  (`~/.config/cothis/tools/`).
+  (`$COTHIS_HOME/tools/`, default `~/.cothis/tools/`).
