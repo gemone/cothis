@@ -115,13 +115,16 @@ travels alongside for failure logs.
 _Avoid_: protocol (that's MCP itself), connection (too vague), channel.
 
 **MCP tool**:
-A single remote tool produced by an MCP server — the `_MCPClientTool`. One
-per entry returned by `tools/list`. Carries a pre-built `__cothis_schema__`
-from the server's `inputSchema` (already OpenAI-compatible JSON Schema).
-Dispatch is async: `__call__` awaits `session.call_tool` on the shared
-server session and normalises the `CallToolResult` to a string (text
-blocks joined; empty → `"(no output)"`; errors → `"Error: "` prefix).
-_Avoid_: MCP server (that's the `_MCPServer` producer), remote function.
+A single remote tool produced by an MCP server — the `_MCPClientTool`. Its
+`__name__` is **prefixed** with its server's label: `mcp:context7` producing a
+remote `query-docs` registers as `context7.query-docs`. The bare remote name
+lives on as `_remote_name` and is what's sent back to the server in
+`call_tool`. Dispatch is async: `__call__` awaits `session.call_tool` on the
+shared server session and normalises the result to a string (text blocks
+joined; empty → `"(no output)"`; errors → `"Error: "` prefix). See ADR-0006
+for the prefix scheme's collision properties.
+_Avoid_: MCP server (that's the `_MCPServer` producer), remote function,
+namespace (implies a hierarchy cothis doesn't have).
 
 **YAMLTool**:
 A tool produced from a YAML declaration under `.agents/tools/`. The
@@ -173,7 +176,9 @@ the tool is not registered — the model never sees a tool it cannot
 dispatch on this host. The skip is observable: a `WARNING` is logged
 naming the tool and the missing executable (every load/dispatch decision
 is visible by default — see Tool lifecycle). Resolution is via
-`shutil.which`.
+`shutil.which`. **MCP stdio servers** get the same WARNING but are *not*
+skipped — they may still launch (full path, runtime PATH) and the
+connect-failure path degrades gracefully.
 _Avoid_: filter, guard, condition.
 
 **Discovery path**:

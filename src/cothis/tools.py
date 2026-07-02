@@ -16,7 +16,15 @@ import typing
 import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    NoReturn,
+    Protocol,
+    cast,
+    overload,
+    runtime_checkable,
+)
 
 import griffe
 import pathspec
@@ -794,13 +802,14 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     Routes on ``type:``. A declaration with ``type: mcp.stdio`` (or
     ``type: mcp.http``) is an MCP server (an ``_MCPServer`` handle producing
     many tools at Agent startup, not one shell tool) — see
-    ``_build_mcp_stdio_server`` / ``_build_mcp_http_server`` and ADR-0005. Any
-    other declaration (``type:`` absent) is a shell-template tool: compile,
-    gate the executable via ``shutil.which``, wrap in ``_ShellTool``. If the
-    executable is not on PATH the tool is not registered — the model never
-    sees a tool it cannot dispatch on this host. The skip is logged at
-    ``WARNING`` (every startup decision is observable by default — see
-    CONTEXT.md "Tool lifecycle").
+    ``_build_mcp_stdio_server`` / ``_build_mcp_http_server`` and ADR-0005. An
+    unknown ``type:`` value raises ``ValueError`` naming the file + value +
+    valid options (story 30). A declaration with ``type:`` absent is a
+    shell-template tool: compile, gate the executable via ``shutil.which``,
+    wrap in ``_ShellTool``. If the executable is not on PATH the tool is not
+    registered — the model never sees a tool it cannot dispatch on this host.
+    The skip is logged at ``WARNING`` (every startup decision is observable
+    by default — see CONTEXT.md "Tool lifecycle").
 
     See ``_compile`` for the shell-YAML shape and ``CommandBlock`` for the
     contract. ``preview`` shares the same compile path, so the two cannot
@@ -816,6 +825,14 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
         return [_build_mcp_stdio_server(spec, source)]
     if isinstance(spec, dict) and spec.get("type") == "mcp.http":
         return [_build_mcp_http_server(spec, source)]
+    # Unknown ``type:`` value → actionable error (story 30).
+    if isinstance(spec, dict) and "type" in spec:
+        where = f" in {source}" if source else ""
+        msg = (
+            f"unknown tool type {spec['type']!r}{where}; "
+            f"valid: 'mcp.stdio', 'mcp.http', or omit 'type:' for a shell tool"
+        )
+        raise ValueError(msg)
     block = _compile(yaml_text, source=source)
     exe = _resolve_executable(block.gate_target)
     if exe is None:
@@ -929,8 +946,6 @@ def _compile(
     the field, and ``source``). Emits ``UserWarning`` for declared-but-
     unreferenced args (``preview`` suppresses; ``load_yaml_tools`` surfaces).
     """
-    import warnings
-
     spec = yaml.safe_load(yaml_text)
     _check_unknown_keys(spec, _TOOL_KEYS, source, what="YAML tool")
     name = str(_require(spec, "name", source))
@@ -1337,13 +1352,11 @@ class _MCPClientTool(_HookableTool):
     by ``tools/list``. Inherits ``_HookableTool`` so ``_execute`` runs its
     hook chains uniformly with every other tool (CONTEXT.md "no per-source
     branching in ``_execute``"). Carries a pre-built ``__cothis_schema__``
-    from the server's ``inputSchema`` (already OpenAI-compatible JSON Schema),
-    so the rich per-parameter descriptions reach the model unchanged.
+    from the server's ``inputSchema`` (already OpenAI-compatible JSON Schema).
 
-    ``__call__`` is ``async`` (ADR-0004): it awaits ``session.call_tool`` and
-    normalizes the result. The session lives on the shared ``_MCPServer``
-    (``_server._session``), set once at Agent startup and reused across every
-    call (persistent session — ADR-0005).
+    Two names (ADR-0006): ``__name__`` is ``{label}.{remote}`` (e.g.
+    ``context7.query-docs``) everywhere cothis-side; ``_remote_name`` is the
+    bare name sent to the server in ``call_tool``.
     """
 
     __name__: str
@@ -1353,17 +1366,19 @@ class _MCPClientTool(_HookableTool):
     def __init__(
         self,
         server: _MCPServer,
-        name: str,
+        label: str,
+        remote_name: str,
         description: str,
         input_schema: dict[str, Any] | None,
     ) -> None:
         super().__init__()
-        self.__name__ = name
-        self.__doc__ = description or f"MCP tool: {name}"
+        self._remote_name = remote_name
+        self.__name__ = f"{label}.{remote_name}"
+        self.__doc__ = description or f"MCP tool: {self.__name__}"
         self.__cothis_schema__ = {
             "type": "function",
             "function": {
-                "name": name,
+                "name": self.__name__,
                 "description": self.__doc__,
                 # ``inputSchema`` from the MCP server is already an OpenAI-
                 # compatible JSON Schema object; pass it straight through.
@@ -1382,7 +1397,7 @@ class _MCPClientTool(_HookableTool):
             raise RuntimeError(
                 f"MCP tool {self.__name__!r}: server session is not active"
             )
-        result = await session.call_tool(self.__name__, kwargs)
+        result = await session.call_tool(self._remote_name, kwargs)
         return _normalize_mcp_result(result)
 
 
@@ -1478,7 +1493,7 @@ class _MCPServer(_HookableTool):
         self._cm: Any = None
         self._session: Any = None
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: Any, **kwargs: Any) -> NoReturn:
         # Satisfies the ``Tool`` protocol structurally but must never be
         # dispatched: the Agent filters ``_MCPServer`` out of ``_tool_map``
         # and only registers the ``_MCPClientTool`` instances it produces.
@@ -1547,9 +1562,14 @@ class _MCPServer(_HookableTool):
             self._session = None
             return []
         self._cm = cm
+        label = self.__name__.removeprefix("mcp:")  # → tool-name prefix (ADR-0006)
         return [
             _MCPClientTool(
-                self, remote.name, remote.description or "", remote.inputSchema
+                self,
+                label,
+                remote.name,
+                remote.description or "",
+                remote.inputSchema,
             )
             for remote in listed.tools
         ]
@@ -1574,17 +1594,14 @@ def _make_mcp_server(
     diagnostic: str,
     source: str | None,
 ) -> _MCPServer:
-    """Wrap a transport factory in a named ``_MCPServer`` handle.
-
-    Shared by the stdio and http builders — only ``open_transport`` and
-    ``diagnostic`` differ between them.
-    """
-    # Prefix the handle name with ``mcp:`` so a server label can never collide
-    # with a real tool name in the discovery registry (``_all_tools``). The
-    # colon is not a valid character in a dotted tool name, so a server handle
-    # can't shadow — or be shadowed by — a dispatchable tool. Purely a
-    # diagnostic label (the server is never dispatched); the tools it produces
-    # keep their own bare names.
+    """Label guard + ``mcp:`` handle prefix for stdio/http builders (ADR-0006)."""
+    where = f" in {source}" if source else ""
+    if not label:
+        msg = f"MCP server label is empty{where}; set a non-empty 'name:'"
+        raise ValueError(msg)
+    if ":" in label:
+        msg = f"MCP server label {label!r} contains ':'{where}"
+        raise ValueError(msg)
     server = _MCPServer(
         name=f"mcp:{label}", open_transport=open_transport, diagnostic=diagnostic
     )
@@ -1616,8 +1633,25 @@ def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> _MCPSer
     if not isinstance(raw_env, dict):
         msg = f"MCP stdio tool: 'env' must be a mapping{where}"
         raise ValueError(msg)
-    env = {str(k): str(v) for k, v in raw_env.items()}
+    env: dict[str, str] = {}
+    for k, v in raw_env.items():
+        if not isinstance(v, str):
+            msg = (
+                f"MCP stdio tool: 'env.{k}' must be a string{where}, "
+                f"got {type(v).__name__}"
+            )
+            raise ValueError(msg)
+        env[str(k)] = v
     label = str(spec.get("name") or (Path(source).stem if source else "mcp"))
+    # cothis: warn-don't-skip — server may launch via full path; connect-failure degrades (ADR-0005).
+    if _resolve_executable(command) is None:
+        logger.warning(
+            "MCP stdio server %r: command %r not on PATH%s; "
+            "will attempt to launch at run time",
+            f"mcp:{label}",
+            command,
+            where,
+        )
     params = StdioServerParameters(command=command, args=args, env=env or None)
 
     @asynccontextmanager
@@ -1714,8 +1748,6 @@ def preview(
     Validation is shared with ``load_yaml_tools`` via ``_compile`` — the
     two paths cannot drift. Raises ``ValueError`` on malformed YAML.
     """
-    import warnings
-
     warnings.filterwarnings("ignore", category=UserWarning)
     block = _compile(yaml_text, source=source, platform=_platform)
     return block.render(**kwargs), block.shell
