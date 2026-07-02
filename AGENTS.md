@@ -13,7 +13,7 @@ Before writing any code, stop at the first rung that holds:
 
 Rules:
 
-- No abstraction that wasn't requested. The four-file layout (`agent.py`, `cli.py`, `tools.py`, `__init__.py`) is the intended shape — resist splitting it further unless a file is clearly doing two jobs.
+- No abstraction that wasn't requested. The package layout (`agent.py`, `cli.py`, `tools/`, `__init__.py`) is the intended shape — resist splitting it further unless a file is clearly doing two jobs. `tools/` is a package because `tools.py` outgrew one file (it was doing five+ jobs); its submodules (`_core.py`, `mcp.py`, `format.py`) are the result of that split, not an invitation to add more.
 - No new dependency if it can be avoided. `pyproject.toml` is lean on purpose.
 - No boilerplate nobody asked for. No config layers, no plugin systems, no settings pydantic-model wrapping what env vars already do.
 - Deletion over addition. Boring over clever. Fewest files possible.

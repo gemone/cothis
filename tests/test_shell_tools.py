@@ -28,14 +28,16 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from cothis.tools import (
+    load_tools_from_layer,
+    load_yaml_tools,
+    preview,
+)
+from cothis.tools.core import (
     _all_placeholders,
     _current_platform,
     _extract_field_names,
     _merge_arg_specs,
     _ShellTool,
-    load_tools_from_layer,
-    load_yaml_tools,
-    preview,
 )
 
 if TYPE_CHECKING:
@@ -272,7 +274,7 @@ def test_platform_overrides_command_for_current(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The current platform's branch overrides the top-level command."""
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.core._current_platform", lambda: "linux")
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
 name: t
@@ -297,16 +299,16 @@ platforms:
   unix:
     command: ["echo", "from-unix"]
 """
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.core._current_platform", lambda: "linux")
     assert load_yaml_tools(yaml_text)[0]() == "from-unix\n"
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "macos")
+    monkeypatch.setattr("cothis.tools.core._current_platform", lambda: "macos")
     assert load_yaml_tools(yaml_text)[0]() == "from-unix\n"
 
 
 def test_exact_platform_wins_over_unix(monkeypatch: pytest.MonkeyPatch) -> None:
     """An exact key (``linux:``) takes precedence over the ``unix:`` fallback."""
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.core._current_platform", lambda: "linux")
     yaml_text = """
 name: t
 command: ["echo", "default"]
@@ -324,7 +326,7 @@ def test_platform_inherits_top_level_command_when_omitted(
 ) -> None:
     """A platform entry without ``command:`` inherits the top-level command."""
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.core._current_platform", lambda: "linux")
     yaml_text = """
 name: t
 command: ["echo", "inherited"]
@@ -438,7 +440,7 @@ def test_per_platform_args_merge_override_same_named(
     Point 1 (ii): branch ``args`` is an override, not a replacement. Same-named
     args take the branch's definition; other top-level args are inherited.
     """
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.core._current_platform", lambda: "linux")
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
 name: t

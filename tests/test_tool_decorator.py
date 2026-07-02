@@ -27,7 +27,8 @@ from typing import Any
 
 import pytest
 
-from cothis.tools import Tool, ToolDef, _parse_docstring, tool
+from cothis.tools import Tool, ToolDef, tool
+from cothis.tools.core import _parse_docstring
 
 
 def test_summary_from_first_paragraph() -> None:
@@ -308,14 +309,14 @@ def test_load_gitignore_returns_none_when_absent(tmp_path: Any) -> None:
     nothing, but returning a real object when None is documented would
     mislead callers into thinking they have patterns to apply.
     """
-    from cothis.tools import _load_gitignore
+    from cothis.tools.builtins import _load_gitignore
 
     assert _load_gitignore(tmp_path) is None
 
 
 def test_load_gitignore_parses_patterns(tmp_path: Any) -> None:
     """ " "``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
-    from cothis.tools import _load_gitignore
+    from cothis.tools.builtins import _load_gitignore
 
     (tmp_path / ".gitignore").write_text("*.log\nbuild/\n")
     spec = _load_gitignore(tmp_path)
@@ -349,7 +350,7 @@ def test_dir_returns_structured_entries(tmp_path: Any) -> None:
     Structured output lets ``_execute`` serialise it as JSON (the model-native
     shape) instead of a bespoke text format the model has to parse.
     """
-    from cothis.tools import _list_dir
+    from cothis.tools.builtins import _list_dir
 
     (tmp_path / "src").mkdir()
     (tmp_path / "README.md").write_text("hi")
@@ -365,7 +366,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
     Error paths stay as strings (not structured) — ``_execute`` passes them
     through unchanged so the model sees an actionable message.
     """
-    from cothis.tools import _list_dir
+    from cothis.tools.builtins import _list_dir
 
     result = _list_dir(path=str(tmp_path / "nonexistent"))
     assert isinstance(result, str)
@@ -374,7 +375,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
     """ " "Recursive listing yields entries with nested relative paths."""
-    from cothis.tools import _list_dir
+    from cothis.tools.builtins import _list_dir
 
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "mod.py").write_text("")
@@ -391,19 +392,19 @@ def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
 
 def test_format_default_is_json(monkeypatch: Any) -> None:
     """ " "Without ``COTHIS_TOOL_OUTPUT_FORMAT``, structured output is JSON."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.delenv("COTHIS_TOOL_OUTPUT_FORMAT", raising=False)
-    out = _format_tool_output([{"a": 1}])
+    out = format_tool_output([{"a": 1}])
     assert out == '[{"a": 1}]'
 
 
 def test_format_csv_table(monkeypatch: Any) -> None:
     """ "``list[dict]`` renders as a CSV table with header + rows."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
-    out = _format_tool_output(
+    out = format_tool_output(
         [{"name": "src", "type": "dir"}, {"name": "x", "type": "file"}]
     )
     lines = out.splitlines()
@@ -414,20 +415,20 @@ def test_format_csv_table(monkeypatch: Any) -> None:
 
 def test_format_tsv_uses_tab_delimiter(monkeypatch: Any) -> None:
     """ "``tsv`` is the same as csv but with tab separators."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "tsv")
-    out = _format_tool_output([{"a": "1", "b": "2"}])
+    out = format_tool_output([{"a": "1", "b": "2"}])
     assert "\t" in out
     assert out.splitlines()[0] == "a\tb"
 
 
 def test_format_csv_flattens_nested_dict(monkeypatch: Any) -> None:
     """ "``csv`` flattens nested dicts with dotted key paths."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
-    out = _format_tool_output({"name": "src", "meta": {"type": "dir", "size": 1024}})
+    out = format_tool_output({"name": "src", "meta": {"type": "dir", "size": 1024}})
     header = out.splitlines()[0]
     assert "meta.type" in header
     assert "meta.size" in header
@@ -436,10 +437,10 @@ def test_format_csv_flattens_nested_dict(monkeypatch: Any) -> None:
 
 def test_format_csv_bare_list_falls_back_to_json(monkeypatch: Any) -> None:
     """ "A bare list of scalars isn't tabular → CSV falls back to JSON."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
-    out = _format_tool_output(["a", "b", "c"])
+    out = format_tool_output(["a", "b", "c"])
     import json as _json
 
     assert _json.loads(out) == ["a", "b", "c"]
@@ -447,10 +448,10 @@ def test_format_csv_bare_list_falls_back_to_json(monkeypatch: Any) -> None:
 
 def test_format_yaml_handles_nested(monkeypatch: Any) -> None:
     """ "YAML renders nested structures natively (no flattening)."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "yaml")
-    out = _format_tool_output({"name": "src", "meta": {"type": "dir"}})
+    out = format_tool_output({"name": "src", "meta": {"type": "dir"}})
     assert "name: src" in out
     assert "meta:" in out
     assert "  type: dir" in out  # nested key is indented, not flattened
@@ -458,10 +459,10 @@ def test_format_yaml_handles_nested(monkeypatch: Any) -> None:
 
 def test_format_unknown_value_defaults_to_json(monkeypatch: Any) -> None:
     """ "An unrecognised ``COTHIS_TOOL_OUTPUT_FORMAT`` value falls back to JSON."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "xml")
-    out = _format_tool_output({"a": 1})
+    out = format_tool_output({"a": 1})
     import json as _json
 
     assert _json.loads(out) == {"a": 1}
@@ -586,7 +587,7 @@ def test_builtin_tools_are_tooldef_instances() -> None:
     Regression check: the migration from bare decorated functions to
     ``ToolDef`` must not break the built-in tools.
     """
-    from cothis.tools import _list_dir, read, write
+    from cothis.tools.builtins import _list_dir, read, write
 
     for t in (read, _list_dir, write):
         assert isinstance(t, ToolDef)

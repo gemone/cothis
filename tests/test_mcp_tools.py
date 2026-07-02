@@ -3,7 +3,7 @@
 Every test that needs a live session drives a real in-memory MCP server via
 the SDK's ``create_connected_server_and_client_session`` transport — no
 subprocess, no network, deterministic. The server is a ``FastMCP`` with a
-handful of tools; ``_MCPServer``'s ``connect`` seam swaps the production
+handful of tools; ``MCPServer``'s ``connect`` seam swaps the production
 stdio transport for this in-memory one, so the adapter code under test is
 exactly what production runs (only the transport differs).
 """
@@ -23,17 +23,18 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from cothis.agent import Agent
 from cothis.tools import (
-    _build_mcp_http_server,
-    _build_mcp_stdio_server,
-    _flatten_exc,
-    _HookableTool,
-    _MCPClientTool,
-    _MCPServer,
-    _normalize_mcp_result,
-    _ShellTool,
+    MCPClientTool,
+    MCPServer,
     load_tools_from_layer,
     load_yaml_tools,
     tool,
+)
+from cothis.tools.core import _HookableTool, _ShellTool
+from cothis.tools.mcp import (
+    _build_mcp_http_server,
+    _build_mcp_stdio_server,
+    _flatten_exc,
+    _normalize_mcp_result,
 )
 
 if TYPE_CHECKING:
@@ -65,11 +66,11 @@ def _in_memory(server: FastMCP) -> Callable[[], Any]:
     return lambda: create_connected_server_and_client_session(server)
 
 
-def _mcp_server(server: FastMCP | None = None) -> _MCPServer:
+def _mcp_server(server: FastMCP | None = None) -> MCPServer:
     # ``mcp:`` prefix matches production handles (``_make_mcp_server``);
     # ``start()`` strips it to get the label ``test``, so produced tools are
     # ``test.add`` / ``test.boom`` (ADR-0006 prefix).
-    return _MCPServer(name="mcp:test", connect=_in_memory(server or _make_server()))
+    return MCPServer(name="mcp:test", connect=_in_memory(server or _make_server()))
 
 
 class _FailingCM:
@@ -145,14 +146,14 @@ def _mock_llm(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_yaml_type_mcp_stdio_routes_to_server() -> None:
-    """``type: mcp.stdio`` produces an ``_MCPServer``, not a shell tool."""
+    """``type: mcp.stdio`` produces an ``MCPServer``, not a shell tool."""
     yaml_text = (
         "type: mcp.stdio\nname: browser\ncommand: uvx\nargs: [browser-use, --mcp]\n"
     )
     tools = load_yaml_tools(yaml_text, source="browser.yaml")
     assert len(tools) == 1
     server = tools[0]
-    assert isinstance(server, _MCPServer)
+    assert isinstance(server, MCPServer)
     assert not isinstance(server, _ShellTool)
     assert server.__name__ == "mcp:browser"
     # ``command``/``args`` are parsed into the safe (secret-free) diagnostic.
@@ -164,7 +165,7 @@ def test_yaml_mcp_env_absent_from_diagnostic() -> None:
     """``env:`` is parsed but kept out of the loggable diagnostic (story 32)."""
     yaml_text = "type: mcp.stdio\ncommand: srv\nenv:\n  API_KEY: s3cr3t\n"
     server = load_yaml_tools(yaml_text)[0]
-    assert isinstance(server, _MCPServer)
+    assert isinstance(server, MCPServer)
     assert "s3cr3t" not in server._diagnostic
     assert "API_KEY" not in server._diagnostic
 
@@ -220,7 +221,7 @@ def test_yaml_mcp_stdio_warns_when_command_not_on_path(
         server = load_yaml_tools(
             "type: mcp.stdio\nname: ghost\ncommand: definitely-not-on-path-xyz\n"
         )[0]
-    assert isinstance(server, _MCPServer)
+    assert isinstance(server, MCPServer)
     assert "definitely-not-on-path-xyz" in caplog.text
     assert "not on PATH" in caplog.text
 
@@ -256,13 +257,13 @@ def test_yaml_mcp_label_with_colon_rejected(yaml_text: str) -> None:
 
 
 def test_yaml_type_mcp_http_routes_to_server() -> None:
-    """``type: mcp.http`` produces an ``_MCPServer`` (reusing the stdio path),
+    """``type: mcp.http`` produces an ``MCPServer`` (reusing the stdio path),
     not a shell tool."""
     yaml_text = "type: mcp.http\nname: remote\nurl: https://example.com/mcp\n"
     tools = load_yaml_tools(yaml_text, source="remote.yaml")
     assert len(tools) == 1
     server = tools[0]
-    assert isinstance(server, _MCPServer)
+    assert isinstance(server, MCPServer)
     assert not isinstance(server, _ShellTool)
     assert server.__name__ == "mcp:remote"
     # ``url`` is parsed into the safe diagnostic; ``headers`` never are.
@@ -282,7 +283,7 @@ def test_yaml_mcp_http_headers_absent_from_diagnostic() -> None:
         "type: mcp.http\nurl: https://x/mcp\nheaders:\n  Authorization: Bearer s3cr3t\n"
     )
     server = load_yaml_tools(yaml_text)[0]
-    assert isinstance(server, _MCPServer)
+    assert isinstance(server, MCPServer)
     assert "s3cr3t" not in server._diagnostic
     assert "Authorization" not in server._diagnostic
 
@@ -311,7 +312,7 @@ def test_http_url_scrubbed_in_diagnostic() -> None:
         "url: 'https://token:hunter2@host.example.com/mcp?api_key=leak'\n"
     )
     server = load_yaml_tools(yaml_text)[0]
-    assert isinstance(server, _MCPServer)
+    assert isinstance(server, MCPServer)
     # Userinfo and query are stripped — both can carry secrets.
     assert "token" not in server._diagnostic
     assert "hunter2" not in server._diagnostic
@@ -328,7 +329,7 @@ def test_http_url_ipv6_brackets_preserved_in_diagnostic() -> None:
     server = load_yaml_tools(
         "type: mcp.http\nurl: 'https://[::1]:8000/mcp?api_key=leak'\n"
     )[0]
-    assert isinstance(server, _MCPServer)
+    assert isinstance(server, MCPServer)
     assert "[::1]:8000" in server._diagnostic  # brackets + port preserved
     assert "leak" not in server._diagnostic
     assert "https://::1" not in server._diagnostic  # not the malformed form
@@ -373,11 +374,11 @@ def test_mixed_directory_loads_all_three_types(tmp_path: Any) -> None:
     # Shell tool is a dispatchable _ShellTool.
     assert "my.shell" in by_name
     assert isinstance(by_name["my.shell"], _ShellTool)
-    # Both MCP kinds are _MCPServer handles (mcp: prefixed, not yet connected).
+    # Both MCP kinds are MCPServer handles (mcp: prefixed, not yet connected).
     assert "mcp:local" in by_name
-    assert isinstance(by_name["mcp:local"], _MCPServer)
+    assert isinstance(by_name["mcp:local"], MCPServer)
     assert "mcp:remote" in by_name
-    assert isinstance(by_name["mcp:remote"], _MCPServer)
+    assert isinstance(by_name["mcp:remote"], MCPServer)
 
 
 # --- normalization (pure) ----------------------------------------------
@@ -428,7 +429,7 @@ async def test_start_discovers_tools_with_schema() -> None:
         by_name = {t.__name__: t for t in tools}
         assert "test.add" in by_name
         add = by_name["test.add"]
-        assert isinstance(add, _MCPClientTool)
+        assert isinstance(add, MCPClientTool)
         assert isinstance(add, _HookableTool)
         assert add.__name__ == "test.add"
         assert add._remote_name == "add"  # bare server-side name for call_tool
@@ -496,7 +497,7 @@ async def test_session_persistent_no_reconnect() -> None:
         connect_calls.append(1)
         return create_connected_server_and_client_session(server_obj)
 
-    server = _MCPServer(name="mcp:t", connect=connect)
+    server = MCPServer(name="mcp:t", connect=connect)
     tools = {t.__name__: t for t in await server.start()}
     try:
         first_session = server._session
@@ -831,7 +832,7 @@ async def test_agent_mcp_failure_keeps_other_tools(
         """Does nothing."""
         return "ok"
 
-    broken = _MCPServer(name="broken", connect=lambda: _FailingCM())
+    broken = MCPServer(name="broken", connect=lambda: _FailingCM())
     agent = Agent(model="x", provider="openrouter", tools=[noop, broken])
     await agent._ensure_mcp()
     try:
@@ -853,7 +854,7 @@ async def test_ensure_mcp_runs_once(monkeypatch: pytest.MonkeyPatch) -> None:
         return create_connected_server_and_client_session(server_obj)
 
     agent = Agent(
-        model="x", provider="openrouter", tools=[_MCPServer(name="t", connect=connect)]
+        model="x", provider="openrouter", tools=[MCPServer(name="t", connect=connect)]
     )
     await agent._ensure_mcp()
     await agent._ensure_mcp()
@@ -870,7 +871,7 @@ async def test_agent_reconnects_after_aclose(monkeypatch: pytest.MonkeyPatch) ->
 
     ``aclose`` must drop the resolved MCP tools and re-arm resolution so a
     later ``_ensure_mcp`` connects afresh — otherwise the stale
-    ``_MCPClientTool`` entries would fail with "session is not active".
+    ``MCPClientTool`` entries would fail with "session is not active".
     """
     _mock_llm(monkeypatch)
     server_obj = _make_server()
@@ -883,7 +884,7 @@ async def test_agent_reconnects_after_aclose(monkeypatch: pytest.MonkeyPatch) ->
     agent = Agent(
         model="x",
         provider="openrouter",
-        tools=[_MCPServer(name="mcp:t", connect=connect)],
+        tools=[MCPServer(name="mcp:t", connect=connect)],
     )
     tc = SimpleNamespace(
         id="c1", function=SimpleNamespace(name="t.add", arguments='{"a": 1, "b": 2}')
@@ -929,7 +930,7 @@ async def test_same_server_duplicate_tool_names_first_wins(
     agent = Agent(
         model="x",
         provider="openrouter",
-        tools=[_MCPServer(name="mcp:dup", connect=_in_memory(dup_server))],
+        tools=[MCPServer(name="mcp:dup", connect=_in_memory(dup_server))],
     )
 
     orig_start = type(agent._mcp_servers[0]).start

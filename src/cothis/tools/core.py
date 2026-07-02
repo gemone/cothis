@@ -1,39 +1,56 @@
-"""Built-in tools exposed to the cothis agent."""
+"""Built-in tools exposed to the cothis agent.
+
+The original ``tools.py`` was split into a ``tools/`` package; this module
+holds the bulk (``Tool`` protocol, ``@tool`` decorator, built-in fs tools,
+YAML shell-tool compiler, discovery). MCP servers live in ``tools.mcp`` and
+output formatting in ``tools.format``; ``tools/__init__.py`` re-exports the
+union so ``from cothis.tools import X`` is unchanged.
+"""
 
 from __future__ import annotations
 
-import csv
 import inspect
-import io
-import json
 import logging
-import os
 import shutil
 import string
 import subprocess
 import sys
 import typing
 import warnings
-from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
-    NoReturn,
     Protocol,
-    cast,
     overload,
     runtime_checkable,
 )
 
 import griffe
-import pathspec
 import yaml
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import Callable
+    from pathlib import Path
 
 logger = logging.getLogger("cothis.tools")
+
+# Re-export surface: every name the old flat ``tools.py`` exposed at module
+# level (public + underscore-private). ``tools/__init__.py`` does
+# ``from cothis.tools.core import *`` to lift these unchanged, so the
+# ``from cothis.tools import X`` contract holds.
+__all__ = [
+    "AfterExecuteError",
+    "CommandBlock",
+    "Tool",
+    "ToolDef",
+    "load_tools_from_layer",
+    "load_yaml_tools",
+    "logger",
+    "preview",
+    "run_hooks_safe",
+    "schema_for",
+    "tool",
+]
 
 
 @runtime_checkable
@@ -54,7 +71,7 @@ class Tool(Protocol):
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
-def _run_hooks_safe(tool: Any, method_name: str, *args: Any) -> Any:
+def run_hooks_safe(tool: Any, method_name: str, *args: Any) -> Any:
     """Call a ``_run_*`` hook method on ``tool`` if it exists; no-op if not.
 
     Real tools (``ToolDef``, ``_ShellTool``) inherit from ``_HookableTool``
@@ -194,7 +211,7 @@ def tool(
 _HOOK_STAGES = ("pre_load", "after_load", "pre_execute", "after_execute", "on_error")
 
 
-class _AfterExecuteError(Exception):
+class AfterExecuteError(Exception):
     """Sentinel raised by ``_run_after_execute`` when a callback crashes.
 
     Carries the original tool ``result`` so ``_execute`` can recover it
@@ -397,7 +414,7 @@ class _HookableTool:
         Exception → chain short-circuits, ``on_error`` fires
         (phase=``"after_execute"``), then the exception **re-raises** so
         ``_execute`` can log the skip and use the original result. The
-        re-raise carries a sentinel ``_AfterExecuteError`` wrapping the
+        re-raise carries a sentinel ``AfterExecuteError`` wrapping the
         original result, so ``_execute`` knows to use ``result`` (not the
         pipeline-so-far value) — a broken after_execute must not hide what
         the tool actually returned.
@@ -414,7 +431,7 @@ class _HookableTool:
                 # can recover it. The sentinel pattern avoids a second return
                 # channel — the exception IS the signal, the attribute IS the
                 # fallback value.
-                raise _AfterExecuteError(result) from exc
+                raise AfterExecuteError(result) from exc
         return current
 
 
@@ -545,216 +562,6 @@ def _build_schema(
     }
 
 
-@tool("fs.read")
-def read(
-    path: str,
-    start_line: int | None = None,
-    end_line: int | None = None,
-) -> str:
-    """Read the contents of a UTF-8 text file, optionally a line range.
-
-    Use this to inspect an existing file before reading or modifying it.
-    Without ``start_line`` / ``end_line``, returns the whole file. With
-    them, returns the slice (1-based, inclusive on both ends).
-
-    Output carries 1-based line numbers (right-aligned, tab-separated) so
-    the model can reference exact lines in follow-up calls (e.g. a
-    precise ``start_line`` / ``end_line`` for a large file).
-
-    Args:
-        path: Path to the file to read. Relative paths are resolved
-            against the current working directory.
-            eg. "src/main.py", "./README.md", "/etc/hostname".
-        start_line: 1-based line number to start reading from (inclusive).
-            Omit or pass null to read from the beginning of the file.
-            eg. 10, 1.
-        end_line: 1-based line number to stop reading at (inclusive).
-            Omit or pass null to read to the end of the file.
-            eg. 20, 100.
-
-    Returns:
-        The requested line range with 1-based line-number prefixes.
-    """
-    text = Path(path).read_text(encoding="utf-8")
-    lines = text.splitlines()
-    total = len(lines)
-    # 1-based, inclusive on both ends. ``None`` means "from start" / "to end".
-    # ``end_line`` beyond EOF is clamped (the model can't know the file length);
-    # ``start_line`` beyond EOF is an actionable error — returning "" would
-    # give the model nothing to act on (AGENTS.md: "error messages that the
-    # LLM can act on").
-    start = max(1, start_line or 1)
-    end = min(total, end_line or total)
-    if start > total:
-        return f"Error: start_line {start} is beyond EOF (file has {total} lines)"
-    width = len(str(end))
-    selected = [f"{i:>{width}}\t{lines[i - 1]}" for i in range(start, end + 1)]
-    return "\n".join(selected)
-
-
-# Directories ``fs.dir`` never descends into, even with ``all=True`` — they're
-# either huge (``.venv``, ``node_modules``), not source (``.git``), or build
-# artifacts (``__pycache__``). Hardcoded, not configurable: every entry here
-# is a directory whose contents would never help the
-# model understand a project. Listed as a module constant so future noise
-# sources are added in one place.
-_IGNORED_DIRS = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        ".venv",
-        "venv",
-        "env",
-        "__pycache__",
-        ".mypy_cache",
-        ".ruff_cache",
-        ".pytest_cache",
-        "node_modules",
-        ".next",
-        "dist",
-        "build",
-        "target",
-        ".DS_Store",
-    }
-)
-# Cap on entries ``fs.dir(recursive=True)`` returns. A recursive listing is
-# meant for "show me the project shape", not "dump 50k site-packages files";
-# a sane project fits well under this. Over-cap → truncate with a count.
-_MAX_DIR_ENTRIES = 500
-
-
-def _load_gitignore(root: Path) -> pathspec.PathSpec | None:
-    """Load ``.gitignore`` patterns from ``root`` (the directory being listed).
-
-    Returns a ``PathSpec`` for matching, or ``None`` if ``root`` has no
-    ``.gitignore`` (so callers skip the matching pass entirely). Patterns
-    are resolved relative to ``root`` — this is the simplest correct scope:
-    it doesn't walk up the directory tree (cothis: YAGNI; the common case is
-    a single ``.gitignore`` at the project root the user cd'd into).
-    """
-    ignore_file = root / ".gitignore"
-    if not ignore_file.is_file():
-        return None
-    return pathspec.PathSpec.from_lines(
-        "gitignore", ignore_file.read_text().splitlines()
-    )
-
-
-@tool("fs.dir")
-def _list_dir(
-    path: str, recursive: bool = False, all: bool = False
-) -> list[dict[str, str]] | dict[str, Any] | str:
-    """List the contents of a directory.
-
-    Use this to discover the structure of a project before reading specific
-    files. Returns a list of entries, each with a ``name`` (path relative to
-    ``path``) and ``type`` (``"dir"`` or ``"file"``). Without ``recursive``,
-    lists one level; with ``recursive=True``, walks the whole subtree.
-
-    By default, follows the same hygiene rules ``git status`` does:
-    paths matched by the directory's ``.gitignore`` are excluded, and
-    dotfiles/dot-directories (``.env``, ``.config``, …) are hidden. Pass
-    ``all=True`` to override both — useful when the model needs to inspect
-    configuration that lives in dotfiles. Hardcoded noise directories
-    (``.git``, ``.venv``, ``__pycache__``, ``node_modules``, …) are always
-    excluded regardless of ``all``; their contents never help the model.
-
-    Recursive listings are capped at 500 entries; over-cap listings include
-    a ``truncated`` count so the model knows to narrow its path.
-
-    Args:
-        path: Path to the directory to list. Relative paths are resolved
-            against the current working directory.
-            eg. ".", "src", "./.agents/tools".
-        recursive: If true, list entries recursively (the full subtree).
-            Omit or pass false for a single-level listing.
-        all: If true, include dotfiles and gitignore-excluded entries
-            (hardcoded noise dirs are still skipped). Omit or pass false
-            for the default git-hygienic listing.
-
-    Returns:
-        A list of ``{"name": <rel-path>, "type": "dir"|"file"}`` entries,
-        or an ``"Error: ..."`` string if ``path`` doesn't exist or isn't a
-        directory. Over-cap recursive listings come back as
-        ``{"entries": [...], "truncated": <count>}``.
-    """
-    root = Path(path)
-    if not root.exists():
-        return f"Error: no such directory: {path}"
-    if not root.is_dir():
-        return f"Error: not a directory: {path}"
-
-    gitignore = None if all else _load_gitignore(root)
-
-    def _is_excluded(p: Path) -> bool:
-        """True if ``p`` should be omitted from the listing."""
-        rel = p.relative_to(root)
-        rel_str = rel.as_posix()
-        # Hardcoded noise: always excluded, even with ``all=True``.
-        if any(part in _IGNORED_DIRS for part in rel.parts):
-            return True
-        if all:
-            return False
-        # Dotfiles / dot-directories: hidden by default ("." prefix on any
-        # path component, not just the leaf — so ``.config/foo`` is hidden too).
-        if any(part.startswith(".") for part in rel.parts):
-            return True
-        # ``.gitignore`` patterns.
-        if gitignore is not None and gitignore.match_file(rel_str):
-            return True
-        return False
-
-    if recursive:
-        all_paths = sorted(
-            (p for p in root.rglob("*") if not _is_excluded(p)),
-            key=lambda p: str(p.relative_to(root)),
-        )
-    else:
-        all_paths = sorted(
-            (p for p in root.iterdir() if not _is_excluded(p)),
-            key=lambda p: p.name,
-        )
-
-    truncated_count = len(all_paths) - _MAX_DIR_ENTRIES
-    paths = all_paths[:_MAX_DIR_ENTRIES]
-    entries = [
-        {
-            "name": p.relative_to(root).as_posix(),
-            "type": "dir" if p.is_dir() else "file",
-        }
-        for p in paths
-    ]
-    if truncated_count > 0:
-        return {"entries": entries, "truncated": truncated_count}
-    return entries
-
-
-@tool("fs.write")
-def write(path: str, content: str) -> str:
-    """Write text to a file on the filesystem, creating it if needed.
-
-    Parent directories are created automatically. Existing files are
-    overwritten.
-
-    Args:
-        path: Path to the file to write.
-            eg. "notes.txt", "src/generated.py", "./output/result.json".
-        content: The text to write to the file.
-            eg. "hello world", a full source file's text.
-
-    Returns:
-        A short confirmation with the number of characters written.
-    """
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return f"Wrote {len(content)} characters to {path}"
-
-
-TOOLS: list[Tool] = [read, _list_dir, write]
-
-
 # ====================================================================
 # YAML tool loading
 #
@@ -815,6 +622,12 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     contract. ``preview`` shares the same compile path, so the two cannot
     drift on what a valid YAMLTool is.
     """
+    # Lazy import breaks a module-init cycle: ``mcp`` imports ``_HookableTool``
+    # from ``_core`` at module level, so a top-level ``_core`` → ``mcp`` import
+    # would be circular. ``load_yaml_tools`` is the sole call site, so a
+    # function-local import keeps the cycle out of import time.
+    from cothis.tools.mcp import _build_mcp_http_server, _build_mcp_stdio_server
+
     # Peek at ``type:`` before ``_compile`` (which is shell-only and would
     # reject the MCP-specific keys). MCP tools carry a different schema (the
     # transport config — ``command``/``args``/``env`` for stdio, ``url``/
@@ -1301,430 +1114,6 @@ class _ShellTool(_HookableTool):
         return proc.stdout
 
 
-# Known keys on a ``type: mcp.stdio`` declaration. ``command`` is the server
-# executable (a string), ``args`` its CLI arguments (a list), ``env`` the
-# subprocess environment (a mapping). Disjoint from the shell-tool schema
-# (``_TOOL_KEYS``) — MCP is a different ``type:``, routed before ``_compile``.
-_MCP_STDIO_KEYS = {"type", "name", "description", "command", "args", "env"}
-
-# Known keys on a ``type: mcp.http`` declaration. ``url`` is the remote server
-# endpoint (a string), ``headers`` the HTTP headers sent on every request (a
-# mapping — may carry secrets like ``Authorization``, so never logged).
-_MCP_HTTP_KEYS = {"type", "name", "description", "url", "headers"}
-
-
-def _normalize_mcp_result(result: Any) -> str:
-    """Flatten an MCP ``CallToolResult`` into a single string for the LLM.
-
-    Rules (issue #16, story 31):
-    - Join every content block's ``.text`` with newlines.
-    - Empty content list → ``"(no output)"`` (the tool ran but said nothing).
-    - ``isError`` true → prefix ``"Error: "`` so the model sees it as a
-      failure it can act on, not a normal result.
-
-    Non-text content blocks (images, embedded resources) are skipped — cothis
-    surfaces text to the model today.
-    cothis: ceiling — image/resource blocks are dropped, not base64-inlined,
-    so ``"(no output)"`` covers *two* cases the spec names as one: a truly
-    empty content list, AND a non-empty list that carries only non-text
-    blocks (both look like "nothing to say" to a text-only agent). Upgrade
-    path: map non-text blocks into the message content array once the agent
-    loop carries multimodal tool results — then the two cases diverge and
-    text-less-but-non-empty results stop collapsing to ``"(no output)"``.
-    """
-    parts = [
-        block.text
-        for block in result.content
-        if getattr(block, "text", None) is not None
-    ]
-    body = "\n".join(parts) if parts else "(no output)"
-    # ``isError`` is camelCase on the MCP pydantic model (verified against
-    # mcp 1.28.1 — ``CallToolResult`` fields: content/structuredContent/isError).
-    if result.isError:
-        return f"Error: {body}"
-    return body
-
-
-class _MCPClientTool(_HookableTool):
-    """A single remote MCP tool, dispatched over a shared server session.
-
-    Produced by ``_MCPServer.start`` — one instance per remote tool returned
-    by ``tools/list``. Inherits ``_HookableTool`` so ``_execute`` runs its
-    hook chains uniformly with every other tool (CONTEXT.md "no per-source
-    branching in ``_execute``"). Carries a pre-built ``__cothis_schema__``
-    from the server's ``inputSchema`` (already OpenAI-compatible JSON Schema).
-
-    Two names (ADR-0006): ``__name__`` is ``{label}.{remote}`` (e.g.
-    ``context7.query-docs``) everywhere cothis-side; ``_remote_name`` is the
-    bare name sent to the server in ``call_tool``.
-    """
-
-    __name__: str
-    __doc__: str
-    __cothis_schema__: dict[str, Any]
-
-    def __init__(
-        self,
-        server: _MCPServer,
-        label: str,
-        remote_name: str,
-        description: str,
-        input_schema: dict[str, Any] | None,
-    ) -> None:
-        super().__init__()
-        self._remote_name = remote_name
-        self.__name__ = f"{label}.{remote_name}"
-        self.__doc__ = description or f"MCP tool: {self.__name__}"
-        self.__cothis_schema__ = {
-            "type": "function",
-            "function": {
-                "name": self.__name__,
-                "description": self.__doc__,
-                # ``inputSchema`` from the MCP server is already an OpenAI-
-                # compatible JSON Schema object; pass it straight through.
-                "parameters": input_schema or {"type": "object", "properties": {}},
-            },
-        }
-        self._server = server
-        # Diagnostics parity with YAML/Python tools (``_all_tools`` reads it).
-        self._source = server._source
-
-    async def __call__(self, **kwargs: Any) -> str:
-        session = self._server._session
-        if session is None:
-            # The server failed to start (its tools shouldn't have been
-            # registered) or was closed. Surface as an error the model sees.
-            raise RuntimeError(
-                f"MCP tool {self.__name__!r}: server session is not active"
-            )
-        result = await session.call_tool(self._remote_name, kwargs)
-        return _normalize_mcp_result(result)
-
-
-def _flatten_exc(exc: BaseException) -> str:
-    """Describe an exception, unwrapping ``ExceptionGroup``s to the real cause.
-
-    anyio runs the MCP transport inside a task group, so a connection/protocol
-    failure surfaces as an ``ExceptionGroup`` whose own message — ``"unhandled
-    errors in a TaskGroup (1 sub-exception)"`` — hides what actually went
-    wrong. Recurse into ``.exceptions`` and join the leaf messages so the
-    startup warning names something the operator (and the model) can act on.
-    """
-    subs = getattr(exc, "exceptions", None)
-    if subs:
-        return "; ".join(_flatten_exc(s) for s in subs)
-    return f"{type(exc).__name__}: {exc}"
-
-
-def _scrub_url(url: str) -> str:
-    """Strip userinfo and query from a url for safe logging.
-
-    A url may carry credentials in the userinfo (``https://token@host``) or
-    in the query string (``?api_key=secret``); both are dropped so the
-    diagnostic keeps only ``scheme://host:port/path`` (story 32 — the
-    ``diagnostic`` is the only url-derived string that reaches a log).
-    """
-    from urllib.parse import urlsplit, urlunsplit
-
-    parts = urlsplit(url)
-    # Drop userinfo (everything before the last ``@``) from the netloc, but
-    # keep the netloc string itself — rebuilding from ``parts.hostname`` would
-    # lose IPv6 brackets (``hostname`` returns ``::1`` for ``[::1]:8000``),
-    # producing a malformed url in the log. Query/fragment are stripped too.
-    netloc = parts.netloc.rsplit("@", 1)[-1] if "@" in parts.netloc else parts.netloc
-    return urlunsplit(parts._replace(netloc=netloc, query="", fragment=""))
-
-
-class _MCPServer(_HookableTool):
-    """A handle to an MCP server declared via ``type: mcp.stdio`` or
-    ``type: mcp.http`` YAML.
-
-    Not a callable tool itself — it's a *producer* of tools. Flows through
-    discovery (``load_tools_from_layer``) and ``_all_tools`` as an opaque
-    item (it satisfies the ``Tool`` protocol minimally: ``__name__`` +
-    ``__call__``), then the Agent resolves it at startup: connect the
-    server, ``tools/list``, expand into one ``_MCPClientTool`` per remote
-    tool (ADR-0005). ``__name__`` is a diagnostic label (``mcp:`` + ``name:``
-    or the file stem), prefixed so it can never collide with the names of the
-    tools it produces — or with any other dispatchable tool in the registry.
-
-    Session lifecycle is manual (``start`` / ``aclose``) because it spans
-    methods: ``async with`` sugar can't hold a context open from one call to
-    the next. ``start`` enters the connection context; ``aclose`` exits it.
-    Both must run in the same task (anyio cancel-scope rule) — the Agent
-    awaits both from its own event loop, so this holds. See ADR-0005.
-
-    The *transport* is the only thing that differs between MCP kinds, so it's
-    the only injected piece: ``open_transport`` is a zero-arg callable
-    returning an async context manager that yields a ``(read, write)`` stream
-    pair; ``_default_connect`` wraps those streams in a ``ClientSession``
-    uniformly. The stdio and http builders each supply the matching
-    ``open_transport``; everything downstream (session, discovery, dispatch,
-    normalization) is shared. ``diagnostic`` is a secret-free string (command
-    + args, or url — never ``env``/``headers``) logged if the server fails to
-    start.
-
-    ``connect`` is an injection seam for tests: a zero-arg callable returning
-    an async context manager that yields an *initialized* ``ClientSession``,
-    bypassing ``open_transport`` entirely. Production leaves it ``None``;
-    tests pass the SDK's in-memory transport.
-    """
-
-    __name__: str
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        open_transport: Callable[[], Any] | None = None,
-        diagnostic: str = "",
-        connect: Callable[[], Any] | None = None,
-    ) -> None:
-        super().__init__()
-        self.__name__ = name
-        # Production transport factory (async CM yielding ``(read, write)``);
-        # ``None`` in pure-seam tests, where ``connect`` supplies the session.
-        self._open_transport = open_transport
-        # Secret-free detail for the failure log (never ``env``/``headers``).
-        self._diagnostic = diagnostic
-        self._connect = connect
-        # Live connection context + session, set by ``start``, cleared by
-        # ``aclose``. ``None`` until started / after close.
-        self._cm: Any = None
-        self._session: Any = None
-
-    def __call__(self, *args: Any, **kwargs: Any) -> NoReturn:
-        # Satisfies the ``Tool`` protocol structurally but must never be
-        # dispatched: the Agent filters ``_MCPServer`` out of ``_tool_map``
-        # and only registers the ``_MCPClientTool`` instances it produces.
-        raise RuntimeError(
-            f"MCP server {self.__name__!r} is a server handle, not a callable tool"
-        )
-
-    @asynccontextmanager
-    async def _default_connect(self) -> AsyncIterator[Any]:
-        """Production transport: open ``open_transport``, wrap in a session.
-
-        Transport-agnostic: ``open_transport`` yields the ``(read, write)``
-        streams (stdio subprocess or http connection); this method wraps them
-        in a ``ClientSession`` and initializes it. The lazy ``ClientSession``
-        import keeps ``import cothis.tools`` cheap (the SDK pulls anyio +
-        pydantic-settings + starlette); only a real MCP server pays.
-        """
-        from mcp import ClientSession
-
-        # Only reached when there's no ``connect`` seam, in which case the
-        # builders always supply ``open_transport``. Assert it for the type
-        # checker (and to fail loudly if a future caller forgets both).
-        assert self._open_transport is not None
-        async with self._open_transport() as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                yield session
-
-    async def start(self) -> list[_MCPClientTool]:
-        """Connect, list remote tools, return them wrapped as ``_MCPClientTool``.
-
-        Enters the connection context (held open on ``self._cm`` until
-        ``aclose``), initializes the session, and calls ``tools/list``. On any
-        failure (command not found, subprocess crash, connection refused,
-        protocol error) logs at ``WARNING`` naming the server + its
-        ``diagnostic`` — never ``env``/``headers`` secrets (story 32) —
-        unwinds any partial context, and returns ``[]`` so the rest of the
-        agent's tools still load (story 30).
-        """
-        cm = self._connect() if self._connect is not None else self._default_connect()
-        try:
-            self._session = await cm.__aenter__()
-            listed = await self._session.list_tools()
-        except Exception as exc:  # noqa: BLE001 — any startup failure is non-fatal
-            # ``diagnostic`` is secret-free by construction (built without
-            # ``env``/``headers``), so it's safe to log (story 32). Unwrap
-            # ExceptionGroups so the message names the real cause, not the
-            # anyio TaskGroup wrapper.
-            detail = f" ({self._diagnostic})" if self._diagnostic else ""
-            logger.warning(
-                "MCP server %r failed to start%s: %s",
-                self.__name__,
-                detail,
-                _flatten_exc(exc),
-            )
-            # Unwind whatever context was entered before the failure.
-            try:
-                await cm.__aexit__(type(exc), exc, exc.__traceback__)
-            except Exception as close_exc:  # noqa: BLE001 — best-effort cleanup
-                logger.debug(
-                    "MCP server %r cleanup after failed start: %s",
-                    self.__name__,
-                    close_exc,
-                )
-            self._cm = None
-            self._session = None
-            return []
-        self._cm = cm
-        label = self.__name__.removeprefix("mcp:")  # → tool-name prefix (ADR-0006)
-        return [
-            _MCPClientTool(
-                self,
-                label,
-                remote.name,
-                remote.description or "",
-                remote.inputSchema,
-            )
-            for remote in listed.tools
-        ]
-
-    async def aclose(self) -> None:
-        """Close the session + transport. Idempotent; safe if never started."""
-        if self._cm is None:
-            return
-        try:
-            await self._cm.__aexit__(None, None, None)
-        except Exception as exc:  # noqa: BLE001 — teardown must not raise
-            logger.debug("MCP server %r close error: %s", self.__name__, exc)
-        finally:
-            self._cm = None
-            self._session = None
-
-
-def _make_mcp_server(
-    label: str,
-    *,
-    open_transport: Callable[[], Any],
-    diagnostic: str,
-    source: str | None,
-) -> _MCPServer:
-    """Label guard + ``mcp:`` handle prefix for stdio/http builders (ADR-0006)."""
-    where = f" in {source}" if source else ""
-    if not label:
-        msg = f"MCP server label is empty{where}; set a non-empty 'name:'"
-        raise ValueError(msg)
-    if ":" in label:
-        msg = f"MCP server label {label!r} contains ':'{where}"
-        raise ValueError(msg)
-    server = _MCPServer(
-        name=f"mcp:{label}", open_transport=open_transport, diagnostic=diagnostic
-    )
-    server._source = source
-    return server
-
-
-def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> _MCPServer:
-    """Build an ``_MCPServer`` from a ``type: mcp.stdio`` YAML mapping.
-
-    ``command`` (required) is the server executable; ``args`` its CLI
-    arguments; ``env`` the subprocess environment (secrets — never logged,
-    story 32). The handle name is ``mcp:`` + ``name`` (or the file stem) —
-    prefixed so it can't collide with a real tool name. Does NOT connect —
-    that's deferred to Agent startup (ADR-0005). Raises ``ValueError`` on a
-    malformed declaration, naming the field + source.
-    """
-    from mcp import StdioServerParameters
-
-    _check_unknown_keys(spec, _MCP_STDIO_KEYS, source, what="MCP stdio tool")
-    command = str(_require(spec, "command", source, what="MCP stdio tool"))
-    where = f" in {source}" if source else ""
-    raw_args = spec.get("args") or []
-    if not isinstance(raw_args, list):
-        msg = f"MCP stdio tool: 'args' must be a list{where}"
-        raise ValueError(msg)
-    args = [str(a) for a in raw_args]
-    raw_env = spec.get("env") or {}
-    if not isinstance(raw_env, dict):
-        msg = f"MCP stdio tool: 'env' must be a mapping{where}"
-        raise ValueError(msg)
-    env: dict[str, str] = {}
-    for k, v in raw_env.items():
-        if not isinstance(v, str):
-            msg = (
-                f"MCP stdio tool: 'env.{k}' must be a string{where}, "
-                f"got {type(v).__name__}"
-            )
-            raise ValueError(msg)
-        env[str(k)] = v
-    label = str(spec.get("name") or (Path(source).stem if source else "mcp"))
-    # cothis: warn-don't-skip — server may launch via full path; connect-failure degrades (ADR-0005).
-    if _resolve_executable(command) is None:
-        logger.warning(
-            "MCP stdio server %r: command %r not on PATH%s; "
-            "will attempt to launch at run time",
-            f"mcp:{label}",
-            command,
-            where,
-        )
-    params = StdioServerParameters(command=command, args=args, env=env or None)
-
-    @asynccontextmanager
-    async def open_transport() -> AsyncIterator[Any]:
-        # Lazy import: the stdio client pulls the full SDK transport stack;
-        # only a real stdio server started at Agent runtime pays for it.
-        from mcp.client.stdio import stdio_client
-
-        async with stdio_client(params) as (read, write):
-            yield (read, write)
-
-    # ``env`` is deliberately excluded from ``diagnostic`` — secrets (story 32).
-    return _make_mcp_server(
-        label,
-        open_transport=open_transport,
-        diagnostic=f"command={command!r} args={args!r}",
-        source=source,
-    )
-
-
-def _build_mcp_http_server(spec: dict[str, Any], source: str | None) -> _MCPServer:
-    """Build an ``_MCPServer`` from a ``type: mcp.http`` YAML mapping.
-
-    ``url`` (required) is the remote server endpoint; ``headers`` an optional
-    mapping sent on every request (secrets like ``Authorization`` — never
-    logged, story 32). The handle name is ``mcp:`` + ``name`` (or the file
-    stem). Does NOT connect — deferred to Agent startup (ADR-0005). Reuses the
-    stdio path's session lifecycle, discovery, dispatch, and normalization;
-    only the transport (``streamablehttp_client``) differs. Raises
-    ``ValueError`` on a malformed declaration, naming the field + source.
-    """
-    _check_unknown_keys(spec, _MCP_HTTP_KEYS, source, what="MCP HTTP tool")
-    url = str(_require(spec, "url", source, what="MCP HTTP tool"))
-    where = f" in {source}" if source else ""
-    raw_headers = spec.get("headers") or {}
-    if not isinstance(raw_headers, dict):
-        msg = f"MCP HTTP tool: 'headers' must be a mapping{where}"
-        raise ValueError(msg)
-    headers = {str(k): str(v) for k, v in raw_headers.items()}
-    label = str(spec.get("name") or (Path(source).stem if source else "mcp"))
-
-    @asynccontextmanager
-    async def open_transport() -> AsyncIterator[Any]:
-        # Lazy import (see the stdio builder). ``streamablehttp_client`` yields
-        # a 3-tuple ``(read, write, get_session_id)``; the session-id callback
-        # isn't needed here, so drop it and yield the same ``(read, write)``
-        # pair the stdio transport does — keeping ``_default_connect`` uniform.
-        # cothis: ceiling — dropping ``get_session_id`` forecloses HTTP session
-        # resumption/reconnect after a dropped connection. Each ``Agent.run``
-        # opens a fresh HTTP transport; there's no way to resume a previous
-        # server-assigned session id. Upgrade path: thread ``get_session_id``
-        # through ``_default_connect`` and reconnect with it if the transport
-        # drops mid-session.
-        from mcp.client.streamable_http import streamablehttp_client
-
-        async with streamablehttp_client(url, headers=headers or None) as (
-            read,
-            write,
-            _get_session_id,
-        ):
-            yield (read, write)
-
-    # ``headers`` is excluded from ``diagnostic`` (secrets). The url itself
-    # is scrubbed — userinfo (``token@host``) and query (``?key=…``) carry
-    # credentials that must never reach a log (story 32).
-    return _make_mcp_server(
-        label,
-        open_transport=open_transport,
-        diagnostic=f"url={_scrub_url(url)!r}",
-        source=source,
-    )
-
-
 def preview(
     yaml_text: str,
     *,
@@ -1930,7 +1319,7 @@ def _build_tool_schema(
     }
 
 
-def _schema_for(tool: Tool) -> Tool | dict[str, Any]:
+def schema_for(tool: Tool) -> Tool | dict[str, Any]:
     """Return ``tool`` in the form any-llm's ``acompletion`` expects.
 
     YAML tools carry a pre-built OpenAI schema on ``__cothis_schema__`` (so
@@ -1944,106 +1333,6 @@ def _schema_for(tool: Tool) -> Tool | dict[str, Any]:
     Tools are defined, not in ``agent.py``.
     """
     return getattr(tool, "__cothis_schema__", tool)
-
-
-# --------------------------------------------------------------------
-# Tool output formatting
-#
-# ``_execute`` calls ``_format_tool_output(result)`` on every structured
-# (dict/list) tool result. The format is chosen via the
-# ``COTHIS_TOOL_OUTPUT_FORMAT`` env var (``json`` | ``csv`` | ``tsv`` | ``yaml``),
-# defaulting to ``json``.
-#
-# Format applicability (CSV/TSV are tabular; YAML/JSON can express anything):
-# - ``list[dict]``  → table in csv/tsv; native in yaml/json.
-# - ``single dict`` → one-row table (nested dicts flattened with dotted
-#   key paths: ``{"a": {"b": 1}}`` → ``a.b``); native in yaml/json.
-# - ``list[non-dict]`` or deeply nested → csv/tsv FALL BACK to json (a bare
-#   list of scalars isn't a table; flattening would lose too much).
-# - ``str`` results bypass formatting entirely (text is text).
-# --------------------------------------------------------------------
-
-
-def _flatten_dict(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-    """Flatten nested dicts with dotted key paths (``{"a": {"b": 1}}`` → ``{"a.b": 1}``).
-
-    Non-dict values (including lists) are left as-is on the leaf — they'll be
-    JSON-encoded per cell by the CSV writer.
-    """
-    out: dict[str, Any] = {}
-    for k, v in d.items():
-        key = f"{prefix}.{k}" if prefix else str(k)
-        if isinstance(v, dict):
-            out.update(_flatten_dict(v, key))
-        else:
-            out[key] = v
-    return out
-
-
-def _to_tabular(data: Any, delimiter: str) -> str | None:
-    """Render ``data`` as CSV/TSV (``delimiter`` = ``,`` or ``\t``).
-
-    Returns ``None`` when ``data`` isn't tabular (bare list of scalars, or a
-    shape CSV can't express) — caller falls back to JSON. Nested dicts are
-    flattened with dotted paths; nested lists/scalars are JSON-encoded per cell.
-    """
-    # Normalise to a list of single-row records.
-    if isinstance(data, dict):
-        rows = [_flatten_dict(data)]
-    elif isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
-        rows = [_flatten_dict(r) for r in data]
-    else:
-        # Bare list of scalars, empty list, or list with non-dict items:
-        # not a table. Signal fallback.
-        return None
-
-    # Union of keys across rows preserves column discovery order.
-    fieldnames: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        for k in row:
-            if k not in seen:
-                fieldnames.append(k)
-                seen.add(k)
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=fieldnames, delimiter=delimiter)
-    writer.writeheader()
-    for row in rows:
-        # Cells must be strings; JSON-encode non-scalars so values stay
-        # model-parseable instead of Python repr.
-        writer.writerow(
-            {
-                k: v if isinstance(v, str) else ("" if v is None else json.dumps(v))
-                for k, v in row.items()
-            }
-        )
-    return buf.getvalue().rstrip("\r\n")
-
-
-def _format_tool_output(result: Any) -> str:
-    """Serialise a structured tool result for the tool message.
-
-    Format is chosen via ``COTHIS_TOOL_OUTPUT_FORMAT`` (``json`` | ``csv`` |
-    ``tsv`` | ``yaml``), defaulting to ``json``. Only ``dict``/``list`` results
-    go through this path; ``str`` results bypass it (text is text).
-
-    CSV/TSV fall back to JSON when the shape isn't tabular (bare list of
-    scalars, deeply nested structures). YAML handles every shape natively.
-    """
-    fmt = os.environ.get("COTHIS_TOOL_OUTPUT_FORMAT", "json").lower()
-    if fmt in ("csv", "tsv"):
-        delim = "\t" if fmt == "tsv" else ","
-        rendered = _to_tabular(result, delim)
-        if rendered is not None:
-            return rendered
-        # Non-tabular shape → fall back to JSON so nothing is lost.
-    if fmt == "yaml":
-        # ``allow_unicode=True`` keeps CJK / emoji readable; ``sort_keys=False``
-        # preserves insertion order so the model sees fields in the author's
-        # intended order.
-        return yaml.dump(result, allow_unicode=True, sort_keys=False).rstrip("\n")
-    return json.dumps(result)
 
 
 def _check_same_layer_duplicate(tool: Tool, source: str, seen: dict[str, str]) -> None:

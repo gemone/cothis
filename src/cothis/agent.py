@@ -32,13 +32,13 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
 from cothis.tools import (
-    Tool,  # noqa: TC001
-    _AfterExecuteError,
-    _format_tool_output,
-    _MCPClientTool,
-    _MCPServer,
-    _run_hooks_safe,
-    _schema_for,
+    AfterExecuteError,
+    MCPClientTool,
+    MCPServer,
+    Tool,
+    format_tool_output,
+    run_hooks_safe,
+    schema_for,
 )
 
 if TYPE_CHECKING:
@@ -147,9 +147,9 @@ class Agent(BaseModel):
     )
     # MCP servers (``type: mcp.stdio`` declarations) separated from callable
     # tools at construction. Resolved lazily on first ``run`` (event loop
-    # ready) into ``_MCPClientTool`` instances that join ``_tool_map`` — see
+    # ready) into ``MCPClientTool`` instances that join ``_tool_map`` — see
     # ``_ensure_mcp`` and ADR-0005. Held here so ``aclose`` can shut them down.
-    _mcp_servers: list[_MCPServer] = PrivateAttr(default_factory=list)
+    _mcp_servers: list[MCPServer] = PrivateAttr(default_factory=list)
     _mcp_started: bool = PrivateAttr(default=False)
 
     def model_post_init(self, __context: Any) -> None:
@@ -170,11 +170,11 @@ class Agent(BaseModel):
         # dispatchable tool. This is startup-time branching, not per-dispatch
         # branching: ``_execute`` still treats every registered tool uniformly
         # (CONTEXT.md "no per-source branching in ``_execute``").
-        self._mcp_servers = [t for t in self.tools if isinstance(t, _MCPServer)]
+        self._mcp_servers = [t for t in self.tools if isinstance(t, MCPServer)]
         self._tool_map = {
             tool.__name__: tool
             for tool in self.tools
-            if not isinstance(tool, _MCPServer)
+            if not isinstance(tool, MCPServer)
         }
 
     async def run(self, user_input: str) -> str:
@@ -369,8 +369,8 @@ class Agent(BaseModel):
 
         ``ask`` calls this after its single ``run``; ``chat`` calls it when
         the session ends. Besides closing each server (idempotent —
-        ``_MCPServer.aclose`` no-ops if never started), it drops the resolved
-        ``_MCPClientTool`` entries from ``_tool_map`` and clears the
+        ``MCPServer.aclose`` no-ops if never started), it drops the resolved
+        ``MCPClientTool`` entries from ``_tool_map`` and clears the
         ``_mcp_started`` guard, so a later ``run`` on the same Agent
         reconnects with fresh sessions instead of dispatching against closed
         ones. Safe to call more than once.
@@ -381,7 +381,7 @@ class Agent(BaseModel):
         self._tool_map = {
             name: tool
             for name, tool in self._tool_map.items()
-            if not isinstance(tool, _MCPClientTool)
+            if not isinstance(tool, MCPClientTool)
         }
         self._mcp_started = False
 
@@ -390,8 +390,8 @@ class Agent(BaseModel):
 
         Built from ``_tool_map`` (not ``self.tools``) so it reflects the
         resolved set: MCP server handles are excluded and the
-        ``_MCPClientTool`` instances they produced (added by ``_ensure_mcp``)
-        are included. Delegates each entry to ``tools._schema_for`` so the
+        ``MCPClientTool`` instances they produced (added by ``_ensure_mcp``)
+        are included. Delegates each entry to ``tools.schema_for`` so the
         schema-serialisation rule (pre-built dict vs callable) lives next to
         the Tool definitions, not here.
 
@@ -400,7 +400,7 @@ class Agent(BaseModel):
         """
         if not self._tool_map:
             return None
-        return [_schema_for(tool) for tool in self._tool_map.values()]
+        return [schema_for(tool) for tool in self._tool_map.values()]
 
     def _ensure_messages(self, user_input: str) -> None:
         """Populate ``self._messages`` for this turn.
@@ -479,7 +479,7 @@ class Agent(BaseModel):
         1. ``pre_execute`` pipeline — callbacks may modify ``args``.
         2. ``tool(**args)`` — the actual tool body.
         3. ``after_execute`` pipeline — callbacks may modify ``result``.
-        4. ``_format_tool_output`` — json/csv/tsv/yaml serialisation.
+        4. ``format_tool_output`` — json/csv/tsv/yaml serialisation.
 
         Any exception in 1–3 fires ``on_error`` (phase names the stage),
         then returns an error string to the LLM. ``after_execute`` failure
@@ -507,7 +507,7 @@ class Agent(BaseModel):
         # Tools inheriting ``_HookableTool`` (ToolDef, _ShellTool) run the
         # pipeline; bare callables (lambdas, legacy defs) skip via duck-typing.
         try:
-            args = _run_hooks_safe(tool, "_run_pre_execute", args)
+            args = run_hooks_safe(tool, "_run_pre_execute", args)
         except Exception as exc:  # noqa: BLE001 — author hook code
             logger.debug("← %s pre_execute raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=pre_execute)", name)
@@ -522,13 +522,13 @@ class Agent(BaseModel):
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             logger.debug("← %s raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=tool)", name)
-            _run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
+            run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
             return f"Error calling {name}: {exc}"
 
         # --- after_execute pipeline (modifies result) ---
         try:
-            result = _run_hooks_safe(tool, "_run_after_execute", result, args)
-        except _AfterExecuteError as after_exc:
+            result = run_hooks_safe(tool, "_run_after_execute", result, args)
+        except AfterExecuteError as after_exc:
             logger.debug(
                 "← %s after_execute raised: %s; using original result",
                 name,
@@ -544,7 +544,7 @@ class Agent(BaseModel):
 
         # Structured result → format (json/csv/tsv/yaml). Str → as-is.
         if isinstance(result, (dict, list)):
-            rendered = _format_tool_output(result)
+            rendered = format_tool_output(result)
         else:
             rendered = str(result)
         logger.debug("← %s: %s", name, rendered)
