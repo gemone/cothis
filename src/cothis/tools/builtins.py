@@ -91,7 +91,7 @@ def _load_gitignore(root: Path) -> pathspec.PathSpec | None:
     if not ignore_file.is_file():
         return None
     return pathspec.PathSpec.from_lines(
-        "gitignore", ignore_file.read_text().splitlines()
+        "gitignore", ignore_file.read_text(encoding="utf-8").splitlines()
     )
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import logging
 import shutil
+import types
 import typing
 from typing import (
     TYPE_CHECKING,
@@ -468,8 +469,10 @@ def _build_schema(
             continue
         annotation = hints.get(pname, param.annotation)
         # Unwrap ``int | None`` → ``int`` so the type map sees the real type.
+        # Handles both ``typing.Union[X, None]`` (origin is ``typing.Union``) and
+        # PEP 604 ``X | None`` (origin is ``types.UnionType``).
         origin = typing.get_origin(annotation)
-        if origin in (typing.Union, type(None)):
+        if origin in (typing.Union, types.UnionType, type(None)):
             non_none = [a for a in typing.get_args(annotation) if a is not type(None)]
             annotation = non_none[0] if non_none else str
         prop: dict[str, Any]

@@ -281,6 +281,23 @@ def test_basic_type_schema_unchanged() -> None:
     assert props["n"] == {"type": "integer", "description": "a number."}
 
 
+def test_pep604_optional_unwrapped() -> None:
+    """PEP 604 ``int | None`` is unwrapped to ``integer``, not ``string``."""
+
+    @tool
+    def f(start_line: int | None = None) -> str:
+        """F.
+
+        Args:
+            start_line: optional 1-based start.
+        """
+        return str(start_line)
+
+    props = f.__cothis_schema__["function"]["parameters"]["properties"]
+    assert props["start_line"]["type"] == "integer"
+    assert "start_line" not in f.__cothis_schema__["function"]["parameters"]["required"]
+
+
 def test_parse_docstring_helper_directly() -> None:
     """ " "``_parse_docstring`` returns (first-paragraph summary, {arg: description})."""
     summary, args = _parse_docstring(

@@ -532,8 +532,9 @@ def preview(
     Validation is shared with ``load_yaml_tools`` via ``_compile`` — the
     two paths cannot drift. Raises ``ValueError`` on malformed YAML.
     """
-    warnings.filterwarnings("ignore", category=UserWarning)
-    block = _compile(yaml_text, source=source, platform=_platform)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        block = _compile(yaml_text, source=source, platform=_platform)
     return block.render(**kwargs), block.shell
 
 
