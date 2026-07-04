@@ -887,13 +887,11 @@ def test_shell_nonzero_exit_returns_error_string() -> None:
     assert "boom" in result
 
 
-def test_shell_executable_resolved_via_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``executable="sh"`` is resolved via PATH like YAML ``shell:``.
+def test_shell_executable_resolved_via_path() -> None:
+    """``executable="sh"`` is resolved via PATH and runs the command.
 
-    POSIX-only: Windows has no ``sh``. The resolution mechanic (``shutil.which``
-    → ``executable=``) is the same on both; one platform is enough to cover it.
+    ``sh`` exists on every POSIX system; the resolution mechanic
+    (``shutil.which`` → ``executable=``) is what this test covers.
     """
     import sys
 
@@ -901,3 +899,16 @@ def test_shell_executable_resolved_via_path(
         pytest.skip("``sh`` is not available on Windows")
     result = shell("echo from-sh", executable="sh")
     assert result == "from-sh\n"
+
+
+def test_shell_missing_executable_returns_error_not_silent_fallback() -> None:
+    """A declared ``executable`` not on PATH returns an error string.
+
+    Mirrors YAML ``_ShellTool`` gating (``shell:`` not on PATH → tool not
+    registered): the author asked for a specific shell that isn't there, so
+    surface the error rather than silently falling back to the system
+    default shell. Runs on every platform — no real executable needed.
+    """
+    result = shell("echo hi", executable="definitely-not-on-path-xyz-123")
+    assert result.startswith("Error:")
+    assert "definitely-not-on-path-xyz-123" in result

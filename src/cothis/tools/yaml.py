@@ -557,6 +557,14 @@ def shell(command: str | list[str], *, executable: str | None = None) -> str:
         proc = subprocess.run(command, capture_output=True, text=True)
     else:
         shell_path = _resolve_executable(executable) if executable else None
+        if executable and shell_path is None:
+            # Mirror YAML ``_ShellTool`` gating: a declared ``shell:`` not on
+            # PATH is a configuration error, not a silent fallback to the
+            # system default (which would be silent breakage — the author
+            # asked for bash, got cmd.exe). YAML skips registration at load
+            # time; ``shell()`` is runtime, so it returns an error string
+            # the agent can act on.
+            return f"Error: shell {executable!r} not found on PATH"
         proc = subprocess.run(
             command,
             shell=True,
