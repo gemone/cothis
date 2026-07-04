@@ -129,35 +129,21 @@ class Agent(BaseModel):
     api_key: str | None = None
     api_base: str | None = None
 
-    # Runtime-only state: not validated, not serialised. Built in
-    # ``model_post_init`` so the pydantic model stays construction-safe.
+    # Runtime-only state: not validated, not serialised.
     _llm: AnyLLM = PrivateAttr()
     _tool_map: dict[str, Tool] = PrivateAttr(default_factory=dict)
-    # Conversation memory. Empty on a fresh Agent; ``_ensure_messages`` fills
-    # the first turn (system + user) and appends ``user`` on every turn after.
-    # ``ask`` (one-shot) never observes cross-turn state because the Agent is
-    # discarded after a single ``run``. ``chat`` reuses one Agent across turns
-    # so this list accumulates the whole session.
-    #
     # cothis: ceiling — messages grow without bound across a long ``chat``
     # session. Token cost per turn rises linearly. No windowing/summarisation
     # is planned; Ctrl-C and start a new session when it gets slow.
     _messages: list[dict[str, Any] | ChatCompletionMessage] = PrivateAttr(
         default_factory=list
     )
-    # MCP servers (``type: mcp.stdio`` declarations) separated from callable
-    # tools at construction. Resolved lazily on first ``run`` (event loop
-    # ready) into ``MCPClientTool`` instances that join ``_tool_map`` — see
-    # ``_ensure_mcp`` and ADR-0005. Held here so ``aclose`` can shut them down.
     _mcp_servers: list[MCPServer] = PrivateAttr(default_factory=list)
+    _mcp_group: Any = PrivateAttr(default=None)
+    _mcp_tool_names: set[str] = PrivateAttr(default_factory=set)
     _mcp_started: bool = PrivateAttr(default=False)
 
     def model_post_init(self, __context: Any) -> None:
-        # cothis: lazy-import any_llm here (not at module top level) so
-        # `import cothis.agent` stays cheap. Importing any_llm eagerly pulls
-        # openai + anthropic types (~1s cold-start), and we only need it
-        # once the Agent is actually constructed. The matching loading
-        # spinner in cli.py wraps this exact call.
         from any_llm import AnyLLM
 
         self._llm = AnyLLM.create(
@@ -165,11 +151,6 @@ class Agent(BaseModel):
             api_key=self.api_key,
             api_base=self.api_base,
         )
-        # MCP servers are producers of tools, not tools — split them out so
-        # ``_tool_map`` / ``_tool_schemas`` never treat a server handle as a
-        # dispatchable tool. This is startup-time branching, not per-dispatch
-        # branching: ``_execute`` still treats every registered tool uniformly
-        # (CONTEXT.md "no per-source branching in ``_execute``").
         self._mcp_servers = [t for t in self.tools if isinstance(t, MCPServer)]
         self._tool_map = {
             tool.__name__: tool
@@ -208,14 +189,6 @@ class Agent(BaseModel):
                     self._messages.append(tool_msg)
                 continue
 
-            # No tool calls: the model is done. But some providers emit a
-            # turn with neither tool_calls nor content (the model "had nothing
-            # to say" this round, or a provider filter dropped the content).
-            # Returning "" silently would print a blank line and exit, which
-            # looks like a crash to the user. Loop again instead — if the
-            # model genuinely has nothing, we'll hit ``MaxIterationsError``
-            # which is at least a loud, named failure.
-            #
             # cothis: ceiling — we can't distinguish "provider dropped content
             # mid-stream" from "model genuinely chose to say nothing". Both
             # look like content=None. Retry is the safe default but wastes a
@@ -280,10 +253,6 @@ class Agent(BaseModel):
                     tool_call_chunks.extend(delta.tool_calls)
 
             if not tool_call_chunks:
-                # No tool calls this turn. If there was content, it's the
-                # final answer — record it and return. If content was also
-                # empty (some providers emit a no-content/no-tool turn),
-                # loop again instead of ending silently — same fix as ``run``.
                 if content_parts or "".join(content_parts):
                     messages.append(
                         {"role": "assistant", "content": "".join(content_parts)}
@@ -291,10 +260,6 @@ class Agent(BaseModel):
                     return
                 continue
 
-            # Intermediate tool-call turn: append the assistant message that
-            # requested the tool calls, then dispatch each call individually,
-            # yielding its ToolCallEvent immediately before execution so the
-            # caller sees per-call ordering on multi-tool turns.
             assembled = self._assemble_tool_calls(tool_call_chunks)
             messages.append(
                 {
@@ -337,23 +302,34 @@ class Agent(BaseModel):
         """Resolve MCP servers into callable tools once, on first run.
 
         Deferred out of ``model_post_init`` because connecting is async and
-        needs a running event loop (ADR-0005). For each declared server:
-        connect, ``tools/list``, and register each remote tool into
-        ``_tool_map`` so it reaches the model via ``_tool_schemas`` and is
-        dispatchable by ``_execute`` like any other tool. A server that fails
-        to start contributes no tools (it logs a WARNING itself) and does not
-        block the others.
+        needs a running event loop (ADR-0005). Creates one
+        ``ClientSessionGroup`` for the whole Agent (the SDK manages
+        connections, tool aggregation, name prefixing, and teardown), then
+        connects each declared server into it. Each remote tool the group
+        exposes becomes an ``MCPClientTool`` in ``_tool_map``. A server that
+        fails to connect contributes no tools (it logs a WARNING itself via
+        ``connect_into``) and does not block the others.
 
-        Runs at most once (``_mcp_started`` guard): the sessions it opens are
+        Runs at most once (``_mcp_started`` guard): the group's sessions are
         persistent for the Agent's lifetime, reused across every ``run`` /
-        ``run_stream`` call. ``aclose`` tears them down.
+        ``run_stream`` call. ``aclose`` tears them down in one ``__aexit__``.
         """
         if self._mcp_started:
             return
         self._mcp_started = True
+        if not self._mcp_servers:
+            return
+
+        from mcp import ClientSessionGroup
+
+        def _prefix(name: str, server_info: Any) -> str:
+            return f"{server_info.name}.{name}"
+
+        group = ClientSessionGroup(component_name_hook=_prefix)
+        await group.__aenter__()
+        self._mcp_group = group
         for server in self._mcp_servers:
-            for mcp_tool in await server.start():
-                # First-write-wins on the rare prefixed-name clash (ADR-0006).
+            for mcp_tool in await server.connect_into(group):
                 if mcp_tool.__name__ in self._tool_map:
                     logger.error(
                         "MCP tool %r skipped: name already registered "
@@ -363,26 +339,30 @@ class Agent(BaseModel):
                     )
                     continue
                 self._tool_map[mcp_tool.__name__] = mcp_tool
+                self._mcp_tool_names.add(mcp_tool.__name__)
 
     async def aclose(self) -> None:
-        """Close every MCP session/subprocess and reset for safe reuse.
+        """Close the MCP session group and reset for safe reuse.
 
         ``ask`` calls this after its single ``run``; ``chat`` calls it when
-        the session ends. Besides closing each server (idempotent —
-        ``MCPServer.aclose`` no-ops if never started), it drops the resolved
-        ``MCPClientTool`` entries from ``_tool_map`` and clears the
-        ``_mcp_started`` guard, so a later ``run`` on the same Agent
-        reconnects with fresh sessions instead of dispatching against closed
-        ones. Safe to call more than once.
+        the session ends. Tears down the ``ClientSessionGroup`` (idempotent —
+        no-op if never started), drops the resolved ``MCPClientTool`` entries
+        from ``_tool_map`` (tracked by name in ``_mcp_tool_names``, so no
+        ``isinstance`` walk), and clears the ``_mcp_started`` guard, so a
+        later ``run`` on the same Agent reconnects with fresh sessions
+        instead of dispatching against closed ones. Safe to call more than
+        once.
         """
-        for server in self._mcp_servers:
-            await server.aclose()
-        # Remove tools whose sessions are now closed and re-arm resolution.
-        self._tool_map = {
-            name: tool
-            for name, tool in self._tool_map.items()
-            if not isinstance(tool, MCPClientTool)
-        }
+        if self._mcp_group is not None:
+            try:
+                await self._mcp_group.__aexit__(None, None, None)
+            except Exception as exc:  # noqa: BLE001 — teardown must not raise
+                logger.debug("MCP group close error: %s", exc)
+            self._mcp_group = None
+        # Remove the MCP-expanded tools by tracked name.
+        for name in self._mcp_tool_names:
+            self._tool_map.pop(name, None)
+        self._mcp_tool_names.clear()
         self._mcp_started = False
 
     def _tool_schemas(self) -> list[Any] | None:
@@ -503,9 +483,6 @@ class Agent(BaseModel):
             logger.debug("tool %s not in tool_map (unknown tool)", name)
             return f"Error: unknown tool {name!r}."
 
-        # --- pre_execute pipeline (modifies args) ---
-        # Tools inheriting ``_HookableTool`` (ToolDef, _ShellTool) run the
-        # pipeline; bare callables (lambdas, legacy defs) skip via duck-typing.
         try:
             args = run_hooks_safe(tool, "_run_pre_execute", args)
         except Exception as exc:  # noqa: BLE001 — author hook code
@@ -525,7 +502,6 @@ class Agent(BaseModel):
             run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
             return f"Error calling {name}: {exc}"
 
-        # --- after_execute pipeline (modifies result) ---
         try:
             result = run_hooks_safe(tool, "_run_after_execute", result, args)
         except AfterExecuteError as after_exc:
@@ -542,7 +518,6 @@ class Agent(BaseModel):
             )
             logger.debug("tool %r on_error fired (phase=after_execute)", name)
 
-        # Structured result → format (json/csv/tsv/yaml). Str → as-is.
         if isinstance(result, (dict, list)):
             rendered = format_tool_output(result)
         else:

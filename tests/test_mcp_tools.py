@@ -1,11 +1,13 @@
-"""Tests for the MCP stdio adapter (issue #16).
+"""Tests for the MCP subsystem (stdio + http) built on the SDK's
+``ClientSessionGroup``.
 
 Every test that needs a live session drives a real in-memory MCP server via
 the SDK's ``create_connected_server_and_client_session`` transport — no
-subprocess, no network, deterministic. The server is a ``FastMCP`` with a
-handful of tools; ``MCPServer``'s ``connect`` seam swaps the production
-stdio transport for this in-memory one, so the adapter code under test is
-exactly what production runs (only the transport differs).
+subprocess, no network, deterministic. The production path
+(``MCPServer.connect_into`` → ``group.connect_to_server``) is exercised
+end-to-end; only ``connect_to_server`` is swapped for the in-memory transport
+(via ``in_memory_group`` for unit tests, or a class-level monkeypatch for
+Agent integration tests where ``_ensure_mcp`` builds its own group).
 """
 
 from __future__ import annotations
@@ -17,35 +19,40 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
-from mcp import StdioServerParameters
+from mcp import ClientSessionGroup
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.types import CallToolResult, ImageContent, Implementation, TextContent
 
 from cothis.agent import Agent
 from cothis.tools import (
     MCPClientTool,
     MCPServer,
-    load_tools_from_layer,
-    load_yaml_tools,
     tool,
 )
-from cothis.tools.core import _HookableTool, _ShellTool
+from cothis.tools.core import _HookableTool, load_tools_from_layer
 from cothis.tools.mcp import (
     _build_mcp_http_server,
     _build_mcp_stdio_server,
     _flatten_exc,
     _normalize_mcp_result,
 )
+from cothis.tools.yaml import _ShellTool, load_yaml_tools
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator
 
 
 # --- fixtures / helpers ------------------------------------------------
 
 
 def _make_server() -> FastMCP:
-    """A minimal in-memory MCP server with an ``add`` and a ``boom`` tool."""
+    """A minimal in-memory MCP server with an ``add`` and a ``boom`` tool.
+
+    The server's self-reported name is ``test-server`` — that's what the
+    ``component_name_hook`` prefixes tool names with (``test-server.add``),
+    NOT cothis's YAML ``name:`` field. Tests assert the prefixed form.
+    """
     server = FastMCP("test-server")
 
     @server.tool()
@@ -61,76 +68,88 @@ def _make_server() -> FastMCP:
     return server
 
 
-def _in_memory(server: FastMCP) -> Callable[[], Any]:
-    """A ``connect`` seam that yields an in-memory session bound to ``server``."""
-    return lambda: create_connected_server_and_client_session(server)
-
-
-def _mcp_server(server: FastMCP | None = None) -> MCPServer:
-    # ``mcp:`` prefix matches production handles (``_make_mcp_server``);
-    # ``start()`` strips it to get the label ``test``, so produced tools are
-    # ``test.add`` / ``test.boom`` (ADR-0006 prefix).
-    return MCPServer(name="mcp:test", connect=_in_memory(server or _make_server()))
-
-
-class _FailingCM:
-    """A connection context whose ``__aenter__`` always fails.
+class _FailingParams:
+    """A stand-in for SDK ``ServerParameters`` that signals failure.
 
     Simulates a server that can't launch (bad command, connection refused) so
-    the load-failure path (story 30) is exercised without a real subprocess.
+    the connect-failure path is exercised without a real subprocess. The
+    exception is read by a monkeypatched ``connect_to_server`` (the params
+    object itself can't raise — it's the transport that would). The exception
+    type is injected (plain RuntimeError or an ExceptionGroup, mirroring how
+    anyio surfaces transport failures).
     """
 
-    async def __aenter__(self) -> Any:
-        raise RuntimeError("connect refused")
-
-    async def __aexit__(self, *exc: object) -> bool:
-        return False
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
 
 
-class _FailingGroupCM:
-    """A connection context whose ``__aenter__`` raises an ``ExceptionGroup``,
-    mirroring how anyio's TaskGroup surfaces an http/transport failure."""
+@asynccontextmanager
+async def in_memory_group(server: FastMCP) -> AsyncIterator[ClientSessionGroup]:
+    """Yield a ``ClientSessionGroup`` whose ``connect_to_server`` is in-memory.
 
-    async def __aenter__(self) -> Any:
-        raise ExceptionGroup(
-            "unhandled errors in a TaskGroup (1 sub-exception)",
-            [ConnectionError("Name or service not known")],
+    Wraps the group context and patches its ``connect_to_server`` to drive an
+    in-memory session (via ``connect_with_session``) instead of spawning a
+    subprocess or opening a socket. The session's CM is registered on the
+    group's own exit stack so it's torn down with the group. The group carries
+    a ``component_name_hook`` that prefixes tool names with the server's
+    self-reported name, matching production behaviour.
+
+    With this group, the REAL ``MCPServer.connect_into`` runs (snapshot before
+    → ``connect_to_server`` → wrap new tools) — only the transport is faked.
+    """
+
+    def _prefix(name: str, server_info: Any) -> str:
+        return f"{server_info.name}.{name}"
+
+    async with ClientSessionGroup(component_name_hook=_prefix) as group:
+
+        async def _in_memory_connect_to_server(
+            params: Any, session_params: Any = None
+        ) -> Any:
+            session = await group._exit_stack.enter_async_context(
+                create_connected_server_and_client_session(server)
+            )
+            await group.connect_with_session(
+                Implementation(name=server.name or "server", version="1.0"), session
+            )
+            return session
+
+        # Monkeypatch the group's connect method to use the in-memory transport
+        # instead of spawning a real subprocess.
+        setattr(group, "connect_to_server", _in_memory_connect_to_server)
+        yield group
+
+
+def _patch_in_memory_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    fastmcp: FastMCP,
+    calls: list[int] | None = None,
+) -> None:
+    """Monkeypatch ``ClientSessionGroup.connect_to_server`` class-wide to be in-memory.
+
+    Used by Agent integration tests where ``_ensure_mcp`` builds its own group
+    internally (so an instance-level patch can't reach it). The real
+    ``MCPServer.connect_into`` snapshot+wrap logic still runs against whatever
+    group the Agent creates. ``calls``, if given, records one entry per
+    connect (so ``runs_once`` / ``reconnects`` tests can count).
+    """
+
+    async def _in_memory_connect_to_server(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        if calls is not None:
+            calls.append(1)
+        session = await self._exit_stack.enter_async_context(  # noqa: SLF001
+            create_connected_server_and_client_session(fastmcp)
         )
+        await self.connect_with_session(
+            Implementation(name=fastmcp.name or "server", version="1.0"), session
+        )
+        return session
 
-    async def __aexit__(self, *exc: object) -> bool:
-        return False
-
-
-class _FakeSession:
-    """A ``ClientSession`` stand-in that lists zero tools.
-
-    Lets a transport-delivery test drive ``_default_connect`` end-to-end
-    (open transport → wrap session → ``list_tools``) while isolating the
-    transport-argument capture from the real MCP protocol.
-    """
-
-    def __init__(self, read: Any, write: Any) -> None:
-        self._read, self._write = read, write
-
-    async def __aenter__(self) -> _FakeSession:
-        return self
-
-    async def __aexit__(self, *exc: Any) -> None:
-        return None
-
-    async def initialize(self) -> None:
-        return None
-
-    async def list_tools(self) -> Any:
-        return SimpleNamespace(tools=[])
-
-
-def _patch_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch ``mcp.ClientSession`` (imported lazily inside ``_default_connect``)
-    with ``_FakeSession`` so no real session/protocol is exercised."""
-    import mcp
-
-    monkeypatch.setattr(mcp, "ClientSession", _FakeSession, raising=False)
+    monkeypatch.setattr(
+        ClientSessionGroup, "connect_to_server", _in_memory_connect_to_server
+    )
 
 
 def _mock_llm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -385,25 +404,30 @@ def test_mixed_directory_loads_all_three_types(tmp_path: Any) -> None:
 
 
 def test_normalize_single_block() -> None:
-    result = SimpleNamespace(content=[SimpleNamespace(text="7")], isError=False)
+    result = CallToolResult(content=[TextContent(type="text", text="7")], isError=False)
     assert _normalize_mcp_result(result) == "7"
 
 
 def test_normalize_multiple_blocks_joined() -> None:
-    result = SimpleNamespace(
-        content=[SimpleNamespace(text="a"), SimpleNamespace(text="b")],
+    result = CallToolResult(
+        content=[
+            TextContent(type="text", text="a"),
+            TextContent(type="text", text="b"),
+        ],
         isError=False,
     )
     assert _normalize_mcp_result(result) == "a\nb"
 
 
 def test_normalize_empty_content() -> None:
-    result = SimpleNamespace(content=[], isError=False)
+    result = CallToolResult(content=[], isError=False)
     assert _normalize_mcp_result(result) == "(no output)"
 
 
 def test_normalize_error_prefixed() -> None:
-    result = SimpleNamespace(content=[SimpleNamespace(text="bad")], isError=True)
+    result = CallToolResult(
+        content=[TextContent(type="text", text="bad")], isError=True
+    )
     assert _normalize_mcp_result(result) == "Error: bad"
 
 
@@ -411,143 +435,119 @@ def test_normalize_nontext_only_content_is_no_output() -> None:
     """A non-empty result carrying only non-text blocks collapses to
     ``(no output)`` for a text-only agent (documented ceiling in
     ``_normalize_mcp_result``: text-less == nothing-to-say)."""
-    # A block with no ``.text`` attribute (e.g. an image block).
-    result = SimpleNamespace(content=[SimpleNamespace(data="<bytes>")], isError=False)
+    # An image block has no ``.text`` attribute.
+    result = CallToolResult(
+        content=[ImageContent(type="image", data="<bytes>", mimeType="image/png")],
+        isError=False,
+    )
     assert _normalize_mcp_result(result) == "(no output)"
 
 
-# --- session lifecycle + dispatch --------------------------------------
+# --- connect_into + dispatch -------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_start_discovers_tools_with_schema() -> None:
-    """``start`` lists remote tools, each wrapped with its ``inputSchema``, with
-    a label-prefixed ``__name__`` and a bare ``_remote_name`` (ADR-0006)."""
-    server = _mcp_server()
-    tools = await server.start()
-    try:
+async def test_connect_into_discovers_tools_with_schema() -> None:
+    """``connect_into`` lists remote tools, each wrapped with its ``inputSchema``
+    and a server-prefixed ``__name__`` (ADR-0006). ``_remote_name`` is the same
+    prefixed name — the group routes ``call_tool`` by it."""
+    server = MCPServer(name="mcp:test-server", params=None)
+    async with in_memory_group(_make_server()) as group:
+        tools = await server.connect_into(group)
         by_name = {t.__name__: t for t in tools}
-        assert "test.add" in by_name
-        add = by_name["test.add"]
+        assert "test-server.add" in by_name
+        add = by_name["test-server.add"]
         assert isinstance(add, MCPClientTool)
         assert isinstance(add, _HookableTool)
-        assert add.__name__ == "test.add"
-        assert add._remote_name == "add"  # bare server-side name for call_tool
+        assert add.__name__ == "test-server.add"
+        # The prefixed name is what ``call_tool`` expects (group keys by it).
+        assert add._remote_name == "test-server.add"
         params = add.__cothis_schema__["function"]["parameters"]
-        assert add.__cothis_schema__["function"]["name"] == "test.add"
+        assert add.__cothis_schema__["function"]["name"] == "test-server.add"
         assert "a" in params["properties"]
         assert "b" in params["properties"]
-    finally:
-        await server.aclose()
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_call_uses_bare_remote_name(
+async def test_mcp_tool_call_routes_by_prefixed_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``call_tool`` receives the bare ``_remote_name``, not the prefixed name."""
-    server = _mcp_server()
-    tools = {t.__name__: t for t in await server.start()}
-    add = tools["test.add"]
-    captured: dict[str, Any] = {}
-    orig_call = server._session.call_tool
+    """``call_tool`` receives the prefixed ``_remote_name`` — the group's
+    ``_tool_to_session`` index is keyed by the prefixed name."""
+    server = MCPServer(name="mcp:test-server", params=None)
+    async with in_memory_group(_make_server()) as group:
+        tools = {t.__name__: t for t in await server.connect_into(group)}
+        add = tools["test-server.add"]
+        captured: dict[str, Any] = {}
+        orig_call = group.call_tool
 
-    async def spy_call(name: str, args: Any) -> Any:
-        captured["name"] = name
-        return await orig_call(name, args)
+        async def spy_call(name: str, arguments: Any = None, **kw: Any) -> Any:
+            captured["name"] = name
+            return await orig_call(name, arguments, **kw)
 
-    monkeypatch.setattr(server._session, "call_tool", spy_call)
-    try:
+        monkeypatch.setattr(group, "call_tool", spy_call)
         assert await add(a=2, b=3) == "5"
-    finally:
-        await server.aclose()
-    assert captured["name"] == "add"  # bare, not "test.add"
+    assert captured["name"] == "test-server.add"
 
 
 @pytest.mark.asyncio
 async def test_call_returns_normalized_string() -> None:
-    server = _mcp_server()
-    tools = {t.__name__: t for t in await server.start()}
-    try:
-        assert await tools["test.add"](a=3, b=4) == "7"
-    finally:
-        await server.aclose()
+    """A successful call returns the result text; two calls prove the session
+    is persistent (group-owned, not reconnected per call)."""
+    server = MCPServer(name="mcp:test-server", params=None)
+    async with in_memory_group(_make_server()) as group:
+        tools = {t.__name__: t for t in await server.connect_into(group)}
+        assert await tools["test-server.add"](a=3, b=4) == "7"
+        assert await tools["test-server.add"](a=10, b=0) == "10"
 
 
 @pytest.mark.asyncio
 async def test_call_error_prefixed() -> None:
     """A remote tool that raises comes back as an ``Error:`` string."""
-    server = _mcp_server()
-    tools = {t.__name__: t for t in await server.start()}
-    try:
-        result = await tools["test.boom"]()
+    server = MCPServer(name="mcp:test-server", params=None)
+    async with in_memory_group(_make_server()) as group:
+        tools = {t.__name__: t for t in await server.connect_into(group)}
+        result = await tools["test-server.boom"]()
         assert result.startswith("Error:")
         assert "kaboom" in result
-    finally:
-        await server.aclose()
 
 
 @pytest.mark.asyncio
-async def test_session_persistent_no_reconnect() -> None:
-    """Multiple calls reuse one session — connect happens exactly once."""
-    server_obj = _make_server()
-    connect_calls: list[int] = []
+async def test_connect_into_returns_only_new_tools() -> None:
+    """``connect_into`` returns only the tools THIS server contributed — not
+    tools already in the group from another server (the before/after snapshot
+    is what lets one group host many servers side by side)."""
+    from mcp.types import Tool as McpTool
 
-    def connect() -> Any:
-        connect_calls.append(1)
-        return create_connected_server_and_client_session(server_obj)
-
-    server = MCPServer(name="mcp:t", connect=connect)
-    tools = {t.__name__: t for t in await server.start()}
-    try:
-        first_session = server._session
-        assert await tools["t.add"](a=1, b=1) == "2"
-        assert await tools["t.add"](a=2, b=2) == "4"
-        assert server._session is first_session
-        assert len(connect_calls) == 1
-    finally:
-        await server.aclose()
+    server = MCPServer(name="mcp:test-server", params=None)
+    async with in_memory_group(_make_server()) as group:
+        # Pretend another server already registered a tool in this group.
+        group._tools[  # noqa: SLF001 — inject a sentinel to test the snapshot
+            "other-server.x"
+        ] = McpTool(name="x", description="d", inputSchema={"type": "object"})
+        tools = {t.__name__: t for t in await server.connect_into(group)}
+        assert "other-server.x" not in tools  # pre-existing tool excluded
+        assert "test-server.add" in tools  # new tool included
+        assert "test-server.boom" in tools
 
 
 @pytest.mark.asyncio
-async def test_aclose_clears_session_and_tools_fail_after() -> None:
-    server = _mcp_server()
-    tools = {t.__name__: t for t in await server.start()}
-    await server.aclose()
-    assert server._session is None
-    assert server._cm is None
-    with pytest.raises(RuntimeError, match="session is not active"):
-        await tools["test.add"](a=1, b=1)
-
-
-@pytest.mark.asyncio
-async def test_aclose_safe_if_never_started() -> None:
-    """Closing a server that never started is a no-op, not an error."""
-    server = _mcp_server()
-    await server.aclose()
-    assert server._session is None
-
-
-@pytest.mark.asyncio
-async def test_stdio_transport_delivers_env(
+async def test_stdio_params_carry_env_to_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The production stdio transport (built by ``_build_mcp_stdio_server``, no
-    ``connect`` seam) hands the declared ``env`` straight to ``stdio_client``
-    — so a server's secrets reach its subprocess (story 32). Patches the lazy
-    transport imports so nothing is actually spawned."""
-    import mcp.client.stdio as mcp_stdio
-
+    """The builder's ``StdioServerParameters`` (with ``env``) reaches
+    ``connect_to_server`` unchanged — so a server's secrets reach its
+    subprocess (story 32). ``connect_to_server`` is faked to capture params
+    without spawning."""
     captured: dict[str, Any] = {}
 
-    @asynccontextmanager
-    async def fake_stdio_client(params: Any) -> AsyncIterator[tuple[str, str]]:
+    async def capture(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
         captured["params"] = params
-        yield ("read", "write")
+        return None  # don't aggregate any tools
 
-    monkeypatch.setattr(mcp_stdio, "stdio_client", fake_stdio_client, raising=False)
-    _patch_session(monkeypatch)
-
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", capture)
     server = _build_mcp_stdio_server(
         {
             "type": "mcp.stdio",
@@ -558,40 +558,29 @@ async def test_stdio_transport_delivers_env(
         },
         source=None,
     )
-    try:
-        assert await server.start() == []
-    finally:
-        await server.aclose()
+    async with ClientSessionGroup() as group:
+        assert await server.connect_into(group) == []
     assert captured["params"].env == {"API_KEY": "s3cr3t"}
     assert captured["params"].command == "srv"
     assert captured["params"].args == ["--x"]
 
 
 @pytest.mark.asyncio
-async def test_http_transport_delivers_url_and_headers(
+async def test_http_params_carry_url_and_headers_to_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The production http transport (built by ``_build_mcp_http_server``) hands
-    ``url`` + ``headers`` straight to ``streamablehttp_client`` — so auth
-    secrets reach the remote (story 32). Patches the lazy transport import so
-    no network call is made."""
-    import mcp.client.streamable_http as mcp_http
-
+    """The builder's ``StreamableHttpParameters`` (with ``headers``) reaches
+    ``connect_to_server`` unchanged — so auth secrets reach the remote
+    (story 32)."""
     captured: dict[str, Any] = {}
 
-    @asynccontextmanager
-    async def fake_streamablehttp_client(
-        url: str, headers: Any = None
-    ) -> AsyncIterator[tuple[str, str, None]]:
-        captured["url"] = url
-        captured["headers"] = headers
-        yield ("read", "write", None)
+    async def capture(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        captured["params"] = params
+        return None
 
-    monkeypatch.setattr(
-        mcp_http, "streamablehttp_client", fake_streamablehttp_client, raising=False
-    )
-    _patch_session(monkeypatch)
-
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", capture)
     server = _build_mcp_http_server(
         {
             "type": "mcp.http",
@@ -601,43 +590,60 @@ async def test_http_transport_delivers_url_and_headers(
         },
         source=None,
     )
-    try:
-        assert await server.start() == []
-    finally:
-        await server.aclose()
-    assert captured["url"] == "https://example.com/mcp"
-    assert captured["headers"] == {"Authorization": "Bearer s3cr3t"}
-
-
-def test_streamablehttp_client_signature_unchanged() -> None:
-    """Pin the SDK's real ``streamablehttp_client`` call shape.
-
-    The http transport calls it as ``(url, headers=...)`` and unpacks its
-    yield as a 3-tuple ``(read, write, get_session_id)``. An SDK rename or
-    arity change would otherwise surface only at runtime against a live
-    server; this smoke test fails fast on import/upgrade. (The transport
-    test above mocks the function, so it asserts cothis's call shape, not
-    the SDK's — this one guards the SDK side.)"""
-    import inspect
-
-    from mcp.client.streamable_http import streamablehttp_client
-
-    sig = inspect.signature(streamablehttp_client)
-    params = list(sig.parameters)
-    assert params[0] == "url", f"SDK renamed first param: {params}"
-    assert "headers" in params, f"SDK dropped headers param: {params}"
-    # ``headers`` must default to None — cothis passes ``headers or None``.
-    assert sig.parameters["headers"].default is None
+    async with ClientSessionGroup() as group:
+        assert await server.connect_into(group) == []
+    assert captured["params"].url == "https://example.com/mcp"
+    assert captured["params"].headers == {"Authorization": "Bearer s3cr3t"}
 
 
 @pytest.mark.asyncio
-async def test_start_failure_logs_warning_returns_empty(
+async def test_connect_into_failure_returns_empty(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect failure logs at WARNING (with diagnostic, never secrets) and
+    yields ``[]`` so the rest of the agent's tools still load (story 30).
+
+    ``_FailingParams`` carries the exception; the monkeypatched
+    ``connect_to_server`` reads it off ``params._exc`` and raises — so the
+    exception type is injected (plain RuntimeError here, ExceptionGroup below)."""
+
+    async def boom(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        raise params._exc
+
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", boom)
+    server = MCPServer(
+        name="mcp:broken",
+        params=_FailingParams(RuntimeError("connect refused")),
+        diagnostic="command='badcmd'",
+    )
+    async with ClientSessionGroup() as group:
+        with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+            tools = await server.connect_into(group)
+    assert tools == []
+    assert "broken" in caplog.text
+    assert "connect refused" in caplog.text
+    assert "badcmd" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stdio_connect_failure_logs_warning_returns_empty(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A launch failure logs at WARNING (command/args, never env) and yields [].
 
     Built via the real builder, so the assertion that ``env`` is absent proves
     the *builder* keeps secrets out of the diagnostic (story 32)."""
+
+    async def boom(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        raise RuntimeError("connect refused")
+
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", boom)
     server = _build_mcp_stdio_server(
         {
             "type": "mcp.stdio",
@@ -648,11 +654,10 @@ async def test_start_failure_logs_warning_returns_empty(
         },
         source=None,
     )
-    server._connect = lambda: _FailingCM()  # force a launch failure
-    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
-        tools = await server.start()
+    async with ClientSessionGroup() as group:
+        with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+            tools = await server.connect_into(group)
     assert tools == []
-    assert server._session is None
     assert "broken" in caplog.text
     assert "connect refused" in caplog.text
     # Safe diagnostics are present…
@@ -664,11 +669,19 @@ async def test_start_failure_logs_warning_returns_empty(
 
 
 @pytest.mark.asyncio
-async def test_http_start_failure_logs_url_never_headers(
+async def test_http_connect_failure_logs_url_never_headers(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An http connection failure logs at WARNING naming the url — never the
     ``headers`` (Authorization secret, story 32) — and yields []."""
+
+    async def boom(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        raise RuntimeError("connect refused")
+
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", boom)
     server = _build_mcp_http_server(
         {
             "type": "mcp.http",
@@ -678,9 +691,9 @@ async def test_http_start_failure_logs_url_never_headers(
         },
         source=None,
     )
-    server._connect = lambda: _FailingCM()  # force a connection failure
-    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
-        tools = await server.start()
+    async with ClientSessionGroup() as group:
+        with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+            tools = await server.connect_into(group)
     assert tools == []
     assert "connect refused" in caplog.text
     # Safe diagnostic (url) is present…
@@ -708,18 +721,29 @@ def test_flatten_exc_unwraps_exception_group() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_failure_unwraps_taskgroup_in_warning(
+async def test_connect_failure_unwraps_taskgroup_in_warning(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the transport fails inside an anyio TaskGroup, the WARNING names
     the real cause, not 'unhandled errors in a TaskGroup'."""
+
+    async def boom(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        raise ExceptionGroup(
+            "unhandled errors in a TaskGroup (1 sub-exception)",
+            [ConnectionError("Name or service not known")],
+        )
+
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", boom)
     server = _build_mcp_http_server(
         {"type": "mcp.http", "name": "remote", "url": "https://example.com/mcp"},
         source=None,
     )
-    server._connect = lambda: _FailingGroupCM()
-    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
-        assert await server.start() == []
+    async with ClientSessionGroup() as group:
+        with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+            assert await server.connect_into(group) == []
     assert "Name or service not known" in caplog.text
     assert "unhandled errors in a TaskGroup" not in caplog.text
 
@@ -730,27 +754,25 @@ async def test_start_failure_unwraps_taskgroup_in_warning(
 @pytest.mark.asyncio
 async def test_pre_and_after_execute_hooks_run() -> None:
     """pre_execute/after_execute pipelines wrap the async MCP call."""
-    server = _mcp_server()
-    tools = {t.__name__: t for t in await server.start()}
-    add = tools["test.add"]
-    seen: dict[str, bool] = {}
+    server = MCPServer(name="mcp:test-server", params=None)
+    async with in_memory_group(_make_server()) as group:
+        tools = {t.__name__: t for t in await server.connect_into(group)}
+        add = tools["test-server.add"]
+        seen: dict[str, bool] = {}
 
-    @add.pre_execute()
-    def _pre(args: dict[str, Any]) -> dict[str, Any]:
-        seen["pre"] = True
-        return {"a": args["a"] + 10, "b": args["b"]}
+        @add.pre_execute()
+        def _pre(args: dict[str, Any]) -> dict[str, Any]:
+            seen["pre"] = True
+            return {"a": args["a"] + 10, "b": args["b"]}
 
-    @add.after_execute()
-    def _post(result: Any, args: dict[str, Any]) -> Any:
-        seen["post"] = True
-        return f"[{result}]"
+        @add.after_execute()
+        def _post(result: Any, args: dict[str, Any]) -> Any:
+            seen["post"] = True
+            return f"[{result}]"
 
-    try:
         args = add._run_pre_execute({"a": 1, "b": 2})
         result = await add(**args)
         result = add._run_after_execute(result, args)
-    finally:
-        await server.aclose()
 
     assert seen == {"pre": True, "post": True}
     assert result == "[13]"  # (1 + 10) + 2, then wrapped
@@ -758,19 +780,17 @@ async def test_pre_and_after_execute_hooks_run() -> None:
 
 @pytest.mark.asyncio
 async def test_on_error_hook_fires() -> None:
-    server = _mcp_server()
-    tools = {t.__name__: t for t in await server.start()}
-    add = tools["test.add"]
-    observed: list[tuple[str, str]] = []
+    server = MCPServer(name="mcp:test-server", params=None)
+    async with in_memory_group(_make_server()) as group:
+        tools = {t.__name__: t for t in await server.connect_into(group)}
+        add = tools["test-server.add"]
+        observed: list[tuple[str, str]] = []
 
-    @add.on_error()
-    def _obs(exc: Exception, phase: str, args: Any, result: Any) -> None:
-        observed.append((type(exc).__name__, phase))
+        @add.on_error()
+        def _obs(exc: Exception, phase: str, args: Any, result: Any) -> None:
+            observed.append((type(exc).__name__, phase))
 
-    try:
         add._run_on_error(ValueError("x"), "tool", {"a": 1})
-    finally:
-        await server.aclose()
     assert observed == [("ValueError", "tool")]
 
 
@@ -783,7 +803,8 @@ async def test_agent_separates_server_and_resolves_tools(
 ) -> None:
     """Server handle is kept out of ``_tool_map``; its tools join after resolve."""
     _mock_llm(monkeypatch)
-    server = _mcp_server()
+    _patch_in_memory_transport(monkeypatch, _make_server())
+    server = MCPServer(name="mcp:test-server", params=None)
     agent = Agent(model="x", provider="openrouter", tools=[server])
 
     # Before resolution: the server is separated out, not dispatchable.
@@ -793,14 +814,15 @@ async def test_agent_separates_server_and_resolves_tools(
 
     await agent._ensure_mcp()
     try:
-        assert "test.add" in agent._tool_map
+        assert "test-server.add" in agent._tool_map
         schemas = agent._tool_schemas()
         assert schemas is not None
         names = [s["function"]["name"] for s in schemas]
-        assert "test.add" in names
+        assert "test-server.add" in names
     finally:
         await agent.aclose()
-    assert server._session is None
+    # aclose tears the group down and re-arms resolution.
+    assert agent._mcp_group is None
 
 
 @pytest.mark.asyncio
@@ -809,10 +831,16 @@ async def test_agent_dispatches_mcp_tool_via_execute(
 ) -> None:
     """A full ``_execute`` round-trip through an MCP tool returns its output."""
     _mock_llm(monkeypatch)
-    agent = Agent(model="x", provider="openrouter", tools=[_mcp_server()])
+    _patch_in_memory_transport(monkeypatch, _make_server())
+    agent = Agent(
+        model="x",
+        provider="openrouter",
+        tools=[MCPServer(name="mcp:test-server", params=None)],
+    )
     await agent._ensure_mcp()
     tc = SimpleNamespace(
-        id="c1", function=SimpleNamespace(name="test.add", arguments='{"a": 5, "b": 6}')
+        id="c1",
+        function=SimpleNamespace(name="test-server.add", arguments='{"a": 5, "b": 6}'),
     )
     try:
         assert await agent._execute(tc) == "11"
@@ -824,7 +852,14 @@ async def test_agent_dispatches_mcp_tool_via_execute(
 async def test_agent_mcp_failure_keeps_other_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server that fails to start contributes nothing; other tools survive."""
+    """A server that fails to connect contributes nothing; other tools survive."""
+
+    async def boom(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        raise RuntimeError("connect refused")
+
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", boom)
     _mock_llm(monkeypatch)
 
     @tool("noop")
@@ -832,12 +867,12 @@ async def test_agent_mcp_failure_keeps_other_tools(
         """Does nothing."""
         return "ok"
 
-    broken = MCPServer(name="broken", connect=lambda: _FailingCM())
+    broken = MCPServer(name="mcp:broken", params=None)
     agent = Agent(model="x", provider="openrouter", tools=[noop, broken])
     await agent._ensure_mcp()
     try:
         assert "noop" in agent._tool_map
-        assert "test.add" not in agent._tool_map
+        assert "test-server.add" not in agent._tool_map
     finally:
         await agent.aclose()
 
@@ -846,108 +881,111 @@ async def test_agent_mcp_failure_keeps_other_tools(
 async def test_ensure_mcp_runs_once(monkeypatch: pytest.MonkeyPatch) -> None:
     """``_ensure_mcp`` connects at most once, however many times it's called."""
     _mock_llm(monkeypatch)
-    server_obj = _make_server()
-    connect_calls: list[int] = []
-
-    def connect() -> Any:
-        connect_calls.append(1)
-        return create_connected_server_and_client_session(server_obj)
-
+    calls: list[int] = []
+    _patch_in_memory_transport(monkeypatch, _make_server(), calls=calls)
     agent = Agent(
-        model="x", provider="openrouter", tools=[MCPServer(name="t", connect=connect)]
+        model="x",
+        provider="openrouter",
+        tools=[MCPServer(name="mcp:test-server", params=None)],
     )
     await agent._ensure_mcp()
     await agent._ensure_mcp()
     try:
-        assert len(connect_calls) == 1
+        assert len(calls) == 1
     finally:
         await agent.aclose()
 
 
 @pytest.mark.asyncio
-async def test_agent_reconnects_after_aclose(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reusing an Agent after ``aclose`` reconnects instead of dispatching
-    against dead sessions.
+async def test_agent_aclose_safe_if_never_ensured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``aclose`` before any ``_ensure_mcp`` is a no-op, not an error.
 
-    ``aclose`` must drop the resolved MCP tools and re-arm resolution so a
-    later ``_ensure_mcp`` connects afresh — otherwise the stale
-    ``MCPClientTool`` entries would fail with "session is not active".
-    """
+    The group is ``None`` until ``_ensure_mcp`` runs; ``aclose`` guards on that
+    (idempotent teardown)."""
     _mock_llm(monkeypatch)
-    server_obj = _make_server()
-    connect_calls: list[int] = []
-
-    def connect() -> Any:
-        connect_calls.append(1)
-        return create_connected_server_and_client_session(server_obj)
-
     agent = Agent(
         model="x",
         provider="openrouter",
-        tools=[MCPServer(name="mcp:t", connect=connect)],
+        tools=[MCPServer(name="mcp:test-server", params=None)],
+    )
+    await agent.aclose()
+    assert agent._mcp_group is None
+    assert agent._mcp_started is False
+
+
+@pytest.mark.asyncio
+async def test_agent_reconnects_after_aclose(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reusing an Agent after ``aclose`` reconnects instead of dispatching
+    against a torn-down group.
+
+    ``aclose`` must drop the resolved MCP tools and re-arm resolution so a
+    later ``_ensure_mcp`` connects afresh — otherwise the stale
+    ``MCPClientTool`` entries would dispatch against a closed group.
+    """
+    _mock_llm(monkeypatch)
+    calls: list[int] = []
+    _patch_in_memory_transport(monkeypatch, _make_server(), calls=calls)
+    agent = Agent(
+        model="x",
+        provider="openrouter",
+        tools=[MCPServer(name="mcp:test-server", params=None)],
     )
     tc = SimpleNamespace(
-        id="c1", function=SimpleNamespace(name="t.add", arguments='{"a": 1, "b": 2}')
+        id="c1",
+        function=SimpleNamespace(name="test-server.add", arguments='{"a": 1, "b": 2}'),
     )
 
     await agent._ensure_mcp()
     assert await agent._execute(tc) == "3"
     await agent.aclose()
     # State is reset: no stale MCP tools, guard re-armed.
-    assert "t.add" not in agent._tool_map
+    assert "test-server.add" not in agent._tool_map
     assert agent._mcp_started is False
 
     # Second cycle reconnects and works again.
     await agent._ensure_mcp()
     try:
-        assert "t.add" in agent._tool_map
+        assert "test-server.add" in agent._tool_map
         assert await agent._execute(tc) == "3"
-        assert len(connect_calls) == 2
+        assert len(calls) == 2
     finally:
         await agent.aclose()
 
 
 @pytest.mark.asyncio
-async def test_same_server_duplicate_tool_names_first_wins(
+async def test_duplicate_prefixed_tool_name_first_wins(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same-remote-name duplicates from one server: first-write-wins + ERROR."""
+    """Two ``MCPClientTool``s resolving to the same prefixed name: first-write-wins,
+    the duplicate is logged at ERROR (ADR-0006).
+
+    Simulated by patching one server's ``connect_into`` to return its first
+    tool twice (same ``__name__``). The Agent's ``_ensure_mcp`` keeps the
+    existing entry and skips the collision."""
     _mock_llm(monkeypatch)
+    _patch_in_memory_transport(monkeypatch, _make_server())
+    server = MCPServer(name="mcp:test-server", params=None)
+    original_connect_into = server.connect_into
 
-    # Build a server that lists two tools both named "dup".
-    from mcp.server.fastmcp import FastMCP
-
-    dup_server = FastMCP("dup-server")
-
-    @dup_server.tool()
-    def dup() -> str:
-        """First definition."""
-        return "first"
-
-    # Inject a second tool of the same name by patching start to return a
-    # duplicate of the first tool (same prefixed name).
-    agent = Agent(
-        model="x",
-        provider="openrouter",
-        tools=[MCPServer(name="mcp:dup", connect=_in_memory(dup_server))],
-    )
-
-    orig_start = type(agent._mcp_servers[0]).start
-
-    async def patched_start(self: Any) -> Any:
-        tools = await orig_start(self)
+    async def duplicating_connect_into(
+        group: ClientSessionGroup,
+    ) -> list[MCPClientTool]:
+        tools = await original_connect_into(group)
         return tools + tools[:1]  # duplicate the first tool (same prefixed name)
 
-    monkeypatch.setattr(type(agent._mcp_servers[0]), "start", patched_start)
+    setattr(server, "connect_into", duplicating_connect_into)
+    agent = Agent(model="x", provider="openrouter", tools=[server])
 
     with caplog.at_level(logging.ERROR, logger="cothis.agent"):
         await agent._ensure_mcp()
     try:
-        # Only one "dup" tool registered (first-write-wins).
-        assert "dup.dup" in agent._tool_map
+        # Only one ``test-server.add`` registered (first-write-wins).
+        assert sum(1 for n in agent._tool_map if n == "test-server.add") == 1
         # The duplicate was logged at ERROR.
         assert "already registered" in caplog.text
-        assert "dup.dup" in caplog.text
+        assert "test-server.add" in caplog.text
     finally:
         await agent.aclose()

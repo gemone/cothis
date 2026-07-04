@@ -11,7 +11,7 @@ startup — from Python callables, YAML declarations, and MCP servers
 Any callable object the `Agent` registers by name and dispatches by
 calling with keyword arguments. The single dispatch protocol — there is
 no per-source branching in `_execute`. Every concrete tool class
-(`ToolDef`, `_ShellTool`, `_MCPClientTool`) inherits `_HookableTool`, so
+(`ToolDef`, `_ShellTool`, `MCPClientTool`) inherits `_HookableTool`, so
 hooks run uniformly for all sources (YAML tools' chains are empty no-ops).
 A tool may be sync or async: `_execute` awaits the return value only if it
 is awaitable (ADR-0004), so MCP's async tools and sync Python/shell tools
@@ -90,40 +90,42 @@ layer (different axis).
 
 **MCP server**:
 An external tool server declared by a `type: mcp.stdio` or `type: mcp.http`
-YAML file — the `_MCPServer` handle. Not a `Tool` itself but a *producer*
+YAML file — the `MCPServer` handle. Not a `Tool` itself but a *producer*
 of tools: one server declaration expands into many tools, discovered at
 runtime via the MCP `tools/list` call. Its `__name__` is a diagnostic label
 (`mcp:` + `name:` or the file stem), prefixed so it can never collide with a
 dispatchable tool's name in the discovery registry. The stdio and http
-variants differ only in their **transport**; everything downstream (session,
-discovery, dispatch, normalisation) is shared. The session it opens is
-**persistent** — connected once at Agent startup, held across every dispatch,
-closed at teardown (see ADR-0005).
-_Avoid_: MCP tool (that's the produced `_MCPClientTool`), MCP client,
+variants differ only in their **transport** (SDK `StdioServerParameters` vs
+`StreamableHttpParameters`); everything downstream (session, discovery,
+dispatch, normalisation) is shared. The session it opens is
+**persistent** — connected once at Agent startup via a
+`ClientSessionGroup`, held across every dispatch, closed at teardown
+(see ADR-0005).
+_Avoid_: MCP tool (that's the produced `MCPClientTool`), MCP client,
 plugin.
 
 **Transport**:
-The wire an `_MCPServer` speaks over — a stdio subprocess (`type: mcp.stdio`,
-`stdio_client`) or an HTTP connection (`type: mcp.http`,
-`streamablehttp_client`). It is the **only** thing that differs between MCP
-kinds, so it is the only injected piece: each builder supplies an
-`open_transport` factory yielding a `(read, write)` stream pair, and
-`_default_connect` wraps those streams in a `ClientSession` uniformly. A
-secret-free `diagnostic` string (url scrubbed of userinfo/query, or
-command — never `env`/`headers`)
+The wire an `MCPServer` speaks over — a stdio subprocess (`type: mcp.stdio`,
+SDK `StdioServerParameters`) or an HTTP connection (`type: mcp.http`,
+SDK `StreamableHttpParameters`). It is the **only** thing that differs
+between MCP kinds, so it is the only injected piece: each builder supplies
+the matching `params` object, and the `ClientSessionGroup` consumes it
+uniformly. A secret-free `diagnostic` string (url scrubbed of
+userinfo/query, or command — never `env`/`headers`)
 travels alongside for failure logs.
 _Avoid_: protocol (that's MCP itself), connection (too vague), channel.
 
 **MCP tool**:
-A single remote tool produced by an MCP server — the `_MCPClientTool`. Its
-`__name__` is **prefixed** with its server's label: `mcp:context7` producing a
-remote `query-docs` registers as `context7.query-docs`. The bare remote name
-lives on as `_remote_name` and is what's sent back to the server in
-`call_tool`. Dispatch is async: `__call__` awaits `session.call_tool` on the
-shared server session and normalises the result to a string (text blocks
-joined; empty → `"(no output)"`; errors → `"Error: "` prefix). See ADR-0006
-for the prefix scheme's collision properties.
-_Avoid_: MCP server (that's the `_MCPServer` producer), remote function,
+A single remote tool produced by an MCP server — the `MCPClientTool`. Its
+`__name__` is **prefixed** with its server's self-reported name (the SDK's
+`component_name_hook` assigns `{server_name}.{remote}`): a server reporting
+`test-server` with a remote `query-docs` registers as
+`test-server.query-docs`. Dispatch is async: `__call__` awaits
+`group.call_tool` on the shared `ClientSessionGroup` and normalises the
+result to a string (text blocks joined; empty → `"(no output)"`; errors →
+`"Error: "` prefix). See ADR-0006 for the prefix scheme's collision
+properties.
+_Avoid_: MCP server (that's the `MCPServer` producer), remote function,
 namespace (implies a hierarchy cothis doesn't have).
 
 **YAMLTool**:

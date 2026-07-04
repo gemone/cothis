@@ -17,24 +17,27 @@ names that only appear there.
 
 ## Decision
 
-**Each MCP tool's `__name__` is prefixed with its producing server's label.**
-A server `mcp:context7` returning a remote `query-docs` registers as
-`context7.query-docs`, not `query-docs`. The bare remote name survives only
-as `_remote_name`, used in the `call_tool` request back to the server (the
-server doesn't know the prefix). The prefix is identical in `__name__`,
-`_tool_map` key, and schema `function.name` — one name, one source of truth.
+**Each MCP tool's `__name__` is prefixed with its producing server's
+name, assigned by the SDK's `component_name_hook`.** A server that
+self-reports as `test-server` returning a remote `add` registers as
+`test-server.add`, not `add`. The prefix is assigned by the
+`ClientSessionGroup`'s `component_name_hook` callback (which receives
+the tool name and the server's `Implementation` info), not by cothis
+hand-appending a label. The prefixed name is identical in `__name__`,
+`_tool_map` key, and schema `function.name` — one name, one source of
+truth.
 
-**Prefix uniqueness follows from server-handle uniqueness, not from a new
-detection layer.** The `mcp:{label}` handle goes through `_all_tools` like
-any discovery entry: same-layer duplicate `mcp:foo` raises at load time;
-cross-layer `mcp:foo` shadows with a `WARNING`. Two MCP servers therefore
-can't produce colliding prefixes (same label → colliding handles → already
-caught). MCP-vs-non-MCP collisions are made highly unlikely (prefixed name
-vs. bare/builtin name), and any residual clash (a user tool named exactly
-`{label}.{remote}`) is caught at registration with an ERROR log +
-first-write-wins, not silently overwritten. No runtime conflict detection
-on MCP tool names is needed — the prefix removes the common collision
-surface; the registration check catches the rare remainder.
+**Prefix uniqueness follows from server-name uniqueness.** The prefix
+comes from the server's self-reported `Implementation.name` (its
+`FastMCP(name=…)` argument at init), NOT from cothis's YAML `name:`
+field. Two servers reporting the same implementation name collide at
+the SDK level (the `ClientSessionGroup` raises on duplicate tool
+keys); cothis's own server-handle dedup (`mcp:{label}`) is a
+load-time guard on the cothis side. MCP-vs-non-MCP collisions are made
+highly unlikely (prefixed name vs. bare/builtin name), and any residual
+clash (a user tool named exactly `{server_name}.{remote}`) is caught at
+registration with an ERROR log + first-write-wins, not silently
+overwritten.
 
 **This is a prefix, not a namespace system.** Builtins (`fs.read`) and user
 tools (a bare `my_tool`) keep their existing names. Only MCP tools carry a

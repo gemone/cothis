@@ -602,7 +602,7 @@ def test_builtin_tools_are_tooldef_instances() -> None:
 
 def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
     """ "A ``.py`` file with a ``@tool`` function is discovered and loaded."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "greet.py").write_text(
         'from cothis import tool\n\n@tool("test.greet")\n'
@@ -617,7 +617,7 @@ def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
 
 def test_load_python_tools_discovers_package(tmp_path: Any) -> None:
     """ "A package directory with ``__init__.py`` is discovered."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -637,7 +637,7 @@ def test_load_python_tools_import_failure_doesnt_crash(
     """ "A broken ``.py`` file logs an error but doesn't crash the loader."""
     import logging
 
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "broken.py").write_text("import nonexistent_module\n", encoding="utf-8")
     # A valid file alongside the broken one should still load.
@@ -659,14 +659,14 @@ def test_load_python_tools_import_failure_doesnt_crash(
 
 def test_load_python_tools_empty_dir_returns_empty(tmp_path: Any) -> None:
     """ "An empty directory yields an empty tool list."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     assert load_tools_from_layer(tmp_path) == []
 
 
 def test_load_python_tools_missing_dir_returns_empty() -> None:
     """ "A non-existent directory yields an empty tool list."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     assert load_tools_from_layer(Path("/nonexistent/path")) == []
 
@@ -675,7 +675,7 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
     tmp_path: Any,
 ) -> None:
     """ "Module-level constants and plain functions are NOT collected."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "mixed.py").write_text(
         "from cothis import tool\n\n"
@@ -698,11 +698,11 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
 def test_loader_discovers_tool_with_pre_load_hooks(tmp_path: Any) -> None:
     """The loader discovers a tool regardless of its pre_load hooks.
 
-    Hooks are NOT run by the loader — they run later in ``_all_tools``
+    Hooks are NOT run by the loader — they run later in ``discover_tools``
     after cross-layer merge (see ADR-0003). The loader returns all
     discovered candidates.
     """
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "t.py").write_text(
         "from cothis import tool\n\n"
@@ -722,7 +722,7 @@ def test_loader_discovers_tool_with_pre_load_hooks(tmp_path: Any) -> None:
 def test_pre_load_any_false_skips_tool() -> None:
     """If any ``pre_load`` callback returns False, ``_run_load_hooks`` returns False.
 
-    The loader discovers the tool; the skip happens when ``_all_tools`` runs
+    The loader discovers the tool; the skip happens when ``discover_tools`` runs
     load hooks on it (see ADR-0003). The third callback never runs.
     """
 
@@ -831,7 +831,7 @@ def test_on_error_self_exception_swallowed() -> None:
 
 def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
     """ "A tool with no hooks is discovered and registered as before."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "t.py").write_text(
         "from cothis import tool\n\n"
@@ -1155,7 +1155,7 @@ def test_on_error_fire_logged(caplog: Any) -> None:
 
 def test_yaml_duplicate_names_detected(tmp_path: Any) -> None:
     """Two YAML files with the same ``name:`` raise ValueError naming both paths."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "a.yaml").write_text(
         'name: dup\ncommand: ["echo", "a"]\n', encoding="utf-8"
@@ -1172,7 +1172,7 @@ def test_yaml_duplicate_names_detected(tmp_path: Any) -> None:
 
 def test_python_duplicate_names_detected(tmp_path: Any) -> None:
     """Two Python tools with the same name raise ValueError naming both paths."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "a.py").write_text(
         'from cothis import tool\n@tool("dup")\n'
@@ -1198,7 +1198,7 @@ def test_cross_format_same_layer_duplicate_raises(tmp_path: Any) -> None:
     in the same directory are same-layer, so they raise — not shadow.
     This is the case the pre-#12 per-format ``seen`` dicts couldn't catch.
     """
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "y.yaml").write_text(
         'name: dup\ncommand: ["echo", "yaml"]\n', encoding="utf-8"
@@ -1217,7 +1217,7 @@ def test_cross_format_same_layer_duplicate_raises(tmp_path: Any) -> None:
 
 def test_no_duplicate_names_loads_normally(tmp_path: Any) -> None:
     """Distinct names load without error."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "a.yaml").write_text(
         'name: first\ncommand: ["echo", "a"]\n', encoding="utf-8"

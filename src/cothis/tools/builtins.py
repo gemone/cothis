@@ -43,11 +43,6 @@ def read(
     text = Path(path).read_text(encoding="utf-8")
     lines = text.splitlines()
     total = len(lines)
-    # 1-based, inclusive on both ends. ``None`` means "from start" / "to end".
-    # ``end_line`` beyond EOF is clamped (the model can't know the file length);
-    # ``start_line`` beyond EOF is an actionable error — returning "" would
-    # give the model nothing to act on (AGENTS.md: "error messages that the
-    # LLM can act on").
     start = max(1, start_line or 1)
     end = min(total, end_line or total)
     if start > total:
@@ -57,12 +52,6 @@ def read(
     return "\n".join(selected)
 
 
-# Directories ``fs.dir`` never descends into, even with ``all=True`` — they're
-# either huge (``.venv``, ``node_modules``), not source (``.git``), or build
-# artifacts (``__pycache__``). Hardcoded, not configurable: every entry here
-# is a directory whose contents would never help the
-# model understand a project. Listed as a module constant so future noise
-# sources are added in one place.
 _IGNORED_DIRS = frozenset(
     {
         ".git",
@@ -156,7 +145,6 @@ def _list_dir(
         """True if ``p`` should be omitted from the listing."""
         rel = p.relative_to(root)
         rel_str = rel.as_posix()
-        # Hardcoded noise: always excluded, even with ``all=True``.
         if any(part in _IGNORED_DIRS for part in rel.parts):
             return True
         if all:
@@ -165,7 +153,6 @@ def _list_dir(
         # path component, not just the leaf — so ``.config/foo`` is hidden too).
         if any(part.startswith(".") for part in rel.parts):
             return True
-        # ``.gitignore`` patterns.
         if gitignore is not None and gitignore.match_file(rel_str):
             return True
         return False
@@ -215,5 +202,6 @@ def write(path: str, content: str) -> str:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return f"Wrote {len(content)} characters to {path}"
+
 
 TOOLS: list[Tool] = [read, _list_dir, write]

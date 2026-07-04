@@ -21,24 +21,6 @@ if TYPE_CHECKING:
     from typing import Any
 
 
-# --------------------------------------------------------------------
-# Tool output formatting
-#
-# ``_execute`` calls ``format_tool_output(result)`` on every structured
-# (dict/list) tool result. The format is chosen via the
-# ``COTHIS_TOOL_OUTPUT_FORMAT`` env var (``json`` | ``csv`` | ``tsv`` | ``yaml``),
-# defaulting to ``json``.
-#
-# Format applicability (CSV/TSV are tabular; YAML/JSON can express anything):
-# - ``list[dict]``  → table in csv/tsv; native in yaml/json.
-# - ``single dict`` → one-row table (nested dicts flattened with dotted
-#   key paths: ``{"a": {"b": 1}}`` → ``a.b``); native in yaml/json.
-# - ``list[non-dict]`` or deeply nested → csv/tsv FALL BACK to json (a bare
-#   list of scalars isn't a table; flattening would lose too much).
-# - ``str`` results bypass formatting entirely (text is text).
-# --------------------------------------------------------------------
-
-
 def flatten_dict(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     """Flatten nested dicts with dotted key paths (``{"a": {"b": 1}}`` → ``{"a.b": 1}``).
 
@@ -68,8 +50,6 @@ def to_tabular(data: Any, delimiter: str) -> str | None:
     elif isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
         rows = [flatten_dict(r) for r in data]
     else:
-        # Bare list of scalars, empty list, or list with non-dict items:
-        # not a table. Signal fallback.
         return None
 
     # Union of keys across rows preserves column discovery order.
@@ -112,7 +92,6 @@ def format_tool_output(result: Any) -> str:
         rendered = to_tabular(result, delim)
         if rendered is not None:
             return rendered
-        # Non-tabular shape → fall back to JSON so nothing is lost.
     if fmt == "yaml":
         # ``allow_unicode=True`` keeps CJK / emoji readable; ``sort_keys=False``
         # preserves insertion order so the model sees fields in the author's
