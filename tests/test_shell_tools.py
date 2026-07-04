@@ -263,6 +263,119 @@ args:
     assert cmd == "echo 1 2 3"
 
 
+def test_shell_value_with_metacharacters_quoted() -> None:
+    """Shell mode: a value containing metacharacters is ``shlex.quote``-d.
+
+    Story 22: a value with spaces or shell metacharacters must not be able to
+    break or inject into the command. ``shlex.quote`` wraps it in single
+    quotes so the shell treats it as one literal token.
+    """
+    yaml_text = """
+name: grep_file
+shell: bash
+command: "echo {pattern}"
+args:
+  - name: pattern
+    type: str
+"""
+    cmd, _ = preview(yaml_text, pattern="foo; rm -rf /")
+    assert cmd == "echo 'foo; rm -rf /'"
+
+
+def test_shell_list_elements_quoted_individually() -> None:
+    """Shell mode: list elements are quoted individually then space-joined.
+
+    Each element is a separate shell token — quoting the joined string would
+    turn multiple arguments into one quoted blob.
+    """
+    yaml_text = """
+name: echo_args
+shell: bash
+command: "echo {args}"
+args:
+  - name: args
+    type: list
+"""
+    cmd, _ = preview(yaml_text, args=["a b", "c"])
+    assert cmd == "echo 'a b' c"
+
+
+def test_shell_value_without_metacharacters_not_quoted() -> None:
+    """A plain alphanumeric value needs no quoting — ``shlex.quote`` passes it through."""
+    yaml_text = """
+name: t
+shell: bash
+command: "echo {name}"
+args:
+  - name: name
+    type: str
+"""
+    cmd, _ = preview(yaml_text, name="hello")
+    assert cmd == "echo hello"
+
+
+def test_argv_value_with_metacharacters_not_quoted() -> None:
+    """Argv mode is inherently safe (``shell=False``) — no quoting applied."""
+    yaml_text = """
+name: t
+command: ["echo", "{val}"]
+args:
+  - name: val
+    type: str
+"""
+    cmd, _ = preview(yaml_text, val="foo; rm -rf /")
+    assert cmd == ["echo", "foo; rm -rf /"]
+
+
+def test_bool_arg_with_to_flag_renders_when_true() -> None:
+    """A bool arg with ``to: --flag`` renders the flag when true (story 12)."""
+    yaml_text = """
+name: uv_add
+shell: bash
+command: "uv add {pkg} {is_dev}"
+args:
+  - name: pkg
+    type: str
+  - name: is_dev
+    type: bool
+    to: --dev
+"""
+    cmd, _ = preview(yaml_text, pkg="requests", is_dev=True)
+    assert cmd == "uv add requests --dev"
+
+
+def test_bool_arg_with_to_flag_renders_empty_when_false() -> None:
+    """A bool arg with ``to: --flag`` renders nothing when false (story 12)."""
+    yaml_text = """
+name: uv_add
+shell: bash
+command: "uv add {pkg} {is_dev}"
+args:
+  - name: pkg
+    type: str
+  - name: is_dev
+    type: bool
+    to: --dev
+"""
+    cmd, _ = preview(yaml_text, pkg="requests", is_dev=False)
+    assert cmd == "uv add requests "
+
+
+def test_bool_flag_ignored_for_non_bool_value() -> None:
+    """``to:`` only fires for bool values; a string value passes through."""
+    yaml_text = """
+name: t
+shell: bash
+command: "echo {val}"
+args:
+  - name: val
+    type: str
+    to: --should-not-appear
+"""
+    cmd, _ = preview(yaml_text, val="hello")
+    assert cmd == "echo hello"
+
+
 # ====================================================================
 # Platform selection (platforms: map)
 # ====================================================================

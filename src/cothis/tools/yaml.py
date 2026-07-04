@@ -19,6 +19,7 @@ function-level).
 from __future__ import annotations
 
 import inspect
+import shlex
 import string
 import subprocess
 import sys
@@ -154,7 +155,8 @@ class CommandBlock:
         Pure: no subprocess, no filesystem, no gating. The list-vs-string
         render fork lives here and only here.
         """
-        mapping = _value_mapping(self._arg_names, kwargs)
+        shell_mode = isinstance(self.command, str)
+        mapping = _value_mapping(self.arg_specs, kwargs, shell=shell_mode)
         if isinstance(self.command, list):
             return [part.format_map(mapping) for part in self.command]
         return self.command.format_map(mapping)
@@ -543,7 +545,7 @@ def preview(
 # parse time (``extra="forbid"`` discipline) so a typo like ``shel:`` or a
 # renamed field surfaces immediately, not as a silently-ignored directive.
 _TOOL_KEYS = {"name", "description", "command", "shell", "args", "platforms"}
-_ARG_KEYS = {"name", "type", "description", "required"}
+_ARG_KEYS = {"name", "type", "description", "required", "to"}
 _PLATFORM_KEYS = {"linux", "macos", "unix", "windows"}
 
 # The single source of truth for the YAML ``type:`` shorthand → Python type.
@@ -592,21 +594,41 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
-def _value_mapping(arg_names: list[str], values: dict[str, Any]) -> dict[str, Any]:
-    """Build the ``format_map`` input: declared names → values.
+def _value_mapping(
+    arg_specs: list[dict[str, Any]],
+    values: dict[str, Any],
+    *,
+    shell: bool = False,
+) -> dict[str, Any]:
+    """Build the ``format_map`` input from declared arg specs and runtime values.
 
-    Values are passed through as-is (not pre-stringified) so Python format
-    specs can apply (``{n:03d}`` needs an int, not a str). Lists are an
-    exception — pre-joined with spaces so ``{ids}`` renders as ``"1 2 3"``
-    rather than ``"[1, 2, 3]"``.
+    - Bool args carrying a ``to:`` flag render as the flag string (``--dev``)
+      when true, empty string when false (story 12). Non-bool values ignore ``to:``.
+    - In shell mode, string values are ``shlex.quote``-d and list elements are
+      quoted individually then space-joined, so a value with spaces or
+      metacharacters cannot inject into the command (story 22). Argv mode
+      (list command) is inherently safe — ``subprocess.run(list)`` does its
+      own tokenisation — so quoting only applies to shell mode.
+    - Other values pass through as-is so Python format specs can apply
+      (``{n:03d}`` needs an int, not a str).
     """
     mapping: dict[str, Any] = {}
-    for name in arg_names:
+    for spec in arg_specs:
+        name = spec["name"]
         if name not in values:
             continue
         value = values[name]
+        flag = spec.get("to")
+        if flag is not None and isinstance(value, bool):
+            mapping[name] = flag if value else ""
+            continue
         if isinstance(value, list):
-            mapping[name] = " ".join(str(v) for v in value)
+            if shell:
+                mapping[name] = " ".join(shlex.quote(str(v)) for v in value)
+            else:
+                mapping[name] = " ".join(str(v) for v in value)
+        elif shell and isinstance(value, str):
+            mapping[name] = shlex.quote(value)
         else:
             mapping[name] = value
     return mapping
