@@ -890,7 +890,14 @@ def test_shell_nonzero_exit_returns_error_string() -> None:
 def test_shell_executable_resolved_via_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``executable="bash"`` is resolved via PATH like YAML ``shell:``."""
-    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-    result = shell("echo from-bash", executable="bash")
-    assert result == "from-bash\n"
+    """``executable="sh"`` is resolved via PATH like YAML ``shell:``.
+
+    POSIX-only: Windows has no ``sh``. The resolution mechanic (``shutil.which``
+    → ``executable=``) is the same on both; one platform is enough to cover it.
+    """
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("``sh`` is not available on Windows")
+    result = shell("echo from-sh", executable="sh")
+    assert result == "from-sh\n"
