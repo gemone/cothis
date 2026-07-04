@@ -322,13 +322,22 @@ class Agent(BaseModel):
 
         from mcp import ClientSessionGroup
 
+        # Prefix each tool with the server's self-reported
+        # ``Implementation.name``, falling back to the YAML ``name:`` label
+        # when the server reports an empty name (ADR-0006). The fallback is
+        # per-server, but servers connect sequentially inside ``connect_into``,
+        # so a mutable cell updated before each connect gives the hook the
+        # right label without leaking cothis state into the SDK.
+        _fallback = {"label": ""}
+
         def _prefix(name: str, server_info: Any) -> str:
-            return f"{server_info.name}.{name}"
+            return f"{server_info.name or _fallback['label']}.{name}"
 
         group = ClientSessionGroup(component_name_hook=_prefix)
         await group.__aenter__()
         self._mcp_group = group
         for server in self._mcp_servers:
+            _fallback["label"] = server._label
             for mcp_tool in await server.connect_into(group):
                 if mcp_tool.__name__ in self._tool_map:
                     logger.error(

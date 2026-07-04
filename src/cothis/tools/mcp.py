@@ -180,6 +180,18 @@ class MCPServer(_HookableTool):
         self.params = params
         self._diagnostic = diagnostic
 
+    @property
+    def _label(self) -> str:
+        """Raw YAML ``name:`` label, without the ``mcp:`` handle prefix.
+
+        ``__name__`` is the discovery handle (``mcp:{label}``), prefixed so it
+        can't collide with a real tool name in the registry. The tool-name
+        prefix uses the bare label — what the user wrote in YAML ``name:``,
+        stripped of the handle decoration. Used as the fallback when the server
+        reports an empty ``Implementation.name`` (ADR-0006).
+        """
+        return self.__name__[4:] if self.__name__.startswith("mcp:") else self.__name__
+
     def __call__(self, *args: Any, **kwargs: Any) -> NoReturn:
         raise RuntimeError(
             f"MCP server {self.__name__!r} is a server declaration, not a callable tool"

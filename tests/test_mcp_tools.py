@@ -272,6 +272,16 @@ def test_yaml_mcp_label_with_colon_rejected(yaml_text: str) -> None:
         load_yaml_tools(yaml_text, source="bad.yaml")
 
 
+def test_mcp_server_label_strips_handle_prefix() -> None:
+    """``_label`` strips the ``mcp:`` discovery-handle prefix from
+    ``__name__``, yielding the raw YAML ``name:`` value used as the
+    tool-name prefix fallback when a server reports an empty
+    ``Implementation.name`` (ADR-0006)."""
+    assert MCPServer(name="mcp:context7", params=None)._label == "context7"
+    # A name without the handle prefix passes through unchanged.
+    assert MCPServer(name="custom", params=None)._label == "custom"
+
+
 # --- YAML routing: http transport --------------------------------------
 
 
@@ -987,5 +997,43 @@ async def test_duplicate_prefixed_tool_name_first_wins(
         # The duplicate was logged at ERROR.
         assert "already registered" in caplog.text
         assert "test-server.add" in caplog.text
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_prefix_falls_back_to_yaml_label_when_server_name_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a server reports an empty ``Implementation.name``, the tool prefix
+    falls back to the YAML ``name:`` label (ADR-0006). Defensive against a
+    non-conformant server that sends an empty string where the spec requires a
+    non-empty name."""
+    _mock_llm(monkeypatch)
+    fastmcp = _make_server()
+
+    async def _empty_name_connect(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        session = await self._exit_stack.enter_async_context(  # noqa: SLF001
+            create_connected_server_and_client_session(fastmcp)
+        )
+        # Server reports an empty name — the non-conformant case.
+        await self.connect_with_session(Implementation(name="", version="1.0"), session)
+        return session
+
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", _empty_name_connect)
+    # MCPServer label is "my-label" (from YAML name:); the server reports "".
+    server = MCPServer(name="mcp:my-label", params=None)
+    agent = Agent(model="x", provider="openrouter", tools=[server])
+
+    await agent._ensure_mcp()
+    try:
+        # Prefix falls back to the YAML label, not the empty server name.
+        assert "my-label.add" in agent._tool_map
+        assert "my-label.boom" in agent._tool_map
+        # No bare or dot-prefixed name leaked through.
+        assert ".add" not in agent._tool_map
+        assert "add" not in agent._tool_map
     finally:
         await agent.aclose()

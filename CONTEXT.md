@@ -120,8 +120,9 @@ A single remote tool produced by an MCP server — the `MCPClientTool`. Its
 `__name__` is **prefixed** with its server's self-reported name (the SDK's
 `component_name_hook` assigns `{server_name}.{remote}`): a server reporting
 `test-server` with a remote `query-docs` registers as
-`test-server.query-docs`. Dispatch is async: `__call__` awaits
-`group.call_tool` on the shared `ClientSessionGroup` and normalises the
+`test-server.query-docs`. When the server reports an empty name, the prefix
+falls back to the YAML `name:` label (ADR-0006). Dispatch is async: `__call__`
+awaits `group.call_tool` on the shared `ClientSessionGroup` and normalises the
 result to a string (text blocks joined; empty → `"(no output)"`; errors →
 `"Error: "` prefix). See ADR-0006 for the prefix scheme's collision
 properties.

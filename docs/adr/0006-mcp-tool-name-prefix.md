@@ -39,6 +39,17 @@ clash (a user tool named exactly `{server_name}.{remote}`) is caught at
 registration with an ERROR log + first-write-wins, not silently
 overwritten.
 
+**Fallback to the YAML label when the server reports an empty name.**
+The MCP spec requires `Implementation.name` to be non-empty, but a
+non-conformant server may send an empty string. The prefix hook falls
+back to the cothis-side YAML `name:` label (stripped of its `mcp:`
+handle prefix) so the tool still gets a meaningful, unique prefix
+rather than a bare remote name that could collide. Servers connect
+sequentially inside `_ensure_mcp`, so the hook reads the current
+server's label from a mutable cell updated before each `connect_into`.
+The YAML label is always non-empty (validated at load time by
+`_make_mcp_server`), so the fallback is always a valid prefix.
+
 **This is a prefix, not a namespace system.** Builtins (`fs.read`) and user
 tools (a bare `my_tool`) keep their existing names. Only MCP tools carry a
 source-distinguishing prefix. cothis does not introduce a hierarchy, a
