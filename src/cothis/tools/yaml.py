@@ -249,12 +249,8 @@ def _compile(
             raise ValueError(msg)
     else:
         if not selected.shell:
-            where = f" in {source}" if source else ""
-            msg = (
-                f"tool {name!r}: string ``command:`` requires a ``shell:`` field"
-                f"{where} (to declare which interpreter runs it)"
-            )
-            raise ValueError(msg)
+            # Auto-select per OS when the author doesn't declare one (story 16).
+            selected.shell = "cmd" if sys.platform == "win32" else "sh"
 
     return CommandBlock(
         name=name,

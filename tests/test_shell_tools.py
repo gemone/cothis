@@ -126,18 +126,19 @@ command: "echo from-bash"
     assert shell == "bash"
 
 
-def test_shell_string_without_shell_field_rejected() -> None:
-    """A string command with no ``shell:`` is rejected — forces explicit declaration.
+def test_shell_auto_selected_when_omitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A string command without ``shell:`` auto-selects the OS default (story 16).
 
-    Relying on a default shell is silent breakage (which shell? does it
-    exist?). Requiring ``shell:`` makes the author declare the interpreter.
+    POSIX → ``sh``, Windows → ``cmd``. Explicit ``shell:`` still overrides.
     """
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
 name: t
 command: echo hi
 """
-    with pytest.raises(ValueError, match="requires a ``shell:``"):
-        load_yaml_tools(yaml_text)
+    tool = _shell_tool(yaml_text)
+    expected = "cmd" if _current_platform() == "windows" else "sh"
+    assert tool._block.shell == expected
 
 
 def test_shell_pipe_supported_in_string_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -712,7 +713,7 @@ def test_preview_inherits_all_compile_checks() -> None:
     construction — this test guards against a future refactor moving a
     check back into ``load_yaml_tools`` only. Covers the two cases preview
     previously missed (argv[0] placeholder, undeclared placeholder) plus
-    the two it already mirrored (string-without-shell, shell-with-list).
+    shell-with-list (argv mode + ``shell:`` is meaningless).
     """
     # argv[0] placeholder — previously load-only; preview must now reject.
     argv0_placeholder = """
@@ -730,9 +731,9 @@ args:
     with pytest.raises(ValueError, match="undeclared placeholder"):
         preview(undeclared)
 
-    # String without shell — both still reject.
-    with pytest.raises(ValueError, match="requires a ``shell:``"):
-        preview('name: t\ncommand: "echo hi"\n')
+    # String without shell — auto-selects OS default (story 16), no error.
+    cmd, _ = preview('name: t\ncommand: "echo hi"\n')
+    assert cmd == "echo hi"
 
     # List WITH shell — both still reject.
     with pytest.raises(ValueError, match="meaningless with a list"):
