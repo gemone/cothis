@@ -537,6 +537,37 @@ def preview(
     return block.render(**kwargs), block.shell
 
 
+def shell(command: str | list[str], *, executable: str | None = None) -> str:
+    """Run a command and return stdout, or an ``Error:`` string on non-zero exit.
+
+    For Python tool authors who need shell-command glue inside ``@tool``
+    functions (story 36). Mirrors YAML ``_ShellTool`` dispatch semantics:
+    capture stdout+stderr, surface non-zero exits as error strings (not
+    exceptions) so the agent loop can recover.
+
+    ``command`` as a ``list`` → argv mode (``shell=False``, no shell
+    interpretation, inherently safe from injection). ``command`` as a ``str``
+    → shell mode (``shell=True``); pass ``executable`` to run under a
+    specific shell (e.g. ``"bash"``), resolved via PATH like YAML ``shell:``.
+    The caller is responsible for escaping user-controlled values in shell
+    mode — ``shlex.quote`` is the standard tool.
+    """
+    if isinstance(command, list):
+        proc = subprocess.run(command, capture_output=True, text=True)
+    else:
+        shell_path = _resolve_executable(executable) if executable else None
+        proc = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            executable=shell_path,
+        )
+    if proc.returncode != 0:
+        return f"Error: exit code {proc.returncode}: {proc.stderr}"
+    return proc.stdout
+
+
 # Known top-level keys on a tool declaration. Unknown keys are rejected at
 # parse time (``extra="forbid"`` discipline) so a typo like ``shel:`` or a
 # renamed field surfaces immediately, not as a silently-ignored directive.

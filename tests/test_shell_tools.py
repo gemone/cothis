@@ -36,6 +36,7 @@ from cothis.tools.yaml import (
     _ShellTool,
     load_yaml_tools,
     preview,
+    shell,
 )
 
 if TYPE_CHECKING:
@@ -862,3 +863,34 @@ def test_nonzero_exit_returns_error_with_stderr() -> None:
     result = tool()
     assert "exit code 3" in result
     assert "boom" in result
+
+
+# ====================================================================
+# shell() helper for Python extensions (story 36)
+# ====================================================================
+
+
+def test_shell_argv_mode_returns_stdout() -> None:
+    """``shell(["echo", "hi"])`` runs in argv mode and returns stdout."""
+    assert shell(["echo", "hello"]) == "hello\n"
+
+
+def test_shell_string_mode_returns_stdout() -> None:
+    """``shell("echo hi")`` runs in shell mode and returns stdout."""
+    assert shell("echo hello") == "hello\n"
+
+
+def test_shell_nonzero_exit_returns_error_string() -> None:
+    """A non-zero exit returns an ``Error:`` string, not an exception."""
+    result = shell(["sh", "-c", "echo boom >&2; exit 3"])
+    assert "exit code 3" in result
+    assert "boom" in result
+
+
+def test_shell_executable_resolved_via_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``executable="bash"`` is resolved via PATH like YAML ``shell:``."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    result = shell("echo from-bash", executable="bash")
+    assert result == "from-bash\n"

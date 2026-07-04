@@ -23,3 +23,4 @@ from cothis.tools.mcp import (
     MCPClientTool,
     MCPServer,
 )
+from cothis.tools.yaml import shell
