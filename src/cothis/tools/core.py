@@ -27,6 +27,7 @@ from typing import (
 )
 
 import griffe
+from pydantic import TypeAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -452,7 +453,9 @@ def _build_schema(
     # annotations as a load-time warning so a typo in a type hint
     # doesn't silently mistype a parameter for the model.
     try:
-        hints = typing.get_type_hints(fn)
+        # ``include_extras=True`` preserves ``Annotated[T, Field(...)]`` metadata
+        # so ``TypeAdapter`` below can extract constraints (story 4).
+        hints = typing.get_type_hints(fn, include_extras=True)
     except Exception:  # noqa: BLE001 — any hint-resolution failure is non-fatal
         hints = {}
     properties: dict[str, dict[str, Any]] = {}
@@ -469,7 +472,19 @@ def _build_schema(
         if origin in (typing.Union, type(None)):
             non_none = [a for a in typing.get_args(annotation) if a is not type(None)]
             annotation = non_none[0] if non_none else str
-        prop: dict[str, Any] = {"type": _PY_JSON_TYPE.get(annotation, "string")}
+        prop: dict[str, Any]
+        try:
+            # ``TypeAdapter`` honours ``Annotated[T, Field(...)]`` constraints
+            # (``ge``/``le``/``min_length``/…) so they reach the LLM schema
+            # (story 4). Falls back to the primitive-type map for anything
+            # ``TypeAdapter`` can't handle.
+            prop = TypeAdapter(annotation).json_schema()
+            # pydantic returns ``{}`` for ``Any`` — always supply a ``type``
+            # so the LLM schema is well-formed.
+            if "type" not in prop:
+                prop["type"] = _PY_JSON_TYPE.get(annotation, "string")
+        except Exception:  # noqa: BLE001 — unresolved/forward-ref types fall back
+            prop = {"type": _PY_JSON_TYPE.get(annotation, "string")}
         desc = arg_descs.get(pname)
         if desc:
             prop["description"] = desc

@@ -23,9 +23,10 @@ Covers:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
+from pydantic import Field
 
 from cothis.tools import Tool, ToolDef, tool
 from cothis.tools.core import _parse_docstring
@@ -238,6 +239,46 @@ def test_var_args_dropped_from_schema() -> None:
 
     props = f.__cothis_schema__["function"]["parameters"]["properties"]
     assert set(props) == {"a"}
+
+
+def test_annotated_field_constraints_reach_schema() -> None:
+    """``Annotated[T, Field(...)]`` constraints flow through to the JSON Schema (story 4).
+
+    pydantic's ``TypeAdapter`` honours ``ge`` / ``le`` / ``min_length`` etc.,
+    so the model sees the valid range and picks in-range arguments.
+    """
+
+    @tool
+    def set_score(score: Annotated[int, Field(ge=0, le=100)]) -> str:
+        """Set the score.
+
+        Args:
+            score: A value 0-100.
+        """
+        return str(score)
+
+    props = set_score.__cothis_schema__["function"]["parameters"]["properties"]
+    score_prop = props["score"]
+    assert score_prop["type"] == "integer"
+    assert score_prop["minimum"] == 0
+    assert score_prop["maximum"] == 100
+    assert score_prop["description"] == "A value 0-100."
+
+
+def test_basic_type_schema_unchanged() -> None:
+    """A plain ``int`` annotation still produces ``{"type": "integer"}`` — no regression."""
+
+    @tool
+    def echo(n: int) -> str:
+        """Echo.
+
+        Args:
+            n: a number.
+        """
+        return str(n)
+
+    props = echo.__cothis_schema__["function"]["parameters"]["properties"]
+    assert props["n"] == {"type": "integer", "description": "a number."}
 
 
 def test_parse_docstring_helper_directly() -> None:
