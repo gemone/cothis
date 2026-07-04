@@ -4,13 +4,12 @@ The original ``tools.py`` was split into a ``tools/`` package. This module
 holds the shared foundation: the ``Tool`` protocol, ``_HookableTool``
 (lifecycle hooks), the ``@tool`` / ``ToolDef`` Python-tool API, the shared
 YAML/MCP validation helpers (``_require`` / ``_check_unknown_keys``),
-schema serialisation (``schema_for``), and the per-layer loader
-(``load_tools_from_layer``).
+schema serialisation (``schema_for``), layer loading (``load_tools_from_layer``),
+and discovery composition (``discover_tools`` — builtins + user + project merge).
 
-YAML shell-tool pipeline lives in ``tools.yaml``; MCP in ``tools.mcp``;
-output formatting in ``tools.format``; discovery composition in
-``tools.discovery``. ``tools/__init__.py`` re-exports the union so
-``from cothis.tools import X`` is unchanged.
+YAML shell-tool pipeline lives in ``tools.yaml``; MCP servers/tools in
+``tools.mcp``; built-in fs tools in ``tools.builtins``; output formatting
+in ``tools.format``. ``tools/__init__.py`` re-exports the public surface.
 """
 
 from __future__ import annotations
@@ -35,10 +34,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("cothis.tools")
 
-# Re-export surface for ``from cothis.tools.core import *``. The YAML
-# pipeline symbols (``CommandBlock`` / ``load_yaml_tools`` / ``preview``)
-# live in ``tools.yaml`` and are re-exported from ``tools/__init__.py``
-# directly.
+# Re-export surface for ``from cothis.tools.core import *``.
 __all__ = [
     "AfterExecuteError",
     "Tool",

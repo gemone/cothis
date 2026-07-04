@@ -176,7 +176,7 @@ def _compile(
     ``preview`` to render any branch from any host) and merges args.
 
     Does NOT gate: ``shutil.which`` is ``load_yaml_tools``'s concern, so
-    ``preview`` can compile any branch regardless of host executables. The
+    ``preview`` can compile any branch regardless of host executables.
     The gated name is exposed via ``CommandBlock.gate_target``.
 
     Raises ``ValueError`` on any contract violation (message names the tool,

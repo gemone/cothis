@@ -33,7 +33,6 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # representation of that constraint.
 from cothis.tools import (
     AfterExecuteError,
-    MCPClientTool,
     MCPServer,
     Tool,
     format_tool_output,
@@ -46,6 +45,8 @@ if TYPE_CHECKING:
 
     from any_llm import AnyLLM
     from any_llm.types.completion import ChatCompletionMessage
+
+    from cothis.tools import MCPClientTool
 
 
 Message = dict[str, Any]
