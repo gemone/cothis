@@ -110,6 +110,17 @@ every other tool), preserving CONTEXT.md's "no per-source branching in
   same Agent after `aclose` therefore reconnects with fresh sessions on
   the next `run` instead of dispatching against closed ones.
 
+- **HTTP session resumption is delegated to the SDK.** The prior
+  hand-rolled transport dropped `streamablehttp_client`'s
+  `get_session_id` callback and documented a known ceiling: a dropped
+  HTTP connection could not be resumed; each `run` opened a fresh
+  transport. After the move to `ClientSessionGroup`, resumption
+  semantics are decided by the SDK's group + transport stack, not by
+  cothis. cothis holds no session id, no reconnect policy, no transport
+  state. If the SDK later exposes resumption control, cothis will need
+  to thread it through `MCPServer.connect_into`; today the ceiling is
+  simply inherited upstream.
+
 - **The test seam is `connect_with_session` on the group.** Tests use
   the SDK's in-memory `create_connected_server_and_client_session`
   transport + `group.connect_with_session` so the adapter code under

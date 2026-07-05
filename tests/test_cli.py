@@ -37,6 +37,40 @@ def test_format_multiple_arguments() -> None:
     assert out.endswith(")")
 
 
+def test_discover_tools_emits_per_tool_debug_log(tmp_path: Any, caplog: Any) -> None:
+    """Story 43: each loaded tool gets a DEBUG line naming its source.
+
+    The WARNING summary stays (for shadow diagnostics); the per-tool DEBUG
+    lines are the user-facing way to answer "why didn't my tool load?"
+    without digging through shadow/gating WARNINGs.
+    """
+    import logging
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "deploy.yaml").write_text(
+        'name: proj.deploy\ncommand: ["echo", "deploy"]\n', encoding="utf-8"
+    )
+    user = tmp_path / "nonexistent"
+
+    with caplog.at_level(logging.DEBUG, logger="cothis.tools"):
+        tools = discover_tools(project, user)
+
+    names = {t.__name__ for t in tools}
+    assert "proj.deploy" in names
+
+    debug_loaded = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "loaded tool" in r.msg and "from" in r.msg
+    ]
+    # Each registered tool emitted one DEBUG line.
+    debug_names = [r.getMessage() for r in debug_loaded]
+    assert any("proj.deploy" in m and "deploy.yaml" in m for m in debug_names)
+    assert any("fs.read" in m and "builtins" in m for m in debug_names)
+    assert any("fs.write" in m and "builtins" in m for m in debug_names)
+
+
 def test_format_integer_argument_not_quoted() -> None:
     event = ToolCallEvent(name="add", arguments={"a": 2, "b": 3})
     out = _format_tool_call(event)
@@ -308,7 +342,7 @@ def test_pre_load_false_on_winner_empties_slot_no_fallback(
         for r in caplog.records
         if r.name == "cothis.tools"
         and r.levelno == logging.WARNING
-        and "pre_load" in r.msg
+        and "pre_load callback returned False" in r.getMessage()
     ]
     assert len(pre_load_skips) == 1
     assert "shared.tool" in pre_load_skips[0].message

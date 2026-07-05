@@ -96,6 +96,16 @@ class MCPClientTool(_HookableTool):
         self.__name__ = mcp_tool.name
         self.__doc__ = mcp_tool.description or f"MCP tool: {mcp_tool.name}"
         self._remote_name = mcp_tool.name
+        # cothis: ceiling — the server's ``inputSchema`` is passed through
+        # verbatim as the OpenAI ``parameters`` field. The MCP spec defines
+        # ``inputSchema`` as a JSON Schema, which is structurally close to
+        # OpenAI's ``parameters`` — but a non-conformant server may ship a
+        # schema missing ``type: "object"``, carrying ``$ref``/``$defs``, or
+        # with provider-specific quirks, and those leak straight to the model.
+        # cothis does no normalisation today. Upgrade path: run the schema
+        # through a normaliser (drop ``$defs`` by inlining, default missing
+        # ``type`` to ``object``, validate it's a function-shaped schema) so
+        # an odd server can't corrupt the tool-call contract.
         self.__cothis_schema__ = {
             "type": "function",
             "function": {
@@ -206,6 +216,17 @@ class MCPServer(_HookableTool):
         protocol error) logs at ``WARNING`` naming the server + its
         ``diagnostic`` — never ``env``/``headers`` secrets (story 32) — and
         returns ``[]`` so the rest of the agent's tools still load (story 30).
+
+        cothis: ceiling — this method reaches into SDK internals: it
+        snapshots ``group.tools`` before/after ``connect_to_server`` and
+        ``model_copy``s each new entry to inject the prefixed name
+        ``MCPClientTool`` will see. These are private attributes on the SDK's
+        ``ClientSessionGroup``; if the SDK reshapes its tool store or stops
+        keying by the prefixed name, this breaks silently (tools registered
+        under the wrong name, or not at all). Upgrade path: SDK exposes an
+        official "connect one server, return its prefixed tools" API
+        (``connect_to_server`` returning the tool list would suffice); adopt
+        it and drop the snapshot diff.
         """
         # Snapshot the group's tools before connecting so we can identify
         # which tools this server contributed (prefix is the server's

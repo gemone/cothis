@@ -115,9 +115,10 @@ driven by the type of `command:`:
   command: ["git", "status", "--short"]
   ```
 - **shell mode** — `command:` is a string. A `shell:` field naming the
-  interpreter (`bash`, `pwsh`, …) is **required**; the string is passed
-  to that shell, supporting pipes / `&&` / redirection. The shell must
-  be on PATH or the tool is not registered.
+  interpreter (`bash`, `pwsh`, …) is supported; if omitted, cothis
+  auto-selects the OS default (`sh` on POSIX, `cmd` on Windows). The
+  string is passed to that shell, supporting pipes / `&&` / redirection.
+  The shell must be on PATH or the tool is not registered.
   ```yaml
   shell: bash
   command: grep foo file | wc -l
@@ -172,9 +173,10 @@ Three forms: `@tool` (name from `__name__`), `@tool("ns.name")`
 (positional name), `@tool(name=…, description=…)`. Per-arg descriptions
 come from the docstring's `Args:` section.
 
-*(Discovery of user-authored `.py` files under `.agents/tools/` is the
-next slice — issue #1, stories 33–35. The decorator is ready; the loader
-isn't.)*
+*(Python-tool discovery — auto-scanning `.py` files under `.agents/tools/`
+for `@tool`-decorated functions — shipped with PR #24. See
+`CONTEXT.md` "Tool source" and ADR-0007 for the design, including the
+deviation from PRD story 38.)*
 
 ### MCP servers (`type: mcp.stdio` / `type: mcp.http`)
 

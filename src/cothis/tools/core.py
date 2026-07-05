@@ -579,7 +579,7 @@ def schema_for(tool: Tool) -> Tool | dict[str, Any]:
 
     Keeping this fork here (next to ``_build_tool_schema``, the producer of
     the attribute) means ``Agent`` stays blind to the ``__cothis_schema__``
-    name — the schema serialisation rule lives in ``tools.py``, where the
+    name — the schema serialisation rule lives in ``tools.core``, where the
     Tools are defined, not in ``agent.py``.
     """
     return getattr(tool, "__cothis_schema__", tool)
@@ -732,6 +732,12 @@ def discover_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
         run_hooks = getattr(tool, "_run_load_hooks", None)
         if run_hooks is None or run_hooks():
             registered.append(tool)
+            # Per-tool DEBUG line: which tool loaded and from where. Story 43 —
+            # the user-facing way to diagnose "why didn't my tool load?".
+            # Tools dropped by ``pre_load`` / hooks below never reach this line;
+            # they're logged at WARNING by ``_run_load_hooks``.
+            src = getattr(tool, "_source", None) or "builtins"
+            logger.debug("loaded tool %r from %s", tool.__name__, src)
 
     logger.warning(
         "discovery: %d tools active (%d shadowed)",

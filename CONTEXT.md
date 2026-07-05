@@ -77,14 +77,22 @@ proceeds). `phase` is one of `"pre_load"` / `"after_load"` /
 _Avoid_: pipeline stage, middleware (both too generic).
 
 **Tool source**:
-A path that yields `Tool` objects. **Currently implemented**: Python
-(`@tool`-decorated functions), YAML (declarative shell template), and MCP
-(external tool server, `type: mcp.stdio` — issue #16 — or `type: mcp.http`
-— issue #17). **Planned, not yet implemented** (issue #1): dynamic
-discovery of user-authored Python files. The pydantic schema base class
-(stories 1–10) was **dropped** — `@tool` is the single Python-tool
-definition API. Tool source is the **format** axis only (Python / YAML /
-MCP) — it is **never** a precedence axis (see Layer).
+A path that yields `Tool` objects. **Implemented**: Python
+(`@tool`-decorated functions, auto-scanned from `.py` files in a
+discovery path), YAML (declarative shell template), and MCP (external
+tool server, `type: mcp.stdio` — issue #16 — or `type: mcp.http` —
+issue #17). The pydantic schema base class (stories 1–10) was **dropped**
+— `@tool` is the single Python-tool definition API. **Deviation from
+PRD story 34**: the PRD asked Python extension files to export a `TOOLS`
+list; the shipped loader instead auto-scans for `@tool`-decorated
+`ToolDef` instances at module level (no export contract — the author
+just decorates). **Deviation from PRD story 38**: the PRD asked Python
+extensions to be a "thin wrapper over the shell-tool template" (i.e.
+Python files call the `shell()` helper); the shipped design treats
+Python extensions as a peer source — `@tool` functions are first-class,
+the `shell()` helper is available but optional. See ADR-0007. Tool
+source is the **format** axis only (Python / YAML / MCP) — it is
+**never** a precedence axis (see Layer).
 _Avoid_: tool type (collides with `YAMLTool`), tool kind, backend,
 layer (different axis).
 
@@ -158,9 +166,17 @@ _Avoid_: compiled tool (collides with Tool), resolved tool, tool spec
 How a YAMLTool's `command:` runs, determined by its YAML type. **argv
 mode** — `command:` is a list, passed to `execve` with `shell=False`;
 each element is one argv item, spaces/special chars are safe by default.
-**shell mode** — `command:` is a string, passed to a declared `shell:`
+**shell mode** — `command:` is a string, passed to a `shell:`
 interpreter with `shell=True`; supports pipes / `&&` / redirection. The
-`shell:` field is required for shell mode and names the gated interpreter.
+`shell:` field names the gated interpreter; if omitted, cothis auto-selects
+the OS default (`sh` on POSIX, `cmd` on Windows — story 16). Shell-mode
+arg values are quoted per interpreter (`shlex.quote` for POSIX,
+`subprocess.list2cmdline` for `cmd`). On POSIX this fully closes
+injection (story 22); on `cmd.exe` it is partial — whitespace-bearing
+values are double-quoted, but values like `foo&bar` pass through
+unquoted and `%VAR%` expansion is undefended (see the `cothis:` ceiling
+on `_shell_quote`). Argv mode (`command:` as a list) is fully safe on
+all platforms — prefer it for untrusted input.
 _Avoid_: command type (collides with arg type), run style.
 
 **Platform**:

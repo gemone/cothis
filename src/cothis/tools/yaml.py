@@ -153,10 +153,14 @@ class CommandBlock:
         not a compile-time bug.
 
         Pure: no subprocess, no filesystem, no gating. The list-vs-string
-        render fork lives here and only here.
+        render fork lives here and only here. Shell-mode values are quoted
+        for THIS tool's declared interpreter (POSIX vs ``cmd``) so a value
+        with spaces or metacharacters cannot inject (story 22).
         """
         shell_mode = isinstance(self.command, str)
-        mapping = _value_mapping(self.arg_specs, kwargs, shell=shell_mode)
+        mapping = _value_mapping(
+            self.arg_specs, kwargs, shell=self.shell if shell_mode else None
+        )
         if isinstance(self.command, list):
             return [part.format_map(mapping) for part in self.command]
         return self.command.format_map(mapping)
@@ -187,7 +191,7 @@ def _compile(
     """
     spec = yaml.safe_load(yaml_text)
     _check_unknown_keys(spec, _TOOL_KEYS, source, what="YAML tool")
-    name = str(_require(spec, "name", source))
+    name = _normalise_tool_name(str(_require(spec, "name", source)), source)
     description = _stringify(spec.get("description")) or f"Shell tool: {name}"
 
     top = _parse_command_block(spec, name, source, what="YAML tool")
@@ -206,7 +210,8 @@ def _compile(
         for plat, block in platforms_raw.items()
     }
 
-    selected = _select_platform(top, platforms, platform=platform)
+    current = platform if platform is not None else _current_platform()
+    selected = _select_platform(top, platforms, platform=current)
 
     merged_args = _merge_arg_specs(top.args, selected.args)
     declared = {a["name"] for a in merged_args}
@@ -249,8 +254,11 @@ def _compile(
             raise ValueError(msg)
     else:
         if not selected.shell:
-            # Auto-select per OS when the author doesn't declare one (story 16).
-            selected.shell = "cmd" if sys.platform == "win32" else "sh"
+            # Auto-select per selected platform when the author doesn't declare
+            # one (story 16). Uses the resolved ``current`` (honours
+            # ``platform`` / ``_platform`` overrides) — previewing the windows
+            # branch from a POSIX host picks ``cmd``, not the host's ``sh``.
+            selected.shell = "cmd" if current == "windows" else "sh"
 
     return CommandBlock(
         name=name,
@@ -502,11 +510,30 @@ class _ShellTool(_HookableTool):
                 text=True,
                 executable=self._shell_path,
             )
-        # Surface non-zero exits as an error string the model can act on,
-        # not an exception that crashes the ReAct loop.
-        if proc.returncode != 0:
-            return f"Error: exit code {proc.returncode}: {proc.stderr}"
+        return _format_proc_result(proc)
+
+
+def _format_proc_result(proc: Any) -> str:
+    """Format a finished ``subprocess.CompletedProcess`` for the LLM.
+
+    Success (exit 0): returns ``stdout``; appends ``stderr`` only when it's
+    non-empty (deprecation warnings / progress notes the model benefits from).
+    Failure (non-zero): returns ``Error: exit code N`` plus both streams,
+    stdout first then stderr — the crash context (stdout emitted before the
+    failure) is often the most actionable signal, and dropping it (the prior
+    behaviour) made the LLM blind to why a command crashed mid-output.
+    Story 18: capture stdout+stderr.
+    """
+    if proc.returncode == 0:
+        if proc.stderr:
+            return f"{proc.stdout}\n[stderr]\n{proc.stderr}"
         return proc.stdout
+    parts = [f"Error: exit code {proc.returncode}"]
+    if proc.stdout:
+        parts.append(f"[stdout]\n{proc.stdout}")
+    if proc.stderr:
+        parts.append(f"[stderr]\n{proc.stderr}")
+    return "\n".join(parts)
 
 
 def preview(
@@ -539,19 +566,20 @@ def preview(
 
 
 def shell(command: str | list[str], *, executable: str | None = None) -> str:
-    """Run a command and return stdout, or an ``Error:`` string on non-zero exit.
+    """Run a command and return its output, or an ``Error:`` string on non-zero exit.
 
     For Python tool authors who need shell-command glue inside ``@tool``
     functions (story 36). Mirrors YAML ``_ShellTool`` dispatch semantics:
-    capture stdout+stderr, surface non-zero exits as error strings (not
-    exceptions) so the agent loop can recover.
+    capture stdout+stderr (story 18), surface non-zero exits as error strings
+    (not exceptions) so the agent loop can recover.
 
     ``command`` as a ``list`` → argv mode (``shell=False``, no shell
     interpretation, inherently safe from injection). ``command`` as a ``str``
     → shell mode (``shell=True``); pass ``executable`` to run under a
     specific shell (e.g. ``"bash"``), resolved via PATH like YAML ``shell:``.
     The caller is responsible for escaping user-controlled values in shell
-    mode — ``shlex.quote`` is the standard tool.
+    mode — ``shlex.quote`` for POSIX shells, ``subprocess.list2cmdline`` for
+    ``cmd`` (see ``_shell_quote`` in this module).
     """
     if isinstance(command, list):
         proc = subprocess.run(command, capture_output=True, text=True)
@@ -572,9 +600,7 @@ def shell(command: str | list[str], *, executable: str | None = None) -> str:
             text=True,
             executable=shell_path,
         )
-    if proc.returncode != 0:
-        return f"Error: exit code {proc.returncode}: {proc.stderr}"
-    return proc.stdout
+    return _format_proc_result(proc)
 
 
 # Known top-level keys on a tool declaration. Unknown keys are rejected at
@@ -630,21 +656,101 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
+# Characters allowed in a tool name. OpenAI / Anthropic function-name rules
+# converge on ``[A-Za-z0-9_-]`` plus ``.`` for cothis's namespace convention.
+# Anything else (spaces, ``/``, ``:``, …) would break provider routing or
+# cothis's dotted-namespace / MCP-prefix scheme. We don't reject on violation —
+# we normalise: spaces / ``/`` / ``:`` → ``-`` (readable), other special
+# characters stripped. Author-facing names like ``uv add`` keep working as
+# ``uv-add``. The original is logged at WARNING so the author sees the rename.
+_NAME_REPLACEMENTS = {" ": "-", "/": "-", ":": "-"}
+
+
+def _normalise_tool_name(raw: str, source: str | None) -> str:
+    """Normalise a YAML ``name:`` into a tool name safe for provider routing.
+
+    Spaces, ``/`` and ``:`` → ``-`` (``"uv add"`` → ``"uv-add"``, ``"a/b"``
+    → ``"a-b"``). Other characters outside ``[A-Za-z0-9_.-]`` are stripped
+    (``"a!b"`` → ``"ab"``). The rename is logged at WARNING when it changes
+    the input, naming the source file so the author can fix it deliberately.
+    Empty after normalisation → ``ValueError`` (a tool with no callable name
+    is unusable).
+    """
+    normalised = ""
+    changed = False
+    for ch in raw:
+        if ch.isalnum() or ch in "_.-":
+            normalised += ch
+        elif ch in _NAME_REPLACEMENTS:
+            normalised += _NAME_REPLACEMENTS[ch]
+            changed = True
+        else:
+            changed = True
+    if not normalised:
+        where = f" in {source}" if source else ""
+        msg = f"tool name {raw!r} normalises to empty{where}; set a non-empty 'name:'"
+        raise ValueError(msg)
+    if changed:
+        where = f" in {source}" if source else ""
+        logger.warning("tool name %r normalised to %r%s", raw, normalised, where)
+    return normalised
+
+
+def _shell_quote(value: str, shell: str | None) -> str:
+    """Shell-quote ``value`` for the named interpreter.
+
+    POSIX shells (``sh``, ``bash``, ``zsh``, ``pwsh``, …) get ``shlex.quote``
+    (single-quote wrapping). PowerShell treats single quotes as quoting too,
+    so the POSIX branch is correct for ``pwsh``.
+
+    Windows ``cmd.exe`` gets ``subprocess.list2cmdline`` — single quotes are
+    NOT cmd quoting, so the POSIX branch would silently fail there.
+
+    cothis: ceiling — ``list2cmdline`` does NOT fully close cmd.exe
+    injection. Per CPython source (``needquote = (" " in arg) or
+    ("\t" in arg) or not arg``) it only double-quotes when the value
+    contains whitespace, tab, or is empty. (A literal double-quote in the
+    value triggers internal ``\"`` escaping, not wrapping — it round-trips
+    correctly but is a different code path.) A value like ``foo&echo
+    PWNED`` (no spaces) passes through UNQUOTED — ``&`` is a live cmd
+    metacharacter, so story 22 is only partially met on cmd.exe. ``%VAR%``
+    expansion is also undefended: cmd.exe expands it inside double quotes
+    too. Upgrade path: (a) hand-roll a full cmd.exe escaper that quotes
+    every value and escapes ``%`` (notoriously fragile), (b) restrict
+    shell-mode-on-Windows to PowerShell (``pwsh``) and require argv mode
+    (``command: [list]``) for untrusted input under ``cmd``, or (c) accept
+    the ceiling and document it per-tool. Today the partial defence is
+    retained (whitespace-bearing values ARE safe) as better than the prior
+    POSIX-only path which was wrong for cmd on every value.
+
+    ``shell`` is the declared interpreter name (``self.shell``); ``None`` means
+    argv mode where quoting never runs (the caller passes ``None``).
+    """
+    if shell == "cmd":
+        # ``list2cmdline`` expects a token list and returns the cmd.exe-safe
+        # rendering of all of them joined by spaces. Pass one token so the
+        # output is exactly that token's cmd-safe form, no leading space.
+        # See the docstring ceiling: this is partial, not complete, defence.
+        return subprocess.list2cmdline([value])
+    return shlex.quote(value)
+
+
 def _value_mapping(
     arg_specs: list[dict[str, Any]],
     values: dict[str, Any],
     *,
-    shell: bool = False,
+    shell: str | None = None,
 ) -> dict[str, Any]:
     """Build the ``format_map`` input from declared arg specs and runtime values.
 
     - Bool args carrying a ``to:`` flag render as the flag string (``--dev``)
       when true, empty string when false (story 12). Non-bool values ignore ``to:``.
-    - In shell mode, string values are ``shlex.quote``-d and list elements are
-      quoted individually then space-joined, so a value with spaces or
-      metacharacters cannot inject into the command (story 22). Argv mode
-      (list command) is inherently safe — ``subprocess.run(list)`` does its
-      own tokenisation — so quoting only applies to shell mode.
+    - In shell mode (``shell`` is the interpreter name), string values are
+      shell-quoted for the SPECIFIC interpreter (POSIX → ``shlex.quote``;
+      ``cmd`` → ``subprocess.list2cmdline``) and list elements are quoted
+      individually then space-joined (story 22). Argv mode (``shell=None``) is
+      inherently safe — ``subprocess.run(list)`` does its own tokenisation — so
+      quoting only applies to shell mode.
     - Other values pass through as-is so Python format specs can apply
       (``{n:03d}`` needs an int, not a str).
     """
@@ -660,11 +766,11 @@ def _value_mapping(
             continue
         if isinstance(value, list):
             if shell:
-                mapping[name] = " ".join(shlex.quote(str(v)) for v in value)
+                mapping[name] = " ".join(_shell_quote(str(v), shell) for v in value)
             else:
                 mapping[name] = " ".join(str(v) for v in value)
         elif shell and isinstance(value, str):
-            mapping[name] = shlex.quote(value)
+            mapping[name] = _shell_quote(value, shell)
         else:
             mapping[name] = value
     return mapping

@@ -23,7 +23,8 @@ Tests spawn short-lived subprocesses (``echo``) but never touch the network.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+import logging
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -912,3 +913,134 @@ def test_shell_missing_executable_returns_error_not_silent_fallback() -> None:
     result = shell("echo hi", executable="definitely-not-on-path-xyz-123")
     assert result.startswith("Error:")
     assert "definitely-not-on-path-xyz-123" in result
+
+
+# ====================================================================
+# Follow-up batch: preview _platform propagation, cmd quoting,
+# stdout+stderr merge, name normalisation (Copilot A/B/C + story 11/21)
+# ====================================================================
+
+
+def test_preview_platform_override_propagates_to_shell_auto_select() -> None:
+    """Copilot A: ``preview(_platform="windows")`` on a POSIX host picks
+    ``cmd``, not ``sh``. The platform override must reach shell auto-selection,
+    not just command-branch selection."""
+    yaml_text = 'name: t\ncommand: "echo hi"\n'  # no shell: → auto-select
+    cmd, shell_name = preview(yaml_text, _platform="windows")
+    assert shell_name == "cmd"
+    cmd, shell_name = preview(yaml_text, _platform="linux")
+    assert shell_name == "sh"
+
+
+def test_cmd_shell_quoting_uses_list2cmdline_not_shlex() -> None:
+    """Copilot B: ``shell: cmd`` mode quotes values with
+    ``subprocess.list2cmdline`` (double-quoted), not ``shlex.quote``
+    (single-quoted). ``shlex.quote`` would silently fail on ``cmd.exe``
+    because cmd doesn't treat single quotes as quoting — story 22 would
+    not hold on Windows."""
+    yaml_text = """
+name: echo_cmd
+shell: cmd
+command: "echo {pattern}"
+args:
+  - name: pattern
+    type: str
+"""
+    cmd, shell_name = preview(yaml_text, pattern="foo & bar")
+    assert shell_name == "cmd"
+    # ``list2cmdline(["foo & bar"])`` → ``'"foo & bar"'`` (double-quoted).
+    # ``shlex.quote("foo & bar")`` → ``"'foo & bar'"`` (single-quoted).
+    # The assertion pins the cmd.exe-safe form.
+    assert cmd == 'echo "foo & bar"'
+
+
+def test_shell_helper_stdout_with_nonempty_stderr_appended() -> None:
+    """Copilot C: on success (exit 0), non-empty ``stderr`` is appended so
+    the agent sees deprecation warnings / progress notes (story 18).
+    Exit 0 + empty stderr → plain stdout (no regression for the common case)."""
+    # A command that writes to stderr but exits 0.
+    result = shell(["sh", "-c", "echo out; echo warn >&2"])
+    assert "out" in result
+    assert "warn" in result
+    assert "[stderr]" in result
+    # Exit 0 + empty stderr → just stdout.
+    assert shell(["echo", "hi"]) == "hi\n"
+
+
+def test_shell_helper_nonzero_exit_includes_stdout_and_stderr() -> None:
+    """Copilot C: on failure, both streams are returned (stdout first).
+    Dropping crash-time stdout would blind the LLM to mid-output failures."""
+    result = shell(["sh", "-c", "echo partial; echo boom >&2; exit 3"])
+    assert "exit code 3" in result
+    assert "partial" in result  # stdout preserved
+    assert "boom" in result  # stderr preserved
+    assert result.index("partial") < result.index("boom")  # stdout first
+
+
+def test_shell_helper_nonzero_exit_with_empty_stdout() -> None:
+    """Failure with no stdout: only the ``[stderr]`` section appears.
+    The ``if proc.stdout`` guard must skip the stdout section cleanly."""
+    result = shell(["sh", "-c", "echo boom >&2; exit 3"])
+    assert "exit code 3" in result
+    assert "boom" in result
+    assert "[stdout]" not in result
+
+
+def test_shell_helper_nonzero_exit_with_empty_stderr() -> None:
+    """Failure with no stderr: only the ``[stdout]`` section appears.
+    The ``if proc.stderr`` guard must skip the stderr section cleanly."""
+    result = shell(["sh", "-c", "echo partial; exit 3"])
+    assert "exit code 3" in result
+    assert "partial" in result
+    assert "[stderr]" not in result
+
+
+def test_shell_tool_name_with_spaces_normalised_to_dashes() -> None:
+    """Story 11/21联动: ``name: uv add`` normalises to ``uv-add``.
+    Provider function-name rules converge on ``[A-Za-z0-9_.-]``; spaces
+    would break routing. Spaces → dashes (readable), logged at WARNING."""
+    import logging
+
+    yaml_text = """
+name: uv add
+command: ["echo", "hi"]
+"""
+    tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "uv-add"
+
+
+def test_shell_tool_name_with_spaces_emits_warning(caplog: Any) -> None:
+    """The space→dash normalisation is observable: a WARNING fires naming
+    the original and normalised forms so the author can fix it deliberately."""
+    yaml_text = 'name: "my tool"\ncommand: ["echo", "hi"]\n'
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        tool = load_yaml_tools(yaml_text)
+    assert tool[0].__name__ == "my-tool"
+    normalise_warnings = [r for r in caplog.records if "normalised" in r.message]
+    assert len(normalise_warnings) == 1
+    assert "my tool" in normalise_warnings[0].message
+    assert "my-tool" in normalise_warnings[0].message
+
+
+def test_shell_tool_name_strips_other_special_chars() -> None:
+    """Characters outside ``[A-Za-z0-9_.-]`` (and not in ``_NAME_REPLACEMENTS``)
+    are stripped, not replaced. ``"a!b"`` → ``"ab"``, not ``"a-b"``.
+    Covers the strip arm distinct from the space/slash/colon→dash arm."""
+    yaml_text = 'name: "a!b@c"\ncommand: ["echo", "hi"]\n'
+    tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "abc"
+
+
+def test_shell_tool_name_empty_after_normalisation_rejected() -> None:
+    """A name that normalises to empty (all special chars) raises — a tool
+    with no callable name is unusable."""
+    yaml_text = 'name: "!!"\ncommand: ["echo", "hi"]\n'
+    with pytest.raises(ValueError, match="normalises to empty"):
+        load_yaml_tools(yaml_text)
+
+
+def test_shell_tool_name_with_alnum_unchanged() -> None:
+    """A normal ``fs.read``-style name passes through unchanged."""
+    yaml_text = 'name: fs.read\ncommand: ["echo", "hi"]\n'
+    tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "fs.read"
