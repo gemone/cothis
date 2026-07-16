@@ -33,8 +33,10 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # representation of that constraint.
 from cothis.tools import (
     AfterExecuteError,
+    HandleManager,
     MCPServer,
     Tool,
+    ensure_handle_ready,
     format_tool_output,
     run_hooks_safe,
     schema_for,
@@ -139,6 +141,7 @@ class Agent(BaseModel):
     _messages: list[dict[str, Any] | ChatCompletionMessage] = PrivateAttr(
         default_factory=list
     )
+    _handle_manager: HandleManager = PrivateAttr(default_factory=HandleManager)
     _mcp_servers: list[MCPServer] = PrivateAttr(default_factory=list)
     _mcp_group: Any = PrivateAttr(default=None)
     _mcp_tool_names: set[str] = PrivateAttr(default_factory=set)
@@ -158,6 +161,10 @@ class Agent(BaseModel):
             for tool in self.tools
             if not isinstance(tool, MCPServer)
         }
+        # Bind the handle manager to every tool that declared a ResourceHandle
+        # Tools without ``_handle_cls`` are skipped by ``bind``.
+        for tool in self._tool_map.values():
+            self._handle_manager.bind(tool)
 
     async def run(self, user_input: str) -> str:
         """Run the agent loop to completion and return the final answer.
@@ -177,6 +184,7 @@ class Agent(BaseModel):
         await self._ensure_mcp()
 
         for _turn in range(self.max_iterations):
+            await self._handle_manager.reclaim_idle()
             response = await self._llm.acompletion(
                 model=self.model,
                 messages=self._messages,
@@ -236,6 +244,7 @@ class Agent(BaseModel):
         max_iterations = self.max_iterations
 
         for _turn in range(max_iterations):
+            await self._handle_manager.reclaim_idle()
             response = await llm.acompletion(
                 model=model,
                 messages=messages,
@@ -370,6 +379,7 @@ class Agent(BaseModel):
             except Exception as exc:  # noqa: BLE001 — teardown must not raise
                 logger.debug("MCP group close error: %s", exc)
             self._mcp_group = None
+        await self._handle_manager.release_all()
         # Remove the MCP-expanded tools by tracked name.
         for name in self._mcp_tool_names:
             self._tool_map.pop(name, None)
@@ -499,6 +509,16 @@ class Agent(BaseModel):
         except Exception as exc:  # noqa: BLE001 — author hook code
             logger.debug("← %s pre_execute raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=pre_execute)", name)
+            return f"Error calling {name}: {exc}"
+
+        # Ensure the tool's ResourceHandle (if any) is acquired before the
+        # body runs — self-healing path. No-op for tools without a
+        # handle (duck-typed like ``run_hooks_safe``).
+        try:
+            await ensure_handle_ready(tool)
+        except Exception as exc:  # noqa: BLE001 — acquire may fail (network, …)
+            logger.debug("← %s handle acquire raised: %s", name, exc)
+            run_hooks_safe(tool, "_run_on_error", exc, "handle", args)
             return f"Error calling {name}: {exc}"
 
         arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())

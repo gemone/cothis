@@ -28,10 +28,14 @@ from __future__ import annotations
 from cothis.tools.builtins import read, write
 from cothis.tools.core import (
     AfterExecuteError,
+    HandleManager,
+    ResourceHandle,
     Tool,
     ToolDef,
     discover_tools,
+    ensure_handle_ready,
     logger,
+    resource,
     run_hooks_safe,
     schema_for,
     tool,

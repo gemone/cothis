@@ -76,6 +76,25 @@ proceeds). `phase` is one of `"pre_load"` / `"after_load"` /
 `"pre_execute"` / `"tool"` / `"after_execute"`, naming which stage raised.
 _Avoid_: pipeline stage, middleware (both too generic).
 
+**Resource handle**:
+An external resource a `Tool` depends on **between** calls — a server
+session, a subprocess, a database connection. A parallel concern to Tool
+lifecycle (not a sixth hook stage): lifecycle hooks are stateless per-call
+interceptors; a handle is stateful and spans many calls. A handle is
+declared **independently of** tools (`@resource`), then bound to one or
+more tools (`@tool(handle=…)`); a tool **may** bind one or **none**
+(`fs.read` holds nothing). The Agent manages handles — not per-tool:
+keepalive reclaims a handle idle past a window (default 600s); LRU evicts
+under capacity pressure (default 8). A handle shared by several tools has
+one `last_used` (any of its tools calling refreshes it) and is reclaimed
+once, then transparently re-acquired on the next call to any of its
+tools. The re-acquire is inserted in `_execute` after `pre_execute`,
+before the tool body, via the same duck-typed no-op pattern as
+`run_hooks_safe` (no per-source branching). Tools without a bound handle
+keep the existing path untouched.
+_Avoid_: connection (too narrow — misses subprocess/file handles),
+resource (too generic), pool (implies many; a tool may hold one).
+
 **Tool source**:
 A path that yields `Tool` objects. **Implemented**: Python
 (`@tool`-decorated functions, auto-scanned from `.py` files in a

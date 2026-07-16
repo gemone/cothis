@@ -14,9 +14,11 @@ in ``tools.format``. ``tools/__init__.py`` re-exports the public surface.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import shutil
+import time
 import types
 import typing
 from typing import (
@@ -39,11 +41,15 @@ logger = logging.getLogger("cothis.tools")
 # Re-export surface for ``from cothis.tools.core import *``.
 __all__ = [
     "AfterExecuteError",
+    "HandleManager",
+    "ResourceHandle",
     "Tool",
     "ToolDef",
     "discover_tools",
+    "ensure_handle_ready",
     "load_tools_from_layer",
     "logger",
+    "resource",
     "run_hooks_safe",
     "schema_for",
     "tool",
@@ -140,13 +146,15 @@ def tool(func: Callable[..., Any], /) -> ToolDef: ...
 
 @overload
 def tool(
-    func: str, /, *, name: str | None = None, description: str | None = None
+    func: str, /, *, name: str | None = None, description: str | None = None,
+    handle: type[ResourceHandle] | None = None,
 ) -> Callable[[Callable[..., Any]], ToolDef]: ...
 
 
 @overload
 def tool(
-    *, name: str | None = None, description: str | None = None
+    *, name: str | None = None, description: str | None = None,
+    handle: type[ResourceHandle] | None = None,
 ) -> Callable[[Callable[..., Any]], ToolDef]: ...
 
 
@@ -155,6 +163,7 @@ def tool(
     *,
     name: str | None = None,
     description: str | None = None,
+    handle: type[ResourceHandle] | None = None,
 ) -> ToolDef | Callable[[Callable[..., Any]], ToolDef]:
     """Decorate a function as a cothis tool with a rich LLM schema.
 
@@ -169,6 +178,13 @@ def tool(
         @tool(name="fs.read", description="...")  # keyword overrides
         def read(path: str) -> str: ...
 
+    Bind a ``ResourceHandle`` so the Agent manages an external
+    resource for this tool::
+
+        @tool("db.query", handle=Db)
+        async def query(sql: str) -> str:
+            return await query.handle.conn.fetchval(sql)
+
     Returns a ``ToolDef`` instance that wraps the function. ``ToolDef``
     satisfies the ``Tool`` Protocol (``__name__`` + ``__call__``) and carries
     a pre-built OpenAI schema on ``__cothis_schema__`` (bypassing any-llm's
@@ -179,7 +195,7 @@ def tool(
     """
 
     def decorate(fn: Any) -> ToolDef:
-        return ToolDef(fn, name=name, description=description)
+        return ToolDef(fn, name=name, description=description, handle=handle)
 
     if isinstance(func, str):
         name = func
@@ -383,6 +399,67 @@ class _HookableTool:
         return current
 
 
+class ResourceHandle:
+    """An external resource a tool depends on between calls.
+
+    Declared independently (``@resource``), bound to one or more tools
+    (``@tool(handle=…)``). The Agent's ``HandleManager`` owns the instance:
+    it calls ``acquire`` before the first call (and after any idle
+    reclamation), ``release`` when the handle is idle past ``keepalive``
+    seconds or evicted under LRU pressure. A handle shared by several
+    tools is one instance with one ``last_used`` — any tool calling
+    refreshes it.
+
+    Subclasses define ``acquire`` / ``release`` and set ``keepalive``::
+
+        @resource(keepalive=300)
+        class Db(ResourceHandle):
+            async def acquire(self): self.conn = await connect()
+            async def release(self): await self.conn.close()
+
+        @tool("db.query", handle=Db)
+        async def query(sql: str) -> str:
+            return await query.handle.conn.fetchval(sql)
+
+    The handle instance is assigned to each bound tool's ``.handle``
+    attribute by the ``HandleManager``; the tool function body reads it
+    there (never as a parameter — it must not pollute the LLM schema).
+    """
+
+    keepalive: float = 600.0
+
+    async def acquire(self) -> None:
+        """Establish the resource. Called before first use and after reclamation."""
+
+    async def release(self) -> None:
+        """Release the resource. Must be idempotent — the manager may call it
+        on an already-released handle under races."""
+
+
+def resource(
+    cls: type[ResourceHandle] | None = None, *, keepalive: float | None = None
+) -> Any:
+    """Mark a class as a ``ResourceHandle`` and optionally override keepalive.
+
+    Two forms::
+
+        @resource
+        class H(ResourceHandle): ...
+
+        @resource(keepalive=120)
+        class H(ResourceHandle): ...
+    """
+
+    def decorate(target: type[ResourceHandle]) -> type[ResourceHandle]:
+        if keepalive is not None:
+            target.keepalive = keepalive
+        return target
+
+    if cls is not None:
+        return decorate(cls)
+    return decorate
+
+
 class ToolDef(_HookableTool):
     """A Python tool: a callable + its schema + lifecycle hooks.
 
@@ -394,6 +471,10 @@ class ToolDef(_HookableTool):
       callbacks into an ordered list per stage. Callbacks are stored here but
       invoked by the discovery loader and ``_execute``; this class only owns
       registration + storage (via the base).
+    - Optional ``handle`` — a ``ResourceHandle`` subclass bound via
+      ``@tool(handle=…)``. The Agent's ``HandleManager`` owns the
+      instance; the tool function body reaches it via ``self.handle``. The
+      handle does NOT appear in the LLM schema.
 
     Hook callbacks are stored in ``self._hooks[stage]`` as a list in
     registration order. The decorator methods return the callback unchanged
@@ -420,6 +501,7 @@ class ToolDef(_HookableTool):
         *,
         name: str | None = None,
         description: str | None = None,
+        handle: type[ResourceHandle] | None = None,
     ) -> None:
         super().__init__()
         self._fn = fn
@@ -428,6 +510,8 @@ class ToolDef(_HookableTool):
         self.__doc__ = description or inspect.getdoc(fn) or f"Python tool: {tool_name}"
         self.__signature__ = inspect.signature(fn)
         self.__cothis_schema__ = _build_schema(fn, tool_name, description)
+        self._handle_cls: type[ResourceHandle] | None = handle
+        self.handle: ResourceHandle | None = None
 
     def __call__(self, **kwargs: Any) -> Any:
         return self._fn(**kwargs)
@@ -745,3 +829,139 @@ def discover_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
         shadow_count,
     )
     return registered
+
+
+async def ensure_handle_ready(tool: Any) -> None:
+    """Ensure a tool's bound handle is acquired; no-op if it has none.
+
+    Duck-typed like ``run_hooks_safe`` — tools without a ``_handle_cls``
+    attribute (bare callables, YAML tools, ``fs.read``) skip this entirely.
+    For tools with a handle, this is the self-healing path: if the
+    handle was reclaimed while idle, it is re-acquired here so the tool body
+    sees a live resource. Called from ``_execute`` after ``pre_execute``,
+    before the tool body.
+    """
+    manager = getattr(tool, "_handle_manager", None)
+    if manager is None:
+        return
+    await manager.ensure_acquired(tool)
+
+
+class HandleManager:
+    """Owns the lifecycle of every ``ResourceHandle`` instance in an Agent.
+
+    A handle class bound to one or more tools (``@tool(handle=…)``) maps to
+    **one** instance here — shared across all tools that reference it. The
+    instance is acquired lazily on first use and reclaimed when idle past
+    ``keepalive`` or evicted under LRU pressure (``max_handles``). Reclamation
+    is driven by ``reclaim_idle`` (called between turns); ``ensure_acquired``
+    is the synchronous self-heal on the dispatch path.
+
+    ``last_used`` is a wall-clock timestamp (``time.time()``) per handle
+    instance; any tool calling ``ensure_acquired`` refreshes it.
+    """
+
+    def __init__(self, *, max_handles: int = 8, reaper_interval: float = 60.0) -> None:
+        self._max_handles = max_handles
+        self._reaper_interval = reaper_interval
+        self._instances: dict[type[ResourceHandle], ResourceHandle] = {}
+        self._live: dict[type[ResourceHandle], float] = {}
+        self._last_used: dict[type[ResourceHandle], float] = {}
+        self._reaper_task: asyncio.Task[None] | None = None
+
+    def _start_reaper(self) -> None:
+        """Start the background idle-reaper if not already running.
+
+        Ensures keepalive is honored while the Agent is idle between turns
+        (e.g. a ``chat`` session waiting on user input). Idempotent.
+        """
+        if self._reaper_task is not None:
+            return
+
+        async def _reap_loop() -> None:
+            while True:
+                await asyncio.sleep(self._reaper_interval)
+                await self.reclaim_idle()
+
+        self._reaper_task = asyncio.ensure_future(_reap_loop())
+
+    def bind(self, tool: Any) -> None:
+        """Attach this manager to a tool and record its handle class.
+
+        Called at Agent startup for every registered tool that has a
+        ``_handle_cls``. Idempotent — multiple tools sharing one handle
+        class register it once.
+        """
+        cls = getattr(tool, "_handle_cls", None)
+        if cls is None:
+            return
+        tool._handle_manager = self
+        if cls not in self._instances:
+            self._instances[cls] = cls()
+
+    async def ensure_acquired(self, tool: Any) -> None:
+        """Ensure the tool's handle is live; acquire (or re-acquire) if not.
+
+        Refreshes ``last_used``. Under LRU pressure, evicts the coldest live
+        handle before acquiring a new one.
+        """
+        cls = getattr(tool, "_handle_cls", None)
+        if cls is None:
+            return
+        instance = self._instances.get(cls)
+        if instance is None:
+            instance = cls()
+            self._instances[cls] = instance
+        if cls not in self._live:
+            if len(self._live) >= self._max_handles:
+                await self._evict_coldest()
+            await instance.acquire()
+            self._live[cls] = time.time()
+            self._start_reaper()
+        self._last_used[cls] = time.time()
+        tool.handle = instance
+
+    async def _evict_coldest(self) -> None:
+        """Evict the least-recently-used live handle to make room."""
+        if not self._live:
+            return
+        coldest = min(self._live, key=lambda c: self._last_used.get(c, 0.0))
+        await self._release_one(coldest)
+
+    async def _release_one(self, cls: type[ResourceHandle]) -> None:
+        instance = self._instances.get(cls)
+        if instance is None or cls not in self._live:
+            return
+        try:
+            await instance.release()
+        except Exception as exc:  # noqa: BLE001 — release must not raise
+            logger.debug("handle %s release error: %s", cls.__name__, exc)
+        self._live.pop(cls, None)
+
+    async def reclaim_idle(self) -> int:
+        """Release handles idle past their ``keepalive``. Returns count reclaimed.
+
+        Called between agent turns. Uses ``last_used`` + the handle class's
+        ``keepalive``.         Live handles still within their window are untouched.
+        """
+        now = time.time()
+        reclaimed = 0
+        for cls in list(self._live):
+            idle = now - self._last_used.get(cls, now)
+            if idle >= cls.keepalive:
+                await self._release_one(cls)
+                reclaimed += 1
+                logger.debug("handle %s reclaimed (idle %.0fs)", cls.__name__, idle)
+        return reclaimed
+
+    async def release_all(self) -> None:
+        """Release every live handle. Called at Agent ``aclose``."""
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            try:
+                await self._reaper_task
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001 — either way done
+                pass
+            self._reaper_task = None
+        for cls in list(self._live):
+            await self._release_one(cls)
