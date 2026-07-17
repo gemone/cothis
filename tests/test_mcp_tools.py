@@ -276,7 +276,7 @@ def test_mcp_server_label_strips_handle_prefix() -> None:
     """``_label`` strips the ``mcp:`` discovery-handle prefix from
     ``__name__``, yielding the raw YAML ``name:`` value used as the
     tool-name prefix fallback when a server reports an empty
-    ``Implementation.name`` (ADR-0006)."""
+    ``Implementation.name`` (ADR-0005)."""
     assert MCPServer(name="mcp:context7", params=None)._label == "context7"
     # A name without the handle prefix passes through unchanged.
     assert MCPServer(name="custom", params=None)._label == "custom"
@@ -459,11 +459,11 @@ def test_normalize_nontext_only_content_is_no_output() -> None:
 @pytest.mark.asyncio
 async def test_connect_into_discovers_tools_with_schema() -> None:
     """``connect_into`` lists remote tools, each wrapped with its ``inputSchema``
-    and a server-prefixed ``__name__`` (ADR-0006). ``_remote_name`` is the same
+    and a server-prefixed ``__name__`` (ADR-0005). ``_remote_name`` is the same
     prefixed name — the group routes ``call_tool`` by it."""
     server = MCPServer(name="mcp:test-server", params=None)
     async with in_memory_group(_make_server()) as group:
-        tools = await server.connect_into(group)
+        tools = (await server.connect_into(group))[0]
         by_name = {t.__name__: t for t in tools}
         assert "test-server.add" in by_name
         add = by_name["test-server.add"]
@@ -486,7 +486,7 @@ async def test_mcp_tool_call_routes_by_prefixed_name(
     ``_tool_to_session`` index is keyed by the prefixed name."""
     server = MCPServer(name="mcp:test-server", params=None)
     async with in_memory_group(_make_server()) as group:
-        tools = {t.__name__: t for t in await server.connect_into(group)}
+        tools = {t.__name__: t for t in (await server.connect_into(group))[0]}
         add = tools["test-server.add"]
         captured: dict[str, Any] = {}
         orig_call = group.call_tool
@@ -506,7 +506,7 @@ async def test_call_returns_normalized_string() -> None:
     is persistent (group-owned, not reconnected per call)."""
     server = MCPServer(name="mcp:test-server", params=None)
     async with in_memory_group(_make_server()) as group:
-        tools = {t.__name__: t for t in await server.connect_into(group)}
+        tools = {t.__name__: t for t in (await server.connect_into(group))[0]}
         assert await tools["test-server.add"](a=3, b=4) == "7"
         assert await tools["test-server.add"](a=10, b=0) == "10"
 
@@ -516,7 +516,7 @@ async def test_call_error_prefixed() -> None:
     """A remote tool that raises comes back as an ``Error:`` string."""
     server = MCPServer(name="mcp:test-server", params=None)
     async with in_memory_group(_make_server()) as group:
-        tools = {t.__name__: t for t in await server.connect_into(group)}
+        tools = {t.__name__: t for t in (await server.connect_into(group))[0]}
         result = await tools["test-server.boom"]()
         assert result.startswith("Error:")
         assert "kaboom" in result
@@ -535,7 +535,7 @@ async def test_connect_into_returns_only_new_tools() -> None:
         group._tools[  # noqa: SLF001 — inject a sentinel to test the snapshot
             "other-server.x"
         ] = McpTool(name="x", description="d", inputSchema={"type": "object"})
-        tools = {t.__name__: t for t in await server.connect_into(group)}
+        tools = {t.__name__: t for t in (await server.connect_into(group))[0]}
         assert "other-server.x" not in tools  # pre-existing tool excluded
         assert "test-server.add" in tools  # new tool included
         assert "test-server.boom" in tools
@@ -569,7 +569,7 @@ async def test_stdio_params_carry_env_to_connect(
         source=None,
     )
     async with ClientSessionGroup() as group:
-        assert await server.connect_into(group) == []
+        assert (await server.connect_into(group))[0] == []
     assert captured["params"].env == {"API_KEY": "s3cr3t"}
     assert captured["params"].command == "srv"
     assert captured["params"].args == ["--x"]
@@ -601,7 +601,7 @@ async def test_http_params_carry_url_and_headers_to_connect(
         source=None,
     )
     async with ClientSessionGroup() as group:
-        assert await server.connect_into(group) == []
+        assert (await server.connect_into(group))[0] == []
     assert captured["params"].url == "https://example.com/mcp"
     assert captured["params"].headers == {"Authorization": "Bearer s3cr3t"}
 
@@ -631,7 +631,7 @@ async def test_connect_into_failure_returns_empty(
     )
     async with ClientSessionGroup() as group:
         with caplog.at_level(logging.WARNING, logger="cothis.tools"):
-            tools = await server.connect_into(group)
+            tools = (await server.connect_into(group))[0]
     assert tools == []
     assert "broken" in caplog.text
     assert "connect refused" in caplog.text
@@ -666,7 +666,7 @@ async def test_stdio_connect_failure_logs_warning_returns_empty(
     )
     async with ClientSessionGroup() as group:
         with caplog.at_level(logging.WARNING, logger="cothis.tools"):
-            tools = await server.connect_into(group)
+            tools = (await server.connect_into(group))[0]
     assert tools == []
     assert "broken" in caplog.text
     assert "connect refused" in caplog.text
@@ -703,7 +703,7 @@ async def test_http_connect_failure_logs_url_never_headers(
     )
     async with ClientSessionGroup() as group:
         with caplog.at_level(logging.WARNING, logger="cothis.tools"):
-            tools = await server.connect_into(group)
+            tools = (await server.connect_into(group))[0]
     assert tools == []
     assert "connect refused" in caplog.text
     # Safe diagnostic (url) is present…
@@ -753,7 +753,7 @@ async def test_connect_failure_unwraps_taskgroup_in_warning(
     )
     async with ClientSessionGroup() as group:
         with caplog.at_level(logging.WARNING, logger="cothis.tools"):
-            assert await server.connect_into(group) == []
+            assert (await server.connect_into(group))[0] == []
     assert "Name or service not known" in caplog.text
     assert "unhandled errors in a TaskGroup" not in caplog.text
 
@@ -766,7 +766,7 @@ async def test_pre_and_after_execute_hooks_run() -> None:
     """pre_execute/after_execute pipelines wrap the async MCP call."""
     server = MCPServer(name="mcp:test-server", params=None)
     async with in_memory_group(_make_server()) as group:
-        tools = {t.__name__: t for t in await server.connect_into(group)}
+        tools = {t.__name__: t for t in (await server.connect_into(group))[0]}
         add = tools["test-server.add"]
         seen: dict[str, bool] = {}
 
@@ -792,7 +792,7 @@ async def test_pre_and_after_execute_hooks_run() -> None:
 async def test_on_error_hook_fires() -> None:
     server = MCPServer(name="mcp:test-server", params=None)
     async with in_memory_group(_make_server()) as group:
-        tools = {t.__name__: t for t in await server.connect_into(group)}
+        tools = {t.__name__: t for t in (await server.connect_into(group))[0]}
         add = tools["test-server.add"]
         observed: list[tuple[str, str]] = []
 
@@ -970,7 +970,7 @@ async def test_duplicate_prefixed_tool_name_first_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two ``MCPClientTool``s resolving to the same prefixed name: first-write-wins,
-    the duplicate is logged at ERROR (ADR-0006).
+    the duplicate is logged at ERROR (ADR-0005).
 
     Simulated by patching one server's ``connect_into`` to return its first
     tool twice (same ``__name__``). The Agent's ``_ensure_mcp`` keeps the
@@ -982,9 +982,9 @@ async def test_duplicate_prefixed_tool_name_first_wins(
 
     async def duplicating_connect_into(
         group: ClientSessionGroup,
-    ) -> list[MCPClientTool]:
-        tools = await original_connect_into(group)
-        return tools + tools[:1]  # duplicate the first tool (same prefixed name)
+    ) -> tuple[list[MCPClientTool], Any]:
+        tools, session = await original_connect_into(group)
+        return tools + tools[:1], session  # duplicate the first tool (same prefixed name)
 
     setattr(server, "connect_into", duplicating_connect_into)
     agent = Agent(model="x", provider="openrouter", tools=[server])
@@ -1006,7 +1006,7 @@ async def test_prefix_falls_back_to_yaml_label_when_server_name_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When a server reports an empty ``Implementation.name``, the tool prefix
-    falls back to the YAML ``name:`` label (ADR-0006). Defensive against a
+    falls back to the YAML ``name:`` label (ADR-0005). Defensive against a
     non-conformant server that sends an empty string where the spec requires a
     non-empty name."""
     _mock_llm(monkeypatch)
@@ -1035,5 +1035,198 @@ async def test_prefix_falls_back_to_yaml_label_when_server_name_empty(
         # No bare or dot-prefixed name leaked through.
         assert ".add" not in agent._tool_map
         assert "add" not in agent._tool_map
+    finally:
+        await agent.aclose()
+
+
+# --- MCP session handle lifecycle (ADR-0005) ---------------------------
+
+
+def test_yaml_mcp_keepalive_parsed() -> None:
+    """``keepalive:`` is parsed into ``MCPServer.keepalive``."""
+    server = load_yaml_tools("type: mcp.stdio\ncommand: srv\nkeepalive: 42\n")[0]
+    assert isinstance(server, MCPServer)
+    assert server.keepalive == 42.0
+
+
+def test_yaml_mcp_pin_parsed() -> None:
+    """``pin: true`` is parsed into ``MCPServer.pin``."""
+    server = load_yaml_tools("type: mcp.stdio\ncommand: srv\npin: true\n")[0]
+    assert isinstance(server, MCPServer)
+    assert server.pin is True
+
+
+def test_yaml_mcp_keepalive_default() -> None:
+    """Without ``keepalive:``, defaults to 600s."""
+    server = load_yaml_tools("type: mcp.stdio\ncommand: srv\n")[0]
+    assert isinstance(server, MCPServer)
+    assert server.keepalive == 600.0
+
+
+def test_yaml_mcp_keepalive_invalid_raises() -> None:
+    """Non-numeric ``keepalive`` raises with an actionable message."""
+    with pytest.raises(ValueError, match="keepalive"):
+        load_yaml_tools("type: mcp.stdio\ncommand: srv\nkeepalive: abc\n")
+
+
+def test_yaml_mcp_keepalive_negative_raises() -> None:
+    """Zero/negative ``keepalive`` raises."""
+    with pytest.raises(ValueError, match="keepalive"):
+        load_yaml_tools("type: mcp.stdio\ncommand: srv\nkeepalive: 0\n")
+
+
+def test_yaml_mcp_pin_non_bool_raises() -> None:
+    """Non-boolean ``pin`` raises with an actionable message."""
+    with pytest.raises(ValueError, match="pin"):
+        load_yaml_tools("type: mcp.stdio\ncommand: srv\npin: 1\n")
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_adopts_session_into_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After ``_ensure_mcp``, the MCP session handle is live in the pool."""
+    _mock_llm(monkeypatch)
+    calls: list[int] = []
+    _patch_in_memory_transport(monkeypatch, _make_server(), calls=calls)
+    server = MCPServer(name="mcp:test-server", params=None)
+    agent = Agent(model="x", provider="openrouter", tools=[server])
+
+    await agent._ensure_mcp()
+    try:
+        # One connect at startup.
+        assert len(calls) == 1
+        # The MCP tool is registered.
+        assert "test-server.add" in agent._tool_map
+        # Its handle class is live in the pool.
+        mcp_tool = agent._tool_map["test-server.add"]
+        handle_cls = mcp_tool._handle_cls
+        assert handle_cls is not None
+        assert handle_cls in agent._handle_manager._live
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_keepalive_reclaims_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An idle MCP session past keepalive is released (disconnected)."""
+    _mock_llm(monkeypatch)
+    _patch_in_memory_transport(monkeypatch, _make_server())
+    server = MCPServer(name="mcp:test-server", params=None, keepalive=0.01)
+    agent = Agent(model="x", provider="openrouter", tools=[server])
+
+    await agent._ensure_mcp()
+    try:
+        mcp_tool = agent._tool_map["test-server.add"]
+        handle_cls = mcp_tool._handle_cls
+        assert handle_cls in agent._handle_manager._live
+
+        import time
+
+        agent._handle_manager._last_used[handle_cls] = time.time() - 100
+        reclaimed = await agent._handle_manager.reclaim_idle()
+        assert reclaimed >= 1
+        assert handle_cls not in agent._handle_manager._live
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_self_heal_reconnects_on_next_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After reclamation, the next call re-acquires (reconnects) the session."""
+    _mock_llm(monkeypatch)
+    calls: list[int] = []
+    _patch_in_memory_transport(monkeypatch, _make_server(), calls=calls)
+    server = MCPServer(name="mcp:test-server", params=None, keepalive=0.01)
+    agent = Agent(model="x", provider="openrouter", tools=[server])
+
+    await agent._ensure_mcp()
+    try:
+        mcp_tool = agent._tool_map["test-server.add"]
+        handle_cls = mcp_tool._handle_cls
+
+        # Reclaim the session.
+        import time
+
+        agent._handle_manager._last_used[handle_cls] = time.time() - 100
+        await agent._handle_manager.reclaim_idle()
+        assert handle_cls not in agent._handle_manager._live
+        connect_count_after_reclaim = len(calls)
+
+        # Self-heal: ensure_acquired re-connects.
+        await agent._handle_manager.ensure_acquired(mcp_tool)
+        assert handle_cls in agent._handle_manager._live
+        assert len(calls) == connect_count_after_reclaim + 1
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_pin_session_not_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pinned MCP server's session survives ``reclaim_idle``."""
+    _mock_llm(monkeypatch)
+    _patch_in_memory_transport(monkeypatch, _make_server())
+    server = MCPServer(name="mcp:test-server", params=None, pin=True)
+    agent = Agent(model="x", provider="openrouter", tools=[server])
+
+    await agent._ensure_mcp()
+    try:
+        mcp_tool = agent._tool_map["test-server.add"]
+        handle_cls = mcp_tool._handle_cls
+
+        import time
+
+        agent._handle_manager._last_used[handle_cls] = time.time() - 9999
+        reclaimed = await agent._handle_manager.reclaim_idle()
+        assert reclaimed == 0
+        assert handle_cls in agent._handle_manager._live
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_connect_into_returns_session() -> None:
+    """``connect_into`` returns ``(tools, session)``, not just tools."""
+    async with in_memory_group(_make_server()) as group:
+        server = MCPServer(name="mcp:test-server", params=None)
+        tools, session = await server.connect_into(group)
+        assert len(tools) > 0
+        assert session is not None
+
+
+@pytest.mark.asyncio
+async def test_mcp_self_heal_dispatch_after_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: after a session is reclaimed, the next ``_execute`` call
+    transparently reconnects and succeeds — the LLM never sees a failure."""
+    _mock_llm(monkeypatch)
+    _patch_in_memory_transport(monkeypatch, _make_server())
+    server = MCPServer(name="mcp:test-server", params=None, keepalive=0.01)
+    agent = Agent(model="x", provider="openrouter", tools=[server])
+
+    await agent._ensure_mcp()
+    try:
+        fake_call = MagicMock()
+        fake_call.function.name = "test-server.add"
+        fake_call.function.arguments = '{"a": 2, "b": 3}'
+
+        # Call 1 — works.
+        result = await agent._execute(fake_call)
+        assert "5" in result
+
+        # Reclaim the session (idle past keepalive).
+        import time
+
+        mcp_tool = agent._tool_map["test-server.add"]
+        handle_cls = mcp_tool._handle_cls
+        agent._handle_manager._last_used[handle_cls] = time.time() - 100
+        await agent._handle_manager.reclaim_idle()
+        assert handle_cls not in agent._handle_manager._live
+
+        # Call 2 — self-heal: _execute's ensure_handle_ready reconnects.
+        fake_call.function.arguments = '{"a": 10, "b": 20}'
+        result = await agent._execute(fake_call)
+        assert "30" in result
     finally:
         await agent.aclose()

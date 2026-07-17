@@ -47,7 +47,9 @@ __all__ = [
     "ToolDef",
     "discover_tools",
     "ensure_handle_ready",
+    "handle_call_done",
     "load_tools_from_layer",
+    "mark_inflight",
     "logger",
     "resource",
     "run_hooks_safe",
@@ -421,12 +423,32 @@ class ResourceHandle:
         async def query(sql: str) -> str:
             return await query.handle.conn.fetchval(sql)
 
+    Subclasses define ``acquire`` / ``release`` and may set the class
+    attributes below::
+
+        @resource(keepalive=300, pin=True)
+        class Db(ResourceHandle):
+            async def acquire(self): self.conn = await connect()
+            async def release(self): await self.conn.close()
+
+        @tool("db.query", handle=Db)
+        async def query(sql: str) -> str:
+            return await query.handle.conn.fetchval(sql)
+
     The handle instance is assigned to each bound tool's ``.handle``
     attribute by the ``HandleManager``; the tool function body reads it
     there (never as a parameter — it must not pollute the LLM schema).
     """
 
     keepalive: float = 600.0
+    #: Acquire on the Agent's first run instead of waiting for the first
+    #: call. After that first acquire the normal lifecycle applies —
+    #: eager handles are still reclaimed when idle or evicted.
+    eager: bool = False
+    #: Keep the resource alive until Agent ``aclose``: exempt from
+    #: keepalive reclamation and LRU eviction, and not counted against
+    #: the ``max_handles`` budget. Implies ``eager``.
+    pin: bool = False
 
     async def acquire(self) -> None:
         """Establish the resource. Called before first use and after reclamation."""
@@ -437,22 +459,34 @@ class ResourceHandle:
 
 
 def resource(
-    cls: type[ResourceHandle] | None = None, *, keepalive: float | None = None
+    cls: type[ResourceHandle] | None = None,
+    *,
+    keepalive: float | None = None,
+    eager: bool = False,
+    pin: bool = False,
 ) -> Any:
-    """Mark a class as a ``ResourceHandle`` and optionally override keepalive.
+    """Mark a class as a ``ResourceHandle`` and optionally tune its lifecycle.
 
-    Two forms::
+    Three forms::
 
         @resource
         class H(ResourceHandle): ...
 
         @resource(keepalive=120)
         class H(ResourceHandle): ...
+
+        @resource(eager=True)   # acquire on first run; pin=True pins until aclose
+        class H(ResourceHandle): ...
     """
 
     def decorate(target: type[ResourceHandle]) -> type[ResourceHandle]:
         if keepalive is not None:
             target.keepalive = keepalive
+        if eager:
+            target.eager = True
+        if pin:
+            target.pin = True
+            target.eager = True  # pin implies eager: it must be alive to stay alive
         return target
 
     if cls is not None:
@@ -847,6 +881,34 @@ async def ensure_handle_ready(tool: Any) -> None:
     await manager.ensure_acquired(tool)
 
 
+def mark_inflight(tool: Any) -> None:
+    """Mark a tool's handle as in-flight; no-op if it has none.
+
+    Duck-typed companion to ``ensure_handle_ready`` — called from
+    ``_execute`` after the handle is acquired, paired with
+    ``handle_call_done`` in the body's ``finally``.
+    """
+    manager = getattr(tool, "_handle_manager", None)
+    if manager is None:
+        return
+    manager.mark_inflight(tool)
+
+
+def handle_call_done(tool: Any) -> None:
+    """End the tool's in-flight handle window; no-op if it has none.
+
+    Duck-typed companion to ``ensure_handle_ready`` — called from
+    ``_execute``'s ``finally`` after the tool body, so a handle is never
+    reclaimed mid-call (finding: the reaper only saw ``last_used`` from
+    call start and could release a handle whose call outlived
+    ``keepalive``).
+    """
+    manager = getattr(tool, "_handle_manager", None)
+    if manager is None:
+        return
+    manager.call_done(tool)
+
+
 class HandleManager:
     """Owns the lifecycle of every ``ResourceHandle`` instance in an Agent.
 
@@ -867,6 +929,7 @@ class HandleManager:
         self._instances: dict[type[ResourceHandle], ResourceHandle] = {}
         self._live: dict[type[ResourceHandle], float] = {}
         self._last_used: dict[type[ResourceHandle], float] = {}
+        self._inflight: dict[type[ResourceHandle], int] = {}
         self._reaper_task: asyncio.Task[None] | None = None
 
     def _start_reaper(self) -> None:
@@ -899,11 +962,42 @@ class HandleManager:
         if cls not in self._instances:
             self._instances[cls] = cls()
 
+    async def start_eager(self) -> None:
+        """Acquire every ``eager`` handle now (Agent's first run).
+
+        Pinned handles imply eager (``@resource(pin=True)``), so this is
+        also how pinned handles stay alive. Idempotent — already-live
+        handles are skipped. Errors per handle are logged and swallowed
+        (an eager handle failing to start must not abort the Agent).
+        """
+        for cls, instance in self._instances.items():
+            if not cls.eager or cls in self._live:
+                continue
+            try:
+                await instance.acquire()
+            except Exception as exc:  # noqa: BLE001 — eager start is best-effort
+                logger.warning("eager handle %s failed to start: %s", cls.__name__, exc)
+                continue
+            self._live[cls] = time.time()
+            self._last_used[cls] = time.time()
+            self._start_reaper()
+
+    def _evictable(self, cls: type[ResourceHandle]) -> bool:
+        """A handle is evictable when not in-flight and not pinned."""
+        return self._inflight.get(cls, 0) == 0 and not getattr(cls, "pin", False)
+
     async def ensure_acquired(self, tool: Any) -> None:
         """Ensure the tool's handle is live; acquire (or re-acquire) if not.
 
-        Refreshes ``last_used``. Under LRU pressure, evicts the coldest live
-        handle before acquiring a new one.
+        Refreshes ``last_used`` and begins an in-flight window: the handle
+        is skipped by ``reclaim_idle`` / ``_evict_coldest`` until the Agent
+        reports the call finished via ``call_done`` (``_execute``'s
+        ``finally``). Under LRU pressure, evicts the coldest *evictable*
+        live handle before acquiring a new one; pinned handles are neither
+        evicted nor counted against ``max_handles``, so a pool full of
+        pinned handles still admits a new one. If every non-pinned live
+        handle is in-flight, the pool temporarily exceeds ``max_handles``
+        — a tool call must never fail because the pool is busy.
         """
         cls = getattr(tool, "_handle_cls", None)
         if cls is None:
@@ -913,7 +1007,7 @@ class HandleManager:
             instance = cls()
             self._instances[cls] = instance
         if cls not in self._live:
-            if len(self._live) >= self._max_handles:
+            if self._unpinned_count() >= self._max_handles:
                 await self._evict_coldest()
             await instance.acquire()
             self._live[cls] = time.time()
@@ -921,11 +1015,66 @@ class HandleManager:
         self._last_used[cls] = time.time()
         tool.handle = instance
 
-    async def _evict_coldest(self) -> None:
-        """Evict the least-recently-used live handle to make room."""
-        if not self._live:
+    def adopt(
+        self, cls: type[ResourceHandle], instance: ResourceHandle
+    ) -> None:
+        """Seed an already-live handle instance into the pool.
+
+        The MCP startup path connects each server once to list its tools —
+        that connection *is* the handle's first acquire. Rather than drop it
+        and reconnect on the first call, the session is adopted: the instance
+        is recorded as live with a fresh ``last_used``, and the next
+        ``ensure_acquired`` finds it already in ``_live`` and skips acquire.
+        """
+        self._instances[cls] = instance
+        self._live[cls] = time.time()
+        self._last_used[cls] = time.time()
+        self._start_reaper()
+
+    def mark_inflight(self, tool: Any) -> None:
+        """Begin a tool's in-flight window so the reaper can't reclaim it.
+
+        Called from ``_execute`` right after ``ensure_acquired`` succeeds.
+        Pairs with ``call_done`` in the body's ``finally``. Separate from
+        ``ensure_acquired`` because acquiring (eager start, self-heal,
+        inspection) does not always imply a call follows.
+        """
+        cls = getattr(tool, "_handle_cls", None)
+        if cls is None:
             return
-        coldest = min(self._live, key=lambda c: self._last_used.get(c, 0.0))
+        self._inflight[cls] = self._inflight.get(cls, 0) + 1
+
+    def _unpinned_count(self) -> int:
+        return sum(1 for cls in self._live if not getattr(cls, "pin", False))
+
+    def call_done(self, tool: Any) -> None:
+        """End the tool's in-flight window and refresh ``last_used``.
+
+        Called from ``_execute``'s ``finally`` — pairs with the increment
+        in ``ensure_acquired``. The refresh restarts the keepalive window
+        at call *end*, so a long call isn't reclaimed on the next reaper
+        tick (its ``last_used`` would otherwise still be the call start).
+        """
+        cls = getattr(tool, "_handle_cls", None)
+        if cls is None:
+            return
+        count = self._inflight.get(cls, 0)
+        if count > 0:
+            self._inflight[cls] = count - 1
+        self._last_used[cls] = time.time()
+
+    async def _evict_coldest(self) -> None:
+        """Evict the least-recently-used evictable handle to make room.
+
+        Only evictable handles (not in-flight, not pinned) are candidates;
+        if none qualify, returns without evicting (the pool exceeds
+        ``max_handles`` until a call finishes or a pinned handle is the
+        only thing live — but pinned handles don't count toward the budget).
+        """
+        candidates = [c for c in self._live if self._evictable(c)]
+        if not candidates:
+            return
+        coldest = min(candidates, key=lambda c: self._last_used.get(c, 0.0))
         await self._release_one(coldest)
 
     async def _release_one(self, cls: type[ResourceHandle]) -> None:
@@ -947,6 +1096,10 @@ class HandleManager:
         now = time.time()
         reclaimed = 0
         for cls in list(self._live):
+            if getattr(cls, "pin", False):
+                continue
+            if self._inflight.get(cls, 0) > 0:
+                continue
             idle = now - self._last_used.get(cls, now)
             if idle >= cls.keepalive:
                 await self._release_one(cls)
@@ -965,3 +1118,4 @@ class HandleManager:
             self._reaper_task = None
         for cls in list(self._live):
             await self._release_one(cls)
+        self._instances.clear()  # permanent teardown — stale entries can't re-acquire

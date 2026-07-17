@@ -91,7 +91,14 @@ once, then transparently re-acquired on the next call to any of its
 tools. The re-acquire is inserted in `_execute` after `pre_execute`,
 before the tool body, via the same duck-typed no-op pattern as
 `run_hooks_safe` (no per-source branching). Tools without a bound handle
-keep the existing path untouched.
+keep the existing path untouched. Three lifecycle knobs: `keepalive`
+(default 600s), `eager` (acquire on first run, default false), and `pin`
+(exempt from reclamation/eviction and the `max_handles` budget until
+`aclose`; implies `eager`, default false). MCP sessions are one instance
+of this mechanism: each server's startup connection is adopted as the
+handle's first acquire, then follows keepalive + LRU. In-flight calls
+are protected: the reaper never reclaims a handle whose tool body hasn't
+returned.
 _Avoid_: connection (too narrow — misses subprocess/file handles),
 resource (too generic), pool (implies many; a tool may hold one).
 
@@ -109,7 +116,7 @@ just decorates). **Deviation from PRD story 38**: the PRD asked Python
 extensions to be a "thin wrapper over the shell-tool template" (i.e.
 Python files call the `shell()` helper); the shipped design treats
 Python extensions as a peer source — `@tool` functions are first-class,
-the `shell()` helper is available but optional. See ADR-0007. Tool
+the `shell()` helper is available but optional. See ADR-0005. Tool
 source is the **format** axis only (Python / YAML / MCP) — it is
 **never** a precedence axis (see Layer).
 _Avoid_: tool type (collides with `YAMLTool`), tool kind, backend,
@@ -124,10 +131,12 @@ runtime via the MCP `tools/list` call. Its `__name__` is a diagnostic label
 dispatchable tool's name in the discovery registry. The stdio and http
 variants differ only in their **transport** (SDK `StdioServerParameters` vs
 `StreamableHttpParameters`); everything downstream (session, discovery,
-dispatch, normalisation) is shared. The session it opens is
-**persistent** — connected once at Agent startup via a
-`ClientSessionGroup`, held across every dispatch, closed at teardown
-(see ADR-0005).
+dispatch, normalisation) is shared. The session it opens is **managed by
+the resource-handle subsystem** (ADR-0005): connected once at Agent
+startup via a `ClientSessionGroup` (that connection is adopted as the
+handle's first acquire), then reclaimed when idle past `keepalive`
+(default 600s) and re-acquired on the next call. `pin: true` opts a
+server back into permanent-session behaviour (ADR-0005).
 _Avoid_: MCP tool (that's the produced `MCPClientTool`), MCP client,
 plugin.
 
@@ -148,10 +157,10 @@ A single remote tool produced by an MCP server — the `MCPClientTool`. Its
 `component_name_hook` assigns `{server_name}.{remote}`): a server reporting
 `test-server` with a remote `query-docs` registers as
 `test-server.query-docs`. When the server reports an empty name, the prefix
-falls back to the YAML `name:` label (ADR-0006). Dispatch is async: `__call__`
+falls back to the YAML `name:` label (ADR-0005). Dispatch is async: `__call__`
 awaits `group.call_tool` on the shared `ClientSessionGroup` and normalises the
 result to a string (text blocks joined; empty → `"(no output)"`; errors →
-`"Error: "` prefix). See ADR-0006 for the prefix scheme's collision
+`"Error: "` prefix). See ADR-0005 for the prefix scheme's collision
 properties.
 _Avoid_: MCP server (that's the `MCPServer` producer), remote function,
 namespace (implies a hierarchy cothis doesn't have).

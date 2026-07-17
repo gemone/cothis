@@ -175,7 +175,7 @@ come from the docstring's `Args:` section.
 
 *(Python-tool discovery — auto-scanning `.py` files under `.agents/tools/`
 for `@tool`-decorated functions — shipped with PR #24. See
-`CONTEXT.md` "Tool source" and ADR-0007 for the design, including the
+`CONTEXT.md` "Tool source" and ADR-0005 for the design, including the
 deviation from PRD story 38.)*
 
 ### MCP servers (`type: mcp.stdio` / `type: mcp.http`)
@@ -209,8 +209,21 @@ cothis connects, lists the server's tools, and registers each one with a
 registers it as `context7.query-docs` (not the bare `query-docs`), so it
 can't collide with a builtin or user tool of the same remote name. The
 model sees and calls `context7.query-docs`; cothis strips the prefix back
-to the bare name when dispatching to the server. The session is opened
-once and reused across the whole run; it is closed when the agent exits.
+to the bare name when dispatching to the server. The session is **managed
+by the resource-handle subsystem** (ADR-0005): connected once at startup
+(that connection is adopted, not wasted), then reclaimed when idle past
+`keepalive` (default 600s) and re-acquired on the next call. Set
+`pin: true` to keep a session alive for the whole run instead:
+
+```yaml
+type: mcp.stdio
+name: browser
+command: uvx
+args: [browser-use, --mcp]
+keepalive: 300   # reclaim the session after 300s of idleness (default 600)
+pin: true        # keep the session alive until the agent exits (default false)
+```
+
 Only the **transport** differs between `mcp.stdio` (subprocess) and
 `mcp.http` (remote); discovery, dispatch, and result handling are shared.
 A server that fails to connect logs a warning (naming the command/url —

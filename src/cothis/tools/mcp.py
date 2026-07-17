@@ -13,7 +13,7 @@ the ``ClientSessionGroup`` consumes each server's params via
 ``connect_into``, lists remote tools, and aggregates them under prefixed
 names (``{label}.{remote}`` via ``component_name_hook``). Each aggregated
 tool is wrapped in an ``MCPClientTool`` so it inherits ``_HookableTool`` for
-lifecycle hooks. See ADR-0005 (deferred connect) and ADR-0006 (prefix).
+lifecycle hooks. See ADR-0005 §2 (deferred connect) and §4 (name prefix).
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cothis.tools.core import (
+    ResourceHandle,
     _check_unknown_keys,
     _HookableTool,
     _require,
@@ -37,8 +38,8 @@ if TYPE_CHECKING:
     from mcp.types import Tool as McpTool
 
 
-_MCP_STDIO_KEYS = {"type", "name", "description", "command", "args", "env"}
-_MCP_HTTP_KEYS = {"type", "name", "description", "url", "headers"}
+_MCP_STDIO_KEYS = {"type", "name", "description", "command", "args", "env", "keepalive", "pin"}
+_MCP_HTTP_KEYS = {"type", "name", "description", "url", "headers", "keepalive", "pin"}
 
 
 def _normalize_mcp_result(result: CallToolResult) -> str:
@@ -72,6 +73,34 @@ def _normalize_mcp_result(result: CallToolResult) -> str:
     return body
 
 
+class MCPSessionHandle(ResourceHandle):
+    """A ``ResourceHandle`` backed by one MCP server's session.
+
+    ``acquire`` connects the server into the shared ``ClientSessionGroup``
+    (listing its tools as a side effect); ``release`` disconnects that one
+    session. The HandleManager owns one *dynamically generated subclass* per
+    server (so each server is one pool entry keyed by its own class), with
+    ``_group`` and ``_params`` set as class attributes. ``keepalive`` / ``pin``
+    come from the YAML declaration, so MCP sessions follow the same
+    keepalive + LRU lifecycle as any other handle (ADR-0005).
+    """
+
+    # Set on the dynamic subclass generated per server in ``_ensure_mcp``.
+    _group: ClientSessionGroup
+    _params: Any
+    _session: Any = None
+
+    async def acquire(self) -> None:
+        self._session = await self._group.connect_to_server(self._params)
+
+    async def release(self) -> None:
+        if self._session is not None:
+            try:
+                await self._group.disconnect_from_server(self._session)
+            finally:
+                self._session = None
+
+
 class MCPClientTool(_HookableTool):
     """A single remote MCP tool, dispatched over a shared ``ClientSessionGroup``.
 
@@ -89,6 +118,9 @@ class MCPClientTool(_HookableTool):
     __name__: str
     __doc__: str
     __cothis_schema__: dict[str, Any]
+    # Set by ``_ensure_mcp`` to the per-server ``MCPSessionHandle`` subclass
+    # so ``ensure_handle_ready`` / ``mark_inflight`` manage the session.
+    _handle_cls: Any = None
 
     def __init__(self, group: ClientSessionGroup, mcp_tool: McpTool) -> None:
         super().__init__()
@@ -184,11 +216,15 @@ class MCPServer(_HookableTool):
         name: str,
         params: Any,
         diagnostic: str = "",
+        keepalive: float = 600.0,
+        pin: bool = False,
     ) -> None:
         super().__init__()
         self.__name__ = name
         self.params = params
         self._diagnostic = diagnostic
+        self.keepalive = keepalive
+        self.pin = pin
 
     @property
     def _label(self) -> str:
@@ -198,7 +234,7 @@ class MCPServer(_HookableTool):
         can't collide with a real tool name in the registry. The tool-name
         prefix uses the bare label — what the user wrote in YAML ``name:``,
         stripped of the handle decoration. Used as the fallback when the server
-        reports an empty ``Implementation.name`` (ADR-0006).
+        reports an empty ``Implementation.name`` (ADR-0005).
         """
         return self.__name__[4:] if self.__name__.startswith("mcp:") else self.__name__
 
@@ -207,15 +243,17 @@ class MCPServer(_HookableTool):
             f"MCP server {self.__name__!r} is a server declaration, not a callable tool"
         )
 
-    async def connect_into(self, group: ClientSessionGroup) -> list[MCPClientTool]:
-        """Connect this server via ``group``, return its tools as ``MCPClientTool``.
+    async def connect_into(
+        self, group: ClientSessionGroup
+    ) -> tuple[list[MCPClientTool], Any]:
+        """Connect this server via ``group``; return ``(tools, session)``.
 
-        The group handles transport, session, and tool-name prefixing (via its
-        ``component_name_hook`` — ``{server_reported_name}.{tool}``). On
-        failure (command not found, subprocess crash, connection refused,
-        protocol error) logs at ``WARNING`` naming the server + its
-        ``diagnostic`` — never ``env``/``headers`` secrets (story 32) — and
-        returns ``[]`` so the rest of the agent's tools still load (story 30).
+        The session is returned so the caller (``Agent._ensure_mcp``) can adopt
+        it as the server's ``MCPSessionHandle`` first acquire — the startup
+        connection that lists tools is not wasted. On failure logs at
+        ``WARNING`` naming the server + its ``diagnostic`` — never
+        ``env``/``headers`` secrets (story 32) — and returns ``([], None)`` so
+        the rest of the agent's tools still load (story 30).
 
         cothis: ceiling — this method reaches into SDK internals: it
         snapshots ``group.tools`` before/after ``connect_to_server`` and
@@ -234,7 +272,7 @@ class MCPServer(_HookableTool):
         # ``name:`` field — they may differ).
         before = set(group.tools)
         try:
-            await group.connect_to_server(self.params)
+            session = await group.connect_to_server(self.params)
         except Exception as exc:  # noqa: BLE001 — any startup failure is non-fatal
             detail = f" ({self._diagnostic})" if self._diagnostic else ""
             logger.warning(
@@ -243,7 +281,7 @@ class MCPServer(_HookableTool):
                 detail,
                 _flatten_exc(exc),
             )
-            return []
+            return [], None
         # The group stores ``Tool.name`` bare but keys its dict by the prefixed
         # name; copy each new tool with its prefixed key so ``MCPClientTool``
         # sees the name the LLM will call it by.
@@ -252,7 +290,7 @@ class MCPServer(_HookableTool):
             for name, tool in group.tools.items()
             if name not in before
         ]
-        return [MCPClientTool(group, tool) for tool in new_tools]
+        return [MCPClientTool(group, tool) for tool in new_tools], session
 
 
 def _make_mcp_server(
@@ -261,8 +299,10 @@ def _make_mcp_server(
     params: Any,
     diagnostic: str,
     source: str | None,
+    keepalive: float = 600.0,
+    pin: bool = False,
 ) -> MCPServer:
-    """Label guard + ``mcp:`` handle prefix for stdio/http builders (ADR-0006)."""
+    """Label guard + ``mcp:`` handle prefix for stdio/http builders (ADR-0005)."""
     where = f" in {source}" if source else ""
     if not label:
         msg = f"MCP server label is empty{where}; set a non-empty 'name:'"
@@ -270,9 +310,42 @@ def _make_mcp_server(
     if ":" in label:
         msg = f"MCP server label {label!r} contains ':'{where}"
         raise ValueError(msg)
-    server = MCPServer(name=f"mcp:{label}", params=params, diagnostic=diagnostic)
+    server = MCPServer(
+        name=f"mcp:{label}",
+        params=params,
+        diagnostic=diagnostic,
+        keepalive=keepalive,
+        pin=pin,
+    )
     server._source = source
     return server
+
+
+def _parse_keepalive(spec: dict[str, Any], source: str | None) -> float:
+    """Parse the optional ``keepalive:`` seconds field with validation."""
+    raw = spec.get("keepalive")
+    if raw is None:
+        return 600.0
+    where = f" in {source}" if source else ""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        msg = f"MCP server: 'keepalive' must be a number (seconds){where}"
+        raise ValueError(msg) from None
+    if value <= 0:
+        msg = f"MCP server: 'keepalive' must be > 0{where}"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_pin(spec: dict[str, Any], source: str | None) -> bool:
+    """Parse the optional ``pin:`` boolean field with validation."""
+    raw = spec.get("pin", False)
+    if not isinstance(raw, bool):
+        where = f" in {source}" if source else ""
+        msg = f"MCP server: 'pin' must be a boolean{where}"
+        raise ValueError(msg)
+    return raw
 
 
 def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> MCPServer:
@@ -324,6 +397,8 @@ def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> MCPServ
         params=params,
         diagnostic=f"command={command!r} args={args!r}",
         source=source,
+        keepalive=_parse_keepalive(spec, source),
+        pin=_parse_pin(spec, source),
     )
 
 
@@ -356,4 +431,6 @@ def _build_mcp_http_server(spec: dict[str, Any], source: str | None) -> MCPServe
         params=params,
         diagnostic=f"url={_scrub_url(url)!r}",
         source=source,
+        keepalive=_parse_keepalive(spec, source),
+        pin=_parse_pin(spec, source),
     )

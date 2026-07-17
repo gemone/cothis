@@ -1044,3 +1044,58 @@ def test_shell_tool_name_with_alnum_unchanged() -> None:
     yaml_text = 'name: fs.read\ncommand: ["echo", "hi"]\n'
     tool = load_yaml_tools(yaml_text)[0]
     assert tool.__name__ == "fs.read"
+
+
+# --- finding #1: argv empty-element drop -------------------------------
+
+
+def test_argv_bool_false_drops_empty_element() -> None:
+    """In argv mode, a bool ``to:`` flag rendered false (→ ``""``) is dropped
+    from the argv list so it never reaches the subprocess as an empty
+    positional. ``uv add requests ''`` must not happen."""
+    yaml_text = """
+name: uv_add
+command: ["uv", "add", "{pkg}", "{is_dev}"]
+args:
+  - name: pkg
+    type: str
+  - name: is_dev
+    type: bool
+    to: --dev
+"""
+    cmd, _ = preview(yaml_text, pkg="requests", is_dev=False)
+    assert cmd == ["uv", "add", "requests"]
+
+
+def test_argv_bool_true_keeps_flag_element() -> None:
+    """In argv mode, a bool ``to:`` flag rendered true keeps the flag."""
+    yaml_text = """
+name: uv_add
+command: ["uv", "add", "{pkg}", "{is_dev}"]
+args:
+  - name: pkg
+    type: str
+  - name: is_dev
+    type: bool
+    to: --dev
+"""
+    cmd, _ = preview(yaml_text, pkg="requests", is_dev=True)
+    assert cmd == ["uv", "add", "requests", "--dev"]
+
+
+# --- finding #3: non-ASCII tool name rejection --------------------------
+
+
+def test_non_ascii_cjk_name_rejected() -> None:
+    """A CJK name (``部署``) is stripped to empty and rejected — ``isalnum``
+    alone admits non-ASCII, which passes load then fails at the provider API."""
+    yaml_text = 'name: "部署"\ncommand: ["echo", "hi"]\n'
+    with pytest.raises(ValueError, match="normalises to empty"):
+        load_yaml_tools(yaml_text)
+
+
+def test_non_ascii_accented_name_stripped() -> None:
+    """Accented Latin chars are stripped (not passed through)."""
+    yaml_text = 'name: "déploy"\ncommand: ["echo", "hi"]\n'
+    tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "dploy"

@@ -15,7 +15,7 @@ author-facing code should import from this package root.
 
 cothis: ceiling — ``TOOLS`` (the builtin registry) is intentionally NOT
 re-exported here. PRD story 39 asked for ``from cothis.tools import TOOLS``
-backward compat; it was dropped (see ADR-0007) because ``TOOLS`` is the
+backward compat; it was dropped (see ADR-0005) because ``TOOLS`` is the
 builtin-layer input to ``discover_tools``, not the public aggregator.
 Upgrade path: none planned — if a future caller needs the builtin set,
 it should call ``discover_tools(Path("."), Path("."))`` or import
@@ -34,7 +34,9 @@ from cothis.tools.core import (
     ToolDef,
     discover_tools,
     ensure_handle_ready,
+    handle_call_done,
     logger,
+    mark_inflight,
     resource,
     run_hooks_safe,
     schema_for,

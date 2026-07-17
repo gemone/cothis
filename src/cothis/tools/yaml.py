@@ -162,7 +162,14 @@ class CommandBlock:
             self.arg_specs, kwargs, shell=self.shell if shell_mode else None
         )
         if isinstance(self.command, list):
-            return [part.format_map(mapping) for part in self.command]
+            # argv mode: drop elements that render to empty (e.g. a ``to:``
+            # bool flag rendered false → ``""``). An empty string passed to
+            # a subprocess is a real positional argument and breaks commands
+            # like ``uv add requests ''`` (finding: ``to:`` flag injection).
+            return [
+                rendered for rendered in (part.format_map(mapping) for part in self.command)
+                if rendered != ""
+            ]
         return self.command.format_map(mapping)
 
 
@@ -679,7 +686,7 @@ def _normalise_tool_name(raw: str, source: str | None) -> str:
     normalised = ""
     changed = False
     for ch in raw:
-        if ch.isalnum() or ch in "_.-":
+        if (ch.isascii() and ch.isalnum()) or ch in "_.-":
             normalised += ch
         elif ch in _NAME_REPLACEMENTS:
             normalised += _NAME_REPLACEMENTS[ch]

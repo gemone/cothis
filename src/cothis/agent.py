@@ -38,9 +38,12 @@ from cothis.tools import (
     Tool,
     ensure_handle_ready,
     format_tool_output,
+    handle_call_done,
+    mark_inflight,
     run_hooks_safe,
     schema_for,
 )
+from cothis.tools.mcp import MCPSessionHandle
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -146,6 +149,7 @@ class Agent(BaseModel):
     _mcp_group: Any = PrivateAttr(default=None)
     _mcp_tool_names: set[str] = PrivateAttr(default_factory=set)
     _mcp_started: bool = PrivateAttr(default=False)
+    _handles_started: bool = PrivateAttr(default=False)
 
     def model_post_init(self, __context: Any) -> None:
         from any_llm import AnyLLM
@@ -182,6 +186,7 @@ class Agent(BaseModel):
         """
         self._ensure_messages(user_input)
         await self._ensure_mcp()
+        await self._ensure_handles()
 
         for _turn in range(self.max_iterations):
             await self._handle_manager.reclaim_idle()
@@ -236,6 +241,7 @@ class Agent(BaseModel):
         """
         self._ensure_messages(user_input)
         await self._ensure_mcp()
+        await self._ensure_handles()
 
         tool_schemas = self._tool_schemas()
         messages = self._messages
@@ -308,6 +314,18 @@ class Agent(BaseModel):
 
     # --- internals -----------------------------------------------------
 
+    async def _ensure_handles(self) -> None:
+        """Acquire eager/pinned handles once, on first run (ADR-0005).
+
+        Runs after ``model_post_init`` bound every declared handle and after
+        ``_ensure_mcp`` has bound any MCP-session handles, so ``eager`` /
+        ``pin`` handles from both sources start together. Idempotent.
+        """
+        if self._handles_started:
+            return
+        self._handles_started = True
+        await self._handle_manager.start_eager()
+
     async def _ensure_mcp(self) -> None:
         """Resolve MCP servers into callable tools once, on first run.
 
@@ -334,7 +352,7 @@ class Agent(BaseModel):
 
         # Prefix each tool with the server's self-reported
         # ``Implementation.name``, falling back to the YAML ``name:`` label
-        # when the server reports an empty name (ADR-0006). The hook closes
+        # when the server reports an empty name (ADR-0005). The hook closes
         # over ``current_label`` by reference, so reassigning it in the loop
         # below is visible to the hook when ``connect_into`` calls it. No
         # ``nonlocal`` needed: the rebind happens in this method's scope (the
@@ -349,7 +367,29 @@ class Agent(BaseModel):
         self._mcp_group = group
         for server in self._mcp_servers:
             current_label = server._label
-            for mcp_tool in await server.connect_into(group):
+            tools, session = await server.connect_into(group)
+            if not tools:
+                continue  # connect failed; ``connect_into`` already warned
+            # Build a per-server ResourceHandle subclass so each server is one
+            # pool entry. The startup connection is adopted as the handle's
+            # first acquire (no wasted reconnect): the session is seeded onto
+            # the instance, and ``adopt`` marks it live. keepalive/pin come
+            # from the YAML declaration (ADR-0005).
+            handle_cls = type(
+                f"MCPSessionHandle_{server._label}",
+                (MCPSessionHandle,),
+                {
+                    "_group": group,
+                    "_params": server.params,
+                    "keepalive": server.keepalive,
+                    "pin": server.pin,
+                    "eager": server.pin,
+                },
+            )
+            instance = handle_cls()
+            instance._session = session
+            self._handle_manager.adopt(handle_cls, instance)
+            for mcp_tool in tools:
                 if mcp_tool.__name__ in self._tool_map:
                     logger.error(
                         "MCP tool %r skipped: name already registered "
@@ -358,6 +398,8 @@ class Agent(BaseModel):
                         server.__name__,
                     )
                     continue
+                mcp_tool._handle_cls = handle_cls
+                self._handle_manager.bind(mcp_tool)
                 self._tool_map[mcp_tool.__name__] = mcp_tool
                 self._mcp_tool_names.add(mcp_tool.__name__)
 
@@ -373,18 +415,24 @@ class Agent(BaseModel):
         instead of dispatching against closed ones. Safe to call more than
         once.
         """
+        # Release handles first: MCP-session handles disconnect their own
+        # sessions via ``disconnect_from_server``. Then exit the group
+        # context (closes whatever group-level resources remain). Reversed
+        # from the prior order so MCP handles never call
+        # ``disconnect_from_server`` on sessions the group already tore down.
+        await self._handle_manager.release_all()
         if self._mcp_group is not None:
             try:
                 await self._mcp_group.__aexit__(None, None, None)
             except Exception as exc:  # noqa: BLE001 — teardown must not raise
                 logger.debug("MCP group close error: %s", exc)
             self._mcp_group = None
-        await self._handle_manager.release_all()
         # Remove the MCP-expanded tools by tracked name.
         for name in self._mcp_tool_names:
             self._tool_map.pop(name, None)
         self._mcp_tool_names.clear()
         self._mcp_started = False
+        self._handles_started = False
 
     def _tool_schemas(self) -> list[Any] | None:
         """Tools in the form any-llm's ``acompletion`` expects.
@@ -521,9 +569,18 @@ class Agent(BaseModel):
             run_hooks_safe(tool, "_run_on_error", exc, "handle", args)
             return f"Error calling {name}: {exc}"
 
-        arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
-        logger.debug("→ %s(%s)", name, arg_repr)
+        # Bracket the body in an in-flight window so the background reaper
+        # can't reclaim this handle mid-call. Pairs with handle_call_done
+        # in the finally below. No-op for tools without a bound handle.
+        # mark_inflight is the FIRST line inside the try: so a failure in
+        # the arg repr below still reaches the finally (and balances the
+        # refcount). Acquire-raised has already early-returned above, so
+        # reaching here means ensure_acquired succeeded.
         try:
+            mark_inflight(tool)
+
+            arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            logger.debug("→ %s(%s)", name, arg_repr)
             result = tool(**args)
             if inspect.isawaitable(result):
                 result = await result
@@ -532,6 +589,10 @@ class Agent(BaseModel):
             logger.debug("tool %r on_error fired (phase=tool)", name)
             run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
             return f"Error calling {name}: {exc}"
+        finally:
+            # End the in-flight window so the reaper can reclaim this
+            # handle again; no-op for tools without a bound handle.
+            handle_call_done(tool)
 
         try:
             result = run_hooks_safe(tool, "_run_after_execute", result, args)
