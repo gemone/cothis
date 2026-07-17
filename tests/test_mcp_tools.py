@@ -1098,7 +1098,7 @@ async def test_mcp_startup_adopts_session_into_pool(monkeypatch: pytest.MonkeyPa
         assert "test-server.add" in agent._tool_map
         # Its handle class is live in the pool.
         mcp_tool = agent._tool_map["test-server.add"]
-        handle_cls = mcp_tool._handle_cls
+        handle_cls = getattr(mcp_tool, "_handle_cls")
         assert handle_cls is not None
         assert handle_cls in agent._handle_manager._live
     finally:
@@ -1116,7 +1116,7 @@ async def test_mcp_keepalive_reclaims_session(monkeypatch: pytest.MonkeyPatch) -
     await agent._ensure_mcp()
     try:
         mcp_tool = agent._tool_map["test-server.add"]
-        handle_cls = mcp_tool._handle_cls
+        handle_cls = getattr(mcp_tool, "_handle_cls")
         assert handle_cls in agent._handle_manager._live
 
         import time
@@ -1143,7 +1143,7 @@ async def test_mcp_self_heal_reconnects_on_next_call(
     await agent._ensure_mcp()
     try:
         mcp_tool = agent._tool_map["test-server.add"]
-        handle_cls = mcp_tool._handle_cls
+        handle_cls = getattr(mcp_tool, "_handle_cls")
 
         # Reclaim the session.
         import time
@@ -1172,7 +1172,7 @@ async def test_mcp_pin_session_not_reclaimed(monkeypatch: pytest.MonkeyPatch) ->
     await agent._ensure_mcp()
     try:
         mcp_tool = agent._tool_map["test-server.add"]
-        handle_cls = mcp_tool._handle_cls
+        handle_cls = getattr(mcp_tool, "_handle_cls")
 
         import time
 
@@ -1219,7 +1219,7 @@ async def test_mcp_self_heal_dispatch_after_reclaim(
         import time
 
         mcp_tool = agent._tool_map["test-server.add"]
-        handle_cls = mcp_tool._handle_cls
+        handle_cls = getattr(mcp_tool, "_handle_cls")
         agent._handle_manager._last_used[handle_cls] = time.time() - 100
         await agent._handle_manager.reclaim_idle()
         assert handle_cls not in agent._handle_manager._live
