@@ -1079,8 +1079,9 @@ class HandleManager:
     async def reclaim_idle(self) -> int:
         """Release handles idle past their ``keepalive``. Returns count reclaimed.
 
-        Called between agent turns. Uses ``last_used`` + the handle class's
-        ``keepalive``.         Live handles still within their window are untouched.
+        Called by the background ``_reaper_task`` every ``reaper_interval``.
+        Uses ``last_used`` + the handle class's ``keepalive``. Live handles
+        still within their window are untouched.
         """
         now = time.time()
         reclaimed = 0
