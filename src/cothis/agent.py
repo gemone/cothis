@@ -76,8 +76,6 @@ logger = logging.getLogger("cothis.agent")
 # with the resolver once #32 lands.
 _DEFAULT_MAX_TOKENS = 8192
 
-_EPHEMERAL_CACHE: dict[str, str] = {"type": "ephemeral"}
-
 
 def _system_param(system: str | list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     """Build the ``amessages`` ``system`` parameter as a block list.
@@ -91,7 +89,7 @@ def _system_param(system: str | list[dict[str, Any]] | None) -> list[dict[str, A
         return None
     if isinstance(system, str):
         return [
-            {"type": "text", "text": system, "cache_control": dict(_EPHEMERAL_CACHE)}
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
         ]
     return system
 
