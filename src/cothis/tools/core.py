@@ -672,21 +672,26 @@ def _check_unknown_keys(
         raise ValueError(msg)
 
 
-def schema_for(tool: Tool) -> Tool | dict[str, Any]:
+def schema_for(tool: Tool) -> dict[str, Any]:
     """Return ``tool``'s schema in Anthropic tool shape (``{name, description, input_schema}``).
 
     Tools carrying a pre-built Anthropic-shape schema on ``__cothis_schema__``
     (so per-arg ``description:`` text reaches the model — any-llm's
     ``callable_to_tool`` would strip it) return that dict; ``Agent`` passes it
-    straight to ``any_llm.amessages``. Tools without the attribute fall
-    through as callables.
+    straight to ``any_llm.amessages``. A bare callable without the attribute
+    gets a schema built on the spot via ``_build_schema`` (same path
+    ``@tool`` uses) — ``amessages`` validates ``tools: list[dict]``, so
+    returning a raw callable would ``ValidationError`` at send time.
 
     Keeping this fork here (next to ``_build_schema``/``_build_tool_schema``,
     the producers of the attribute) means ``Agent`` stays blind to the
     ``__cothis_schema__`` name — the schema serialisation rule lives in
     ``tools.core``, where the Tools are defined, not in ``agent.py``.
     """
-    return getattr(tool, "__cothis_schema__", tool)
+    schema = getattr(tool, "__cothis_schema__", None)
+    if schema is not None:
+        return schema
+    return _build_schema(tool, tool.__name__, None)
 
 
 def _check_same_layer_duplicate(tool: Tool, source: str, seen: dict[str, str]) -> None:

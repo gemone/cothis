@@ -154,6 +154,21 @@ def _concat_text(content: list[dict[str, Any]]) -> str:
     )
 
 
+def _tool_uses_in(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return every ``tool_use`` block in an assistant content list.
+
+    The turn decision keys on this (not ``stop_reason``): a generation cut
+    off mid-tool-call by ``max_tokens`` carries ``stop_reason == "max_tokens"``
+    but still leaves a ``tool_use`` block in the content. Keying on ``stop_reason``
+    would return that turn as final, storing an assistant message whose
+    ``tool_use`` is unpaired — Anthropic requires every ``tool_use`` to be
+    followed by a matching ``tool_result``, so the next turn 400s and the
+    session is poisoned. Detecting by block presence keeps the pairing
+    invariant intact regardless of why the turn ended.
+    """
+    return [b for b in content if b.get("type") == "tool_use"]
+
+
 def _init_stream_block(content_block: Any) -> dict[str, Any]:
     """Seed a block dict from ``ContentBlockStartEvent.content_block``.
 
@@ -229,9 +244,9 @@ class Agent(BaseModel):
     provider:
         any-llm provider key, e.g. ``"mistral"``, ``"openai"``, ``"anthropic"``.
     tools:
-        Python callables the agent can invoke. Each must have a docstring
-        and type annotations; any-llm converts them into the provider's
-        tool schema automatically.
+        Python callables the agent can invoke. ``@tool``-decorated functions,
+        YAML tools, and MCP tools carry a pre-built Anthropic-shape schema;
+        bare callables get one built from their docstring + signature.
     system:
         Optional system prompt. A ``str`` becomes a single persona text block
         (with ephemeral ``cache_control``); a pre-built Anthropic block list
@@ -293,12 +308,14 @@ class Agent(BaseModel):
         returns. Use ``run_stream`` when the caller wants the final answer
         token-by-token (e.g. ``cothis chat``).
 
-        Turn decision uses ``response.stop_reason`` (``== "tool_use"`` → tool
-        turn); any other ``stop_reason`` ends the loop and returns the
-        concatenated ``text`` blocks (empty → ``""``). This removes the old
-        content-None retry heuristic: ``stop_reason`` is the authoritative
-        end-of-turn signal, so there is no "did the provider drop content?"
-        ambiguity to retry through.
+        Turn decision keys on the **presence of ``tool_use`` blocks** in the
+        response content (not ``stop_reason``): if the model emitted any
+        ``tool_use``, execute them and continue; otherwise return the
+        concatenated ``text`` blocks (empty → ``""``). This keeps the
+        Anthropic pairing invariant intact even when a generation is cut off
+        mid-tool-call by ``max_tokens`` (``stop_reason == "max_tokens"`` but
+        a partial ``tool_use`` is still present — keying on ``stop_reason``
+        would leave it unpaired and 400 the next turn).
 
         Side effect: appends the user message, each assistant response, and
         every tool result to ``self._messages``. This is what lets ``chat``
@@ -325,11 +342,10 @@ class Agent(BaseModel):
             msg = _assistant_msg_from_response(response)
             self._messages.append(msg)
 
-            if response.stop_reason == "tool_use":
+            tool_uses = _tool_uses_in(msg["content"])
+            if tool_uses:
                 result_blocks: list[dict[str, Any]] = []
-                for block in msg["content"]:
-                    if block.get("type") != "tool_use":
-                        continue
+                for block in tool_uses:
                     is_error, output = await self._execute_tool(block)
                     result_blocks.append(
                         _tool_result_block(block["id"], output, is_error)
@@ -361,7 +377,9 @@ class Agent(BaseModel):
         ``ContentBlockStartEvent.content_block``, mutated by per-block deltas
         (``TextDelta``/``ThinkingDelta`` append, ``SignatureDelta`` overwrites,
         ``InputJSONDelta`` accumulates then parses at block stop). The turn
-        decision uses ``stop_reason`` from ``MessageDeltaEvent``;
+        decision keys on **presence of ``tool_use`` blocks** (not
+        ``stop_reason``) so a ``max_tokens`` cutoff mid-tool-call still
+        executes the partial call and keeps the pairing invariant intact;
         ``MessageStopEvent`` is only a stream-termination latch (the first one
         seen ends iteration; openrouter emits duplicates).
 
@@ -436,7 +454,7 @@ class Agent(BaseModel):
                 }
             )
 
-            if stop_reason == "tool_use":
+            if _tool_uses_in(content):
                 result_blocks = []
                 for block in content:
                     if block.get("type") != "tool_use":

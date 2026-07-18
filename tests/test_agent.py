@@ -443,6 +443,75 @@ def test_agent_rejects_non_tool() -> None:
         Agent(model="x", provider="mistral", tools=[not_a_tool])
 
 
+def test_tool_schemas_builds_anthropic_schema_for_bare_callable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare callable (no ``__cothis_schema__``) gets an Anthropic-shape dict.
+
+    ``amessages`` validates ``tools: list[dict]``; returning a raw callable
+    (the old fall-through) would ``ValidationError`` at send time.
+    """
+    agent = _patched_agent(monkeypatch)
+
+    def echo(msg: str) -> str:
+        """Echo the message.
+
+        Args:
+            msg: The message to echo.
+        """
+        return msg
+
+    agent._tool_map["echo"] = echo
+    schema = agent._tool_schemas()[0]
+    assert schema["name"] == "echo"
+    assert schema["description"] == "Echo the message."
+    assert schema["input_schema"]["properties"]["msg"]["description"] == (
+        "The message to echo."
+    )
+    assert schema["input_schema"]["required"] == ["msg"]
+
+
+# --- run(): max_tokens cutoff mid-tool-call ---------------------------------
+
+
+def test_run_max_tokens_mid_tool_call_executes_tool_not_poisons_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``max_tokens`` cut off mid-tool-call: ``tool_use`` present but
+    ``stop_reason == "max_tokens"``.
+
+    Must still execute the tool so the session stays valid (every
+    ``tool_use`` paired with a ``tool_result``). Returning here would store
+    an unpaired ``tool_use`` that 400s the next turn — permanently breaking
+    a ``chat`` session.
+    """
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["echo"] = lambda **kw: "ok"
+    state = {"turn": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        state["turn"] += 1
+        if state["turn"] == 1:
+            return _msg_response(
+                [ToolUseBlock(type="tool_use", id="tu1", name="echo", input={})],
+                stop_reason="max_tokens",
+            )
+        return _msg_response([TextBlock(type="text", text="recovered")])
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    result = asyncio.run(agent.run("hi"))
+    assert result == "recovered"
+    # The partial tool_use was executed and paired with a tool_result.
+    tool_result_msgs = [
+        m
+        for m in agent._messages
+        if m["role"] == "user"
+        and any(b.get("type") == "tool_result" for b in m["content"])
+    ]
+    assert tool_result_msgs
+    assert tool_result_msgs[-1]["content"][0]["tool_use_id"] == "tu1"
+
+
 
 
 # --- run_stream -------------------------------------------------------------
@@ -583,6 +652,57 @@ async def test_run_stream_tool_turn_yields_event_then_final(
     assert out[0].name == "add"
     assert out[0].arguments == {"a": 2, "b": 3}
     assert out[1] == "5"
+
+
+@pytest.mark.asyncio
+async def test_run_stream_max_tokens_mid_tool_call_still_executes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``max_tokens`` mid-tool-call in the stream path: ``tool_use`` block
+    present but ``stop_reason == "max_tokens"``. Must still execute the tool
+    so the session stays valid (pairing invariant)."""
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["add"] = lambda **kw: "ok"
+
+    def turn1() -> list[Any]:
+        return [
+            _message_start("m1"),
+            _block_start(
+                0, ToolUseBlock(type="tool_use", id="tu1", name="add", input={})
+            ),
+            _block_stop(0),
+            _msg_delta("max_tokens"),  # cut off, but tool_use block is present
+            _msg_stop(),
+        ]
+
+    def turn2() -> list[Any]:
+        return [
+            _message_start("m2"),
+            _block_start(0, TextBlock(type="text", text="")),
+            _block_delta(0, TextDelta(type="text_delta", text="recovered")),
+            _block_stop(0),
+            _msg_delta("end_turn"),
+            _msg_stop(),
+        ]
+
+    turn = {"i": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        turn["i"] += 1
+        return _stream_from(turn1() if turn["i"] == 1 else turn2())
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    out = await _drain(agent.run_stream("hi"))
+    assert isinstance(out[0], ToolCallEvent)
+    assert out[1] == "recovered"
+    # tool_use paired with tool_result — session valid.
+    tool_result_msgs = [
+        m
+        for m in agent._messages
+        if m["role"] == "user"
+        and any(b.get("type") == "tool_result" for b in m["content"])
+    ]
+    assert tool_result_msgs
 
 
 @pytest.mark.asyncio
