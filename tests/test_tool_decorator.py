@@ -52,7 +52,7 @@ def test_summary_from_first_paragraph() -> None:
 
     schema = greet.__cothis_schema__
     assert schema is not None
-    desc = schema["function"]["description"]
+    desc = schema["description"]
     assert desc == "Greet someone by name."
     assert "Longer explanation" not in desc
 
@@ -71,7 +71,7 @@ def test_per_arg_description_from_args_section() -> None:
 
         return a + b
 
-    props = add.__cothis_schema__["function"]["parameters"]["properties"]
+    props = add.__cothis_schema__["input_schema"]["properties"]
     assert props["a"]["description"] == "The first operand."
     assert props["b"]["description"] == "The second operand."
 
@@ -92,7 +92,7 @@ def test_type_mapping_from_annotation() -> None:
         """
         return ""
 
-    props = typed.__cothis_schema__["function"]["parameters"]["properties"]
+    props = typed.__cothis_schema__["input_schema"]["properties"]
     assert props["n"]["type"] == "integer"
     assert props["s"]["type"] == "string"
     assert props["f"]["type"] == "number"
@@ -112,7 +112,7 @@ def test_unknown_annotation_falls_back_to_string() -> None:
         """
         return ""
 
-    props = custom.__cothis_schema__["function"]["parameters"]["properties"]
+    props = custom.__cothis_schema__["input_schema"]["properties"]
     assert props["x"]["type"] == "string"
 
 
@@ -129,7 +129,7 @@ def test_required_vs_optional_from_defaults() -> None:
         """
         return ""
 
-    required = f.__cothis_schema__["function"]["parameters"]["required"]
+    required = f.__cothis_schema__["input_schema"]["required"]
     assert required == ["req"]
 
 
@@ -147,7 +147,7 @@ def test_multiline_description_collapsed() -> None:
         """
         return ""
 
-    desc = read.__cothis_schema__["function"]["parameters"]["properties"]["path"][
+    desc = read.__cothis_schema__["input_schema"]["properties"]["path"][
         "description"
     ]
     assert "Relative paths are resolved" in desc
@@ -172,7 +172,7 @@ def test_tool_with_positional_name() -> None:
         return ""
 
     assert read.__name__ == "fs.read"
-    assert read.__cothis_schema__["function"]["name"] == "fs.read"
+    assert read.__cothis_schema__["name"] == "fs.read"
 
 
 def test_tool_with_keyword_name_and_description() -> None:
@@ -185,8 +185,8 @@ def test_tool_with_keyword_name_and_description() -> None:
 
     assert f.__name__ == "custom.tool"
     schema = f.__cothis_schema__
-    assert schema["function"]["name"] == "custom.tool"
-    assert schema["function"]["description"] == "Override description."
+    assert schema["name"] == "custom.tool"
+    assert schema["description"] == "Override description."
 
 
 def test_tool_no_parens_uses_dunder_name() -> None:
@@ -197,7 +197,7 @@ def test_tool_no_parens_uses_dunder_name() -> None:
         """Bare."""
         return x
 
-    assert bare.__cothis_schema__["function"]["name"] == "bare"
+    assert bare.__cothis_schema__["name"] == "bare"
 
 
 def test_no_docstring_yields_default_description() -> None:
@@ -209,7 +209,7 @@ def test_no_docstring_yields_default_description() -> None:
 
     schema = bare.__cothis_schema__
     # No docstring → description falls back. The fallback names the function.
-    assert "bare" in schema["function"]["description"]
+    assert "bare" in schema["description"]
 
 
 def test_no_args_section_yields_no_descriptions() -> None:
@@ -221,7 +221,7 @@ def test_no_args_section_yields_no_descriptions() -> None:
 
         return x
 
-    props = f.__cothis_schema__["function"]["parameters"]["properties"]
+    props = f.__cothis_schema__["input_schema"]["properties"]
     assert "description" not in props["x"]
 
 
@@ -237,7 +237,7 @@ def test_var_args_dropped_from_schema() -> None:
         """
         return ""
 
-    props = f.__cothis_schema__["function"]["parameters"]["properties"]
+    props = f.__cothis_schema__["input_schema"]["properties"]
     assert set(props) == {"a"}
 
 
@@ -257,7 +257,7 @@ def test_annotated_field_constraints_reach_schema() -> None:
         """
         return str(score)
 
-    props = set_score.__cothis_schema__["function"]["parameters"]["properties"]
+    props = set_score.__cothis_schema__["input_schema"]["properties"]
     score_prop = props["score"]
     assert score_prop["type"] == "integer"
     assert score_prop["minimum"] == 0
@@ -277,7 +277,7 @@ def test_basic_type_schema_unchanged() -> None:
         """
         return str(n)
 
-    props = echo.__cothis_schema__["function"]["parameters"]["properties"]
+    props = echo.__cothis_schema__["input_schema"]["properties"]
     assert props["n"] == {"type": "integer", "description": "a number."}
 
 
@@ -293,9 +293,9 @@ def test_pep604_optional_unwrapped() -> None:
         """
         return str(start_line)
 
-    props = f.__cothis_schema__["function"]["parameters"]["properties"]
+    props = f.__cothis_schema__["input_schema"]["properties"]
     assert props["start_line"]["type"] == "integer"
-    assert "start_line" not in f.__cothis_schema__["function"]["parameters"]["required"]
+    assert "start_line" not in f.__cothis_schema__["input_schema"]["required"]
 
 
 def test_parse_docstring_helper_directly() -> None:
@@ -557,7 +557,7 @@ def test_tooldef_satisfies_tool_protocol() -> None:
 
     assert my_tool.__name__ == "ns.name"
     assert callable(my_tool)
-    assert my_tool.__cothis_schema__["function"]["name"] == "ns.name"
+    assert my_tool.__cothis_schema__["name"] == "ns.name"
     # __call__ delegates to the wrapped function.
     assert my_tool(x="hello") == "hello"
 
@@ -938,11 +938,9 @@ async def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None
         return args
 
     agent._tool_map["pipe"] = echo
-    tc = MagicMock()
-    tc.function.name = "pipe"
-    tc.function.arguments = '{"x": "start"}'
-    result = await agent._execute(tc)
-    assert result == "start-A-B"  # both pre_execute callbacks ran in order
+    tu = {"name": "pipe", "input": {"x": "start"}}
+    is_error, result = await agent._execute_tool(tu)
+    assert (is_error, result) == (False, "start-A-B")  # both pre_execute callbacks ran in order
 
 
 @pytest.mark.asyncio
@@ -971,10 +969,9 @@ async def test_pre_execute_exception_short_circuits_and_returns_error(
         raise ValueError("blocked by pre_execute")
 
     agent._tool_map["guarded"] = guarded
-    tc = MagicMock()
-    tc.function.name = "guarded"
-    tc.function.arguments = '{"x": "hi"}'
-    result = await agent._execute(tc)
+    tu = {"name": "guarded", "input": {"x": "hi"}}
+    is_error, result = await agent._execute_tool(tu)
+    assert is_error is True
     assert result.startswith("Error calling guarded: blocked by pre_execute")
 
 
@@ -1007,11 +1004,9 @@ async def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> No
         return result + "!"
 
     agent._tool_map["transform"] = base
-    tc = MagicMock()
-    tc.function.name = "transform"
-    tc.function.arguments = "{}"
-    result = await agent._execute(tc)
-    assert result == "HELLO!"  # both after_execute callbacks ran in order
+    tu = {"name": "transform", "input": {}}
+    is_error, result = await agent._execute_tool(tu)
+    assert (is_error, result) == (False, "HELLO!")  # both after_execute callbacks ran in order
 
 
 @pytest.mark.asyncio
@@ -1038,12 +1033,10 @@ async def test_after_execute_exception_uses_original_result(monkeypatch: Any) ->
         raise RuntimeError("after_execute crashed")
 
     agent._tool_map["safe"] = base
-    tc = MagicMock()
-    tc.function.name = "safe"
-    tc.function.arguments = "{}"
-    result = await agent._execute(tc)
+    tu = {"name": "safe", "input": {}}
+    is_error, result = await agent._execute_tool(tu)
     # Original result preserved — broken after_execute doesn't hide it.
-    assert result == "real-output"
+    assert (is_error, result) == (False, "real-output")
 
 
 @pytest.mark.asyncio
@@ -1072,10 +1065,9 @@ async def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
         errors.append((str(exc), phase))
 
     agent._tool_map["crash"] = base
-    tc = MagicMock()
-    tc.function.name = "crash"
-    tc.function.arguments = "{}"
-    result = await agent._execute(tc)
+    tu = {"name": "crash", "input": {}}
+    is_error, result = await agent._execute_tool(tu)
+    assert is_error is True
     assert result.startswith("Error calling crash")
     assert errors == [("tool body failed", "tool")]
 
@@ -1110,10 +1102,8 @@ async def test_on_error_at_execute_phase_correct(monkeypatch: Any) -> None:
         errors.append((str(exc), phase))
 
     agent._tool_map["t"] = base
-    tc = MagicMock()
-    tc.function.name = "t"
-    tc.function.arguments = "{}"
-    await agent._execute(tc)
+    tu = {"name": "t", "input": {}}
+    await agent._execute_tool(tu)
     assert errors == [("pre_execute failed", "pre_execute")]
 
 
@@ -1137,10 +1127,8 @@ async def test_no_hooks_execute_baseline_unchanged(monkeypatch: Any) -> None:
         return f"got {x}"
 
     agent._tool_map["plain"] = base
-    tc = MagicMock()
-    tc.function.name = "plain"
-    tc.function.arguments = '{"x": "hello"}'
-    assert await agent._execute(tc) == "got hello"
+    tu = {"name": "plain", "input": {"x": "hello"}}
+    assert await agent._execute_tool(tu) == (False, "got hello")
 
 
 # --------------------------------------------------------------------

@@ -19,9 +19,21 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+# Runtime imports of the Anthropic stream-event types: ``isinstance`` dispatch
+# in ``run_stream`` is how ty narrows the ``MessageStreamEvent`` union (it
+# can't narrow by string ``event.type`` comparison). The union is itself just
+# these anthropic SDK classes (any-llm re-exports them).
+from anthropic.types import (  # noqa: I001
+    RawContentBlockDeltaEvent,
+    RawContentBlockStartEvent,
+    RawContentBlockStopEvent,
+    RawMessageDeltaEvent,
+    RawMessageStartEvent,
+    RawMessageStopEvent,
+)
+from any_llm.types.messages import TextDelta
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 # cothis: ``Tool`` must be runtime-imported (not TYPE_CHECKING-only) because
@@ -49,7 +61,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from any_llm import AnyLLM
-    from any_llm.types.completion import ChatCompletionMessage
+    from any_llm.types.messages import MessageResponse, MessageStreamEvent
 
     from cothis.tools import MCPClientTool
 
@@ -58,32 +70,148 @@ Message = dict[str, Any]
 
 logger = logging.getLogger("cothis.agent")
 
+# cothis: ``max_tokens`` is hardcoded this slice; slice #32 resolves it from
+# the bundled litellm ``model_prices.json`` (fallback 8192), overridable via
+# ``COTHIS_MAX_TOKENS`` / ``--max-tokens``. Upgrade path: replace this const
+# with the resolver once #32 lands.
+_DEFAULT_MAX_TOKENS = 8192
 
-def _safe_parse_args(raw: str | None) -> dict[str, Any]:
-    """Best-effort JSON parse for a streamed tool-call arguments string.
 
-    The accumulated ``arguments`` from ``_assemble_tool_calls`` should be a
-    complete JSON object by the time the stream ends, but providers can emit
-    malformed JSON (trailing commas, truncation). On failure we fall back to
-    ``{"_raw": raw}`` so the CLI still has something to show the user
-    instead of crashing mid-stream.
+def _system_param(system: str | list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Build the ``amessages`` ``system`` parameter as a block list.
 
-    cothis: empty/None ``raw`` returns ``{}`` rather than the spec's
-    ``{"_raw": raw}`` fallback. This lets the display format a no-arg tool
-    call as ``calling fs.read()`` instead of ``calling fs.read(_raw='')``.
-    The trade-off: a tool can't distinguish "provider sent empty string"
-    from "provider sent no arguments" — acceptable for cothis today since
-    no built-in tool has ambiguous empty-arg semantics. Upgrade path: if a
-    future tool needs the distinction, gate on ``raw is None`` vs
-    ``raw == ''``.
+    A ``str`` persona becomes a single text block carrying
+    ``cache_control: {type: ephemeral}``. A pre-built block list is passed
+    through unchanged (the caller owns ``cache_control`` placement — e.g. the
+    AGENTS.md assembler in #33). ``None`` → ``None`` (no system param sent).
     """
-    if not raw:
-        return {}
+    if system is None:
+        return None
+    if isinstance(system, str):
+        return [
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+        ]
+    return system
+
+
+def _assistant_msg_from_response(response: MessageResponse) -> dict[str, Any]:
+    """Convert a non-stream ``MessageResponse`` into the dict stored in ``_messages``.
+
+    The dict carries response metadata (``id``/``model``/``stop_reason``/
+    ``usage``) so callers can inspect it; ``_request_messages`` strips those
+    before the next ``amessages`` call (Anthropic's native API rejects extra
+    fields on message dicts). ``content`` blocks are ``model_dump``'d with
+    ``exclude_none`` so no ``None`` fields leak into the replayed request.
+    """
+    return {
+        "role": "assistant",
+        "content": [b.model_dump(exclude_none=True) for b in response.content],
+        "id": response.id,
+        "model": response.model,
+        "stop_reason": response.stop_reason,
+        "usage": response.usage.model_dump(exclude_none=True)
+        if response.usage
+        else None,
+    }
+
+
+def _request_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project stored messages to ``{role, content}`` for ``amessages``.
+
+    Anthropic's native API validates message dicts strictly; the metadata we
+    keep on assistant messages for inspection would be rejected, so strip to
+    the two request-side fields at send time.
+    """
+    return [{"role": m["role"], "content": m["content"]} for m in messages]
+
+
+def _tool_result_block(
+    tool_use_id: str, content: str, is_error: bool
+) -> dict[str, Any]:
+    """Build a ``tool_result`` content block for a user message.
+
+    ``content`` is the (already-serialised) tool output string (matches
+    ``_execute``'s string contract). On error the Anthropic-native
+    ``is_error: true`` flag is set so the model can tell a failed call from a
+    successful one.
+    """
+    block: dict[str, Any] = {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content,
+    }
+    if is_error:
+        block["is_error"] = True
+    return block
+
+
+def _concat_text(content: list[dict[str, Any]]) -> str:
+    """Concatenate every ``text`` block in an assistant content list."""
+    return "".join(
+        b.get("text", "") for b in content if b.get("type") == "text"
+    )
+
+
+def _tool_uses_in(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return every ``tool_use`` block in an assistant content list.
+
+    The turn decision keys on this (not ``stop_reason``): a generation cut
+    off mid-tool-call by ``max_tokens`` carries ``stop_reason == "max_tokens"``
+    but still leaves a ``tool_use`` block in the content. Keying on ``stop_reason``
+    would return that turn as final, storing an assistant message whose
+    ``tool_use`` is unpaired — Anthropic requires every ``tool_use`` to be
+    followed by a matching ``tool_result``, so the next turn 400s and the
+    session is poisoned. Detecting by block presence keeps the pairing
+    invariant intact regardless of why the turn ended.
+    """
+    return [b for b in content if b.get("type") == "tool_use"]
+
+
+def _init_stream_block(content_block: Any) -> dict[str, Any]:
+    """Seed a block dict from ``ContentBlockStartEvent.content_block``.
+
+    The start event's ``content_block`` already carries the block's type and
+    initial fields (``ToolUseBlock``: ``id``/``name``/``input={}``;
+    ``TextBlock``: ``text=""``; ``ThinkingBlock``: ``thinking=""``). Dump it
+    and add a private ``_input_json`` accumulator for ``tool_use`` partials.
+    """
+    d = content_block.model_dump(exclude_none=True)
+    if d.get("type") == "tool_use":
+        d["_input_json"] = ""
+    return d
+
+
+def _apply_stream_delta(block: dict[str, Any], delta: Any) -> None:
+    """Accumulate one ``ContentBlockDeltaEvent.delta`` into ``block`` in place.
+
+    ``TextDelta``/``ThinkingDelta`` append; ``SignatureDelta`` overwrites (it
+    carries the block's final signature, finalised at ``content_block_stop`` —
+    appending would corrupt it); ``InputJSONDelta`` appends to the private
+    ``_input_json`` string, parsed by ``_finalize_stream_block``.
+    """
+    dtype = delta.type
+    if dtype == "text_delta":
+        block["text"] = block.get("text", "") + delta.text
+    elif dtype == "thinking_delta":
+        block["thinking"] = block.get("thinking", "") + delta.thinking
+    elif dtype == "signature_delta":
+        block["signature"] = delta.signature
+    elif dtype == "input_json_delta":
+        block["_input_json"] = block.get("_input_json", "") + delta.partial_json
+
+
+def _finalize_stream_block(block: dict[str, Any]) -> None:
+    """Parse a ``tool_use`` block's accumulated ``_input_json`` into ``input``."""
+    if block.get("type") != "tool_use":
+        return
+    raw = block.pop("_input_json", "")
+    # cothis: partial_json should be complete JSON by content_block_stop.
+    # Malformed → empty dict so dispatch surfaces a clean error rather than
+    # crashing mid-stream. Upgrade path: surface the bad JSON to the model.
     try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {"_raw": raw}
+        block["input"] = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
-        return {"_raw": raw}
+        block["input"] = {}
 
 
 @dataclass(frozen=True)
@@ -114,11 +242,14 @@ class Agent(BaseModel):
     provider:
         any-llm provider key, e.g. ``"mistral"``, ``"openai"``, ``"anthropic"``.
     tools:
-        Python callables the agent can invoke. Each must have a docstring
-        and type annotations; any-llm converts them into the provider's
-        tool schema automatically.
-    system_prompt:
-        Optional system message prepended to every run.
+        Python callables the agent can invoke. ``@tool``-decorated functions,
+        YAML tools, and MCP tools carry a pre-built Anthropic-shape schema;
+        bare callables get one built from their docstring + signature.
+    system:
+        Optional system prompt. A ``str`` becomes a single persona text block
+        (with ephemeral ``cache_control``); a pre-built Anthropic block list
+        is passed through as-is. Sent as the ``amessages`` ``system``
+        parameter, never as a ``{role: system}`` message.
     max_iterations:
         Safety cap on the number of LLM round-trips per ``run``.
     api_key / api_base:
@@ -130,7 +261,7 @@ class Agent(BaseModel):
     model: str
     provider: str
     tools: list[Tool] = Field(default_factory=list)
-    system_prompt: str | None = None
+    system: str | list[dict[str, Any]] | None = None
     max_iterations: int = 10
     api_key: str | None = None
     api_base: str | None = None
@@ -138,12 +269,10 @@ class Agent(BaseModel):
     # Runtime-only state: not validated, not serialised.
     _llm: AnyLLM = PrivateAttr()
     _tool_map: dict[str, Tool] = PrivateAttr(default_factory=dict)
-    # cothis: ceiling — messages grow without bound across a long ``chat``
-    # session. Token cost per turn rises linearly. No windowing/summarisation
-    # is planned; Ctrl-C and start a new session when it gets slow.
-    _messages: list[dict[str, Any] | ChatCompletionMessage] = PrivateAttr(
-        default_factory=list
-    )
+    # Anthropic-shaped message dicts (user/assistant only). Assistant dicts
+    # carry response metadata (id/model/stop_reason/usage); ``_request_messages``
+    # strips them before the next ``amessages`` call.
+    _messages: list[dict[str, Any]] = PrivateAttr(default_factory=list)
     _handle_manager: HandleManager = PrivateAttr(default_factory=HandleManager)
     _mcp_servers: list[MCPServer] = PrivateAttr(default_factory=list)
     _mcp_group: Any = PrivateAttr(default=None)
@@ -177,6 +306,15 @@ class Agent(BaseModel):
         returns. Use ``run_stream`` when the caller wants the final answer
         token-by-token (e.g. ``cothis chat``).
 
+        Turn decision keys on the **presence of ``tool_use`` blocks** in the
+        response content (not ``stop_reason``): if the model emitted any
+        ``tool_use``, execute them and continue; otherwise return the
+        concatenated ``text`` blocks (empty → ``""``). This keeps the
+        Anthropic pairing invariant intact even when a generation is cut off
+        mid-tool-call by ``max_tokens`` (``stop_reason == "max_tokens"`` but
+        a partial ``tool_use`` is still present — keying on ``stop_reason``
+        would leave it unpaired and 400 the next turn).
+
         Side effect: appends the user message, each assistant response, and
         every tool result to ``self._messages``. This is what lets ``chat``
         reuse one Agent across turns — but it also means calling ``run``
@@ -189,125 +327,151 @@ class Agent(BaseModel):
         await self._ensure_handles()
 
         for _turn in range(self.max_iterations):
-            response = await self._llm.acompletion(
-                model=self.model,
-                messages=self._messages,
-                tools=self._tool_schemas(),
+            response = cast(
+                "MessageResponse",
+                await self._llm.amessages(
+                    model=self.model,
+                    messages=_request_messages(self._messages),
+                    max_tokens=_DEFAULT_MAX_TOKENS,
+                    system=_system_param(self.system),
+                    tools=self._tool_schemas(),
+                ),
             )
-            message = response.choices[0].message
-            self._messages.append(message)
+            msg = _assistant_msg_from_response(response)
+            self._messages.append(msg)
 
-            if message.tool_calls:
-                for tool_msg in await self._execute_tool_calls(message.tool_calls):
-                    self._messages.append(tool_msg)
+            tool_uses = _tool_uses_in(msg["content"])
+            if tool_uses:
+                result_blocks: list[dict[str, Any]] = []
+                for block in tool_uses:
+                    is_error, output = await self._execute_tool(block)
+                    result_blocks.append(
+                        _tool_result_block(block["id"], output, is_error)
+                    )
+                self._messages.append({"role": "user", "content": result_blocks})
                 continue
 
-            # cothis: ceiling — we can't distinguish "provider dropped content
-            # mid-stream" from "model genuinely chose to say nothing". Both
-            # look like content=None. Retry is the safe default but wastes a
-            # turn on the second case. Upgrade path: provider-specific sniffing
-            # (e.g. OpenRouter's finish_reason) to tell drop from silence.
-            if message.content:
-                return message.content
+            # Non-tool turn: final answer (text concat; empty → "").
+            return _concat_text(msg["content"])
 
         raise MaxIterationsError(
-            f"Agent did not finish within {self.max_iterations} iterations. "
-            f"Last message had no content and no tool calls."
+            f"Agent did not finish within {self.max_iterations} iterations."
         )
 
     async def run_stream(self, user_input: str) -> AsyncIterator[str | ToolCallEvent]:
-        """Run the ReAct loop, yielding content deltas and tool-call events.
+        """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
 
         Yields:
-            ``str``: a content delta from the model's final answer, as soon
-                as it arrives. The CLI accumulates these into a Live-rendered
-                Markdown view.
+            ``str``: a ``TextDelta`` fragment of the model's final answer, as
+                soon as it arrives. The CLI accumulates these into a
+                Live-rendered Markdown view.
             ``ToolCallEvent``: emitted immediately before each individual
                 tool dispatch (not batched), so multi-tool turns surface
                 "calling X" → X runs → "calling Y" → Y runs in order.
 
-        Side effect: same as ``run`` — mutates ``self._messages``.
+        The accumulator consumes the Anthropic stream-event union directly
+        (any-llm synthesises these events from OpenAI chunks for non-Anthropic
+        providers via ``messages_compat``): block state is seeded from
+        ``ContentBlockStartEvent.content_block``, mutated by per-block deltas
+        (``TextDelta``/``ThinkingDelta`` append, ``SignatureDelta`` overwrites,
+        ``InputJSONDelta`` accumulates then parses at block stop). The turn
+        decision keys on **presence of ``tool_use`` blocks** (not
+        ``stop_reason``) so a ``max_tokens`` cutoff mid-tool-call still
+        executes the partial call and keeps the pairing invariant intact;
+        ``MessageStopEvent`` is only a stream-termination latch (the first one
+        seen ends iteration; openrouter emits duplicates).
 
-        cothis: optimistic yield — every ``delta.content`` the provider
-        sends is yielded immediately, without waiting to see whether the
-        current turn will also emit ``tool_calls``. In practice
-        (OpenAI/Anthropic streaming semantics) tool-call turns emit empty
-        content, so content deltas only flow on the final turn. Ceiling:
-        if a provider streams content *and* tool_calls in the same turn,
-        that interim text reaches the caller as if it were a final-answer
-        fragment. Upgrade path: buffer content until end-of-turn, then
-        yield only if no tool_calls arrived (costs one turn of latency).
+        cothis: thinking blocks are accumulated passively (this slice does not
+        pass the ``thinking`` param, so claude won't emit them and other
+        providers never do); they are replayed verbatim if they ever arrive,
+        since stripping them makes the model re-invoke tools.
+
+        Side effect: same as ``run`` — mutates ``self._messages``.
         """
         self._ensure_messages(user_input)
         await self._ensure_mcp()
         await self._ensure_handles()
 
         tool_schemas = self._tool_schemas()
-        messages = self._messages
         model = self.model
         llm = self._llm
         max_iterations = self.max_iterations
 
         for _turn in range(max_iterations):
-            response = await llm.acompletion(
-                model=model,
-                messages=messages,
-                tools=tool_schemas,
-                stream=True,
+            stream = cast(
+                "AsyncIterator[MessageStreamEvent]",
+                await llm.amessages(
+                    model=model,
+                    messages=_request_messages(self._messages),
+                    max_tokens=_DEFAULT_MAX_TOKENS,
+                    system=_system_param(self.system),
+                    tools=tool_schemas,
+                    stream=True,
+                ),
             )
 
-            content_parts: list[str] = []
-            tool_call_chunks: list[Any] = []
-            async for chunk in response:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    content_parts.append(delta.content)
-                    yield delta.content
-                if delta.tool_calls:
-                    tool_call_chunks.extend(delta.tool_calls)
+            blocks: dict[int, dict[str, Any]] = {}
+            stop_reason: str | None = None
+            response_id: str | None = None
+            response_model: str | None = None
+            response_usage: Any = None
+            async for event in stream:
+                if isinstance(event, RawMessageStartEvent):
+                    response_id = event.message.id
+                    response_model = event.message.model
+                elif isinstance(event, RawContentBlockStartEvent):
+                    blocks[event.index] = _init_stream_block(event.content_block)
+                elif isinstance(event, RawContentBlockDeltaEvent):
+                    _apply_stream_delta(blocks[event.index], event.delta)
+                    if isinstance(event.delta, TextDelta):
+                        yield event.delta.text
+                elif isinstance(event, RawContentBlockStopEvent):
+                    block = blocks.get(event.index)
+                    if block is not None:
+                        _finalize_stream_block(block)
+                elif isinstance(event, RawMessageDeltaEvent):
+                    if event.delta.stop_reason is not None:
+                        stop_reason = event.delta.stop_reason
+                    response_usage = event.usage
+                elif isinstance(event, RawMessageStopEvent):
+                    # Termination latch: first message_stop ends this turn's
+                    # stream. openrouter emits duplicates; break on the first.
+                    break
 
-            if not tool_call_chunks:
-                if content_parts or "".join(content_parts):
-                    messages.append(
-                        {"role": "assistant", "content": "".join(content_parts)}
-                    )
-                    return
-                continue
-
-            assembled = self._assemble_tool_calls(tool_call_chunks)
-            messages.append(
+            content = [blocks[i] for i in sorted(blocks)]
+            self._messages.append(
                 {
                     "role": "assistant",
-                    "content": "".join(content_parts) or None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in assembled
-                    ],
+                    "content": content,
+                    "id": response_id,
+                    "model": response_model,
+                    "stop_reason": stop_reason,
+                    "usage": response_usage.model_dump(exclude_none=True)
+                    if response_usage is not None
+                    else None,
                 }
             )
-            for tc in assembled:
-                yield ToolCallEvent(
-                    name=tc.function.name,
-                    arguments=_safe_parse_args(tc.function.arguments),
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": await self._execute(tc),
-                    }
-                )
+
+            if _tool_uses_in(content):
+                result_blocks = []
+                for block in content:
+                    if block.get("type") != "tool_use":
+                        continue
+                    yield ToolCallEvent(
+                        name=block["name"], arguments=block["input"]
+                    )
+                    is_error, output = await self._execute_tool(block)
+                    result_blocks.append(
+                        _tool_result_block(block["id"], output, is_error)
+                    )
+                self._messages.append({"role": "user", "content": result_blocks})
+                continue
+
+            # Non-tool turn: final answer streamed already; just end the loop.
+            return
 
         raise MaxIterationsError(
-            f"Agent did not finish within {self.max_iterations} iterations. "
-            f"Last message had no content and no tool calls."
+            f"Agent did not finish within {self.max_iterations} iterations."
         )
 
     # --- internals -----------------------------------------------------
@@ -440,93 +604,35 @@ class Agent(BaseModel):
         self._handles_started = False
 
     def _tool_schemas(self) -> list[Any] | None:
-        """Tools in the form any-llm's ``acompletion`` expects.
+        """Tools in Anthropic shape (``{name, description, input_schema}``) for ``amessages``.
 
         Built from ``_tool_map`` (not ``self.tools``) so it reflects the
         resolved set: MCP server handles are excluded and the
         ``MCPClientTool`` instances they produced (added by ``_ensure_mcp``)
         are included. Delegates each entry to ``tools.schema_for`` so the
-        schema-serialisation rule (pre-built dict vs callable) lives next to
-        the Tool definitions, not here.
+        schema-serialisation rule (pre-built Anthropic dict vs callable) lives
+        next to the Tool definitions, not here.
 
-        Returns ``None`` when there are no tools, matching the prior
-        ``list(self.tools) or None`` behaviour.
+        Returns ``None`` when there are no tools.
         """
         if not self._tool_map:
             return None
         return [schema_for(tool) for tool in self._tool_map.values()]
 
     def _ensure_messages(self, user_input: str) -> None:
-        """Populate ``self._messages`` for this turn.
+        """Append the user turn to ``self._messages`` as an Anthropic block list.
 
-        First turn: seed with system prompt (if any) and the user message.
-        Subsequent turns: append the user message to the existing history.
+        The system prompt is sent as the ``amessages`` ``system`` parameter
+        (see ``_system_param``), never as a ``{role: system}`` message, so
+        this only ever appends a user message. ``chat`` reuses one Agent
+        across turns, so each call extends the in-memory history.
         """
-        if self._messages:
-            self._messages.append({"role": "user", "content": user_input})
-            return
-        if self.system_prompt:
-            self._messages.append({"role": "system", "content": self.system_prompt})
-        self._messages.append({"role": "user", "content": user_input})
+        self._messages.append(
+            {"role": "user", "content": [{"type": "text", "text": user_input}]}
+        )
 
-    async def _execute_tool_calls(self, tool_calls: list[Any]) -> list[dict[str, Any]]:
-        """Dispatch every tool call and return ready-to-append ``tool`` dicts.
-
-        Accepts any object exposing ``.id``, ``.function.name`` and
-        ``.function.arguments`` — that covers both the pydantic
-        ``ChatCompletionMessageToolCall`` returned by the non-stream path and
-        the ``SimpleNamespace`` produced by ``_assemble_tool_calls`` for the
-        stream path.
-        """
-        results: list[dict[str, Any]] = []
-        for tool_call in tool_calls:
-            results.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": await self._execute(tool_call),
-                }
-            )
-        return results
-
-    def _assemble_tool_calls(self, chunks: list[Any]) -> list[SimpleNamespace]:
-        """Merge streamed ``ChoiceDeltaToolCall`` fragments by index.
-
-        Streaming tool calls arrive as many fragments per logical call: the
-        first usually carries ``id`` + ``function.name``; the rest carry
-        ``function.arguments`` fragments that must be string-concatenated.
-        Multiple parallel tool calls are distinguished by ``index``.
-
-        Returns objects with the same attribute shape as the non-stream
-        ``ChatCompletionMessageToolCall`` (``.id``, ``.function.name``,
-        ``.function.arguments``) so ``_execute_tool_calls`` can consume both.
-        """
-        by_index: dict[int, dict[str, str | None]] = {}
-        for tc in chunks:
-            entry = by_index.setdefault(
-                tc.index,
-                {"id": None, "name": None, "arguments": ""},
-            )
-            if tc.id:
-                entry["id"] = tc.id
-            if tc.function:
-                if tc.function.name:
-                    entry["name"] = tc.function.name
-                if tc.function.arguments:
-                    entry["arguments"] += tc.function.arguments
-        return [
-            SimpleNamespace(
-                id=by_index[i]["id"],
-                function=SimpleNamespace(
-                    name=by_index[i]["name"],
-                    arguments=by_index[i]["arguments"],
-                ),
-            )
-            for i in sorted(by_index)
-        ]
-
-    async def _execute(self, tool_call: Any) -> str:
-        """Dispatch a single tool call and return its result as a string.
+    async def _execute_tool(self, tool_use: dict[str, Any]) -> tuple[bool, str]:
+        """Dispatch a single ``tool_use`` block; return ``(is_error, output)``.
 
         Lifecycle (all tools carry hooks via ``_HookableTool``; YAML tools'
         hook chains are empty no-ops):
@@ -535,34 +641,32 @@ class Agent(BaseModel):
         3. ``after_execute`` pipeline — callbacks may modify ``result``.
         4. ``format_tool_output`` — json/csv/tsv/yaml serialisation.
 
-        Any exception in 1–3 fires ``on_error`` (phase names the stage),
-        then returns an error string to the LLM. ``after_execute`` failure
-        uses the original result (don't hide the tool's output).
+        Any exception in 1–3 fires ``on_error`` (phase names the stage), then
+        returns ``(True, error_str)`` so the caller can set the
+        Anthropic-native ``is_error`` flag on the ``tool_result`` block.
+        ``after_execute`` failure uses the original result (don't hide the
+        tool's output). ``tool_use["input"]`` is already a dict (the Messages
+        API delivers it parsed), so the old JSON-string parsing is gone.
 
-        Dispatch is async (ADR-0004) to support async tools (MCP). Sync
-        tools (ToolDef, ``_ShellTool``, bare callables) return non-coroutine
-        values; the ``isawaitable`` check skips the await for them, so their
-        behavior is unchanged.
+        Dispatch is async (ADR-0004) to support async tools (MCP). Sync tools
+        (ToolDef, ``_ShellTool``, bare callables) return non-coroutine values;
+        the ``isawaitable`` check skips the await for them, so their behavior
+        is unchanged.
         """
-        name = tool_call.function.name
-        raw_args = tool_call.function.arguments or "{}"
-        try:
-            args: dict[str, Any] = json.loads(raw_args)
-        except json.JSONDecodeError:
-            logger.debug("tool %s args parse failed: %s", name, raw_args)
-            return f"Error: could not parse tool arguments for {name!r}: {raw_args}"
+        name = tool_use["name"]
+        args: dict[str, Any] = tool_use.get("input") or {}
 
         tool = self._tool_map.get(name)
         if tool is None:
             logger.debug("tool %s not in tool_map (unknown tool)", name)
-            return f"Error: unknown tool {name!r}."
+            return True, f"Error: unknown tool {name!r}."
 
         try:
             args = run_hooks_safe(tool, "_run_pre_execute", args)
         except Exception as exc:  # noqa: BLE001 — author hook code
             logger.debug("← %s pre_execute raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=pre_execute)", name)
-            return f"Error calling {name}: {exc}"
+            return True, f"Error calling {name}: {exc}"
 
         # Ensure the tool's ResourceHandle (if any) is acquired before the
         # body runs — self-healing path. No-op for tools without a
@@ -572,7 +676,7 @@ class Agent(BaseModel):
         except Exception as exc:  # noqa: BLE001 — acquire may fail (network, …)
             logger.debug("← %s handle acquire raised: %s", name, exc)
             run_hooks_safe(tool, "_run_on_error", exc, "handle", args)
-            return f"Error calling {name}: {exc}"
+            return True, f"Error calling {name}: {exc}"
 
         # Bracket the body in an in-flight window so the background reaper
         # can't reclaim this handle mid-call. Pairs with handle_call_done
@@ -593,7 +697,7 @@ class Agent(BaseModel):
             logger.debug("← %s raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=tool)", name)
             run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
-            return f"Error calling {name}: {exc}"
+            return True, f"Error calling {name}: {exc}"
         finally:
             # End the in-flight window so the reaper can reclaim this
             # handle again; no-op for tools without a bound handle.
@@ -620,4 +724,4 @@ class Agent(BaseModel):
         else:
             rendered = str(result)
         logger.debug("← %s: %s", name, rendered)
-        return rendered
+        return False, rendered

@@ -188,7 +188,7 @@ def tool(
 
     Returns a ``ToolDef`` instance that wraps the function. ``ToolDef``
     satisfies the ``Tool`` Protocol (``__name__`` + ``__call__``) and carries
-    a pre-built OpenAI schema on ``__cothis_schema__`` (bypassing any-llm's
+    a pre-built Anthropic-shape tool schema on ``__cothis_schema__`` (bypassing any-llm's
     lossy ``callable_to_tool``, which drops per-parameter ``description``
     fields). It also exposes the five lifecycle hook decorators
     (``.pre_load()`` / ``.after_load()`` / ``.pre_execute()`` /
@@ -553,7 +553,7 @@ class ToolDef(_HookableTool):
 def _build_schema(
     fn: Any, tool_name: str, description_override: str | None
 ) -> dict[str, Any]:
-    """Build the OpenAI-format tool schema from a function's docstring + signature.
+    """Build the Anthropic-format tool schema from a function's docstring + signature.
 
     Reads the Google-style docstring (``griffe``) for the summary line and
     per-arg descriptions, and ``inspect.signature`` + ``typing.get_type_hints``
@@ -618,15 +618,12 @@ def _build_schema(
         or f"Python tool: {tool_name}"
     )
     return {
-        "type": "function",
-        "function": {
-            "name": tool_name,
-            "description": tool_desc,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            },
+        "name": tool_name,
+        "description": tool_desc,
+        "input_schema": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
         },
     }
 
@@ -675,20 +672,26 @@ def _check_unknown_keys(
         raise ValueError(msg)
 
 
-def schema_for(tool: Tool) -> Tool | dict[str, Any]:
-    """Return ``tool`` in the form any-llm's ``acompletion`` expects.
+def schema_for(tool: Tool) -> dict[str, Any]:
+    """Return ``tool``'s schema in Anthropic tool shape (``{name, description, input_schema}``).
 
-    YAML tools carry a pre-built OpenAI schema on ``__cothis_schema__`` (so
-    per-arg ``description:`` text reaches the model — any-llm's
-    ``callable_to_tool`` would strip it). Tools without the attribute fall
-    through as callables and any-llm converts them.
+    Tools carrying a pre-built Anthropic-shape schema on ``__cothis_schema__``
+    (so per-arg ``description:`` text reaches the model — any-llm's
+    ``callable_to_tool`` would strip it) return that dict; ``Agent`` passes it
+    straight to ``any_llm.amessages``. A bare callable without the attribute
+    gets a schema built on the spot via ``_build_schema`` (same path
+    ``@tool`` uses) — ``amessages`` validates ``tools: list[dict]``, so
+    returning a raw callable would ``ValidationError`` at send time.
 
-    Keeping this fork here (next to ``_build_tool_schema``, the producer of
-    the attribute) means ``Agent`` stays blind to the ``__cothis_schema__``
-    name — the schema serialisation rule lives in ``tools.core``, where the
-    Tools are defined, not in ``agent.py``.
+    Keeping this fork here (next to ``_build_schema``/``_build_tool_schema``,
+    the producers of the attribute) means ``Agent`` stays blind to the
+    ``__cothis_schema__`` name — the schema serialisation rule lives in
+    ``tools.core``, where the Tools are defined, not in ``agent.py``.
     """
-    return getattr(tool, "__cothis_schema__", tool)
+    schema = getattr(tool, "__cothis_schema__", None)
+    if schema is not None:
+        return schema
+    return _build_schema(tool, tool.__name__, None)
 
 
 def _check_same_layer_duplicate(tool: Tool, source: str, seen: dict[str, str]) -> None:

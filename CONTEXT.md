@@ -23,8 +23,10 @@ The single Python-tool definition API (replaces the dropped pydantic
 base class, issue #1 stories 1–10). Three forms: `@tool`, `@tool("name")`,
 `@tool(name=…, description=…)`. Reads a Google-style docstring via `griffe`
 (summary → tool description, `Args:` → per-arg descriptions) and
-`inspect.signature` (types + required/optional), pre-builds an OpenAI
-schema on `__cothis_schema__`. `fs.read`, `fs.write`, `fs.dir` all use it.
+`inspect.signature` (types + required/optional), pre-builds an
+Anthropic-shape tool schema (`{name, description, input_schema}`) that
+`Agent` passes straight to `any_llm.amessages`. `fs.read`, `fs.write`,
+`fs.dir` all use it.
 _Avoid_: tool factory, tool wrapper, tool class.
 
 **Tool output format**:
@@ -168,10 +170,11 @@ namespace (implies a hierarchy cothis doesn't have).
 **YAMLTool**:
 A tool produced from a YAML declaration under `.agents/tools/`. The
 YAML-source `Tool` — carries `__name__`, `__doc__`, `__signature__`, and
-a pre-built `__cothis_schema__` (so per-arg descriptions reach the LLM
-without going through `any-llm`'s lossy `callable_to_tool`). `_compile`
-produces a `CommandBlock` from the YAML; `load_yaml_tools` gates the
-executable and wraps it in a `_ShellTool` instance.
+a pre-built Anthropic-shape tool schema (`{name, description, input_schema}`,
+so per-arg descriptions reach the LLM without going through `any-llm`'s
+lossy `callable_to_tool`). `_compile` produces a `CommandBlock` from the
+YAML; `load_yaml_tools` gates the executable and wraps it in a
+`_ShellTool` instance.
 _Avoid_: shell tool (overloaded with execution mode), YAML function.
 
 **CommandBlock**:

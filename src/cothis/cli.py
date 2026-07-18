@@ -92,7 +92,7 @@ def ask(
             model=model,
             provider=provider,
             tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
-            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            system=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
         )
     with console.status("thinking...", spinner="dots"):
@@ -159,7 +159,7 @@ async def _chat_session(
             model=model,
             provider=provider,
             tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
-            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            system=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
         )
 

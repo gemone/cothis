@@ -472,8 +472,8 @@ async def test_connect_into_discovers_tools_with_schema() -> None:
         assert add.__name__ == "test-server.add"
         # The prefixed name is what ``call_tool`` expects (group keys by it).
         assert add._remote_name == "test-server.add"
-        params = add.__cothis_schema__["function"]["parameters"]
-        assert add.__cothis_schema__["function"]["name"] == "test-server.add"
+        params = add.__cothis_schema__["input_schema"]
+        assert add.__cothis_schema__["name"] == "test-server.add"
         assert "a" in params["properties"]
         assert "b" in params["properties"]
 
@@ -850,7 +850,7 @@ async def test_agent_separates_server_and_resolves_tools(
         assert "test-server.add" in agent._tool_map
         schemas = agent._tool_schemas()
         assert schemas is not None
-        names = [s["function"]["name"] for s in schemas]
+        names = [s["name"] for s in schemas]
         assert "test-server.add" in names
     finally:
         await agent.aclose()
@@ -871,12 +871,9 @@ async def test_agent_dispatches_mcp_tool_via_execute(
         tools=[MCPServer(name="mcp:test-server", params=None)],
     )
     await agent._ensure_mcp()
-    tc = SimpleNamespace(
-        id="c1",
-        function=SimpleNamespace(name="test-server.add", arguments='{"a": 5, "b": 6}'),
-    )
+    tu = {"name": "test-server.add", "input": {"a": 5, "b": 6}}
     try:
-        assert await agent._execute(tc) == "11"
+        assert await agent._execute_tool(tu) == (False, "11")
     finally:
         await agent.aclose()
 
@@ -965,13 +962,10 @@ async def test_agent_reconnects_after_aclose(monkeypatch: pytest.MonkeyPatch) ->
         provider="openrouter",
         tools=[MCPServer(name="mcp:test-server", params=None)],
     )
-    tc = SimpleNamespace(
-        id="c1",
-        function=SimpleNamespace(name="test-server.add", arguments='{"a": 1, "b": 2}'),
-    )
+    tu = {"name": "test-server.add", "input": {"a": 1, "b": 2}}
 
     await agent._ensure_mcp()
-    assert await agent._execute(tc) == "3"
+    assert await agent._execute_tool(tu) == (False, "3")
     await agent.aclose()
     # State is reset: no stale MCP tools, guard re-armed.
     assert "test-server.add" not in agent._tool_map
@@ -981,7 +975,7 @@ async def test_agent_reconnects_after_aclose(monkeypatch: pytest.MonkeyPatch) ->
     await agent._ensure_mcp()
     try:
         assert "test-server.add" in agent._tool_map
-        assert await agent._execute(tc) == "3"
+        assert await agent._execute_tool(tu) == (False, "3")
         assert len(calls) == 2
     finally:
         await agent.aclose()
@@ -1283,12 +1277,10 @@ async def test_mcp_self_heal_dispatch_after_reclaim(
 
     await agent._ensure_mcp()
     try:
-        fake_call = MagicMock()
-        fake_call.function.name = "test-server.add"
-        fake_call.function.arguments = '{"a": 2, "b": 3}'
-
         # Call 1 — works.
-        result = await agent._execute(fake_call)
+        tu = {"name": "test-server.add", "input": {"a": 2, "b": 3}}
+        is_error, result = await agent._execute_tool(tu)
+        assert is_error is False
         assert "5" in result
 
         # Reclaim the session (idle past keepalive).
@@ -1300,9 +1292,10 @@ async def test_mcp_self_heal_dispatch_after_reclaim(
         await agent._handle_manager.reclaim_idle()
         assert handle_cls not in agent._handle_manager._live
 
-        # Call 2 — self-heal: _execute's ensure_handle_ready reconnects.
-        fake_call.function.arguments = '{"a": 10, "b": 20}'
-        result = await agent._execute(fake_call)
+        # Call 2 — self-heal: _execute_tool's ensure_handle_ready reconnects.
+        tu = {"name": "test-server.add", "input": {"a": 10, "b": 20}}
+        is_error, result = await agent._execute_tool(tu)
+        assert is_error is False
         assert "30" in result
     finally:
         await agent.aclose()

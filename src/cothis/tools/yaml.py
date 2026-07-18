@@ -767,14 +767,14 @@ def _build_signature(arg_specs: list[dict[str, Any]]) -> inspect.Signature:
 def _build_tool_schema(
     name: str, description: str, arg_specs: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Build an OpenAI-format tool schema dict carrying per-arg descriptions.
+    """Build an Anthropic-format tool schema dict carrying per-arg descriptions.
 
     any-llm's ``callable_to_tool`` drops per-parameter ``description``
     fields (it only reads type annotations), so YAML tools pre-build the
-    full schema here and Agent passes it straight through to the provider
-    via any-llm's dict-passthrough (``prepare_tools`` leaves dicts alone).
-    This is how the rich ``description:`` text a YAML author writes
-    actually reaches the model.
+    full schema here in Anthropic shape (``{name, description, input_schema}``)
+    and Agent passes it straight through to ``any_llm.amessages`` via any-llm's
+    dict-passthrough (``prepare_tools`` leaves dicts alone). This is how the
+    rich ``description:`` text a YAML author writes actually reaches the model.
     """
     properties: dict[str, dict[str, Any]] = {}
     required: list[str] = []
@@ -788,14 +788,11 @@ def _build_tool_schema(
         if arg.get("required", True):
             required.append(arg["name"])
     return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            },
+        "name": name,
+        "description": description,
+        "input_schema": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
         },
     }
