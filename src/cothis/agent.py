@@ -227,6 +227,55 @@ class MaxIterationsError(RuntimeError):
     """Raised when the agent exhausts its iteration budget before finishing."""
 
 
+def _coalesce_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge adjacent same-type blocks; drop empty text blocks.
+
+    ``any_llm``'s OpenAI→Messages stream converter opens a NEW content block
+    on every reasoning→text transition in the chunk stream. For models that
+    interleave reasoning and text per chunk (e.g. ``gpt-oss-120b`` on
+    openrouter), this produces an assistant message with dozens of tiny
+    ``thinking`` fragments interleaved with empty ``text`` blocks (the latter
+    because ``delta.content is not None`` is True for the empty string).
+    Some providers silently return empty content when such a malformed
+    message is replayed on the next turn — observed as ``cothis chat``
+    finishing a tool turn and returning to ``>>>`` with no answer shown.
+
+    Coalescing restores the canonical block shape (one merged ``thinking``,
+    one ``text``, then ``tool_use``) so the next turn's request is
+    well-formed. Empty ``text`` blocks (pure noise from the converter) are
+    dropped. ``tool_use`` blocks are preserved verbatim and never merged.
+
+    cothis: ``thinking`` signatures are not preserved across merges — this
+    slice does not pass the ``thinking`` param, so Anthropic doesn't validate
+    them on the way back, and other providers' reasoning blocks never carry
+    a real signature anyway.
+    """
+    out: list[dict[str, Any]] = []
+    for block in content:
+        btype = block.get("type")
+        # Drop empty text blocks (artifact of empty ``delta.content`` strings).
+        if btype == "text" and not (block.get("text") or "").strip():
+            continue
+        # Merge adjacent text/thinking blocks into the previous one.
+        if (
+            out
+            and out[-1].get("type") == btype
+            and btype in ("text", "thinking")
+        ):
+            if btype == "text":
+                out[-1]["text"] = (out[-1].get("text") or "") + (
+                    block.get("text") or ""
+                )
+            else:  # thinking
+                out[-1]["thinking"] = (out[-1].get("thinking") or "") + (
+                    block.get("thinking") or ""
+                )
+            continue
+        # Copy so we don't mutate the caller's dict on a later merge.
+        out.append(dict(block))
+    return out
+
+
 class Agent(BaseModel):
     """A minimal ReAct-style agent loop over any-llm.
 
@@ -461,6 +510,27 @@ class Agent(BaseModel):
                     break
 
             content = [blocks[i] for i in sorted(blocks)]
+
+            # Safety net: yield any text accumulated in blocks that wasn't
+            # yielded during streaming (e.g. isinstance check missed it).
+            # Done BEFORE coalesce so list indexes still match block indexes.
+            for i, block in enumerate(content):
+                if (
+                    block.get("type") == "text"
+                    and i not in _yielded_text_indexes
+                ):
+                    text = block.get("text", "")
+                    if text:
+                        yield text
+
+            # Coalesce adjacent same-type blocks before storing. The
+            # OpenAI→Messages stream converter fragments blocks on every
+            # reasoning/text transition; without this, a gpt-oss turn can
+            # leave an assistant message with dozens of tiny thinking
+            # fragments + empty text blocks, which the next provider call
+            # silently rejects (chat returns to ``>>>`` with no answer).
+            content = _coalesce_content(content)
+
             self._messages.append(
                 {
                     "role": "assistant",
@@ -473,17 +543,6 @@ class Agent(BaseModel):
                     else None,
                 }
             )
-
-            # Safety net: yield any text accumulated in blocks that wasn't
-            # yielded during streaming (e.g. isinstance check missed it).
-            for i, block in enumerate(content):
-                if (
-                    block.get("type") == "text"
-                    and i not in _yielded_text_indexes
-                ):
-                    text = block.get("text", "")
-                    if text:
-                        yield text
 
             if _tool_uses_in(content):
                 result_blocks = []

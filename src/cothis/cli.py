@@ -226,6 +226,7 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
     stream = agent.run_stream(prompt)
     status = console.status("thinking...", spinner="dots")
     live: Live | None = None
+    has_max_iterations_error = False
     accumulated = ""
     status.start()
     try:
@@ -250,6 +251,7 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
                 accumulated += event
                 live.update(Markdown(accumulated))
     except MaxIterationsError as exc:
+        has_max_iterations_error = True
         if live is not None:
             live.stop()
         else:
@@ -257,7 +259,9 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
         console.print(f"[red]Error:[/red] {exc}")
         return
     finally:
-        if live is not None:
+        if has_max_iterations_error:
+            pass  # already handled in except
+        elif live is not None:
             live.stop()
             console.print()
         elif accumulated:

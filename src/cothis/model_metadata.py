@@ -81,6 +81,12 @@ def resolve_max_tokens(
        that prefix model ids.
     4. ``_FALLBACK_MAX_TOKENS`` (8192) — unknown model.
 
+    The resolved value is the model's real ``max_output_tokens`` (e.g.
+    gpt-oss-120b → 32768). A provider may reject it if the account's
+    prepaid balance can't cover that many tokens at the model's rate
+    (openrouter returns HTTP 402) — that's an account/credits issue, not a
+    cothis bug; lower with ``--max-tokens`` if it happens.
+
     Negative or zero ``override`` is treated as "not set" so a stray ``0``
     from a misconfigured env var doesn't silently disable generation.
     """
