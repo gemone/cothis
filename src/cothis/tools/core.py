@@ -904,8 +904,9 @@ class HandleManager:
     **one** instance here — shared across all tools that reference it. The
     instance is acquired lazily on first use and reclaimed when idle past
     ``keepalive`` or evicted under LRU pressure (``max_handles``). Reclamation
-    is driven by ``reclaim_idle`` (called between turns); ``ensure_acquired``
-    is the synchronous self-heal on the dispatch path.
+    is driven by the background ``_reaper_task`` (firing every
+    ``reaper_interval``); ``ensure_acquired`` is the synchronous self-heal on
+    the dispatch path.
 
     ``last_used`` is a wall-clock timestamp (``time.time()``) per handle
     instance; any tool calling ``ensure_acquired`` refreshes it.
@@ -1078,8 +1079,9 @@ class HandleManager:
     async def reclaim_idle(self) -> int:
         """Release handles idle past their ``keepalive``. Returns count reclaimed.
 
-        Called between agent turns. Uses ``last_used`` + the handle class's
-        ``keepalive``.         Live handles still within their window are untouched.
+        Called by the background ``_reaper_task`` every ``reaper_interval``.
+        Uses ``last_used`` + the handle class's ``keepalive``. Live handles
+        still within their window are untouched.
         """
         now = time.time()
         reclaimed = 0

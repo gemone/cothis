@@ -189,7 +189,6 @@ class Agent(BaseModel):
         await self._ensure_handles()
 
         for _turn in range(self.max_iterations):
-            await self._handle_manager.reclaim_idle()
             response = await self._llm.acompletion(
                 model=self.model,
                 messages=self._messages,
@@ -250,7 +249,6 @@ class Agent(BaseModel):
         max_iterations = self.max_iterations
 
         for _turn in range(max_iterations):
-            await self._handle_manager.reclaim_idle()
             response = await llm.acompletion(
                 model=model,
                 messages=messages,
