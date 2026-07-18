@@ -363,16 +363,16 @@ class Agent(BaseModel):
     def _effective_max_tokens(self) -> int:
         """The ``max_tokens`` to pass to ``amessages`` for this Agent.
 
-        Resolved lazily on first call: an explicit ``self.max_tokens`` wins;
-        otherwise the litellm metadata is consulted once and cached. Cached
-        on the instance (not per-call) so the metadata lookup + JSON parse
-        happen at most once per ``Agent``.
+        Resolved lazily on first call via :func:`resolve_max_tokens`, which
+        applies the full precedence (override > model > {provider}/model >
+        fallback) and the non-positive-override safety (a stray ``0`` from a
+        misconfigured env var is treated as "not set"). Cached on the
+        instance (not per-call) so the metadata lookup + JSON parse happen
+        at most once per ``Agent``.
         """
-        if self.max_tokens is not None:
-            return self.max_tokens
         if self._resolved_max_tokens < 0:
             self._resolved_max_tokens = resolve_max_tokens(
-                self.model, self.provider
+                self.model, self.provider, self.max_tokens
             )
         return self._resolved_max_tokens
 

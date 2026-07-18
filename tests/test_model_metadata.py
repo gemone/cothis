@@ -125,13 +125,30 @@ def test_agent_effective_max_tokens_resolves_on_first_call(
     assert agent._resolved_max_tokens == 32768
 
 
-def test_agent_effective_max_tokens_explicit_value_wins_and_skips_resolution(
+def test_agent_effective_max_tokens_explicit_value_wins_and_caches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent = _make_agent(monkeypatch, max_tokens=1234)
     assert agent._effective_max_tokens() == 1234
-    # Explicit value means the cache is never populated (sentinel stays).
-    assert agent._resolved_max_tokens == -1
+    # Override wins and is cached on the instance.
+    assert agent._resolved_max_tokens == 1234
+
+
+def test_agent_effective_max_tokens_non_positive_override_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION: ``max_tokens=0`` must NOT be sent to the provider.
+
+    The non-positive-override safety lives in ``resolve_max_tokens``; the
+    Agent must route the override through the resolver (not short-circuit on
+    ``is not None``) so that safety actually applies. Otherwise a stray
+    ``COTHIS_MAX_TOKENS=0`` from a misconfigured env var reaches the provider
+    and 400s cryptically.
+    """
+    agent = _make_agent(monkeypatch, max_tokens=0)
+    assert agent._effective_max_tokens() == 32768  # resolved, not 0
+    agent_neg = _make_agent(monkeypatch, max_tokens=-5)
+    assert agent_neg._effective_max_tokens() == 32768
 
 
 def test_agent_effective_max_tokens_unknown_model_falls_back(
