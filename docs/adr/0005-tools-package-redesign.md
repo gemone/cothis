@@ -257,9 +257,15 @@ clash is caught at registration with an ERROR log + first-write-wins.
 
 **Fallback to the YAML label when the server reports an empty name.**
 The hook falls back to the cothis-side YAML `name:` label (stripped of
-its `mcp:` prefix) so the tool still gets a meaningful prefix. Servers
-connect sequentially inside `_ensure_mcp`, so the hook reads the current
-server's label from a mutable cell updated before each connect.
+its `mcp:` prefix) so the tool still gets a meaningful prefix. The hook
+fires inside `connect_to_server` with nothing identifying *which* cothis
+server is connecting, so the label travels through a mutable cell
+updated immediately before each connect — by the startup loop in
+`_ensure_mcp`, and by `MCPSessionHandle.acquire` on every re-acquire —
+keeping each empty-name server's prefix stable across the keepalive/LRU
+session lifecycle. Connects never run concurrently (startup,
+`start_eager`, and `ensure_acquired` all await connects inline), so the
+temporal handoff is race-free.
 
 **This is a prefix, not a namespace system.** Builtins (`fs.read`) and
 user tools keep their existing names. `_tool_map` stays a flat dict; no

@@ -352,21 +352,26 @@ class Agent(BaseModel):
 
         # Prefix each tool with the server's self-reported
         # ``Implementation.name``, falling back to the YAML ``name:`` label
-        # when the server reports an empty name (ADR-0005). The hook closes
-        # over ``current_label`` by reference, so reassigning it in the loop
-        # below is visible to the hook when ``connect_into`` calls it. No
-        # ``nonlocal`` needed: the rebind happens in this method's scope (the
-        # enclosing scope), not inside ``_prefix`` — which only reads.
-        current_label = ""
+        # when the server reports an empty name (ADR-0005). The hook fires
+        # inside ``connect_to_server`` with nothing identifying *which*
+        # cothis server is connecting, so the fallback label travels through
+        # a shared mutable cell: the writer sets it immediately before each
+        # connect (the startup loop below; ``MCPSessionHandle.acquire`` on
+        # every re-acquire), and the hook reads it during that connect.
+        # cothis: ceiling — the handoff assumes no two servers connect
+        # concurrently (true today: startup, ``start_eager`` and
+        # ``ensure_acquired`` all await connects inline). Parallel connects
+        # would need the label keyed by something the hook can see.
+        fallback: dict[str, str] = {"label": ""}
 
         def _prefix(name: str, server_info: Any) -> str:
-            return f"{server_info.name or current_label}.{name}"
+            return f"{server_info.name or fallback['label']}.{name}"
 
         group = ClientSessionGroup(component_name_hook=_prefix)
         await group.__aenter__()
         self._mcp_group = group
         for server in self._mcp_servers:
-            current_label = server._label
+            fallback["label"] = server._label
             tools, session = await server.connect_into(group)
             if not tools:
                 continue  # connect failed; ``connect_into`` already warned
@@ -381,6 +386,8 @@ class Agent(BaseModel):
                 {
                     "_group": group,
                     "_params": server.params,
+                    "_fallback": fallback,
+                    "_fallback_label": server._label,
                     "keepalive": server.keepalive,
                     "pin": server.pin,
                     "eager": server.pin,

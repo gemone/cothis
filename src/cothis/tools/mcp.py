@@ -18,6 +18,7 @@ lifecycle hooks. See ADR-0005 §2 (deferred connect) and §4 (name prefix).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -88,9 +89,18 @@ class MCPSessionHandle(ResourceHandle):
     # Set on the dynamic subclass generated per server in ``_ensure_mcp``.
     _group: ClientSessionGroup
     _params: Any
+    # Fallback-label cell shared with the group's ``component_name_hook``.
+    # The hook fires inside ``connect_to_server`` with nothing identifying
+    # *which* cothis server is connecting, so ``acquire`` publishes its own
+    # label first — an empty-name server keeps its own prefix across
+    # re-acquires instead of inheriting the last-connected server's
+    # (ADR-0005 §4).
+    _fallback: dict[str, str]
+    _fallback_label: str
     _session: Any = None
 
     async def acquire(self) -> None:
+        self._fallback["label"] = self._fallback_label
         self._session = await self._group.connect_to_server(self._params)
 
     async def release(self) -> None:
@@ -153,6 +163,9 @@ class MCPClientTool(_HookableTool):
         return _normalize_mcp_result(result)
 
 
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+
+
 def _flatten_exc(exc: BaseException) -> str:
     """Describe an exception, unwrapping ``ExceptionGroup``s to the real cause.
 
@@ -161,11 +174,16 @@ def _flatten_exc(exc: BaseException) -> str:
     errors in a TaskGroup (1 sub-exception)"`` — hides what actually went
     wrong. Recurse into ``.exceptions`` and join the leaf messages so the
     startup warning names something the operator (and the model) can act on.
+
+    URLs in leaf messages are scrubbed: httpx exceptions embed the full
+    request URL, and httpx masks userinfo passwords but NOT query strings —
+    an ``?api_key=…`` in the ``url:`` field would otherwise reach the log in
+    cleartext (story 32).
     """
     subs = getattr(exc, "exceptions", None)
     if subs:
         return "; ".join(_flatten_exc(s) for s in subs)
-    return f"{type(exc).__name__}: {exc}"
+    return _URL_RE.sub(lambda m: _scrub_url(m.group(0)), f"{type(exc).__name__}: {exc}")
 
 
 def _scrub_url(url: str) -> str:
@@ -173,8 +191,9 @@ def _scrub_url(url: str) -> str:
 
     A url may carry credentials in the userinfo (``https://token@host``) or
     in the query string (``?api_key=secret``); both are dropped so the
-    diagnostic keeps only ``scheme://host:port/path`` (story 32 — the
-    ``diagnostic`` is the only url-derived string that reaches a log).
+    diagnostic keeps only ``scheme://host:port/path`` (story 32). Applied to
+    every url-derived string that reaches a log: the ``diagnostic``, and
+    exception messages via ``_flatten_exc``.
     """
     from urllib.parse import urlsplit, urlunsplit
 

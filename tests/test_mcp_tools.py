@@ -730,6 +730,29 @@ def test_flatten_exc_unwraps_exception_group() -> None:
     assert "TaskGroup" not in msg
 
 
+def test_flatten_exc_scrubs_url_secrets() -> None:
+    """httpx errors embed the full request URL — query string included — so
+    the flattened text must pass every URL through ``_scrub_url`` (story 32).
+    Uses a real ``raise_for_status`` error, wrapped in an ExceptionGroup the
+    way anyio surfaces transport failures."""
+    import httpx
+
+    response = httpx.Response(
+        401,
+        request=httpx.Request("GET", "https://mcp.example.com/mcp?api_key=SECRET123"),
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        group = ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [exc])
+    msg = _flatten_exc(group)
+    assert "SECRET123" not in msg
+    assert "api_key" not in msg
+    # The scrubbed URL itself survives — the log stays actionable.
+    assert "https://mcp.example.com/mcp" in msg
+    assert "HTTPStatusError" in msg
+
+
 @pytest.mark.asyncio
 async def test_connect_failure_unwraps_taskgroup_in_warning(
     caplog: pytest.LogCaptureFixture,
@@ -1035,6 +1058,59 @@ async def test_prefix_falls_back_to_yaml_label_when_server_name_empty(
         # No bare or dot-prefixed name leaked through.
         assert ".add" not in agent._tool_map
         assert "add" not in agent._tool_map
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_empty_name_prefix_stable_across_reacquire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-acquire after reclaim must reuse the server's OWN fallback label.
+
+    Two servers both report an empty ``Implementation.name``. After the
+    first server's session is reclaimed and re-acquired, its tools must
+    re-register under ``aaa.`` (their advertised prefix), not under the
+    last-connected server's label — otherwise ``call_tool`` routes by a
+    name the group no longer has and raises ``KeyError`` for the rest of
+    the session (ADR-0005 §4).
+    """
+    _mock_llm(monkeypatch)
+    fastmcp = _make_server()
+
+    async def _empty_name_connect(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        session = await self._exit_stack.enter_async_context(  # noqa: SLF001
+            create_connected_server_and_client_session(fastmcp)
+        )
+        # Server reports an empty name — the non-conformant case.
+        await self.connect_with_session(Implementation(name="", version="1.0"), session)
+        return session
+
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", _empty_name_connect)
+    aaa = MCPServer(name="mcp:aaa", params=None)
+    zzz = MCPServer(name="mcp:zzz", params=None)
+    agent = Agent(model="x", provider="openrouter", tools=[aaa, zzz])
+
+    await agent._ensure_mcp()
+    try:
+        assert "aaa.add" in agent._tool_map
+        assert "zzz.add" in agent._tool_map
+        tool_a = agent._tool_map["aaa.add"]
+        cls_a = getattr(tool_a, "_handle_cls")
+
+        # Reclaim aaa's session only; zzz stays live.
+        import time
+
+        agent._handle_manager._last_used[cls_a] = time.time() - 9999
+        await agent._handle_manager.reclaim_idle()
+        assert cls_a not in agent._handle_manager._live
+
+        # Re-acquire: tools must come back under aaa.* and dispatch works.
+        await agent._handle_manager.ensure_acquired(tool_a)
+        assert cls_a in agent._handle_manager._live
+        assert await tool_a(a=2, b=3) == "5"
     finally:
         await agent.aclose()
 
