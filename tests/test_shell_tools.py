@@ -509,12 +509,12 @@ args:
 """
     schema = _shell_tool(yaml_text).__cothis_schema__
     assert schema is not None
-    assert schema["function"]["description"] == "Calculate something."
-    assert schema["function"]["parameters"]["properties"]["n"]["description"] == (
+    assert schema["description"] == "Calculate something."
+    assert schema["input_schema"]["properties"]["n"]["description"] == (
         "The number to calculate with."
     )
-    assert schema["function"]["parameters"]["properties"]["n"]["type"] == "integer"
-    assert schema["function"]["parameters"]["required"] == ["n"]
+    assert schema["input_schema"]["properties"]["n"]["type"] == "integer"
+    assert schema["input_schema"]["required"] == ["n"]
 
 
 def test_declared_but_unreferenced_arg_dropped_with_warning(
@@ -540,7 +540,7 @@ args:
         tool = _shell_tool(yaml_text)
     schema = tool.__cothis_schema__
     assert schema is not None
-    props = schema["function"]["parameters"]["properties"]
+    props = schema["input_schema"]["properties"]
     assert "used" in props
     assert "unused" not in props
 
@@ -574,7 +574,7 @@ platforms:
 """
     schema = _shell_tool(yaml_text).__cothis_schema__
     assert schema is not None
-    props = schema["function"]["parameters"]["properties"]
+    props = schema["input_schema"]["properties"]
     assert props["a"]["description"] == "linux-specific a."
     assert props["b"]["description"] == "top-level b."
 

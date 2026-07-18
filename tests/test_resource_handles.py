@@ -314,7 +314,7 @@ async def test_handle_not_in_llm_schema() -> None:
         """
         return sql
 
-    props = q.__cothis_schema__["function"]["parameters"]["properties"]
+    props = q.__cothis_schema__["input_schema"]["properties"]
     assert list(props) == ["sql"]
     assert "handle" not in props
 
@@ -457,26 +457,17 @@ async def test_inflight_balanced_when_repr_raises(
 
     agent = Agent(model="x", provider="openrouter", tools=[reprboom])
     mgr = agent._handle_manager
-    # The handle isn't live until ensure_acquired runs in _execute; that's
+    # The handle isn't live until ensure_acquired runs in _execute_tool; that's
     # fine — we assert on the post-call refcount, not pre-call state.
 
-    tool_call = SimpleNamespace(
-        function=SimpleNamespace(name="reprboom", arguments=None)
-    )
+    # tool_use.input is already a dict (Messages API delivers it parsed), so
+    # inject BoomRepr directly to make the debug repr raise inside _execute_tool.
+    tu = {"name": "reprboom", "input": {"x": BoomRepr()}}
 
-    # arguments=None → json.loads("{}") runs; we need a BoomRepr value to
-    # reach the repr. Patch _execute's json.loads to inject one.
-    import json as _json
+    is_error, result = await agent._execute_tool(tu)
 
-    monkeypatch.setattr(
-        _json,
-        "loads",
-        lambda _raw: {"x": BoomRepr()},
-    )
-
-    result = await agent._execute(tool_call)
-
-    # repr raised inside _execute's debug logging → surfaced as error to LLM.
+    # repr raised inside _execute_tool's debug logging → surfaced as error to LLM.
+    assert is_error is True
     assert "Error" in result
     # The fix: mark_inflight is inside the try, so the finally ran and the
     # refcount balanced. Pre-fix this would be 1 (leaked).

@@ -118,7 +118,8 @@ class MCPClientTool(_HookableTool):
     server exposes. Inherits ``_HookableTool`` so ``_execute`` runs its hook
     chains uniformly with every other tool (CONTEXT.md "no per-source
     branching in ``_execute``"). Carries a pre-built ``__cothis_schema__``
-    from the server's ``inputSchema`` (already OpenAI-compatible JSON Schema).
+    from the server's ``inputSchema`` (Anthropic tool shape's ``input_schema``,
+    a JSON Schema passed through verbatim).
 
     ``__name__`` is the prefixed name (``{label}.{remote}``, assigned by the
     SDK's ``component_name_hook``); ``_remote_name`` is the same prefixed
@@ -139,23 +140,21 @@ class MCPClientTool(_HookableTool):
         self.__doc__ = mcp_tool.description or f"MCP tool: {mcp_tool.name}"
         self._remote_name = mcp_tool.name
         # cothis: ceiling — the server's ``inputSchema`` is passed through
-        # verbatim as the OpenAI ``parameters`` field. The MCP spec defines
-        # ``inputSchema`` as a JSON Schema, which is structurally close to
-        # OpenAI's ``parameters`` — but a non-conformant server may ship a
-        # schema missing ``type: "object"``, carrying ``$ref``/``$defs``, or
-        # with provider-specific quirks, and those leak straight to the model.
-        # cothis does no normalisation today. Upgrade path: run the schema
-        # through a normaliser (drop ``$defs`` by inlining, default missing
-        # ``type`` to ``object``, validate it's a function-shaped schema) so
-        # an odd server can't corrupt the tool-call contract.
+        # verbatim as the ``input_schema`` field (Anthropic tool shape). The
+        # MCP spec defines ``inputSchema`` as a JSON Schema, which is
+        # structurally what Anthropic's ``input_schema`` expects — but a
+        # non-conformant server may ship a schema missing ``type: "object"``,
+        # carrying ``$ref``/``$defs``, or with provider-specific quirks, and
+        # those leak straight to the model. cothis does no normalisation
+        # today. Upgrade path: run the schema through a normaliser (drop
+        # ``$defs`` by inlining, default missing ``type`` to ``object``,
+        # validate it's a function-shaped schema) so an odd server can't
+        # corrupt the tool-call contract.
         self.__cothis_schema__ = {
-            "type": "function",
-            "function": {
-                "name": mcp_tool.name,
-                "description": self.__doc__,
-                "parameters": mcp_tool.inputSchema
-                or {"type": "object", "properties": {}},
-            },
+            "name": mcp_tool.name,
+            "description": self.__doc__,
+            "input_schema": mcp_tool.inputSchema
+            or {"type": "object", "properties": {}},
         }
 
     async def __call__(self, **kwargs: Any) -> str:
