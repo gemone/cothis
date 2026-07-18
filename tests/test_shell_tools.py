@@ -23,19 +23,21 @@ Tests spawn short-lived subprocesses (``echo``) but never touch the network.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+import logging
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from cothis.tools import (
+from cothis.tools.core import load_tools_from_layer
+from cothis.tools.yaml import (
     _all_placeholders,
     _current_platform,
     _extract_field_names,
     _merge_arg_specs,
     _ShellTool,
-    load_tools_from_layer,
     load_yaml_tools,
     preview,
+    shell,
 )
 
 if TYPE_CHECKING:
@@ -126,18 +128,19 @@ command: "echo from-bash"
     assert shell == "bash"
 
 
-def test_shell_string_without_shell_field_rejected() -> None:
-    """A string command with no ``shell:`` is rejected — forces explicit declaration.
+def test_shell_auto_selected_when_omitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A string command without ``shell:`` auto-selects the OS default (story 16).
 
-    Relying on a default shell is silent breakage (which shell? does it
-    exist?). Requiring ``shell:`` makes the author declare the interpreter.
+    POSIX → ``sh``, Windows → ``cmd``. Explicit ``shell:`` still overrides.
     """
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
 name: t
 command: echo hi
 """
-    with pytest.raises(ValueError, match="requires a ``shell:``"):
-        load_yaml_tools(yaml_text)
+    tool = _shell_tool(yaml_text)
+    expected = "cmd" if _current_platform() == "windows" else "sh"
+    assert tool._block.shell == expected
 
 
 def test_shell_pipe_supported_in_string_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -263,6 +266,119 @@ args:
     assert cmd == "echo 1 2 3"
 
 
+def test_shell_value_with_metacharacters_quoted() -> None:
+    """Shell mode: a value containing metacharacters is ``shlex.quote``-d.
+
+    Story 22: a value with spaces or shell metacharacters must not be able to
+    break or inject into the command. ``shlex.quote`` wraps it in single
+    quotes so the shell treats it as one literal token.
+    """
+    yaml_text = """
+name: grep_file
+shell: bash
+command: "echo {pattern}"
+args:
+  - name: pattern
+    type: str
+"""
+    cmd, _ = preview(yaml_text, pattern="foo; rm -rf /")
+    assert cmd == "echo 'foo; rm -rf /'"
+
+
+def test_shell_list_elements_quoted_individually() -> None:
+    """Shell mode: list elements are quoted individually then space-joined.
+
+    Each element is a separate shell token — quoting the joined string would
+    turn multiple arguments into one quoted blob.
+    """
+    yaml_text = """
+name: echo_args
+shell: bash
+command: "echo {args}"
+args:
+  - name: args
+    type: list
+"""
+    cmd, _ = preview(yaml_text, args=["a b", "c"])
+    assert cmd == "echo 'a b' c"
+
+
+def test_shell_value_without_metacharacters_not_quoted() -> None:
+    """A plain alphanumeric value needs no quoting — ``shlex.quote`` passes it through."""
+    yaml_text = """
+name: t
+shell: bash
+command: "echo {name}"
+args:
+  - name: name
+    type: str
+"""
+    cmd, _ = preview(yaml_text, name="hello")
+    assert cmd == "echo hello"
+
+
+def test_argv_value_with_metacharacters_not_quoted() -> None:
+    """Argv mode is inherently safe (``shell=False``) — no quoting applied."""
+    yaml_text = """
+name: t
+command: ["echo", "{val}"]
+args:
+  - name: val
+    type: str
+"""
+    cmd, _ = preview(yaml_text, val="foo; rm -rf /")
+    assert cmd == ["echo", "foo; rm -rf /"]
+
+
+def test_bool_arg_with_to_flag_renders_when_true() -> None:
+    """A bool arg with ``to: --flag`` renders the flag when true (story 12)."""
+    yaml_text = """
+name: uv_add
+shell: bash
+command: "uv add {pkg} {is_dev}"
+args:
+  - name: pkg
+    type: str
+  - name: is_dev
+    type: bool
+    to: --dev
+"""
+    cmd, _ = preview(yaml_text, pkg="requests", is_dev=True)
+    assert cmd == "uv add requests --dev"
+
+
+def test_bool_arg_with_to_flag_renders_empty_when_false() -> None:
+    """A bool arg with ``to: --flag`` renders nothing when false (story 12)."""
+    yaml_text = """
+name: uv_add
+shell: bash
+command: "uv add {pkg} {is_dev}"
+args:
+  - name: pkg
+    type: str
+  - name: is_dev
+    type: bool
+    to: --dev
+"""
+    cmd, _ = preview(yaml_text, pkg="requests", is_dev=False)
+    assert cmd == "uv add requests "
+
+
+def test_bool_flag_ignored_for_non_bool_value() -> None:
+    """``to:`` only fires for bool values; a string value passes through."""
+    yaml_text = """
+name: t
+shell: bash
+command: "echo {val}"
+args:
+  - name: val
+    type: str
+    to: --should-not-appear
+"""
+    cmd, _ = preview(yaml_text, val="hello")
+    assert cmd == "echo hello"
+
+
 # ====================================================================
 # Platform selection (platforms: map)
 # ====================================================================
@@ -272,7 +388,7 @@ def test_platform_overrides_command_for_current(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The current platform's branch overrides the top-level command."""
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "linux")
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
 name: t
@@ -297,16 +413,16 @@ platforms:
   unix:
     command: ["echo", "from-unix"]
 """
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "linux")
     assert load_yaml_tools(yaml_text)[0]() == "from-unix\n"
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "macos")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "macos")
     assert load_yaml_tools(yaml_text)[0]() == "from-unix\n"
 
 
 def test_exact_platform_wins_over_unix(monkeypatch: pytest.MonkeyPatch) -> None:
     """An exact key (``linux:``) takes precedence over the ``unix:`` fallback."""
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "linux")
     yaml_text = """
 name: t
 command: ["echo", "default"]
@@ -324,7 +440,7 @@ def test_platform_inherits_top_level_command_when_omitted(
 ) -> None:
     """A platform entry without ``command:`` inherits the top-level command."""
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "linux")
     yaml_text = """
 name: t
 command: ["echo", "inherited"]
@@ -438,7 +554,7 @@ def test_per_platform_args_merge_override_same_named(
     Point 1 (ii): branch ``args`` is an override, not a replacement. Same-named
     args take the branch's definition; other top-level args are inherited.
     """
-    monkeypatch.setattr("cothis.tools._current_platform", lambda: "linux")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "linux")
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
 name: t
@@ -599,7 +715,7 @@ def test_preview_inherits_all_compile_checks() -> None:
     construction — this test guards against a future refactor moving a
     check back into ``load_yaml_tools`` only. Covers the two cases preview
     previously missed (argv[0] placeholder, undeclared placeholder) plus
-    the two it already mirrored (string-without-shell, shell-with-list).
+    shell-with-list (argv mode + ``shell:`` is meaningless).
     """
     # argv[0] placeholder — previously load-only; preview must now reject.
     argv0_placeholder = """
@@ -617,9 +733,9 @@ args:
     with pytest.raises(ValueError, match="undeclared placeholder"):
         preview(undeclared)
 
-    # String without shell — both still reject.
-    with pytest.raises(ValueError, match="requires a ``shell:``"):
-        preview('name: t\ncommand: "echo hi"\n')
+    # String without shell — auto-selects OS default (story 16), no error.
+    cmd, _ = preview('name: t\ncommand: "echo hi"\n')
+    assert cmd == "echo hi"
 
     # List WITH shell — both still reject.
     with pytest.raises(ValueError, match="meaningless with a list"):
@@ -748,3 +864,238 @@ def test_nonzero_exit_returns_error_with_stderr() -> None:
     result = tool()
     assert "exit code 3" in result
     assert "boom" in result
+
+
+# ====================================================================
+# shell() helper for Python extensions (story 36)
+# ====================================================================
+
+
+def test_shell_argv_mode_returns_stdout() -> None:
+    """``shell(["echo", "hi"])`` runs in argv mode and returns stdout."""
+    assert shell(["echo", "hello"]) == "hello\n"
+
+
+def test_shell_string_mode_returns_stdout() -> None:
+    """``shell("echo hi")`` runs in shell mode and returns stdout."""
+    assert shell("echo hello") == "hello\n"
+
+
+def test_shell_nonzero_exit_returns_error_string() -> None:
+    """A non-zero exit returns an ``Error:`` string, not an exception."""
+    result = shell(["sh", "-c", "echo boom >&2; exit 3"])
+    assert "exit code 3" in result
+    assert "boom" in result
+
+
+def test_shell_executable_resolved_via_path() -> None:
+    """``executable="sh"`` is resolved via PATH and runs the command.
+
+    ``sh`` exists on every POSIX system; the resolution mechanic
+    (``shutil.which`` → ``executable=``) is what this test covers.
+    """
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("``sh`` is not available on Windows")
+    result = shell("echo from-sh", executable="sh")
+    assert result == "from-sh\n"
+
+
+def test_shell_missing_executable_returns_error_not_silent_fallback() -> None:
+    """A declared ``executable`` not on PATH returns an error string.
+
+    Mirrors YAML ``_ShellTool`` gating (``shell:`` not on PATH → tool not
+    registered): the author asked for a specific shell that isn't there, so
+    surface the error rather than silently falling back to the system
+    default shell. Runs on every platform — no real executable needed.
+    """
+    result = shell("echo hi", executable="definitely-not-on-path-xyz-123")
+    assert result.startswith("Error:")
+    assert "definitely-not-on-path-xyz-123" in result
+
+
+# ====================================================================
+# Follow-up batch: preview _platform propagation, cmd quoting,
+# stdout+stderr merge, name normalisation (Copilot A/B/C + story 11/21)
+# ====================================================================
+
+
+def test_preview_platform_override_propagates_to_shell_auto_select() -> None:
+    """Copilot A: ``preview(_platform="windows")`` on a POSIX host picks
+    ``cmd``, not ``sh``. The platform override must reach shell auto-selection,
+    not just command-branch selection."""
+    yaml_text = 'name: t\ncommand: "echo hi"\n'  # no shell: → auto-select
+    cmd, shell_name = preview(yaml_text, _platform="windows")
+    assert shell_name == "cmd"
+    cmd, shell_name = preview(yaml_text, _platform="linux")
+    assert shell_name == "sh"
+
+
+def test_cmd_shell_quoting_uses_list2cmdline_not_shlex() -> None:
+    """Copilot B: ``shell: cmd`` mode quotes values with
+    ``subprocess.list2cmdline`` (double-quoted), not ``shlex.quote``
+    (single-quoted). ``shlex.quote`` would silently fail on ``cmd.exe``
+    because cmd doesn't treat single quotes as quoting — story 22 would
+    not hold on Windows."""
+    yaml_text = """
+name: echo_cmd
+shell: cmd
+command: "echo {pattern}"
+args:
+  - name: pattern
+    type: str
+"""
+    cmd, shell_name = preview(yaml_text, pattern="foo & bar")
+    assert shell_name == "cmd"
+    # ``list2cmdline(["foo & bar"])`` → ``'"foo & bar"'`` (double-quoted).
+    # ``shlex.quote("foo & bar")`` → ``"'foo & bar'"`` (single-quoted).
+    # The assertion pins the cmd.exe-safe form.
+    assert cmd == 'echo "foo & bar"'
+
+
+def test_shell_helper_stdout_with_nonempty_stderr_appended() -> None:
+    """Copilot C: on success (exit 0), non-empty ``stderr`` is appended so
+    the agent sees deprecation warnings / progress notes (story 18).
+    Exit 0 + empty stderr → plain stdout (no regression for the common case)."""
+    # A command that writes to stderr but exits 0.
+    result = shell(["sh", "-c", "echo out; echo warn >&2"])
+    assert "out" in result
+    assert "warn" in result
+    assert "[stderr]" in result
+    # Exit 0 + empty stderr → just stdout.
+    assert shell(["echo", "hi"]) == "hi\n"
+
+
+def test_shell_helper_nonzero_exit_includes_stdout_and_stderr() -> None:
+    """Copilot C: on failure, both streams are returned (stdout first).
+    Dropping crash-time stdout would blind the LLM to mid-output failures."""
+    result = shell(["sh", "-c", "echo partial; echo boom >&2; exit 3"])
+    assert "exit code 3" in result
+    assert "partial" in result  # stdout preserved
+    assert "boom" in result  # stderr preserved
+    assert result.index("partial") < result.index("boom")  # stdout first
+
+
+def test_shell_helper_nonzero_exit_with_empty_stdout() -> None:
+    """Failure with no stdout: only the ``[stderr]`` section appears.
+    The ``if proc.stdout`` guard must skip the stdout section cleanly."""
+    result = shell(["sh", "-c", "echo boom >&2; exit 3"])
+    assert "exit code 3" in result
+    assert "boom" in result
+    assert "[stdout]" not in result
+
+
+def test_shell_helper_nonzero_exit_with_empty_stderr() -> None:
+    """Failure with no stderr: only the ``[stdout]`` section appears.
+    The ``if proc.stderr`` guard must skip the stderr section cleanly."""
+    result = shell(["sh", "-c", "echo partial; exit 3"])
+    assert "exit code 3" in result
+    assert "partial" in result
+    assert "[stderr]" not in result
+
+
+def test_shell_tool_name_with_spaces_normalised_to_dashes() -> None:
+    """Story 11/21联动: ``name: uv add`` normalises to ``uv-add``.
+    Provider function-name rules converge on ``[A-Za-z0-9_.-]``; spaces
+    would break routing. Spaces → dashes (readable), logged at WARNING."""
+    import logging
+
+    yaml_text = """
+name: uv add
+command: ["echo", "hi"]
+"""
+    tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "uv-add"
+
+
+def test_shell_tool_name_with_spaces_emits_warning(caplog: Any) -> None:
+    """The space→dash normalisation is observable: a WARNING fires naming
+    the original and normalised forms so the author can fix it deliberately."""
+    yaml_text = 'name: "my tool"\ncommand: ["echo", "hi"]\n'
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        tool = load_yaml_tools(yaml_text)
+    assert tool[0].__name__ == "my-tool"
+    normalise_warnings = [r for r in caplog.records if "normalised" in r.message]
+    assert len(normalise_warnings) == 1
+    assert "my tool" in normalise_warnings[0].message
+    assert "my-tool" in normalise_warnings[0].message
+
+
+def test_shell_tool_name_strips_other_special_chars() -> None:
+    """Characters outside ``[A-Za-z0-9_.-]`` (and not in ``_NAME_REPLACEMENTS``)
+    are stripped, not replaced. ``"a!b"`` → ``"ab"``, not ``"a-b"``.
+    Covers the strip arm distinct from the space/slash/colon→dash arm."""
+    yaml_text = 'name: "a!b@c"\ncommand: ["echo", "hi"]\n'
+    tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "abc"
+
+
+def test_shell_tool_name_empty_after_normalisation_rejected() -> None:
+    """A name that normalises to empty (all special chars) raises — a tool
+    with no callable name is unusable."""
+    yaml_text = 'name: "!!"\ncommand: ["echo", "hi"]\n'
+    with pytest.raises(ValueError, match="normalises to empty"):
+        load_yaml_tools(yaml_text)
+
+
+def test_shell_tool_name_with_alnum_unchanged() -> None:
+    """A normal ``fs.read``-style name passes through unchanged."""
+    yaml_text = 'name: fs.read\ncommand: ["echo", "hi"]\n'
+    tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "fs.read"
+
+
+# --- finding #1: argv empty-element drop -------------------------------
+
+
+def test_argv_bool_false_drops_empty_element() -> None:
+    """In argv mode, a bool ``to:`` flag rendered false (→ ``""``) is dropped
+    from the argv list so it never reaches the subprocess as an empty
+    positional. ``uv add requests ''`` must not happen."""
+    yaml_text = """
+name: uv_add
+command: ["uv", "add", "{pkg}", "{is_dev}"]
+args:
+  - name: pkg
+    type: str
+  - name: is_dev
+    type: bool
+    to: --dev
+"""
+    cmd, _ = preview(yaml_text, pkg="requests", is_dev=False)
+    assert cmd == ["uv", "add", "requests"]
+
+
+def test_argv_bool_true_keeps_flag_element() -> None:
+    """In argv mode, a bool ``to:`` flag rendered true keeps the flag."""
+    yaml_text = """
+name: uv_add
+command: ["uv", "add", "{pkg}", "{is_dev}"]
+args:
+  - name: pkg
+    type: str
+  - name: is_dev
+    type: bool
+    to: --dev
+"""
+    cmd, _ = preview(yaml_text, pkg="requests", is_dev=True)
+    assert cmd == ["uv", "add", "requests", "--dev"]
+
+
+# --- finding #3: non-ASCII tool name rejection --------------------------
+
+
+def test_non_ascii_cjk_name_rejected() -> None:
+    """A CJK name (``部署``) is stripped to empty and rejected — ``isalnum``
+    alone admits non-ASCII, which passes load then fails at the provider API."""
+    yaml_text = 'name: "部署"\ncommand: ["echo", "hi"]\n'
+    with pytest.raises(ValueError, match="normalises to empty"):
+        load_yaml_tools(yaml_text)
+
+
+def test_non_ascii_accented_name_stripped() -> None:
+    """Accented Latin chars are stripped (not passed through)."""
+    yaml_text = 'name: "déploy"\ncommand: ["echo", "hi"]\n'
+    tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "dploy"

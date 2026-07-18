@@ -5,7 +5,7 @@ today; it's worth locking down because its output format is what users read
 to debug multi-step agent turns, and the ``repr`` convention (strings quoted,
 numbers not) is a deliberate choice.
 
-``_all_tools`` tests cover the two-layer discovery model (project-local +
+``discover_tools`` tests cover the two-layer discovery model (project-local +
 user-global) and the cross-layer ceiling (raises until #10/#11 land).
 """
 
@@ -15,7 +15,8 @@ import os
 from typing import Any
 
 from cothis.agent import ToolCallEvent
-from cothis.cli import _all_tools, _format_tool_call
+from cothis.cli import _format_tool_call
+from cothis.tools import discover_tools
 
 
 def test_format_string_argument_quoted() -> None:
@@ -34,6 +35,40 @@ def test_format_multiple_arguments() -> None:
     assert "content='hello'" in out
     assert out.startswith("calling fs.write(")
     assert out.endswith(")")
+
+
+def test_discover_tools_emits_per_tool_debug_log(tmp_path: Any, caplog: Any) -> None:
+    """Story 43: each loaded tool gets a DEBUG line naming its source.
+
+    The WARNING summary stays (for shadow diagnostics); the per-tool DEBUG
+    lines are the user-facing way to answer "why didn't my tool load?"
+    without digging through shadow/gating WARNINGs.
+    """
+    import logging
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "deploy.yaml").write_text(
+        'name: proj.deploy\ncommand: ["echo", "deploy"]\n', encoding="utf-8"
+    )
+    user = tmp_path / "nonexistent"
+
+    with caplog.at_level(logging.DEBUG, logger="cothis.tools"):
+        tools = discover_tools(project, user)
+
+    names = {t.__name__ for t in tools}
+    assert "proj.deploy" in names
+
+    debug_loaded = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "loaded tool" in r.msg and "from" in r.msg
+    ]
+    # Each registered tool emitted one DEBUG line.
+    debug_names = [r.getMessage() for r in debug_loaded]
+    assert any("proj.deploy" in m and "deploy.yaml" in m for m in debug_names)
+    assert any("fs.read" in m and "builtins" in m for m in debug_names)
+    assert any("fs.write" in m and "builtins" in m for m in debug_names)
 
 
 def test_format_integer_argument_not_quoted() -> None:
@@ -61,24 +96,24 @@ def test_format_string_with_special_chars_repr_escaped() -> None:
 
 
 # --------------------------------------------------------------------
-# _all_tools: two-layer discovery + cross-layer shadow semantics (#9, #10, #11)
+# discover_tools: two-layer discovery + cross-layer shadow semantics (#9, #10, #11)
 # --------------------------------------------------------------------
 
 
-def test_all_tools_user_global_absent_no_error(tmp_path: Any) -> None:
+def test_discover_tools_user_global_absent_no_error(tmp_path: Any) -> None:
     """Missing user-global dir is the common case — must not error."""
     project = tmp_path / "project"
     project.mkdir()
     user = tmp_path / "nonexistent"
 
-    tools = _all_tools(project, user)
+    tools = discover_tools(project, user)
     # Only builtins load (fs.read, fs.dir, fs.write).
     names = {t.__name__ for t in tools}
     assert "fs.read" in names
     assert "fs.write" in names
 
 
-def test_all_tools_user_global_loads_tools(tmp_path: Any) -> None:
+def test_discover_tools_user_global_loads_tools(tmp_path: Any) -> None:
     """Tools from ``$COTHIS_HOME/tools/`` appear in the tool list."""
     project = tmp_path / "project"
     project.mkdir()
@@ -88,12 +123,12 @@ def test_all_tools_user_global_loads_tools(tmp_path: Any) -> None:
         'name: user.hello\ncommand: ["echo", "hi"]\n', encoding="utf-8"
     )
 
-    tools = _all_tools(project, user)
+    tools = discover_tools(project, user)
     names = {t.__name__ for t in tools}
     assert "user.hello" in names
 
 
-def test_all_tools_project_local_loads_tools(tmp_path: Any) -> None:
+def test_discover_tools_project_local_loads_tools(tmp_path: Any) -> None:
     """Tools from ``.agents/tools/`` appear in the tool list."""
     project = tmp_path / "project"
     project.mkdir()
@@ -102,7 +137,7 @@ def test_all_tools_project_local_loads_tools(tmp_path: Any) -> None:
     )
     user = tmp_path / "nonexistent"
 
-    tools = _all_tools(project, user)
+    tools = discover_tools(project, user)
     names = {t.__name__ for t in tools}
     assert "proj.deploy" in names
 
@@ -120,7 +155,7 @@ def test_shadow_project_local_wins(tmp_path: Any) -> None:
         'name: shared.tool\ncommand: ["echo", "user"]\n', encoding="utf-8"
     )
 
-    tools = _all_tools(project, user)
+    tools = discover_tools(project, user)
     by_name = {t.__name__: t for t in tools}
     assert "shared.tool" in by_name
     # Project-local won — its output is "proj", not "user".
@@ -136,7 +171,7 @@ def test_shadow_custom_overrides_builtin(tmp_path: Any) -> None:
     )
     user = tmp_path / "nonexistent"
 
-    tools = _all_tools(project, user)
+    tools = discover_tools(project, user)
     by_name = {t.__name__: t for t in tools}
     assert "fs.read" in by_name
     # Custom won — its output is "fake", not the builtin fs.read behavior.
@@ -154,8 +189,8 @@ def test_shadow_emits_warning_both_layers(tmp_path: Any, caplog: Any) -> None:
     )
     user = tmp_path / "nonexistent"
 
-    with caplog.at_level(logging.WARNING, logger="cothis.cli"):
-        _all_tools(project, user)
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        discover_tools(project, user)
 
     # The shadow warning names the tool, both layers, and both sources.
     shadow_warnings = [
@@ -192,8 +227,8 @@ def test_shadow_warning_names_both_file_paths(tmp_path: Any, caplog: Any) -> Non
         'name: shared.tool\ncommand: ["echo", "user"]\n', encoding="utf-8"
     )
 
-    with caplog.at_level(logging.WARNING, logger="cothis.cli"):
-        _all_tools(project, user)
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        discover_tools(project, user)
 
     shadow_warnings = [r for r in caplog.records if "shadows" in r.message]
     assert len(shadow_warnings) == 1
@@ -211,7 +246,7 @@ def test_chained_shadow_three_layers_two_warnings(tmp_path: Any, caplog: Any) ->
 
     Covers the chained-shadow path Copilot flagged: user-global shadows a
     builtin AND project-local shadows the user-global tool, both in one
-    ``_all_tools`` call. Two distinct warnings must fire, and the final
+    ``discover_tools`` call. Two distinct warnings must fire, and the final
     winner must be project-local.
     """
     import logging
@@ -227,8 +262,8 @@ def test_chained_shadow_three_layers_two_warnings(tmp_path: Any, caplog: Any) ->
         'name: fs.read\ncommand: ["echo", "user"]\n', encoding="utf-8"
     )
 
-    with caplog.at_level(logging.WARNING, logger="cothis.cli"):
-        tools = _all_tools(project, user)
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        tools = discover_tools(project, user)
 
     # Two shadow warnings: user-global→builtins, then project-local→user-global.
     shadow_warnings = [r for r in caplog.records if "shadows" in r.message]
@@ -254,8 +289,8 @@ def test_no_shadow_loads_both(tmp_path: Any, caplog: Any) -> None:
         'name: user.hello\ncommand: ["echo", "hi"]\n', encoding="utf-8"
     )
 
-    with caplog.at_level(logging.WARNING, logger="cothis.cli"):
-        tools = _all_tools(project, user)
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        tools = discover_tools(project, user)
 
     names = {t.__name__: t for t in tools}
     assert "proj.deploy" in names
@@ -295,7 +330,7 @@ def test_pre_load_false_on_winner_empties_slot_no_fallback(
     )
 
     with caplog.at_level(logging.WARNING, logger="cothis"):
-        tools = _all_tools(project, user)
+        tools = discover_tools(project, user)
 
     names = {t.__name__ for t in tools}
     assert "shared.tool" not in names  # winner dropped, no fallback to user-global
@@ -307,7 +342,7 @@ def test_pre_load_false_on_winner_empties_slot_no_fallback(
         for r in caplog.records
         if r.name == "cothis.tools"
         and r.levelno == logging.WARNING
-        and "pre_load" in r.message
+        and "pre_load callback returned False" in r.getMessage()
     ]
     assert len(pre_load_skips) == 1
     assert "shared.tool" in pre_load_skips[0].message
@@ -349,7 +384,7 @@ def test_shadowed_tool_load_hooks_never_fire(tmp_path: Any, monkeypatch: Any) ->
         encoding="utf-8",
     )
 
-    tools = _all_tools(project, user)
+    tools = discover_tools(project, user)
 
     # Winner is registered (project-local YAML), loser is not.
     by_name = {t.__name__: t for t in tools}

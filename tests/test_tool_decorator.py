@@ -23,11 +23,13 @@ Covers:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
+from pydantic import Field
 
-from cothis.tools import Tool, ToolDef, _parse_docstring, tool
+from cothis.tools import Tool, ToolDef, tool
+from cothis.tools.core import _parse_docstring
 
 
 def test_summary_from_first_paragraph() -> None:
@@ -239,6 +241,63 @@ def test_var_args_dropped_from_schema() -> None:
     assert set(props) == {"a"}
 
 
+def test_annotated_field_constraints_reach_schema() -> None:
+    """``Annotated[T, Field(...)]`` constraints flow through to the JSON Schema (story 4).
+
+    pydantic's ``TypeAdapter`` honours ``ge`` / ``le`` / ``min_length`` etc.,
+    so the model sees the valid range and picks in-range arguments.
+    """
+
+    @tool
+    def set_score(score: Annotated[int, Field(ge=0, le=100)]) -> str:
+        """Set the score.
+
+        Args:
+            score: A value 0-100.
+        """
+        return str(score)
+
+    props = set_score.__cothis_schema__["function"]["parameters"]["properties"]
+    score_prop = props["score"]
+    assert score_prop["type"] == "integer"
+    assert score_prop["minimum"] == 0
+    assert score_prop["maximum"] == 100
+    assert score_prop["description"] == "A value 0-100."
+
+
+def test_basic_type_schema_unchanged() -> None:
+    """A plain ``int`` annotation still produces ``{"type": "integer"}`` — no regression."""
+
+    @tool
+    def echo(n: int) -> str:
+        """Echo.
+
+        Args:
+            n: a number.
+        """
+        return str(n)
+
+    props = echo.__cothis_schema__["function"]["parameters"]["properties"]
+    assert props["n"] == {"type": "integer", "description": "a number."}
+
+
+def test_pep604_optional_unwrapped() -> None:
+    """PEP 604 ``int | None`` is unwrapped to ``integer``, not ``string``."""
+
+    @tool
+    def f(start_line: int | None = None) -> str:
+        """F.
+
+        Args:
+            start_line: optional 1-based start.
+        """
+        return str(start_line)
+
+    props = f.__cothis_schema__["function"]["parameters"]["properties"]
+    assert props["start_line"]["type"] == "integer"
+    assert "start_line" not in f.__cothis_schema__["function"]["parameters"]["required"]
+
+
 def test_parse_docstring_helper_directly() -> None:
     """ " "``_parse_docstring`` returns (first-paragraph summary, {arg: description})."""
     summary, args = _parse_docstring(
@@ -308,14 +367,14 @@ def test_load_gitignore_returns_none_when_absent(tmp_path: Any) -> None:
     nothing, but returning a real object when None is documented would
     mislead callers into thinking they have patterns to apply.
     """
-    from cothis.tools import _load_gitignore
+    from cothis.tools.builtins import _load_gitignore
 
     assert _load_gitignore(tmp_path) is None
 
 
 def test_load_gitignore_parses_patterns(tmp_path: Any) -> None:
     """ " "``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
-    from cothis.tools import _load_gitignore
+    from cothis.tools.builtins import _load_gitignore
 
     (tmp_path / ".gitignore").write_text("*.log\nbuild/\n")
     spec = _load_gitignore(tmp_path)
@@ -349,7 +408,7 @@ def test_dir_returns_structured_entries(tmp_path: Any) -> None:
     Structured output lets ``_execute`` serialise it as JSON (the model-native
     shape) instead of a bespoke text format the model has to parse.
     """
-    from cothis.tools import _list_dir
+    from cothis.tools.builtins import _list_dir
 
     (tmp_path / "src").mkdir()
     (tmp_path / "README.md").write_text("hi")
@@ -365,7 +424,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
     Error paths stay as strings (not structured) — ``_execute`` passes them
     through unchanged so the model sees an actionable message.
     """
-    from cothis.tools import _list_dir
+    from cothis.tools.builtins import _list_dir
 
     result = _list_dir(path=str(tmp_path / "nonexistent"))
     assert isinstance(result, str)
@@ -374,7 +433,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
     """ " "Recursive listing yields entries with nested relative paths."""
-    from cothis.tools import _list_dir
+    from cothis.tools.builtins import _list_dir
 
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "mod.py").write_text("")
@@ -391,19 +450,19 @@ def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
 
 def test_format_default_is_json(monkeypatch: Any) -> None:
     """ " "Without ``COTHIS_TOOL_OUTPUT_FORMAT``, structured output is JSON."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.delenv("COTHIS_TOOL_OUTPUT_FORMAT", raising=False)
-    out = _format_tool_output([{"a": 1}])
+    out = format_tool_output([{"a": 1}])
     assert out == '[{"a": 1}]'
 
 
 def test_format_csv_table(monkeypatch: Any) -> None:
     """ "``list[dict]`` renders as a CSV table with header + rows."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
-    out = _format_tool_output(
+    out = format_tool_output(
         [{"name": "src", "type": "dir"}, {"name": "x", "type": "file"}]
     )
     lines = out.splitlines()
@@ -414,20 +473,20 @@ def test_format_csv_table(monkeypatch: Any) -> None:
 
 def test_format_tsv_uses_tab_delimiter(monkeypatch: Any) -> None:
     """ "``tsv`` is the same as csv but with tab separators."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "tsv")
-    out = _format_tool_output([{"a": "1", "b": "2"}])
+    out = format_tool_output([{"a": "1", "b": "2"}])
     assert "\t" in out
     assert out.splitlines()[0] == "a\tb"
 
 
 def test_format_csv_flattens_nested_dict(monkeypatch: Any) -> None:
     """ "``csv`` flattens nested dicts with dotted key paths."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
-    out = _format_tool_output({"name": "src", "meta": {"type": "dir", "size": 1024}})
+    out = format_tool_output({"name": "src", "meta": {"type": "dir", "size": 1024}})
     header = out.splitlines()[0]
     assert "meta.type" in header
     assert "meta.size" in header
@@ -436,10 +495,10 @@ def test_format_csv_flattens_nested_dict(monkeypatch: Any) -> None:
 
 def test_format_csv_bare_list_falls_back_to_json(monkeypatch: Any) -> None:
     """ "A bare list of scalars isn't tabular → CSV falls back to JSON."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "csv")
-    out = _format_tool_output(["a", "b", "c"])
+    out = format_tool_output(["a", "b", "c"])
     import json as _json
 
     assert _json.loads(out) == ["a", "b", "c"]
@@ -447,10 +506,10 @@ def test_format_csv_bare_list_falls_back_to_json(monkeypatch: Any) -> None:
 
 def test_format_yaml_handles_nested(monkeypatch: Any) -> None:
     """ "YAML renders nested structures natively (no flattening)."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "yaml")
-    out = _format_tool_output({"name": "src", "meta": {"type": "dir"}})
+    out = format_tool_output({"name": "src", "meta": {"type": "dir"}})
     assert "name: src" in out
     assert "meta:" in out
     assert "  type: dir" in out  # nested key is indented, not flattened
@@ -458,10 +517,10 @@ def test_format_yaml_handles_nested(monkeypatch: Any) -> None:
 
 def test_format_unknown_value_defaults_to_json(monkeypatch: Any) -> None:
     """ "An unrecognised ``COTHIS_TOOL_OUTPUT_FORMAT`` value falls back to JSON."""
-    from cothis.tools import _format_tool_output
+    from cothis.tools.format import format_tool_output
 
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "xml")
-    out = _format_tool_output({"a": 1})
+    out = format_tool_output({"a": 1})
     import json as _json
 
     assert _json.loads(out) == {"a": 1}
@@ -586,7 +645,7 @@ def test_builtin_tools_are_tooldef_instances() -> None:
     Regression check: the migration from bare decorated functions to
     ``ToolDef`` must not break the built-in tools.
     """
-    from cothis.tools import _list_dir, read, write
+    from cothis.tools.builtins import _list_dir, read, write
 
     for t in (read, _list_dir, write):
         assert isinstance(t, ToolDef)
@@ -601,7 +660,7 @@ def test_builtin_tools_are_tooldef_instances() -> None:
 
 def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
     """ "A ``.py`` file with a ``@tool`` function is discovered and loaded."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "greet.py").write_text(
         'from cothis import tool\n\n@tool("test.greet")\n'
@@ -616,7 +675,7 @@ def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
 
 def test_load_python_tools_discovers_package(tmp_path: Any) -> None:
     """ "A package directory with ``__init__.py`` is discovered."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -636,7 +695,7 @@ def test_load_python_tools_import_failure_doesnt_crash(
     """ "A broken ``.py`` file logs an error but doesn't crash the loader."""
     import logging
 
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "broken.py").write_text("import nonexistent_module\n", encoding="utf-8")
     # A valid file alongside the broken one should still load.
@@ -658,14 +717,14 @@ def test_load_python_tools_import_failure_doesnt_crash(
 
 def test_load_python_tools_empty_dir_returns_empty(tmp_path: Any) -> None:
     """ "An empty directory yields an empty tool list."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     assert load_tools_from_layer(tmp_path) == []
 
 
 def test_load_python_tools_missing_dir_returns_empty() -> None:
     """ "A non-existent directory yields an empty tool list."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     assert load_tools_from_layer(Path("/nonexistent/path")) == []
 
@@ -674,7 +733,7 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
     tmp_path: Any,
 ) -> None:
     """ "Module-level constants and plain functions are NOT collected."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "mixed.py").write_text(
         "from cothis import tool\n\n"
@@ -697,11 +756,11 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
 def test_loader_discovers_tool_with_pre_load_hooks(tmp_path: Any) -> None:
     """The loader discovers a tool regardless of its pre_load hooks.
 
-    Hooks are NOT run by the loader — they run later in ``_all_tools``
+    Hooks are NOT run by the loader — they run later in ``discover_tools``
     after cross-layer merge (see ADR-0003). The loader returns all
     discovered candidates.
     """
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "t.py").write_text(
         "from cothis import tool\n\n"
@@ -721,7 +780,7 @@ def test_loader_discovers_tool_with_pre_load_hooks(tmp_path: Any) -> None:
 def test_pre_load_any_false_skips_tool() -> None:
     """If any ``pre_load`` callback returns False, ``_run_load_hooks`` returns False.
 
-    The loader discovers the tool; the skip happens when ``_all_tools`` runs
+    The loader discovers the tool; the skip happens when ``discover_tools`` runs
     load hooks on it (see ADR-0003). The third callback never runs.
     """
 
@@ -830,7 +889,7 @@ def test_on_error_self_exception_swallowed() -> None:
 
 def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
     """ "A tool with no hooks is discovered and registered as before."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "t.py").write_text(
         "from cothis import tool\n\n"
@@ -1154,7 +1213,7 @@ def test_on_error_fire_logged(caplog: Any) -> None:
 
 def test_yaml_duplicate_names_detected(tmp_path: Any) -> None:
     """Two YAML files with the same ``name:`` raise ValueError naming both paths."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "a.yaml").write_text(
         'name: dup\ncommand: ["echo", "a"]\n', encoding="utf-8"
@@ -1171,7 +1230,7 @@ def test_yaml_duplicate_names_detected(tmp_path: Any) -> None:
 
 def test_python_duplicate_names_detected(tmp_path: Any) -> None:
     """Two Python tools with the same name raise ValueError naming both paths."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "a.py").write_text(
         'from cothis import tool\n@tool("dup")\n'
@@ -1197,7 +1256,7 @@ def test_cross_format_same_layer_duplicate_raises(tmp_path: Any) -> None:
     in the same directory are same-layer, so they raise — not shadow.
     This is the case the pre-#12 per-format ``seen`` dicts couldn't catch.
     """
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "y.yaml").write_text(
         'name: dup\ncommand: ["echo", "yaml"]\n', encoding="utf-8"
@@ -1216,7 +1275,7 @@ def test_cross_format_same_layer_duplicate_raises(tmp_path: Any) -> None:
 
 def test_no_duplicate_names_loads_normally(tmp_path: Any) -> None:
     """Distinct names load without error."""
-    from cothis.tools import load_tools_from_layer
+    from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "a.yaml").write_text(
         'name: first\ncommand: ["echo", "a"]\n', encoding="utf-8"

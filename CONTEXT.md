@@ -11,7 +11,7 @@ startup — from Python callables, YAML declarations, and MCP servers
 Any callable object the `Agent` registers by name and dispatches by
 calling with keyword arguments. The single dispatch protocol — there is
 no per-source branching in `_execute`. Every concrete tool class
-(`ToolDef`, `_ShellTool`, `_MCPClientTool`) inherits `_HookableTool`, so
+(`ToolDef`, `_ShellTool`, `MCPClientTool`) inherits `_HookableTool`, so
 hooks run uniformly for all sources (YAML tools' chains are empty no-ops).
 A tool may be sync or async: `_execute` awaits the return value only if it
 is awaitable (ADR-0004), so MCP's async tools and sync Python/shell tools
@@ -76,54 +76,93 @@ proceeds). `phase` is one of `"pre_load"` / `"after_load"` /
 `"pre_execute"` / `"tool"` / `"after_execute"`, naming which stage raised.
 _Avoid_: pipeline stage, middleware (both too generic).
 
+**Resource handle**:
+An external resource a `Tool` depends on **between** calls — a server
+session, a subprocess, a database connection. A parallel concern to Tool
+lifecycle (not a sixth hook stage): lifecycle hooks are stateless per-call
+interceptors; a handle is stateful and spans many calls. A handle is
+declared **independently of** tools (`@resource`), then bound to one or
+more tools (`@tool(handle=…)`); a tool **may** bind one or **none**
+(`fs.read` holds nothing). The Agent manages handles — not per-tool:
+keepalive reclaims a handle idle past a window (default 600s); LRU evicts
+under capacity pressure (default 8). A handle shared by several tools has
+one `last_used` (any of its tools calling refreshes it) and is reclaimed
+once, then transparently re-acquired on the next call to any of its
+tools. The re-acquire is inserted in `_execute` after `pre_execute`,
+before the tool body, via the same duck-typed no-op pattern as
+`run_hooks_safe` (no per-source branching). Tools without a bound handle
+keep the existing path untouched. Three lifecycle knobs: `keepalive`
+(default 600s), `eager` (acquire on first run, default false), and `pin`
+(exempt from reclamation/eviction and the `max_handles` budget until
+`aclose`; implies `eager`, default false). MCP sessions are one instance
+of this mechanism: each server's startup connection is adopted as the
+handle's first acquire, then follows keepalive + LRU. In-flight calls
+are protected: the reaper never reclaims a handle whose tool body hasn't
+returned.
+_Avoid_: connection (too narrow — misses subprocess/file handles),
+resource (too generic), pool (implies many; a tool may hold one).
+
 **Tool source**:
-A path that yields `Tool` objects. **Currently implemented**: Python
-(`@tool`-decorated functions), YAML (declarative shell template), and MCP
-(external tool server, `type: mcp.stdio` — issue #16 — or `type: mcp.http`
-— issue #17). **Planned, not yet implemented** (issue #1): dynamic
-discovery of user-authored Python files. The pydantic schema base class
-(stories 1–10) was **dropped** — `@tool` is the single Python-tool
-definition API. Tool source is the **format** axis only (Python / YAML /
-MCP) — it is **never** a precedence axis (see Layer).
+A path that yields `Tool` objects. **Implemented**: Python
+(`@tool`-decorated functions, auto-scanned from `.py` files in a
+discovery path), YAML (declarative shell template), and MCP (external
+tool server, `type: mcp.stdio` — issue #16 — or `type: mcp.http` —
+issue #17). The pydantic schema base class (stories 1–10) was **dropped**
+— `@tool` is the single Python-tool definition API. **Deviation from
+PRD story 34**: the PRD asked Python extension files to export a `TOOLS`
+list; the shipped loader instead auto-scans for `@tool`-decorated
+`ToolDef` instances at module level (no export contract — the author
+just decorates). **Deviation from PRD story 38**: the PRD asked Python
+extensions to be a "thin wrapper over the shell-tool template" (i.e.
+Python files call the `shell()` helper); the shipped design treats
+Python extensions as a peer source — `@tool` functions are first-class,
+the `shell()` helper is available but optional. See ADR-0005. Tool
+source is the **format** axis only (Python / YAML / MCP) — it is
+**never** a precedence axis (see Layer).
 _Avoid_: tool type (collides with `YAMLTool`), tool kind, backend,
 layer (different axis).
 
 **MCP server**:
 An external tool server declared by a `type: mcp.stdio` or `type: mcp.http`
-YAML file — the `_MCPServer` handle. Not a `Tool` itself but a *producer*
+YAML file — the `MCPServer` handle. Not a `Tool` itself but a *producer*
 of tools: one server declaration expands into many tools, discovered at
 runtime via the MCP `tools/list` call. Its `__name__` is a diagnostic label
 (`mcp:` + `name:` or the file stem), prefixed so it can never collide with a
 dispatchable tool's name in the discovery registry. The stdio and http
-variants differ only in their **transport**; everything downstream (session,
-discovery, dispatch, normalisation) is shared. The session it opens is
-**persistent** — connected once at Agent startup, held across every dispatch,
-closed at teardown (see ADR-0005).
-_Avoid_: MCP tool (that's the produced `_MCPClientTool`), MCP client,
+variants differ only in their **transport** (SDK `StdioServerParameters` vs
+`StreamableHttpParameters`); everything downstream (session, discovery,
+dispatch, normalisation) is shared. The session it opens is **managed by
+the resource-handle subsystem** (ADR-0005): connected once at Agent
+startup via a `ClientSessionGroup` (that connection is adopted as the
+handle's first acquire), then reclaimed when idle past `keepalive`
+(default 600s) and re-acquired on the next call. `pin: true` opts a
+server back into permanent-session behaviour (ADR-0005).
+_Avoid_: MCP tool (that's the produced `MCPClientTool`), MCP client,
 plugin.
 
 **Transport**:
-The wire an `_MCPServer` speaks over — a stdio subprocess (`type: mcp.stdio`,
-`stdio_client`) or an HTTP connection (`type: mcp.http`,
-`streamablehttp_client`). It is the **only** thing that differs between MCP
-kinds, so it is the only injected piece: each builder supplies an
-`open_transport` factory yielding a `(read, write)` stream pair, and
-`_default_connect` wraps those streams in a `ClientSession` uniformly. A
-secret-free `diagnostic` string (url scrubbed of userinfo/query, or
-command — never `env`/`headers`)
+The wire an `MCPServer` speaks over — a stdio subprocess (`type: mcp.stdio`,
+SDK `StdioServerParameters`) or an HTTP connection (`type: mcp.http`,
+SDK `StreamableHttpParameters`). It is the **only** thing that differs
+between MCP kinds, so it is the only injected piece: each builder supplies
+the matching `params` object, and the `ClientSessionGroup` consumes it
+uniformly. A secret-free `diagnostic` string (url scrubbed of
+userinfo/query, or command — never `env`/`headers`)
 travels alongside for failure logs.
 _Avoid_: protocol (that's MCP itself), connection (too vague), channel.
 
 **MCP tool**:
-A single remote tool produced by an MCP server — the `_MCPClientTool`. Its
-`__name__` is **prefixed** with its server's label: `mcp:context7` producing a
-remote `query-docs` registers as `context7.query-docs`. The bare remote name
-lives on as `_remote_name` and is what's sent back to the server in
-`call_tool`. Dispatch is async: `__call__` awaits `session.call_tool` on the
-shared server session and normalises the result to a string (text blocks
-joined; empty → `"(no output)"`; errors → `"Error: "` prefix). See ADR-0006
-for the prefix scheme's collision properties.
-_Avoid_: MCP server (that's the `_MCPServer` producer), remote function,
+A single remote tool produced by an MCP server — the `MCPClientTool`. Its
+`__name__` is **prefixed** with its server's self-reported name (the SDK's
+`component_name_hook` assigns `{server_name}.{remote}`): a server reporting
+`test-server` with a remote `query-docs` registers as
+`test-server.query-docs`. When the server reports an empty name, the prefix
+falls back to the YAML `name:` label (ADR-0005). Dispatch is async: `__call__`
+awaits `group.call_tool` on the shared `ClientSessionGroup` and normalises the
+result to a string (text blocks joined; empty → `"(no output)"`; errors →
+`"Error: "` prefix). See ADR-0005 for the prefix scheme's collision
+properties.
+_Avoid_: MCP server (that's the `MCPServer` producer), remote function,
 namespace (implies a hierarchy cothis doesn't have).
 
 **YAMLTool**:
@@ -155,9 +194,17 @@ _Avoid_: compiled tool (collides with Tool), resolved tool, tool spec
 How a YAMLTool's `command:` runs, determined by its YAML type. **argv
 mode** — `command:` is a list, passed to `execve` with `shell=False`;
 each element is one argv item, spaces/special chars are safe by default.
-**shell mode** — `command:` is a string, passed to a declared `shell:`
+**shell mode** — `command:` is a string, passed to a `shell:`
 interpreter with `shell=True`; supports pipes / `&&` / redirection. The
-`shell:` field is required for shell mode and names the gated interpreter.
+`shell:` field names the gated interpreter; if omitted, cothis auto-selects
+the OS default (`sh` on POSIX, `cmd` on Windows — story 16). Shell-mode
+arg values are quoted per interpreter (`shlex.quote` for POSIX,
+`subprocess.list2cmdline` for `cmd`). On POSIX this fully closes
+injection (story 22); on `cmd.exe` it is partial — whitespace-bearing
+values are double-quoted, but values like `foo&bar` pass through
+unquoted and `%VAR%` expansion is undefended (see the `cothis:` ceiling
+on `_shell_quote`). Argv mode (`command:` as a list) is fully safe on
+all platforms — prefer it for untrusted input.
 _Avoid_: command type (collides with arg type), run style.
 
 **Platform**:

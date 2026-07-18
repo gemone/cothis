@@ -8,9 +8,6 @@ import os
 import sys
 from pathlib import Path
 
-# Enable any-llm's unified exception hierarchy so provider-specific errors
-# are converted into any_llm.exceptions.* regardless of which provider
-# the user picks.
 # Must run before cothis.agent imports any_llm.
 os.environ.setdefault("ANY_LLM_UNIFIED_EXCEPTIONS", "1")
 
@@ -22,111 +19,24 @@ from rich.live import Live
 from rich.markdown import Markdown
 
 from cothis.agent import Agent, ToolCallEvent
-from cothis.tools import TOOLS, Tool, load_tools_from_layer
+from cothis.tools import discover_tools
 
 app = typer.Typer()
 console = Console()
-logger = logging.getLogger("cothis.cli")
 
-# cothis: the system prompt is hardcoded (not user-configurable) and identical
-# across ``ask`` and ``chat``. Both commands share the same persona so the
-# behavior a user learns in one mode transfers to the other. Ceiling: no
-# env var / flag override today. Upgrade path: add ``--system-prompt`` /
-# ``COTHIS_SYSTEM_PROMPT`` and fall back to this constant.
-#
-# cothis: the prompt deliberately does NOT name tools. Which tools are
-# available is surfaced to the model purely via the ``tools=`` schemas
-# passed to the completion API — naming them here is redundant and drifts
-# the moment a YAML/Python tool is added or a built-in is removed. The
-# model learns its capabilities from the tool schemas, not the prompt.
 DEFAULT_SYSTEM_PROMPT = (
     "You are a concise, helpful assistant. Use the tools you are given "
     "to inspect and modify files and run commands as needed."
 )
 
-# Set by the root callback's --debug option. Consumed by main() to decide
-# whether to surface the full traceback.
 _debug = False
 
-# Discovery paths (see CONTEXT.md "Discovery path"). Project-local is
-# cwd-relative; user-global lives under the cothis home directory
-# (``$COTHIS_HOME`` or ``~/.cothis``). Both are optional — ``_all_tools``
-# handles missing dirs without error.
 _PROJECT_TOOLS_DIR = Path(".agents/tools")
-# Empty/unset ``COTHIS_HOME`` → default ``~/.cothis``. ``expanduser`` so
-# ``COTHIS_HOME=~/my-cothis`` works (``Path`` doesn't expand ``~`` itself).
+# Empty/unset ``COTHIS_HOME`` → default ``~/.cothis``.
 _COTHIS_HOME = Path(
     os.environ.get("COTHIS_HOME") or Path.home() / ".cothis"
 ).expanduser()
 _USER_TOOLS_DIR = _COTHIS_HOME / "tools"
-
-
-def _all_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
-    """Built-in tools plus any declared in the two discovery layers.
-
-    Loads YAML and Python tool declarations from ``user_dir`` (user-global)
-    and ``project_dir`` (project-local). Both are optional; absence is not
-    an error. Each directory is one **layer** (see CONTEXT.md "Layer").
-
-    Layers resolve in ascending precedence: builtins → user-global →
-    project-local. A higher-precedence tool with the same ``__name__``
-    **shadows** the lower one (dict overwrite). Each shadow emits a
-    ``logger.warning`` naming both layers + source paths. Same-layer
-    conflicts (two YAML files in one directory, or a YAML + Python file in
-    the same directory claiming one name) still raise ``ValueError`` —
-    that's an author error caught by ``load_tools_from_layer``'s shared
-    ``seen`` dict.
-
-    Lifecycle hooks (``pre_load`` / ``after_load``) run AFTER shadow
-    resolution, on the winning tool only. A shadowed tool's hooks never
-    fire. If the winner's ``pre_load`` returns ``False`` or raises, the
-    slot goes **empty — no fallback** to the shadowed tool (shadowing is a
-    replacement, not a try). See ADR-0003.
-    """
-    layers = [
-        ("builtins", TOOLS),
-        ("user-global", load_tools_from_layer(user_dir)),
-        ("project-local", load_tools_from_layer(project_dir)),
-    ]
-    # Ascending-precedence dict overwrite: later layer wins on name conflict.
-    # Parallel ``layer_of`` tracks which layer produced each winner, so the
-    # shadow warning can name both layers (the tool carries ``_source`` only).
-    registry: dict[str, Tool] = {}
-    layer_of: dict[str, str] = {}
-    shadow_count = 0
-    for layer_name, layer_tools in layers:
-        for tool in layer_tools:
-            name = tool.__name__
-            if name in registry:
-                prev_src = getattr(registry[name], "_source", None) or "builtins"
-                new_src = getattr(tool, "_source", None) or "builtins"
-                logger.warning(
-                    "tool %r from %s (%s) shadows %s (%s)",
-                    name,
-                    layer_name,
-                    new_src,
-                    layer_of[name],
-                    prev_src,
-                )
-                shadow_count += 1
-            registry[name] = tool
-            layer_of[name] = layer_name
-
-    # Run load hooks on the merged winners only (ADR-0003 Q3).
-    # Bare callables (no ``_run_load_hooks`` attr) skip hooks entirely.
-    # pre_load=False / hook exception empties the slot — no fallback (Q4).
-    registered: list[Tool] = []
-    for tool in registry.values():
-        run_hooks = getattr(tool, "_run_load_hooks", None)
-        if run_hooks is None or run_hooks():
-            registered.append(tool)
-
-    logger.warning(
-        "discovery: %d tools active (%d shadowed)",
-        len(registered),
-        shadow_count,
-    )
-    return registered
 
 
 @app.callback()
@@ -148,14 +58,9 @@ def _root(
     """cothis — an any-llm agent loop."""
     global _debug
     _debug = debug
-    # ``--debug`` = everything (cothis + openai + httpx + traceback).
-    # ``-v`` / ``--verbose`` = cothis only (tool-call I/O, gating skips) —
-    # the signal you actually want when checking what reached the model,
-    # without the HTTP/TLS noise swamping it.
     if debug or verbose:
         logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
     if verbose and not debug:
-        # Quiet the chatty downstream loggers; keep ``cothis.*`` at DEBUG.
         for noisy in ("openai", "httpx", "httpcore", "asyncio"):
             logging.getLogger(noisy).setLevel(logging.INFO)
 
@@ -182,21 +87,11 @@ def ask(
     ),
 ) -> None:
     """Run the agent once and print its final answer."""
-    # cothis: two-phase status — loading covers lazy any_llm import + Agent
-    # construction; thinking covers the full run() loop (LLM calls + tool
-    # execution). rich's Status wraps a Live(transient=True) internally, so
-    # each spinner's text disappears on exit and the plain-text answer is
-    # the only thing left on screen.
-    #
-    # The answer goes through ``typer.echo`` (not ``console.print``) so ask
-    # stays pipe-friendly: ``cothis ask "..." | jq`` / ``> file`` see clean
-    # stdout with no ANSI escape codes. Markdown rendering is reserved for
-    # the interactive ``chat`` command.
     with console.status("loading...", spinner="dots"):
         agent = Agent(
             model=model,
             provider=provider,
-            tools=_all_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
+            tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
         )
@@ -259,51 +154,29 @@ async def _chat_session(
     provider: str,
     max_iterations: int,
 ) -> None:
-    # One event loop owns the whole session so any cross-turn async state
-    # inside AnyLLM (HTTP keep-alive, client caches) stays bound to the
-    # same loop. ``ask`` doesn't need this because it discards the Agent
-    # after one ``run``, but ``chat`` reuses it.
     with console.status("loading...", spinner="dots"):
         agent = Agent(
             model=model,
             provider=provider,
-            tools=_all_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
+            tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
         )
 
-    # PromptSession is the native async entry into prompt_toolkit. We need
-    # ``prompt_async`` rather than the sync ``prompt()`` because we are
-    # already inside an event loop; the sync call internally drives its own
-    # loop and errors out with "asyncio.run() cannot be called from a
-    # running event loop".
+    # prompt_toolkit over stdlib ``input()``: CPython auto-loads GNU readline
+    # for ``input``, which mis-counts CJK / wide-char column width and leaves
+    # visual residue on backspace. prompt_toolkit does its own ``wcwidth``
+    # accounting and renders the line itself.
     #
-    # We use prompt_toolkit instead of stdlib ``input()`` because CPython
-    # auto-loads GNU readline for ``input``, and readline mis-counts the
-    # terminal column width of CJK / wide chars — backspacing over a
-    # Chinese character leaves visual residue on screen (the received
-    # string is correct, but the display looks broken). prompt_toolkit does
-    # its own width accounting via ``wcwidth`` and renders the input line
-    # itself, so delete is clean for any script. Also gives us history /
-    # Emacs keys for free.
-    #
-    # We deliberately do *not* run the sync ``prompt`` via
-    # ``asyncio.to_thread``. The chat loop is strictly serial
-    # (input → stream → input), so nothing concurrent benefits from the
-    # offload, and wrapping it in a worker thread plus pressing Ctrl-C
-    # repeatedly races interpreter shutdown — the worker stays blocked on
-    # stdin while the main thread unwinds, producing a noisy
-    # ``KeyboardInterrupt`` traceback from the atexit join. Calling
-    # ``prompt_async`` lets SIGINT route through the loop's own signal
-    # handling, which prompt_toolkit handles cleanly.
+    # ``prompt_async`` (not sync ``prompt`` via ``asyncio.to_thread``): the
+    # latter races interpreter shutdown on Ctrl-C — the worker stays blocked
+    # on stdin while the main thread unwinds, producing a noisy traceback.
     session = PromptSession()
     try:
         while True:
             try:
                 prompt_text = await session.prompt_async(">>> ")
             except EOFError, KeyboardInterrupt:
-                # Ctrl-D / Ctrl-C at the prompt: end the session quietly.
-                # Execution-mid Ctrl-C still bubbles up through main().
                 console.print()
                 break
             if not prompt_text.strip():
@@ -311,7 +184,6 @@ async def _chat_session(
 
             await _stream_answer(agent, prompt_text)
     finally:
-        # Shut down any MCP subprocesses the session opened before returning.
         await agent.aclose()
 
 
@@ -343,8 +215,6 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
     try:
         async for event in stream:
             if isinstance(event, ToolCallEvent):
-                # Back to thinking state: tear down Live if we were streaming,
-                # restart the spinner, print the tool call above it.
                 if live is not None:
                     live.stop()
                     live = None
@@ -352,8 +222,7 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
                     status.start()
                 console.print(_format_tool_call(event), style="dim")
                 continue
-            # Content delta. First one of a fresh streaming phase: stop the
-            # spinner, spin up Live. Subsequent ones just update it.
+            # Content delta — first one spins up Live, subsequent ones update it.
             if live is None:
                 status.stop()
                 accumulated = event
@@ -394,7 +263,6 @@ def main() -> None:
     try:
         app(standalone_mode=False)
     except click.ClickException as exc:
-        # Usage / bad-parameter errors — Click formats these itself.
         exc.show()
         sys.exit(exc.exit_code)
     except click.Abort:
@@ -405,7 +273,6 @@ def main() -> None:
     except BaseException as exc:
         if _debug:
             raise
-        # Still tell the user what went wrong — just without the traceback.
         typer.echo(f"Error: {exc}", err=True)
         sys.exit(1)
 
