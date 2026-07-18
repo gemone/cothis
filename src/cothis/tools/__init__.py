@@ -4,8 +4,7 @@ Public interface for the tools package. Re-exported here:
 ``discover_tools`` (the aggregator the CLI calls), ``tool`` / ``ToolDef``
 (the Python-tool authoring API), ``Tool`` / ``MCPServer`` / ``MCPClientTool``
 (types the Agent and tests consume), ``read`` / ``write`` (the fs builtins
-re-exported for ``from cothis import read`` convenience), ``shell`` (the
-helper for Python extensions), ``format_tool_output``, and the four
+re-exported for ``from cothis import read`` convenience), ``format_tool_output``, and the four
 hook-related names (``run_hooks_safe`` / ``schema_for`` / ``AfterExecuteError``
 / ``logger``).
 
@@ -47,4 +46,3 @@ from cothis.tools.mcp import (
     MCPClientTool,
     MCPServer,
 )
-from cothis.tools.yaml import shell

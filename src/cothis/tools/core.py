@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import shutil
 import time
 import types
 import typing
@@ -674,17 +673,6 @@ def _check_unknown_keys(
             f"allowed: {sorted(allowed)!r}"
         )
         raise ValueError(msg)
-
-
-def _resolve_executable(name_or_path: str) -> str | None:
-    """Resolve an executable name to a path via ``shutil.which``.
-
-    Returns the resolved path, or ``None`` if not found. ``None`` means
-    "not on PATH" → caller skips registration (silent gate). Used by both
-    the YAML shell-tool gate (argv[0] / ``shell:`` interpreter) and the MCP
-    stdio server launch check.
-    """
-    return shutil.which(name_or_path)
 
 
 def schema_for(tool: Tool) -> Tool | dict[str, Any]:
