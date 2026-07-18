@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import shlex
+import shutil
 import string
 import subprocess
 import sys
@@ -32,7 +33,6 @@ from cothis.tools.core import (
     _check_unknown_keys,
     _HookableTool,
     _require,
-    _resolve_executable,
     logger,
 )
 
@@ -75,7 +75,7 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
         )
         raise ValueError(msg)
     block = _compile(yaml_text, source=source)
-    exe = _resolve_executable(block.gate_target)
+    exe = shutil.which(block.gate_target)
     if exe is None:
         logger.warning(
             "tool %r gated off: %s not on PATH", block.name, block.gate_target
@@ -570,44 +570,6 @@ def preview(
         warnings.filterwarnings("ignore", category=UserWarning)
         block = _compile(yaml_text, source=source, platform=_platform)
     return block.render(**kwargs), block.shell
-
-
-def shell(command: str | list[str], *, executable: str | None = None) -> str:
-    """Run a command and return its output, or an ``Error:`` string on non-zero exit.
-
-    For Python tool authors who need shell-command glue inside ``@tool``
-    functions (story 36). Mirrors YAML ``_ShellTool`` dispatch semantics:
-    capture stdout+stderr (story 18), surface non-zero exits as error strings
-    (not exceptions) so the agent loop can recover.
-
-    ``command`` as a ``list`` → argv mode (``shell=False``, no shell
-    interpretation, inherently safe from injection). ``command`` as a ``str``
-    → shell mode (``shell=True``); pass ``executable`` to run under a
-    specific shell (e.g. ``"bash"``), resolved via PATH like YAML ``shell:``.
-    The caller is responsible for escaping user-controlled values in shell
-    mode — ``shlex.quote`` for POSIX shells, ``subprocess.list2cmdline`` for
-    ``cmd`` (see ``_shell_quote`` in this module).
-    """
-    if isinstance(command, list):
-        proc = subprocess.run(command, capture_output=True, text=True)
-    else:
-        shell_path = _resolve_executable(executable) if executable else None
-        if executable and shell_path is None:
-            # Mirror YAML ``_ShellTool`` gating: a declared ``shell:`` not on
-            # PATH is a configuration error, not a silent fallback to the
-            # system default (which would be silent breakage — the author
-            # asked for bash, got cmd.exe). YAML skips registration at load
-            # time; ``shell()`` is runtime, so it returns an error string
-            # the agent can act on.
-            return f"Error: shell {executable!r} not found on PATH"
-        proc = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            executable=shell_path,
-        )
-    return _format_proc_result(proc)
 
 
 # Known top-level keys on a tool declaration. Unknown keys are rejected at

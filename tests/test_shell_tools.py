@@ -37,7 +37,6 @@ from cothis.tools.yaml import (
     _ShellTool,
     load_yaml_tools,
     preview,
-    shell,
 )
 
 if TYPE_CHECKING:
@@ -867,55 +866,6 @@ def test_nonzero_exit_returns_error_with_stderr() -> None:
 
 
 # ====================================================================
-# shell() helper for Python extensions (story 36)
-# ====================================================================
-
-
-def test_shell_argv_mode_returns_stdout() -> None:
-    """``shell(["echo", "hi"])`` runs in argv mode and returns stdout."""
-    assert shell(["echo", "hello"]) == "hello\n"
-
-
-def test_shell_string_mode_returns_stdout() -> None:
-    """``shell("echo hi")`` runs in shell mode and returns stdout."""
-    assert shell("echo hello") == "hello\n"
-
-
-def test_shell_nonzero_exit_returns_error_string() -> None:
-    """A non-zero exit returns an ``Error:`` string, not an exception."""
-    result = shell(["sh", "-c", "echo boom >&2; exit 3"])
-    assert "exit code 3" in result
-    assert "boom" in result
-
-
-def test_shell_executable_resolved_via_path() -> None:
-    """``executable="sh"`` is resolved via PATH and runs the command.
-
-    ``sh`` exists on every POSIX system; the resolution mechanic
-    (``shutil.which`` → ``executable=``) is what this test covers.
-    """
-    import sys
-
-    if sys.platform == "win32":
-        pytest.skip("``sh`` is not available on Windows")
-    result = shell("echo from-sh", executable="sh")
-    assert result == "from-sh\n"
-
-
-def test_shell_missing_executable_returns_error_not_silent_fallback() -> None:
-    """A declared ``executable`` not on PATH returns an error string.
-
-    Mirrors YAML ``_ShellTool`` gating (``shell:`` not on PATH → tool not
-    registered): the author asked for a specific shell that isn't there, so
-    surface the error rather than silently falling back to the system
-    default shell. Runs on every platform — no real executable needed.
-    """
-    result = shell("echo hi", executable="definitely-not-on-path-xyz-123")
-    assert result.startswith("Error:")
-    assert "definitely-not-on-path-xyz-123" in result
-
-
-# ====================================================================
 # Follow-up batch: preview _platform propagation, cmd quoting,
 # stdout+stderr merge, name normalisation (Copilot A/B/C + story 11/21)
 # ====================================================================
@@ -952,47 +902,6 @@ args:
     # ``shlex.quote("foo & bar")`` → ``"'foo & bar'"`` (single-quoted).
     # The assertion pins the cmd.exe-safe form.
     assert cmd == 'echo "foo & bar"'
-
-
-def test_shell_helper_stdout_with_nonempty_stderr_appended() -> None:
-    """Copilot C: on success (exit 0), non-empty ``stderr`` is appended so
-    the agent sees deprecation warnings / progress notes (story 18).
-    Exit 0 + empty stderr → plain stdout (no regression for the common case)."""
-    # A command that writes to stderr but exits 0.
-    result = shell(["sh", "-c", "echo out; echo warn >&2"])
-    assert "out" in result
-    assert "warn" in result
-    assert "[stderr]" in result
-    # Exit 0 + empty stderr → just stdout.
-    assert shell(["echo", "hi"]) == "hi\n"
-
-
-def test_shell_helper_nonzero_exit_includes_stdout_and_stderr() -> None:
-    """Copilot C: on failure, both streams are returned (stdout first).
-    Dropping crash-time stdout would blind the LLM to mid-output failures."""
-    result = shell(["sh", "-c", "echo partial; echo boom >&2; exit 3"])
-    assert "exit code 3" in result
-    assert "partial" in result  # stdout preserved
-    assert "boom" in result  # stderr preserved
-    assert result.index("partial") < result.index("boom")  # stdout first
-
-
-def test_shell_helper_nonzero_exit_with_empty_stdout() -> None:
-    """Failure with no stdout: only the ``[stderr]`` section appears.
-    The ``if proc.stdout`` guard must skip the stdout section cleanly."""
-    result = shell(["sh", "-c", "echo boom >&2; exit 3"])
-    assert "exit code 3" in result
-    assert "boom" in result
-    assert "[stdout]" not in result
-
-
-def test_shell_helper_nonzero_exit_with_empty_stderr() -> None:
-    """Failure with no stderr: only the ``[stdout]`` section appears.
-    The ``if proc.stderr`` guard must skip the stderr section cleanly."""
-    result = shell(["sh", "-c", "echo partial; exit 3"])
-    assert "exit code 3" in result
-    assert "partial" in result
-    assert "[stderr]" not in result
 
 
 def test_shell_tool_name_with_spaces_normalised_to_dashes() -> None:

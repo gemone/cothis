@@ -19,6 +19,7 @@ lifecycle hooks. See ADR-0005 §2 (deferred connect) and §4 (name prefix).
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +28,6 @@ from cothis.tools.core import (
     _check_unknown_keys,
     _HookableTool,
     _require,
-    _resolve_executable,
     logger,
 )
 
@@ -401,7 +401,7 @@ def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> MCPServ
             raise ValueError(msg)
         env[str(k)] = v
     label = str(spec.get("name") or (Path(source).stem if source else "mcp"))
-    if _resolve_executable(command) is None:
+    if shutil.which(command) is None:
         logger.warning(
             "MCP stdio server %r: command %r not on PATH%s; "
             "will attempt to launch at run time",
