@@ -40,6 +40,7 @@ from any_llm.types.messages import (
     MessageDeltaUsage,
     MessageResponse,
     MessageUsage,
+    StopReason,
     TextBlock,
     TextDelta,
     ToolUseBlock,
@@ -134,7 +135,7 @@ def test_request_messages_strips_assistant_metadata() -> None:
 
 
 def _msg_response(
-    content: list[Any], stop_reason: str = "end_turn"
+    content: list[Any], stop_reason: StopReason = "end_turn"
 ) -> MessageResponse:
     return MessageResponse(
         id="msg_1",
@@ -462,7 +463,9 @@ def test_tool_schemas_builds_anthropic_schema_for_bare_callable(
         return msg
 
     agent._tool_map["echo"] = echo
-    schema = agent._tool_schemas()[0]
+    schemas = agent._tool_schemas()
+    assert schemas is not None  # _tool_map populated above
+    schema = schemas[0]
     assert schema["name"] == "echo"
     assert schema["description"] == "Echo the message."
     assert schema["input_schema"]["properties"]["msg"]["description"] == (
@@ -536,11 +539,11 @@ def _message_start(msg_id: str = "m1") -> RawMessageStartEvent:
     )
 
 
-def _delta(stop_reason: str) -> Delta:
-    return Delta(type="message_delta", stop_reason=stop_reason)
+def _delta(stop_reason: StopReason) -> Delta:
+    return Delta(stop_reason=stop_reason)
 
 
-def _msg_delta(stop_reason: str) -> RawMessageDeltaEvent:
+def _msg_delta(stop_reason: StopReason) -> RawMessageDeltaEvent:
     return RawMessageDeltaEvent(
         type="message_delta",
         delta=_delta(stop_reason),
