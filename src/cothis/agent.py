@@ -228,32 +228,40 @@ class MaxIterationsError(RuntimeError):
 
 
 def _coalesce_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge adjacent same-type blocks; drop empty text blocks.
+    """Drop empty text blocks and merge adjacent same-type blocks.
 
-    ``any_llm``'s OpenAI→Messages stream converter opens a NEW content block
-    on every reasoning→text transition in the chunk stream. For models that
-    interleave reasoning and text per chunk (e.g. ``gpt-oss-120b`` on
-    openrouter), this produces an assistant message with dozens of tiny
-    ``thinking`` fragments interleaved with empty ``text`` blocks (the latter
-    because ``delta.content is not None`` is True for the empty string).
-    Some providers silently return empty content when such a malformed
-    message is replayed on the next turn — observed as ``cothis chat``
-    finishing a tool turn and returning to ``>>>`` with no answer shown.
+    Reasoning-capable providers (e.g. ``gpt-oss-120b`` on openrouter) emit
+    ``reasoning`` and ``content`` as **mutually exclusive** per chunk: while
+    reasoning, ``delta.content == ""`` (explicit "no text right now"); while
+    answering, ``delta.reasoning`` is absent. any-llm's OpenAI→Messages
+    stream converter, however, opens a text-block lifecycle on any chunk
+    where ``delta.content is not None`` — so each reasoning chunk opens and
+    closes an empty ``text`` block, and the resulting assistant message
+    holds dozens of tiny ``thinking`` fragments interleaved with empty
+    ``text`` blocks. When that malformed message is replayed on the next
+    turn, some providers silently return empty content — observed as
+    ``cothis chat`` finishing a tool turn and returning to ``>>>`` with no
+    answer shown.
 
-    Coalescing restores the canonical block shape (one merged ``thinking``,
-    one ``text``, then ``tool_use``) so the next turn's request is
-    well-formed. Empty ``text`` blocks (pure noise from the converter) are
-    dropped. ``tool_use`` blocks are preserved verbatim and never merged.
+    This helper filters at storage time: empty ``text`` blocks (the explicit
+    "no content" signal) are dropped, and adjacent same-type blocks are
+    merged into one. The result matches the canonical Messages shape (one
+    ``thinking`` + one ``text`` + ``tool_use``). ``tool_use`` blocks are
+    preserved verbatim and never merged.
 
     cothis: ``thinking`` signatures are not preserved across merges — this
     slice does not pass the ``thinking`` param, so Anthropic doesn't validate
     them on the way back, and other providers' reasoning blocks never carry
-    a real signature anyway.
+    a real signature anyway. The proper fix is upstream (any-llm should use
+    ``if delta.content:`` rather than ``if delta.content is not None:``);
+    this is cothis's defensive layer so the agent works regardless.
     """
     out: list[dict[str, Any]] = []
     for block in content:
         btype = block.get("type")
-        # Drop empty text blocks (artifact of empty ``delta.content`` strings).
+        # Drop empty text blocks. An empty text block is the explicit "no
+        # content" signal from the provider (delta.content == "" during
+        # reasoning chunks); keeping it poisons the next-turn request.
         if btype == "text" and not (block.get("text") or "").strip():
             continue
         # Merge adjacent text/thinking blocks into the previous one.
