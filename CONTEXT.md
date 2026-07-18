@@ -7,6 +7,18 @@ startup — from Python callables, YAML declarations, and MCP servers
 
 ## Language
 
+**@model_metadata `max_tokens` resolution**:
+`Agent` passes an output-token cap to every `amessages` call. The cap is
+resolved by `cothis.model_metadata.resolve_max_tokens(model, provider,
+override)` against a bundled copy of litellm's
+`model_prices_and_context_window.json` (`src/cothis/data/`, read via
+`importlib.resources`). Match order: explicit `override` >
+exact `model` key > `{provider}/{model}` key > fallback `8192`.
+Per-entry field order: `max_output_tokens` > legacy `max_tokens` > 8192.
+The bundled JSON is refreshed weekly by the `update-model-prices`
+workflow (ADR-0007). Override: `--max-tokens` / `COTHIS_MAX_TOKENS`.
+_Avoid_: model context window, max context (the cap is on *output* tokens only).
+
 **Tool**:
 Any callable object the `Agent` registers by name and dispatches by
 calling with keyword arguments. The single dispatch protocol — there is

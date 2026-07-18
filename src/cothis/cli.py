@@ -18,7 +18,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 
-from cothis.agent import Agent, ToolCallEvent
+from cothis.agent import Agent, MaxIterationsError, ToolCallEvent
 from cothis.tools import discover_tools
 
 app = typer.Typer()
@@ -85,6 +85,12 @@ def ask(
     max_iterations: int = typer.Option(
         30, "--max-iterations", help="LLM round-trip cap."
     ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        envvar="COTHIS_MAX_TOKENS",
+        help="Output-token cap. Default: resolved from bundled litellm metadata for the model.",
+    ),
 ) -> None:
     """Run the agent once and print its final answer."""
     with console.status("loading...", spinner="dots"):
@@ -94,6 +100,7 @@ def ask(
             tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
             system=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
+            max_tokens=max_tokens,
         )
     with console.status("thinking...", spinner="dots"):
         answer = asyncio.run(_run_and_close(agent, prompt))
@@ -131,6 +138,12 @@ def chat(
     max_iterations: int = typer.Option(
         30, "--max-iterations", help="LLM round-trip cap."
     ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        envvar="COTHIS_MAX_TOKENS",
+        help="Output-token cap. Default: resolved from bundled litellm metadata for the model.",
+    ),
 ) -> None:
     """Run an interactive multi-turn chat session.
 
@@ -144,6 +157,7 @@ def chat(
             model=model,
             provider=provider,
             max_iterations=max_iterations,
+            max_tokens=max_tokens,
         )
     )
 
@@ -153,6 +167,7 @@ async def _chat_session(
     model: str,
     provider: str,
     max_iterations: int,
+    max_tokens: int | None,
 ) -> None:
     with console.status("loading...", spinner="dots"):
         agent = Agent(
@@ -161,6 +176,7 @@ async def _chat_session(
             tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
             system=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
+            max_tokens=max_tokens,
         )
 
     # prompt_toolkit over stdlib ``input()``: CPython auto-loads GNU readline
@@ -233,10 +249,19 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
             else:
                 accumulated += event
                 live.update(Markdown(accumulated))
+    except MaxIterationsError as exc:
+        if live is not None:
+            live.stop()
+        else:
+            status.stop()
+        console.print(f"[red]Error:[/red] {exc}")
+        return
     finally:
         if live is not None:
             live.stop()
             console.print()
+        elif accumulated:
+            console.print(Markdown(accumulated))
         else:
             status.stop()
 

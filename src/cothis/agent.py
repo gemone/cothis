@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # ruff's TC001 rule can't see the runtime use and wants it moved under
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
+from cothis.model_metadata import resolve_max_tokens
 from cothis.tools import (
     AfterExecuteError,
     HandleManager,
@@ -69,12 +70,6 @@ if TYPE_CHECKING:
 Message = dict[str, Any]
 
 logger = logging.getLogger("cothis.agent")
-
-# cothis: ``max_tokens`` is hardcoded this slice; slice #32 resolves it from
-# the bundled litellm ``model_prices.json`` (fallback 8192), overridable via
-# ``COTHIS_MAX_TOKENS`` / ``--max-tokens``. Upgrade path: replace this const
-# with the resolver once #32 lands.
-_DEFAULT_MAX_TOKENS = 8192
 
 
 def _system_param(system: str | list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
@@ -252,6 +247,11 @@ class Agent(BaseModel):
         parameter, never as a ``{role: system}`` message.
     max_iterations:
         Safety cap on the number of LLM round-trips per ``run``.
+    max_tokens:
+        Output-token cap forwarded to ``amessages``. ``None`` (default) →
+        resolved once from the bundled litellm model metadata at the first
+        ``amessages`` call (see ``cothis.model_metadata``); an explicit int
+        wins. CLI users set this via ``--max-tokens`` / ``COTHIS_MAX_TOKENS``.
     api_key / api_base:
         Forwarded to ``AnyLLM.create``. Default to the provider's env vars.
     """
@@ -263,6 +263,7 @@ class Agent(BaseModel):
     tools: list[Tool] = Field(default_factory=list)
     system: str | list[dict[str, Any]] | None = None
     max_iterations: int = 10
+    max_tokens: int | None = None
     api_key: str | None = None
     api_base: str | None = None
 
@@ -273,6 +274,9 @@ class Agent(BaseModel):
     # carry response metadata (id/model/stop_reason/usage); ``_request_messages``
     # strips them before the next ``amessages`` call.
     _messages: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    # Cached ``max_tokens`` resolved from litellm metadata on first use. ``-1``
+    # sentinel = not yet resolved; ``resolve_max_tokens`` never returns < 1.
+    _resolved_max_tokens: int = PrivateAttr(default=-1)
     _handle_manager: HandleManager = PrivateAttr(default_factory=HandleManager)
     _mcp_servers: list[MCPServer] = PrivateAttr(default_factory=list)
     _mcp_group: Any = PrivateAttr(default=None)
@@ -298,6 +302,22 @@ class Agent(BaseModel):
         # Tools without ``_handle_cls`` are skipped by ``bind``.
         for tool in self._tool_map.values():
             self._handle_manager.bind(tool)
+
+    def _effective_max_tokens(self) -> int:
+        """The ``max_tokens`` to pass to ``amessages`` for this Agent.
+
+        Resolved lazily on first call: an explicit ``self.max_tokens`` wins;
+        otherwise the litellm metadata is consulted once and cached. Cached
+        on the instance (not per-call) so the metadata lookup + JSON parse
+        happen at most once per ``Agent``.
+        """
+        if self.max_tokens is not None:
+            return self.max_tokens
+        if self._resolved_max_tokens < 0:
+            self._resolved_max_tokens = resolve_max_tokens(
+                self.model, self.provider
+            )
+        return self._resolved_max_tokens
 
     async def run(self, user_input: str) -> str:
         """Run the agent loop to completion and return the final answer.
@@ -332,7 +352,7 @@ class Agent(BaseModel):
                 await self._llm.amessages(
                     model=self.model,
                     messages=_request_messages(self._messages),
-                    max_tokens=_DEFAULT_MAX_TOKENS,
+                    max_tokens=self._effective_max_tokens(),
                     system=_system_param(self.system),
                     tools=self._tool_schemas(),
                 ),
@@ -403,7 +423,7 @@ class Agent(BaseModel):
                 await llm.amessages(
                     model=model,
                     messages=_request_messages(self._messages),
-                    max_tokens=_DEFAULT_MAX_TOKENS,
+                    max_tokens=self._effective_max_tokens(),
                     system=_system_param(self.system),
                     tools=tool_schemas,
                     stream=True,
@@ -415,6 +435,7 @@ class Agent(BaseModel):
             response_id: str | None = None
             response_model: str | None = None
             response_usage: Any = None
+            _yielded_text_indexes: set[int] = set()
             async for event in stream:
                 if isinstance(event, RawMessageStartEvent):
                     response_id = event.message.id
@@ -425,6 +446,7 @@ class Agent(BaseModel):
                     _apply_stream_delta(blocks[event.index], event.delta)
                     if isinstance(event.delta, TextDelta):
                         yield event.delta.text
+                        _yielded_text_indexes.add(event.index)
                 elif isinstance(event, RawContentBlockStopEvent):
                     block = blocks.get(event.index)
                     if block is not None:
@@ -451,6 +473,17 @@ class Agent(BaseModel):
                     else None,
                 }
             )
+
+            # Safety net: yield any text accumulated in blocks that wasn't
+            # yielded during streaming (e.g. isinstance check missed it).
+            for i, block in enumerate(content):
+                if (
+                    block.get("type") == "text"
+                    and i not in _yielded_text_indexes
+                ):
+                    text = block.get("text", "")
+                    if text:
+                        yield text
 
             if _tool_uses_in(content):
                 result_blocks = []
