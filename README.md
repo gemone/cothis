@@ -22,7 +22,17 @@ uv run cothis ask "List the files in this repo and explain what each one does."
 ```
 
 `openrouter` is the default provider and `openai/gpt-oss-120b` is the
-default model — both can be overridden. No key yet? Grab a free one
+default model — both can be overridden.
+
+> **Heads-up:** OpenRouter's free / default models are **not stable under
+> long context** — once a session's accumulated history (prompt + tool
+> output + history) grows past a few thousand tokens, the default model
+> starts dropping tool calls, truncating output, or returning errors. For
+> multi-turn `chat` sessions or large file reads, switch to a more
+> capable model via `-m` (e.g. `anthropic/claude-3.5-haiku`,
+> `openai/gpt-4.1-mini`).
+
+No key yet? Grab a free one
 from OpenRouter's
 [free-models collection](https://openrouter.ai/collections/free-models)
 and pass any of those IDs via `-m`:
