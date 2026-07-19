@@ -335,12 +335,13 @@ read automatically by `any-llm` based on the chosen provider.
 | -------------------------- | ----------------------------------------- | ---------------------- |
 | `COTHIS_PROVIDER`          | any-llm provider key (see table below).   | `openrouter`           |
 | `COTHIS_MODEL`             | Model identifier for the chosen provider. | `openai/gpt-oss-120b`  |
+| `COTHIS_MAX_TOKENS`        | Override the output-token cap (otherwise resolved per-model from bundled litellm metadata). | *(unset)* |
 | `COTHIS_TOOL_OUTPUT_FORMAT`| How `dict`/`list` tool results are serialised: `json`, `csv`, `tsv`, `yaml`. `str` results bypass this. | `json` |
 | `DEBUG`                    | If truthy, show all debug logs + tracebacks. | *(unset)*           |
 | `VERBOSE`                  | If truthy, show cothis tool-call I/O (no openai/httpx noise). | *(unset)* |
 
-Command-line flags (`-p` / `-m` / `--debug`) take precedence over env
-vars, which take precedence over defaults.
+Command-line flags (`-p` / `-m` / `--max-tokens` / `--debug`) take precedence
+over env vars, which take precedence over defaults.
 
 ### API keys
 
@@ -370,6 +371,36 @@ Mistral, OpenRouter, Ollama, Gemini, Groq, and many more.
 
 For the full list and each provider's API key env var / capabilities,
 see the [any-llm providers page](https://docs.mozilla.ai/providers).
+
+
+## Model metadata
+
+`max_tokens` (the output-token cap passed to the model) is resolved per
+model from a bundled copy of litellm's
+[`model_prices_and_context_window.json`](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)
+at `src/cothis/data/model_prices.json`. The resolver matches the model
+id, then `{provider}/{model}`, falling back to `8192` when neither is
+present. No network call at runtime.
+
+Override the resolved value with `--max-tokens` (or `COTHIS_MAX_TOKENS`)
+on either `ask` or `chat`:
+
+```bash
+uv run cothis ask --max-tokens 4096 "..."
+COTHIS_MAX_TOKENS=4096 uv run cothis chat
+```
+
+The bundled JSON is refreshed by the
+[`update-model-prices`](https://github.com/gemone/cothis/actions/workflows/update-model-prices.yml)
+workflow — a weekly Sunday 09:00 UTC cron (also runnable manually from
+the Actions tab). When litellm's source changes, the workflow opens a PR
+against `src/cothis/data/model_prices.json`; no PR when there's no diff.
+
+**Known ceiling**: litellm's `litellm_provider` field names diverge from
+any-llm's provider keys (e.g. `together_ai` vs `together`). cothis does
+not fuzzy-match on provider, so a model whose only key in litellm is
+provider-prefixed under a *different* name resolves to the 8192
+fallback. Override with `--max-tokens` in that case.
 
 
 ## Debug

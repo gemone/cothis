@@ -116,10 +116,11 @@ makes the model re-invoke tools (validated).
 
 ### 5. `max_tokens` hardcoded this slice
 
-#31 passes `max_tokens = 8192`. #32 replaces this with a resolver over
-the bundled litellm `model_prices_and_context_window.json`, fallback
-8192, overridable via `COTHIS_MAX_TOKENS` / `--max-tokens`, with a
-weekly GitHub workflow refreshing the JSON.
+#31 passes `max_tokens = 8192`. **Replaced by #32** (ADR-0007): the
+constant is removed; `max_tokens` is resolved per-model from the bundled
+litellm `model_prices_and_context_window.json`, fallback 8192,
+overridable via `COTHIS_MAX_TOKENS` / `--max-tokens`, with a weekly
+GitHub workflow refreshing the JSON.
 
 ## PR1 follow-on decisions (validated in #29 research; implemented later)
 

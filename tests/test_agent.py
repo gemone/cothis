@@ -31,6 +31,7 @@ from anthropic.types import (
     RawMessageStartEvent,
     RawMessageStopEvent,
     SignatureDelta,
+    ThinkingBlock,
     ThinkingDelta,
 )
 from anthropic.types.message import Message
@@ -53,6 +54,7 @@ from cothis.agent import (
     ToolCallEvent,
     _apply_stream_delta,
     _assistant_msg_from_response,
+    _coalesce_content,
     _concat_text,
     _finalize_stream_block,
     _init_stream_block,
@@ -749,3 +751,156 @@ async def test_run_stream_tolerates_empty_text_block(
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
     assert out == []  # no text deltas, but no crash
+
+
+@pytest.mark.asyncio
+async def test_run_stream_coalesces_fragmented_assistant_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION: gpt-oss-120b interleaves reasoning/text per chunk, and
+    any-llm's OpenAI→Messages stream converter opens a NEW content block on
+    every reasoning→text transition. The result is an assistant message with
+    dozens of tiny ``thinking`` fragments interleaved with empty ``text``
+    blocks. When that malformed message is replayed on the next turn, some
+    providers (openrouter) silently return empty content — observed in
+    ``cothis chat`` as the agent finishing a tool call and returning to
+    ``>>>`` with no answer.
+
+    ``_coalesce_content`` (applied in ``run_stream`` before storing) merges
+    adjacent same-type blocks and drops empty text blocks, restoring the
+    canonical block shape so the next-turn request is well-formed.
+
+    This test feeds a fragmented turn-1 stream (three thinking/text
+    alternations + a tool_use) and asserts the stored assistant message
+    coalesces to one ``thinking`` + one ``text`` + one ``tool_use`` block.
+    """
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["echo"] = lambda **kw: "ok"
+
+    # Fragmented stream: the converter emits thinking[0] text[1] thinking[2]
+    # text[3] thinking[4] text[5] tool_use[6], where text[1]/text[3] are
+    # empty (delta.content == "" gets a block start) and text[5] carries
+    # the actual content.
+    def turn1() -> list[Any]:
+        return [
+            _message_start("m1"),
+            _block_start(0, ThinkingBlock(type="thinking", thinking="", signature="")),
+            _block_delta(0, ThinkingDelta(type="thinking_delta", thinking="th")),
+            _block_stop(0),
+            _block_start(1, TextBlock(type="text", text="")),
+            _block_stop(1),  # empty text block (dropped on coalesce)
+            _block_start(2, ThinkingBlock(type="thinking", thinking="", signature="")),
+            _block_delta(2, ThinkingDelta(type="thinking_delta", thinking="ink")),
+            _block_stop(2),
+            _block_start(3, TextBlock(type="text", text="")),
+            _block_stop(3),  # empty text block (dropped)
+            _block_start(4, ThinkingBlock(type="thinking", thinking="", signature="")),
+            _block_stop(4),  # empty thinking fragment (kept — non-empty after merge)
+            _block_start(5, TextBlock(type="text", text="")),
+            _block_delta(5, TextDelta(type="text_delta", text="hello")),
+            _block_stop(5),
+            _block_start(
+                6, ToolUseBlock(type="tool_use", id="tu1", name="echo", input={})
+            ),
+            _block_stop(6),
+            _msg_delta("tool_use"),
+            _msg_stop(),
+        ]
+
+    state = {"n": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        # Turn 1: fragmented stream. Turn 2+: empty-text final turn.
+        state["n"] += 1
+        if state["n"] == 1:
+            return _stream_from(turn1())
+        return _stream_from([
+            _message_start("m2"),
+            _block_start(0, TextBlock(type="text", text="")),
+            _block_delta(0, TextDelta(type="text_delta", text="done")),
+            _block_stop(0),
+            _msg_delta("end_turn"),
+            _msg_stop(),
+        ])
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    out = await _drain(agent.run_stream("hi"))
+    # Stream yielded the text delta from turn 1 + tool event + turn 2 text.
+    assert "hello" in out
+    assert "done" in out
+    assert any(isinstance(e, ToolCallEvent) for e in out)
+
+    # Stored turn-1 assistant message is coalesced: 3 blocks, not 7.
+    stored_turn1 = [
+        m for m in agent._messages if m["role"] == "assistant"
+    ][0]
+    types = [b["type"] for b in stored_turn1["content"]]
+    assert types == ["thinking", "text", "tool_use"]
+    # Thinking fragments merged.
+    assert stored_turn1["content"][0]["thinking"] == "think"
+    # Text delta carried through.
+    assert stored_turn1["content"][1]["text"] == "hello"
+
+
+# --- _coalesce_content unit tests -------------------------------------------
+
+
+def test_coalesce_merges_adjacent_text_blocks() -> None:
+    out = _coalesce_content([
+        {"type": "text", "text": "Hello "},
+        {"type": "text", "text": "world"},
+    ])
+    assert out == [{"type": "text", "text": "Hello world"}]
+
+
+def test_coalesce_merges_adjacent_thinking_blocks() -> None:
+    out = _coalesce_content([
+        {"type": "thinking", "thinking": "th", "signature": "x"},
+        {"type": "thinking", "thinking": "ink", "signature": "y"},
+    ])
+    # Thinking merged; signatures are not preserved across merges (this slice
+    # doesn't pass the thinking param, so Anthropic doesn't validate them).
+    assert out == [{"type": "thinking", "thinking": "think", "signature": "x"}]
+
+
+def test_coalesce_drops_empty_text_blocks() -> None:
+    out = _coalesce_content([
+        {"type": "text", "text": ""},  # dropped
+        {"type": "text", "text": "   "},  # whitespace-only, dropped
+        {"type": "text", "text": "real"},
+    ])
+    assert out == [{"type": "text", "text": "real"}]
+
+
+def test_coalesce_preserves_tool_use_blocks() -> None:
+    blocks = [
+        {"type": "text", "text": "ok"},
+        {"type": "tool_use", "id": "tu1", "name": "echo", "input": {}},
+        {"type": "tool_use", "id": "tu2", "name": "echo", "input": {}},
+    ]
+    out = _coalesce_content(blocks)
+    # Two tool_use blocks are NOT merged into each other (each is a distinct call).
+    assert [b["type"] for b in out] == ["text", "tool_use", "tool_use"]
+    assert out[1]["id"] == "tu1"
+    assert out[2]["id"] == "tu2"
+
+
+def test_coalesce_does_not_mutate_input() -> None:
+    original = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+    snapshot = [dict(b) for b in original]
+    _coalesce_content(original)
+    assert original == snapshot
+
+
+def test_coalesce_alternating_thinking_then_text_stays_separate() -> None:
+    """Real shape from gpt-oss: thinking, text, thinking, text — coalesce
+    keeps each as a separate block (they alternate, not adjacent)."""
+    out = _coalesce_content([
+        {"type": "thinking", "thinking": "hm"},
+        {"type": "text", "text": "answer"},
+        {"type": "thinking", "thinking": "more"},
+        {"type": "text", "text": " continued"},
+    ])
+    assert [b["type"] for b in out] == ["thinking", "text", "thinking", "text"]
+    assert out[1]["text"] == "answer"
+    assert out[3]["text"] == " continued"

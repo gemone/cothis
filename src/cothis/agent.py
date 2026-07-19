@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # ruff's TC001 rule can't see the runtime use and wants it moved under
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
+from cothis.model_metadata import resolve_max_tokens
 from cothis.tools import (
     AfterExecuteError,
     HandleManager,
@@ -69,12 +70,6 @@ if TYPE_CHECKING:
 Message = dict[str, Any]
 
 logger = logging.getLogger("cothis.agent")
-
-# cothis: ``max_tokens`` is hardcoded this slice; slice #32 resolves it from
-# the bundled litellm ``model_prices.json`` (fallback 8192), overridable via
-# ``COTHIS_MAX_TOKENS`` / ``--max-tokens``. Upgrade path: replace this const
-# with the resolver once #32 lands.
-_DEFAULT_MAX_TOKENS = 8192
 
 
 def _system_param(system: str | list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
@@ -232,6 +227,63 @@ class MaxIterationsError(RuntimeError):
     """Raised when the agent exhausts its iteration budget before finishing."""
 
 
+def _coalesce_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop empty text blocks and merge adjacent same-type blocks.
+
+    Reasoning-capable providers (e.g. ``gpt-oss-120b`` on openrouter) emit
+    ``reasoning`` and ``content`` as **mutually exclusive** per chunk: while
+    reasoning, ``delta.content == ""`` (explicit "no text right now"); while
+    answering, ``delta.reasoning`` is absent. any-llm's OpenAI→Messages
+    stream converter, however, opens a text-block lifecycle on any chunk
+    where ``delta.content is not None`` — so each reasoning chunk opens and
+    closes an empty ``text`` block, and the resulting assistant message
+    holds dozens of tiny ``thinking`` fragments interleaved with empty
+    ``text`` blocks. When that malformed message is replayed on the next
+    turn, some providers silently return empty content — observed as
+    ``cothis chat`` finishing a tool turn and returning to ``>>>`` with no
+    answer shown.
+
+    This helper filters at storage time: empty ``text`` blocks (the explicit
+    "no content" signal) are dropped, and adjacent same-type blocks are
+    merged into one. The result matches the canonical Messages shape (one
+    ``thinking`` + one ``text`` + ``tool_use``). ``tool_use`` blocks are
+    preserved verbatim and never merged.
+
+    cothis: ``thinking`` signatures are not preserved across merges — this
+    slice does not pass the ``thinking`` param, so Anthropic doesn't validate
+    them on the way back, and other providers' reasoning blocks never carry
+    a real signature anyway. The proper fix is upstream (any-llm should use
+    ``if delta.content:`` rather than ``if delta.content is not None:``);
+    this is cothis's defensive layer so the agent works regardless.
+    """
+    out: list[dict[str, Any]] = []
+    for block in content:
+        btype = block.get("type")
+        # Drop empty text blocks. An empty text block is the explicit "no
+        # content" signal from the provider (delta.content == "" during
+        # reasoning chunks); keeping it poisons the next-turn request.
+        if btype == "text" and not (block.get("text") or "").strip():
+            continue
+        # Merge adjacent text/thinking blocks into the previous one.
+        if (
+            out
+            and out[-1].get("type") == btype
+            and btype in ("text", "thinking")
+        ):
+            if btype == "text":
+                out[-1]["text"] = (out[-1].get("text") or "") + (
+                    block.get("text") or ""
+                )
+            else:  # thinking
+                out[-1]["thinking"] = (out[-1].get("thinking") or "") + (
+                    block.get("thinking") or ""
+                )
+            continue
+        # Copy so we don't mutate the caller's dict on a later merge.
+        out.append(dict(block))
+    return out
+
+
 class Agent(BaseModel):
     """A minimal ReAct-style agent loop over any-llm.
 
@@ -252,6 +304,11 @@ class Agent(BaseModel):
         parameter, never as a ``{role: system}`` message.
     max_iterations:
         Safety cap on the number of LLM round-trips per ``run``.
+    max_tokens:
+        Output-token cap forwarded to ``amessages``. ``None`` (default) →
+        resolved once from the bundled litellm model metadata at the first
+        ``amessages`` call (see ``cothis.model_metadata``); an explicit int
+        wins. CLI users set this via ``--max-tokens`` / ``COTHIS_MAX_TOKENS``.
     api_key / api_base:
         Forwarded to ``AnyLLM.create``. Default to the provider's env vars.
     """
@@ -263,6 +320,7 @@ class Agent(BaseModel):
     tools: list[Tool] = Field(default_factory=list)
     system: str | list[dict[str, Any]] | None = None
     max_iterations: int = 10
+    max_tokens: int | None = None
     api_key: str | None = None
     api_base: str | None = None
 
@@ -273,6 +331,9 @@ class Agent(BaseModel):
     # carry response metadata (id/model/stop_reason/usage); ``_request_messages``
     # strips them before the next ``amessages`` call.
     _messages: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    # Cached ``max_tokens`` resolved from litellm metadata on first use. ``-1``
+    # sentinel = not yet resolved; ``resolve_max_tokens`` never returns < 1.
+    _resolved_max_tokens: int = PrivateAttr(default=-1)
     _handle_manager: HandleManager = PrivateAttr(default_factory=HandleManager)
     _mcp_servers: list[MCPServer] = PrivateAttr(default_factory=list)
     _mcp_group: Any = PrivateAttr(default=None)
@@ -298,6 +359,22 @@ class Agent(BaseModel):
         # Tools without ``_handle_cls`` are skipped by ``bind``.
         for tool in self._tool_map.values():
             self._handle_manager.bind(tool)
+
+    def _effective_max_tokens(self) -> int:
+        """The ``max_tokens`` to pass to ``amessages`` for this Agent.
+
+        Resolved lazily on first call via :func:`resolve_max_tokens`, which
+        applies the full precedence (override > model > {provider}/model >
+        fallback) and the non-positive-override safety (a stray ``0`` from a
+        misconfigured env var is treated as "not set"). Cached on the
+        instance (not per-call) so the metadata lookup + JSON parse happen
+        at most once per ``Agent``.
+        """
+        if self._resolved_max_tokens < 0:
+            self._resolved_max_tokens = resolve_max_tokens(
+                self.model, self.provider, self.max_tokens
+            )
+        return self._resolved_max_tokens
 
     async def run(self, user_input: str) -> str:
         """Run the agent loop to completion and return the final answer.
@@ -332,7 +409,7 @@ class Agent(BaseModel):
                 await self._llm.amessages(
                     model=self.model,
                     messages=_request_messages(self._messages),
-                    max_tokens=_DEFAULT_MAX_TOKENS,
+                    max_tokens=self._effective_max_tokens(),
                     system=_system_param(self.system),
                     tools=self._tool_schemas(),
                 ),
@@ -403,7 +480,7 @@ class Agent(BaseModel):
                 await llm.amessages(
                     model=model,
                     messages=_request_messages(self._messages),
-                    max_tokens=_DEFAULT_MAX_TOKENS,
+                    max_tokens=self._effective_max_tokens(),
                     system=_system_param(self.system),
                     tools=tool_schemas,
                     stream=True,
@@ -415,6 +492,7 @@ class Agent(BaseModel):
             response_id: str | None = None
             response_model: str | None = None
             response_usage: Any = None
+            _yielded_text_indexes: set[int] = set()
             async for event in stream:
                 if isinstance(event, RawMessageStartEvent):
                     response_id = event.message.id
@@ -425,6 +503,7 @@ class Agent(BaseModel):
                     _apply_stream_delta(blocks[event.index], event.delta)
                     if isinstance(event.delta, TextDelta):
                         yield event.delta.text
+                        _yielded_text_indexes.add(event.index)
                 elif isinstance(event, RawContentBlockStopEvent):
                     block = blocks.get(event.index)
                     if block is not None:
@@ -439,6 +518,27 @@ class Agent(BaseModel):
                     break
 
             content = [blocks[i] for i in sorted(blocks)]
+
+            # Safety net: yield any text accumulated in blocks that wasn't
+            # yielded during streaming (e.g. isinstance check missed it).
+            # Done BEFORE coalesce so list indexes still match block indexes.
+            for i, block in enumerate(content):
+                if (
+                    block.get("type") == "text"
+                    and i not in _yielded_text_indexes
+                ):
+                    text = block.get("text", "")
+                    if text:
+                        yield text
+
+            # Coalesce adjacent same-type blocks before storing. The
+            # OpenAI→Messages stream converter fragments blocks on every
+            # reasoning/text transition; without this, a gpt-oss turn can
+            # leave an assistant message with dozens of tiny thinking
+            # fragments + empty text blocks, which the next provider call
+            # silently rejects (chat returns to ``>>>`` with no answer).
+            content = _coalesce_content(content)
+
             self._messages.append(
                 {
                     "role": "assistant",
