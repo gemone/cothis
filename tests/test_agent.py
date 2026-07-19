@@ -21,7 +21,6 @@ import json
 import logging
 import re
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
@@ -148,16 +147,21 @@ def test_sanitize_tool_name_matches_openai_pattern(raw, expected) -> None:
 
 def test_tool_schemas_emit_sanitized_names(monkeypatch: pytest.MonkeyPatch) -> None:
     """Schema name reuses the wire-sanitised ``_tool_map`` key verbatim."""
-    agent = _patched_agent(monkeypatch)
-    fake_tool = SimpleNamespace(
-        __cothis_schema__={
-            "name": "fs.read",  # tool's own (unsanitised) name — overridden by map key
+
+    class _FakeSchemaTool:
+        __name__ = "fs.read"
+        __cothis_schema__ = {
+            "name": "fs.read",  # own (unsanitised) name — overridden by map key
             "description": "read",
             "input_schema": {"type": "object", "properties": {}},
         }
-    )
-    agent._tool_map = {"fs_read": fake_tool}  # key sanitised at registration
+
+        def __call__(self, *args: Any, **kw: Any) -> Any: ...
+
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map = {"fs_read": _FakeSchemaTool()}  # key sanitised at registration
     schemas = agent._tool_schemas()
+    assert schemas is not None
     assert len(schemas) == 1
     assert schemas[0]["name"] == "fs_read"  # wire name matches dispatch key
 
@@ -186,8 +190,19 @@ def test_init_warns_on_sanitised_key_collision(
     monkeypatch.setattr(
         any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
     )
-    tool_a = SimpleNamespace(__name__="fs.read", __call__=lambda **kw: "a")
-    tool_b = SimpleNamespace(__name__="fs_read", __call__=lambda **kw: "b")
+    class _ToolA:
+        __name__ = "fs.read"
+
+        def __call__(self, *args: Any, **kw: Any) -> Any:
+            return "a"
+
+    class _ToolB:
+        __name__ = "fs_read"
+
+        def __call__(self, *args: Any, **kw: Any) -> Any:
+            return "b"
+
+    tool_a, tool_b = _ToolA(), _ToolB()
     with caplog.at_level(logging.WARNING, logger="cothis.agent"):
         agent = Agent(model="x", provider="openrouter", tools=[tool_a, tool_b])
     assert agent._tool_map == {"fs_read": tool_b}  # last-write-wins
