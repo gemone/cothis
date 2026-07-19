@@ -122,7 +122,6 @@ def _load_agents_md() -> str | None:
     Returns ``None`` when no file is found (or all found files are empty).
     """
     import os
-    from pathlib import Path
 
     pattern = os.environ.get("COTHIS_AGENTS_PATTERN", "AGENTS.md")
     patterns = [p.strip() for p in pattern.split(",")]
@@ -142,8 +141,10 @@ def _load_agents_md() -> str | None:
     ).expanduser()
 
     # Map layer names to their directories (only layers present in the order).
-    # ponytail: static dict of layer→dir; unknown layer names are silently
-    # skipped (no error — the user might have a future layer in their env).
+    # Unknown layer names are logged at debug (visible under --debug) but
+    # never fatal — the user might have a future layer in their env. A typo
+    # in COTHIS_AGENTS_ORDER surfaces there rather than as a silent empty block.
+    _KNOWN_LAYERS = ("user-agents", "user-cothis", "project")
     layer_dirs: dict[str, Path] = {}
     for name in layer_order:
         if name == "user-agents" and user_global:
@@ -152,7 +153,11 @@ def _load_agents_md() -> str | None:
             layer_dirs[name] = cothis_home
         elif name == "project":
             layer_dirs[name] = Path.cwd()
-        # unknown → skip
+        elif name not in _KNOWN_LAYERS:
+            logger.debug(
+                "COTHIS_AGENTS_ORDER: unknown layer %r skipped (known: %s)",
+                name, ", ".join(_KNOWN_LAYERS),
+            )
 
     parts: list[str] = []
     for name in layer_order:
@@ -175,15 +180,38 @@ def _read_first_matching(directory: Path, patterns: list[str]) -> str | None:
     Returns ``None`` when no file is found or the matched file is empty
     (after stripping). Patterns are literal filenames, not globs.
     """
+    import locale
+
+    fallback = locale.getpreferredencoding(False)
     for pat in patterns:
         filepath = Path(directory) / pat
         try:
-            text = filepath.read_text(encoding="utf-8")
-        except (OSError, FileNotFoundError, IsADirectoryError):
+            text = _read_text(filepath, fallback)
+        except OSError:
             continue
-        if text.strip():
+        if text and text.strip():
             return text
     return None
+
+
+def _read_text(filepath: Path, fallback_encoding: str) -> str | None:
+    """Read *filepath* as UTF-8, then *fallback_encoding*; ``None`` if neither decodes.
+
+    ponytail: two-tier decode covers UTF-8 (~99% of AGENTS.md) plus
+    Windows/legacy encodings (GBK/CP1252/etc. via the locale fallback).
+    Skip — never ``errors="replace"`` — on decode failure: garbled bytes
+    injected into the system prompt are worse than the block being absent.
+    Auto-detection (chardet) would be a new dep for a rare case; revisit
+    only if the locale tier measurably falls short.
+    """
+    try:
+        return filepath.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return filepath.read_text(encoding=fallback_encoding)
+    except (UnicodeDecodeError, LookupError):
+        return None
 
 
 def _assistant_msg_from_response(response: MessageResponse) -> dict[str, Any]:

@@ -62,6 +62,7 @@ from cothis.agent import (
     _init_stream_block,
     _load_agents_md,
     _read_first_matching,
+    _read_text,
     _request_messages,
     _system_param,
     _tool_result_block,
@@ -1119,6 +1120,39 @@ def test_read_first_matching_skips_empty_file(
     (tmp_path / "A.md").write_text("   \n  ")
     result = _read_first_matching(tmp_path, ["A.md"])
     assert result is None
+
+
+def test_read_text_decodes_utf8(tmp_path: Path) -> None:
+    f = tmp_path / "A.md"
+    f.write_text("héllo 中文", encoding="utf-8")
+    assert _read_text(f, "gbk") == "héllo 中文"
+
+
+def test_read_text_falls_back_to_locale_encoding(tmp_path: Path) -> None:
+    # GBK bytes that are NOT valid UTF-8 — exercises the fallback tier.
+    f = tmp_path / "A.md"
+    f.write_bytes("你好".encode("gbk"))
+    assert _read_text(f, "gbk") == "你好"
+
+
+def test_read_text_returns_none_when_neither_decodes(tmp_path: Path) -> None:
+    # 0x80 is invalid in both UTF-8 and ASCII — confirms we skip (return
+    # None) rather than raise or lossy-replace with U+FFFD.
+    f = tmp_path / "A.md"
+    f.write_bytes(b"\x80\xff")
+    assert _read_text(f, "ascii") is None
+
+
+def test_read_first_matching_reads_gbk_via_locale_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # End-to-end: a non-UTF-8 file is readable when the locale fallback
+    # matches its encoding. Locks in that bad bytes never crash the run.
+    import locale as _locale
+
+    (tmp_path / "AGENTS.md").write_bytes("规则".encode("gbk"))
+    monkeypatch.setattr(_locale, "getpreferredencoding", lambda _x: "gbk")
+    assert _read_first_matching(tmp_path, ["AGENTS.md"]) == "规则"
 
 
 def test_system_param_str_calls_assembler_and_includes_agents_md(
