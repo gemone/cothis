@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 # Runtime imports of the Anthropic stream-event types: ``isinstance`` dispatch
@@ -64,8 +65,6 @@ if TYPE_CHECKING:
     from any_llm import AnyLLM
     from any_llm.types.messages import MessageResponse, MessageStreamEvent
 
-    from cothis.tools import MCPClientTool
-
 
 Message = dict[str, Any]
 
@@ -75,18 +74,142 @@ logger = logging.getLogger("cothis.agent")
 def _system_param(system: str | list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     """Build the ``amessages`` ``system`` parameter as a block list.
 
-    A ``str`` persona becomes a single text block carrying
-    ``cache_control: {type: ephemeral}``. A pre-built block list is passed
-    through unchanged (the caller owns ``cache_control`` placement — e.g. the
-    AGENTS.md assembler in #33). ``None`` → ``None`` (no system param sent).
+    A ``str`` persona is assembled via ``_assemble_system`` into
+    ``[persona_block, agents_md_block?, catalog_slot?]``. A pre-built block
+    list is passed through unchanged. ``None`` → ``None``.
     """
     if system is None:
         return None
     if isinstance(system, str):
-        return [
-            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
-        ]
+        return _assemble_system(system)
     return system
+
+
+def _assemble_system(persona: str) -> list[dict[str, Any]]:
+    """Build the system block list: ``[persona, agents_md?, catalog?]``.
+
+    Each block carries ``cache_control: {type: ephemeral}``. The AGENTS.md
+    block is included only when at least one file is found; the catalog
+    block slot is reserved for #30 (no-op until skills land).
+    """
+    blocks: list[dict[str, Any]] = [
+        {"type": "text", "text": persona, "cache_control": {"type": "ephemeral"}}
+    ]
+    agents_md = _load_agents_md()
+    if agents_md is not None:
+        blocks.append(
+            {
+                "type": "text",
+                "text": agents_md,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+    # ponytail: catalog block slot reserved for #30 — append a catalog block
+    # here when skills land.
+    return blocks
+
+
+def _load_agents_md() -> str | None:
+    """Read AGENTS.md from configured layers, concat, XML-tag.
+
+    Layers are read in ``COTHIS_AGENTS_ORDER`` (default:
+    ``user-agents,user-cothis,project``). Each layer matches the first file
+    matching any filename in ``COTHIS_AGENTS_PATTERN`` (default:
+    ``AGENTS.md``). User-global layers are skipped when
+    ``COTHIS_AGENTS_USER_GLOBAL`` is ``0`` / ``false`` / ``no`` / ``off``.
+    Returns ``None`` when no file is found (or all found files are empty).
+    """
+    import os
+
+    pattern = os.environ.get("COTHIS_AGENTS_PATTERN", "AGENTS.md")
+    patterns = [p.strip() for p in pattern.split(",")]
+
+    order = os.environ.get("COTHIS_AGENTS_ORDER", "user-agents,user-cothis,project")
+    layer_order = [o.strip() for o in order.split(",")]
+
+    user_global = os.environ.get("COTHIS_AGENTS_USER_GLOBAL", "1")
+    user_global = user_global.lower() not in ("0", "false", "no", "off")
+
+    home = Path.home()
+    # cothis: mirror cli.py's COTHIS_HOME resolution so empty/unset/~/ all
+    # behave identically across modules. Extract a shared resolver if a
+    # third caller appears.
+    cothis_home = Path(
+        os.environ.get("COTHIS_HOME") or (home / ".cothis")
+    ).expanduser()
+
+    # Map layer names to their directories (only layers present in the order).
+    # Unknown layer names are logged at debug (visible under --debug) but
+    # never fatal — the user might have a future layer in their env. A typo
+    # in COTHIS_AGENTS_ORDER surfaces there rather than as a silent empty block.
+    _KNOWN_LAYERS = ("user-agents", "user-cothis", "project")
+    layer_dirs: dict[str, Path] = {}
+    for name in layer_order:
+        if name == "user-agents" and user_global:
+            layer_dirs[name] = home / ".agents"
+        elif name == "user-cothis" and user_global:
+            layer_dirs[name] = cothis_home
+        elif name == "project":
+            layer_dirs[name] = Path.cwd()
+        elif name not in _KNOWN_LAYERS:
+            logger.debug(
+                "COTHIS_AGENTS_ORDER: unknown layer %r skipped (known: %s)",
+                name, ", ".join(_KNOWN_LAYERS),
+            )
+
+    parts: list[str] = []
+    for name in layer_order:
+        layer_dir = layer_dirs.get(name)
+        if layer_dir is None:
+            continue
+        content = _read_first_matching(layer_dir, patterns)
+        if content is None:
+            continue
+        parts.append(f'<agents_md type="{name}">\n{content}\n</agents_md>')
+
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def _read_first_matching(directory: Path, patterns: list[str]) -> str | None:
+    """Read the first file in *directory* matching any *patterns* pattern.
+
+    Returns ``None`` when no file is found or the matched file is empty
+    (after stripping). Patterns are literal filenames, not globs.
+    """
+    import locale
+
+    fallback = locale.getpreferredencoding(False)
+    for pat in patterns:
+        filepath = Path(directory) / pat
+        try:
+            text = _read_text(filepath, fallback)
+        except OSError:
+            continue
+        if text and text.strip():
+            return text
+    return None
+
+
+def _read_text(filepath: Path, fallback_encoding: str) -> str | None:
+    """Read *filepath* as UTF-8, then *fallback_encoding*; ``None`` if neither decodes.
+
+    ponytail: two-tier decode covers UTF-8 (~99% of AGENTS.md) plus
+    Windows/legacy encodings (GBK/CP1252/etc. via the locale fallback).
+    Skip — never ``errors="replace"`` — on decode failure: garbled bytes
+    injected into the system prompt are worse than the block being absent.
+    Auto-detection (chardet) would be a new dep for a rare case; revisit
+    only if the locale tier measurably falls short.
+    """
+    try:
+        return filepath.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return filepath.read_text(encoding=fallback_encoding)
+    except (UnicodeDecodeError, LookupError):
+        return None
 
 
 def _assistant_msg_from_response(response: MessageResponse) -> dict[str, Any]:
@@ -403,6 +526,11 @@ class Agent(BaseModel):
         await self._ensure_mcp()
         await self._ensure_handles()
 
+        # cothis: snapshot the assembled system prompt once per run so the
+        # persona/rules can't drift mid-loop (e.g. the agent edits ./AGENTS.md
+        # via a file tool) and we don't re-read disk every iteration.
+        system_param = _system_param(self.system)
+
         for _turn in range(self.max_iterations):
             response = cast(
                 "MessageResponse",
@@ -410,7 +538,7 @@ class Agent(BaseModel):
                     model=self.model,
                     messages=_request_messages(self._messages),
                     max_tokens=self._effective_max_tokens(),
-                    system=_system_param(self.system),
+                    system=system_param,
                     tools=self._tool_schemas(),
                 ),
             )
@@ -473,6 +601,8 @@ class Agent(BaseModel):
         model = self.model
         llm = self._llm
         max_iterations = self.max_iterations
+        # cothis: snapshot system prompt once per run — see Agent.run.
+        system_param = _system_param(self.system)
 
         for _turn in range(max_iterations):
             stream = cast(
@@ -481,7 +611,7 @@ class Agent(BaseModel):
                     model=model,
                     messages=_request_messages(self._messages),
                     max_tokens=self._effective_max_tokens(),
-                    system=_system_param(self.system),
+                    system=system_param,
                     tools=tool_schemas,
                     stream=True,
                 ),

@@ -46,3 +46,25 @@ from cothis.tools.mcp import (
     MCPClientTool,
     MCPServer,
 )
+
+__all__ = [
+    "AfterExecuteError",
+    "HandleManager",
+    "MCPClientTool",
+    "MCPServer",
+    "ResourceHandle",
+    "Tool",
+    "ToolDef",
+    "discover_tools",
+    "ensure_handle_ready",
+    "format_tool_output",
+    "handle_call_done",
+    "logger",
+    "mark_inflight",
+    "read",
+    "resource",
+    "run_hooks_safe",
+    "schema_for",
+    "tool",
+    "write",
+]
