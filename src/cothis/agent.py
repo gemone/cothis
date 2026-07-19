@@ -995,9 +995,16 @@ class Agent(BaseModel):
         If a Session is attached, the user message is enqueued for durable
         write here (R2) — one site covers both ``run`` and ``run_stream``;
         ``ask``'s ``_session is None`` skips it cheaply.
+
+        Uses ``_append_merged`` (not raw ``append``): a resumed session
+        can legitimately end in ``role="user"`` (crash mid-LLM-call, or
+        trailing ``tool_result`` with no final assistant), and Anthropic
+        rejects consecutive same-role messages with HTTP 400. Merging
+        mirrors ``Session.append_block``'s semantics so ``_messages`` and
+        ``session.messages`` stay consistent.
         """
         block = {"type": "text", "text": user_input}
-        self._messages.append({"role": "user", "content": [block]})
+        _append_merged(self._messages, "user", block)
         if self._session is not None:
             self._session.append_block("user", block)
 

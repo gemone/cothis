@@ -806,3 +806,99 @@ def test_attach_session_seeds_agent_messages_from_loaded_history(
         f"{request_user_texts}"
     )
     assert "follow up" in request_user_texts
+
+
+def test_ensure_messages_merges_when_history_ends_with_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: resume after a trailing-``user`` crash must not produce
+    consecutive ``user`` messages (Anthropic HTTP 400).
+
+    A session can legitimately end in ``role="user"``: crash mid-LLM-call
+    (user input persisted, assistant response never written), or trailing
+    ``tool_result`` with no final assistant. The next ``_ensure_messages``
+    call must merge into the trailing user message, not append a second
+    one. Before the fix, ``_ensure_messages`` used raw ``append`` and
+    ``_messages`` ended up as ``[..., {user}, {user}]``.
+    """
+    from unittest.mock import MagicMock
+
+    import any_llm
+
+    from cothis.agent import Agent
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM,
+        "create",
+        staticmethod(lambda *a, **kw: MagicMock()),
+    )
+
+    db_path = tmp_path / "sessions" / "session.db"
+    s1 = Session.new(db_path, cwd=tmp_path, model="x", flush_sync=True)
+    sid = s1.session_id
+    s1.append_message("user", [{"type": "text", "text": "first prompt"}])
+    s1.close()  # trailing user — no assistant reply
+
+    s2 = Session.load(db_path, sid, flush_sync=True)
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    agent.attach_session(s2)
+
+    # _ensure_messages is the unit: does a new user input merge?
+    agent._ensure_messages("follow up")
+
+    # Exactly ONE user message: two text blocks merged into it.
+    user_msgs = [m for m in agent._messages if m["role"] == "user"]
+    assert len(user_msgs) == 1, (
+        f"Expected 1 user message (merged), got {len(user_msgs)}. "
+        f"Consecutive user messages → Anthropic 400."
+    )
+    text_blocks = [
+        b for b in user_msgs[0]["content"]
+        if b.get("type") == "text"
+    ]
+    assert len(text_blocks) == 2
+    assert text_blocks[0]["text"] == "first prompt"
+    assert text_blocks[1]["text"] == "follow up"
+    s2.close()
+
+
+def test_crud_roundtrip_real_consumer_thread(tmp_path: Path) -> None:
+    """``flush_sync=False`` round-trip: real queue + daemon consumer.
+
+    All other CRUD tests use ``flush_sync=True`` (inline ``_drain_one``,
+    no thread), so a bug specific to the async path — close() joining
+    before the consumer drains, or the consumer writing out of order —
+    would slip through. This test enqueues a multi-turn conversation
+    through the real consumer, closes, reloads, and deep-compares.
+
+    Covers two async-path risks: (1) close()/drain timing — does the
+    consumer actually persist everything before close() returns? (2)
+    write ordering — do blocks land in enqueue order?
+    """
+    db_path = tmp_path / "sessions" / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m")  # flush_sync=False (default)
+    sid = s.session_id
+
+    # Multi-turn: user → assistant(tool_use) → tool_result → assistant(text).
+    s.append_message("user", [_user_text("turn 1")])
+    s.append_message("assistant", _assistant_with_tool_use("using tool", "tu1"))
+    s.append_block("user", _tool_result("tu1", "result data"))
+    s.append_message("assistant", [{"type": "text", "text": "final answer"}])
+    s.close()
+
+    s2 = Session.load(db_path, sid, flush_sync=True)
+    try:
+        # Ordering: roles must match enqueue order exactly.
+        assert [m["role"] for m in s2.messages] == [
+            "user", "assistant", "user", "assistant",
+        ]
+        # Data integrity: every enqueued block survived the async path.
+        assert s2.messages[0]["content"] == [_user_text("turn 1")]
+        assistant1_types = [b["type"] for b in s2.messages[1]["content"]]
+        assert assistant1_types == ["thinking", "text", "tool_use"]
+        tool_result = s2.messages[2]["content"][0]
+        assert tool_result["tool_use_id"] == "tu1"
+        assert tool_result["content"] == "result data"
+        assert s2.messages[3]["content"][0]["text"] == "final answer"
+    finally:
+        s2.close()

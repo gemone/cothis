@@ -741,26 +741,34 @@ class Session:
         """Drain the queue, join the consumer, close storage + lock.
 
         Idempotent. Unregisters the atexit hook so the process-exit path
-        can't double-fire. The consumer is given 30s to drain; if it
-        hasn't finished by then (huge backlog, slow disk), storage closes
-        anyway and the in-flight write may be partial — the same loss
-        ceiling as ``kill -9``.
+        can't double-fire. The consumer is given 5s to drain; if it
+        hasn't finished by then (huge backlog, slow disk), the lock is
+        released but storage is left OPEN — closing a SQLite connection
+        from this thread while the daemon consumer is mid-``write_atomic``
+        would make its next write raise ``ProgrammingError`` (swallowed
+        by ``_drain_one``), losing the entire remaining queue. The
+        daemon finishes its residual drain on its own; SQLite's WAL
+        recovery handles any incomplete txn at process exit. Same loss
+        ceiling as ``kill -9``, strictly better than force-close.
         """
         if self._closed:
             return
         self._closed = True
         atexit.unregister(self._drain_sync)
         self._stop.set()
+        consumer_alive = False
         if self._consumer is not None:
             # 5s is generous: a single sqlite commit is 30-70ms (issue's
             # measurement); 5s drains dozens of backlogged writes. If the
-            # consumer is somehow stuck (a bug), force-close rather than
-            # hang the whole CLI for half a minute.
+            # consumer is somehow stuck (a bug), don't hang the CLI for
+            # half a minute — release the lock and let the daemon finish.
             self._consumer.join(timeout=5)
-            if self._consumer.is_alive():
+            consumer_alive = self._consumer.is_alive()
+            if consumer_alive:
                 logger.warning(
                     "Session %s: consumer still alive after 5s close; "
-                    "force-closing (in-flight write may be lost).",
+                    "leaving storage open for daemon to finish draining "
+                    "(lock released; loss ceiling = kill -9).",
                     self._session_id,
                 )
         # Note: close() runs on the caller's thread (NOT via
@@ -769,6 +777,7 @@ class Session:
         # be on the same thread. The blocking cost is bounded (drain +
         # 5s join ceiling) and only paid once at session end.
         try:
-            self._storage.close()
+            if not consumer_alive:
+                self._storage.close()
         finally:
             self._release_lock()
