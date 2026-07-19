@@ -317,3 +317,46 @@ platform-map refactor — see ADR-0001. `platforms:` map keys (`linux` /
 `macos` / `unix` / `windows`) replace per-branch `if:` predicates; argv[0]
 / `shell:` gating replaces `has_shell()` / `has_exe()`.
 _Avoid_: (term retired; do not reintroduce without revisiting ADR-0001).
+
+**Session**:
+The durable unit of conversation history — one `cothis chat` invocation's
+accumulated turns, persisted to SQLite so it survives process exit (ADR-0006,
+ implemented in #34). A `Session` owns an in-memory `messages: list[dict]`
+that is isomorphic to `Agent._messages` (Anthropic block shape) — the
+Agent reads from this mirror after load; SQLite is its durable backing,
+never read from after the single load-time SELECT. Writes flow through an
+in-process queue to a single background consumer thread (or, in test mode,
+inline via `flush_sync=True`); `user` is enqueued on input, `tool_result`
+per-execution, `assistant` as one atomic multi-block write at MessageStop.
+`cothis chat` constructs a Session lazily (session_id always in memory;
+lock eager, `sessions` row + title + `.gitignore` lazy on first drain);
+`cothis ask` constructs none (ephemeral). One `Session` per process;
+a second process reaching a live session is refused via a cross-process
+file lock (filelock; `fcntl.flock` on POSIX, `msvcrt`+`kernel32` on Windows)
+on `<cache_dir>/<id>.lock` — decoupled from the db location because locks
+are flock carriers, not durable state.
+**Db resolution (three modes)**: `COTHIS_SESSIONS_TYPE=project` →
+`<cwd>/.agents/sessions/session.db` (split layout, per-project);
+`COTHIS_SESSIONS_DIR=<path>` → `<path>/session.db` (split layout, custom
+location); neither set → `$COTHIS_HOME/agents.db` (default single-file,
+unified entry for all sessions and eventually config/audit tables).
+Locks live under `$XDG_CACHE_HOME/cothis/` (default `~/.cache/cothis/`).
+_Avoid_: conversation (too generic), history (the message list, not the
+container), dialogue.
+
+**Block**:
+A single content element of an Anthropic message — exactly the Anthropic
+content-block dict shape (`text` / `thinking` / `tool_use` /
+`tool_result` / `image`). cothis does **not** define a separate Python
+type for blocks: the in-memory representation is the Anthropic dict, and
+SQLite stores one row per block with per-type columns (`content` /
+`signature` / `tool_id` / `tool_name` / `tool_input` / `tool_use_id` /
+`tool_output` / `image_source`) so inject/query/prune/compress are native
+SQL. A *Message* is `{role, content: list[Block]}`; Anthropic requires
+strict user/assistant alternation, so consecutive same-role appends
+(per-execution `tool_result`) merge into one Message. Atomic multi-block
+writes (the assistant at MessageStop) share one SQLite transaction;
+reload drops any trailing partial turn that would leave an orphan
+`tool_use` (no matching `tool_result`).
+_Avoid_: chunk, fragment, entry (all too generic); node (collides with
+the fork tree's session node, #35).

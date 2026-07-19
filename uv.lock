@@ -401,6 +401,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "any-llm-sdk", extra = ["all"] },
+    { name = "filelock" },
     { name = "griffe" },
     { name = "mcp" },
     { name = "pathspec" },
@@ -424,6 +425,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "any-llm-sdk", extras = ["all"], specifier = ">=1.17.0" },
+    { name = "filelock", specifier = ">=3.13" },
     { name = "griffe", specifier = ">=2.1.0" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "pathspec", specifier = ">=0.12.1" },

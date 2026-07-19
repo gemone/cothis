@@ -19,6 +19,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 
 from cothis.agent import Agent, MaxIterationsError, ToolCallEvent
+from cothis.session import Session, SessionLockedError
 from cothis.tools import discover_tools
 
 app = typer.Typer()
@@ -37,6 +38,31 @@ _COTHIS_HOME = Path(
     os.environ.get("COTHIS_HOME") or Path.home() / ".cothis"
 ).expanduser()
 _USER_TOOLS_DIR = _COTHIS_HOME / "tools"
+
+
+def _resolve_db_path() -> Path:
+    """Resolve the SQLite db path for session persistence.
+
+    Three modes (highest precedence first):
+
+    1. ``COTHIS_SESSIONS_TYPE=project`` → ``<cwd>/.agents/sessions/session.db``
+       (split layout — db lives in the project, sessions scoped per-project).
+    2. ``COTHIS_SESSIONS_DIR=<path>`` → ``<path>/session.db``
+       (split layout at a caller-chosen location).
+    3. neither set → ``$COTHIS_HOME/agents.db``
+       (default single-file layout — all sessions in one global db).
+
+    Lock files live elsewhere (``$XDG_CACHE_HOME/cothis/<id>.lock``) and are
+    resolved inside ``Session``; this function only owns the db path. Split
+    modes share the ``session.db`` filename to distinguish them from the
+    default ``agents.db`` (which is the unified entry the user sees by
+    default and may eventually hold config/audit tables too).
+    """
+    if os.environ.get("COTHIS_SESSIONS_TYPE") == "project":
+        return Path.cwd() / ".agents" / "sessions" / "session.db"
+    if dir_env := os.environ.get("COTHIS_SESSIONS_DIR"):
+        return Path(dir_env).expanduser() / "session.db"
+    return _COTHIS_HOME / "agents.db"
 
 
 @app.callback()
@@ -169,38 +195,52 @@ async def _chat_session(
     max_iterations: int,
     max_tokens: int | None,
 ) -> None:
-    with console.status("loading...", spinner="dots"):
-        agent = Agent(
-            model=model,
-            provider=provider,
-            tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
-            system=DEFAULT_SYSTEM_PROMPT,
-            max_iterations=max_iterations,
-            max_tokens=max_tokens,
-        )
-
-    # prompt_toolkit over stdlib ``input()``: CPython auto-loads GNU readline
-    # for ``input``, which mis-counts CJK / wide-char column width and leaves
-    # visual residue on backspace. prompt_toolkit does its own ``wcwidth``
-    # accounting and renders the line itself.
-    #
-    # ``prompt_async`` (not sync ``prompt`` via ``asyncio.to_thread``): the
-    # latter races interpreter shutdown on Ctrl-C — the worker stays blocked
-    # on stdin while the main thread unwinds, producing a noisy traceback.
-    session = PromptSession()
+    # ``chat`` is the only command that persists. ``Session.new`` takes the
+    # cross-process lock eagerly; the sessions row + title are written
+    # lazily on the first user message's drain. ``ask`` constructs no
+    # Session (ephemeral). ``SessionLockedError`` from new() propagates
+    # through asyncio.run → main()'s BaseException handler → "Error: …" +
+    # exit 1.
+    session = Session.new(_resolve_db_path(), cwd=Path.cwd(), model=model)
     try:
-        while True:
-            try:
-                prompt_text = await session.prompt_async(">>> ")
-            except EOFError, KeyboardInterrupt:
-                console.print()
-                break
-            if not prompt_text.strip():
-                continue
+        with console.status("loading...", spinner="dots"):
+            agent = Agent(
+                model=model,
+                provider=provider,
+                tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
+                system=DEFAULT_SYSTEM_PROMPT,
+                max_iterations=max_iterations,
+                max_tokens=max_tokens,
+            )
+            agent.attach_session(session)
 
-            await _stream_answer(agent, prompt_text)
+        # prompt_toolkit over stdlib ``input()``: CPython auto-loads GNU readline
+        # for ``input``, which mis-counts CJK / wide-char column width and leaves
+        # visual residue on backspace. prompt_toolkit does its own ``wcwidth``
+        # accounting and renders the line itself.
+        #
+        # ``prompt_async`` (not sync ``prompt`` via ``asyncio.to_thread``): the
+        # latter races interpreter shutdown on Ctrl-C — the worker stays blocked
+        # on stdin while the main thread unwinds, producing a noisy traceback.
+        prompts = PromptSession()
+        try:
+            while True:
+                try:
+                    prompt_text = await prompts.prompt_async(">>> ")
+                except EOFError, KeyboardInterrupt:
+                    console.print()
+                    break
+                if not prompt_text.strip():
+                    continue
+
+                await _stream_answer(agent, prompt_text)
+        finally:
+            await agent.aclose()
     finally:
-        await agent.aclose()
+        # Idempotent: if attach succeeded, ``agent.aclose()`` above already
+        # closed the session (drained + joined + storage closed). If Agent
+        # construction failed before attach, this is the cleanup path.
+        session.close()
 
 
 async def _stream_answer(agent: Agent, prompt: str) -> None:

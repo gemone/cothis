@@ -128,9 +128,73 @@ These are stable decisions recorded here as the PR1 index; each lands
 in its own slice and may extend this ADR.
 
 - **Session store — one row per block, WAL + `BEGIN deferred`.**
-  Validated: `BEGIN deferred` fairness=1.0 across 4 concurrent writers;
-  `BEGIN IMMEDIATE` starves. Hot DB at `$COTHIS_HOME/cothis.db`,
-  overridable via `COTHIS_SESSIONS_DIR`. Implemented in #34.
+  Validated: `BEGIN deferred` fairness=1.0 across 4 concurrent writers
+  (multi-process — the real CLI contention model; multi-thread fairness
+  is dominated by the GIL and doesn't distinguish deferred from
+  immediate, so #34's unit test pins the *configuration* rather than
+  the empirical fairness number); `BEGIN IMMEDIATE` starves. Hot DB at
+  `$COTHIS_HOME/agents.db`, overridable via `COTHIS_SESSIONS_DIR`.
+  Implemented in #34. **#34 specifics** (decisions captured during the
+  #34 grilling, recorded here so #35/#36 inherit them):
+  - **Three-mode db resolution** (CLI ``_resolve_db_path``):
+    `COTHIS_SESSIONS_TYPE=project` → ``<cwd>/.agents/sessions/session.db``
+    (split layout, per-project); `COTHIS_SESSIONS_DIR=<path>` →
+    ``<path>/session.db`` (split layout at a custom location); neither set
+    → ``$COTHIS_HOME/agents.db`` (default single-file, all sessions in one
+    global db that may eventually host config/audit tables too). Split
+    modes use the ``session.db`` filename to distinguish them from the
+    default ``agents.db``.
+  - **Lock files decoupled from db location.** Live under
+    ``$XDG_CACHE_HOME/cothis/<session_id>.lock`` (default ``~/.cache/cothis/``),
+    not next to the db. Rationale: locks are flock carriers — regenerable,
+    not durable state; the cache dir is the OS-managed location for such
+    files and is wiped on reboot / tmpfs clear. ``session_id`` is uuid4
+    (globally unique) so no db-scoping is needed to prevent collisions.
+  - **Block in memory = Anthropic dict.** No new `Block` Python type;
+    `Session.messages` is `list[dict]` isomorphic to `Agent._messages`,
+    so load → Agent is zero-translation.
+  - **Assistant message atomic, drop-trailing on reload.** A multi-block
+    `append_message` is one txn (N blocks all-or-nothing). Reload detects
+    an assistant `tool_use` with no matching `tool_result` and drops the
+    orphan tail (Q2-A) — AND persists the truncate via
+    ``DELETE FROM blocks WHERE msg_idx >= cut``, so a later reload doesn't
+    re-truncate at the same point and silently erase appended messages.
+    Prevents the unpaired-tool_use 400 on the next `amessages` call.
+    `is_error` on `tool_result` is ephemeral (not stored): the assistant
+    has already reacted to it by reload time.
+  - **All-sync queue + consumer.** `queue.Queue` + daemon
+    `threading.Thread`; `flush_sync=True` is a deterministic test mode
+    that bypasses the queue. `Session.close()` is sync and idempotent,
+    called **directly** from `Agent.aclose()` (NOT via `asyncio.to_thread` —
+    filelock's lock counter is thread-local); `atexit` is the process-level
+    fallback and unregisters on a clean close.
+  - **Cross-platform lock via `filelock`.** Uses `fcntl.flock` on POSIX,
+    `msvcrt.locking` + `kernel32` on Windows. ``filelock`` was already a
+    transitive dependency (via `huggingface-hub`); promoting it to direct
+    is 0 new install. Lock failure raises `SessionLockedError` → CLI exit
+    non-zero.
+  - **`.gitignore` auto-write only in split mode.** When the db's parent
+    dir resolves inside the process cwd (only possible under
+    `TYPE=project` or `DIR=<cwd>/...`), write `*` to
+    `<db_dir>/.gitignore` (skip-if-exists). Default mode's `~/.cothis/`
+    is never in a project, so no `.gitignore` is written there.
+  - **`chat` lazy row, eager lock.** `Session.new` allocates the id +
+    takes the lock immediately; the `sessions` row + title (first user
+    text, first-line then 60 chars with `...`) are written lazily on the
+    first enqueue's drain. `ask` constructs no Session at all (ephemeral).
+  - **`schema_version` + `PRAGMA user_version` both placeholders.** The
+    column writes 1 and the PRAGMA is set to 1, but neither is read in
+    #34 — pure placeholders so #30 / #35 don't need migrations.
+  - **`fork` deferred to #35.** The `sessions` table has `parent_id` /
+    `parent_seq` columns (NULL, not written); the `fork` method, the
+    in-memory SessionGraph, and ancestor-chain context assembly all land
+    in #35.
+  - **`--resume <id>` CLI flag deferred to #35.** `Session.load` exists
+    (the round-trip test + #35's resume UI use it), but `cothis chat`
+    in #34 only creates fresh sessions.
+  - **`history/<date>.db` deferred to #36.** Split mode creates the
+    ``session.db`` + ``lock/`` skeleton but does NOT implement per-day
+    archive DBs — that's #36's cross-DB archival work.
 - **Fork tree — in-memory graph over flat rows.** Validated 3-10×
   faster than a recursive CTE; `flat_load` of 10k sessions ≈ 9ms.
   Implemented in #35.
