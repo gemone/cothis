@@ -65,8 +65,6 @@ if TYPE_CHECKING:
     from any_llm import AnyLLM
     from any_llm.types.messages import MessageResponse, MessageStreamEvent
 
-    from cothis.tools import MCPClientTool
-
 
 Message = dict[str, Any]
 
