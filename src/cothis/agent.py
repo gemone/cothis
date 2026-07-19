@@ -18,6 +18,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -263,6 +264,17 @@ def _tool_result_block(
     return block
 
 
+def _sanitize_tool_name(name: str) -> str:
+    """Map a tool name onto the OpenAI tool-name pattern ``^[a-zA-Z0-9_-]+$``.
+
+    cothis namespaces tools with ``.``/``:`` (``fs.read``, ``mcp:context7``),
+    which Anthropic accepts but strict OpenAI-compatible providers (DeepSeek)
+    reject with HTTP 400. Applied symmetrically — schema names sent to the
+    model and ``_tool_map`` keys both run through this, so dispatch matches.
+    """
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+
+
 def _concat_text(content: list[dict[str, Any]]) -> str:
     """Concatenate every ``text`` block in an assistant content list."""
     return "".join(
@@ -473,11 +485,29 @@ class Agent(BaseModel):
             api_base=self.api_base,
         )
         self._mcp_servers = [t for t in self.tools if isinstance(t, MCPServer)]
-        self._tool_map = {
-            tool.__name__: tool
-            for tool in self.tools
-            if not isinstance(tool, MCPServer)
-        }
+        # ponytail: ``_tool_map`` keys are wire-sanitised (``fs.read`` →
+        # ``fs_read``) so OpenAI-compatible providers (DeepSeek) accept them.
+        # Tool objects keep their original ``__name__`` for routing/logging;
+        # the sanitisation is a registration-layer concern only.
+        self._tool_map = {}
+        for tool in self.tools:
+            if isinstance(tool, MCPServer):
+                continue
+            key = _sanitize_tool_name(tool.__name__)
+            if key in self._tool_map:
+                # ponytail: collision ceiling — two names sanitising to the
+                # same wire key (``fs.read`` vs ``fs_read``) shadow silently.
+                # ``discover_tools`` dedupes on the unsanitised ``__name__``,
+                # so it can't see these; surface here. Last-write-wins matches
+                # the dict-comprehension semantics this replaces.
+                logger.warning(
+                    "Tool %r shadowed by %r (both map to wire name %r); "
+                    "keeping the latter.",
+                    self._tool_map[key].__name__,
+                    tool.__name__,
+                    key,
+                )
+            self._tool_map[key] = tool
         # Bind the handle manager to every tool that declared a ResourceHandle
         # Tools without ``_handle_cls`` are skipped by ``bind``.
         for tool in self._tool_map.values():
@@ -557,7 +587,21 @@ class Agent(BaseModel):
                 continue
 
             # Non-tool turn: final answer (text concat; empty → "").
-            return _concat_text(msg["content"])
+            answer = _concat_text(msg["content"])
+            if not answer:
+                # cothis: surface the diagnostic fields the response already
+                # carries. ``stop_reason`` tells the user whether it was a
+                # ``max_tokens`` cutoff (raise --max-tokens), an ``end_turn``
+                # (model chose to say nothing — switch models), or something
+                # else. Avoids hard-coding one direction of advice.
+                logger.warning(
+                    "Model returned empty text (stop_reason=%s, blocks=%s, "
+                    "usage=%s).",
+                    msg.get("stop_reason"),
+                    [b.get("type", "?") for b in msg["content"]],
+                    msg.get("usage"),
+                )
+            return answer
 
         raise MaxIterationsError(
             f"Agent did not finish within {self.max_iterations} iterations."
@@ -687,9 +731,14 @@ class Agent(BaseModel):
                 for block in content:
                     if block.get("type") != "tool_use":
                         continue
-                    yield ToolCallEvent(
-                        name=block["name"], arguments=block["input"]
+                    # cothis: restore the original (pre-sanitisation) name for
+                    # human-facing output; the model emits the wire name.
+                    display_name = getattr(
+                        self._tool_map.get(block["name"]),
+                        "__name__",
+                        block["name"],
                     )
+                    yield ToolCallEvent(name=display_name, arguments=block["input"])
                     is_error, output = await self._execute_tool(block)
                     result_blocks.append(
                         _tool_result_block(block["id"], output, is_error)
@@ -789,7 +838,8 @@ class Agent(BaseModel):
             instance._session = session
             self._handle_manager.adopt(handle_cls, instance)
             for mcp_tool in tools:
-                if mcp_tool.__name__ in self._tool_map:
+                name = _sanitize_tool_name(mcp_tool.__name__)
+                if name in self._tool_map:
                     logger.error(
                         "MCP tool %r skipped: name already registered "
                         "(server %r); keeping the existing tool",
@@ -799,8 +849,8 @@ class Agent(BaseModel):
                     continue
                 mcp_tool._handle_cls = handle_cls
                 self._handle_manager.bind(mcp_tool)
-                self._tool_map[mcp_tool.__name__] = mcp_tool
-                self._mcp_tool_names.add(mcp_tool.__name__)
+                self._tool_map[name] = mcp_tool
+                self._mcp_tool_names.add(name)
 
     async def aclose(self) -> None:
         """Close the MCP session group and reset for safe reuse.
@@ -847,7 +897,12 @@ class Agent(BaseModel):
         """
         if not self._tool_map:
             return None
-        return [schema_for(tool) for tool in self._tool_map.values()]
+        # Map keys are already wire-sanitised at registration — use them
+        # verbatim so the schema name matches what dispatch looks up.
+        return [
+            {**schema_for(tool), "name": name}
+            for name, tool in self._tool_map.items()
+        ]
 
     def _ensure_messages(self, user_input: str) -> None:
         """Append the user turn to ``self._messages`` as an Anthropic block list.
@@ -890,6 +945,11 @@ class Agent(BaseModel):
         if tool is None:
             logger.debug("tool %s not in tool_map (unknown tool)", name)
             return True, f"Error: unknown tool {name!r}."
+
+        # cothis: the model echoes the wire-sanitised name (``fs.read`` →
+        # ``fs_read``); restore the original ``__name__`` so human-facing
+        # logs and error messages match the documented tool names.
+        name = getattr(tool, "__name__", name)
 
         try:
             args = run_hooks_safe(tool, "_run_pre_execute", args)

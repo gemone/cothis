@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -64,6 +66,7 @@ from cothis.agent import (
     _read_first_matching,
     _read_text,
     _request_messages,
+    _sanitize_tool_name,
     _system_param,
     _tool_result_block,
 )
@@ -123,6 +126,95 @@ def test_concat_text_joins_text_blocks_skips_others() -> None:
 
 def test_concat_text_empty_when_no_text_blocks() -> None:
     assert _concat_text([{"type": "thinking", "thinking": "x"}]) == ""
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("fs.read", "fs_read"),
+        ("mcp:context7", "mcp_context7"),
+        ("date.calculate", "date_calculate"),
+        ("code.lines", "code_lines"),
+        ("echo", "echo"),
+        ("resolve-library-id", "resolve-library-id"),
+    ],
+)
+def test_sanitize_tool_name_matches_openai_pattern(raw, expected) -> None:
+    """cothis dotted/colon names must map onto ``^[a-zA-Z0-9_-]+$``."""
+    out = _sanitize_tool_name(raw)
+    assert out == expected
+    assert re.fullmatch(r"[a-zA-Z0-9_-]+", out)
+
+
+def test_tool_schemas_emit_sanitized_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Schema name reuses the wire-sanitised ``_tool_map`` key verbatim."""
+    agent = _patched_agent(monkeypatch)
+    fake_tool = SimpleNamespace(
+        __cothis_schema__={
+            "name": "fs.read",  # tool's own (unsanitised) name — overridden by map key
+            "description": "read",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    )
+    agent._tool_map = {"fs_read": fake_tool}  # key sanitised at registration
+    schemas = agent._tool_schemas()
+    assert len(schemas) == 1
+    assert schemas[0]["name"] == "fs_read"  # wire name matches dispatch key
+
+
+def test_execute_tool_resolves_sanitised_wire_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatch hits the map directly — key was sanitised at registration."""
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["fs_read"] = lambda **kw: "ok"  # sanitised key
+    is_error, out = asyncio.run(
+        agent._execute_tool({"name": "fs_read", "input": {}})
+    )
+    assert is_error is False
+    assert out == "ok"
+
+
+def test_init_warns_on_sanitised_key_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two names sanitising to the same wire key (``fs.read`` vs ``fs_read``)
+    must log a WARNING; last-write-wins matches dict semantics."""
+    import any_llm
+
+    monkeypatch.setattr(
+        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
+    )
+    tool_a = SimpleNamespace(__name__="fs.read", __call__=lambda **kw: "a")
+    tool_b = SimpleNamespace(__name__="fs_read", __call__=lambda **kw: "b")
+    with caplog.at_level(logging.WARNING, logger="cothis.agent"):
+        agent = Agent(model="x", provider="openrouter", tools=[tool_a, tool_b])
+    assert agent._tool_map == {"fs_read": tool_b}  # last-write-wins
+    assert "shadowed" in caplog.text
+    assert "fs.read" in caplog.text
+
+
+def test_execute_tool_error_message_uses_original_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Human-facing error string uses the tool's original ``__name__``
+    (``fs.read``), not the wire-sanitised key the model echoed."""
+
+    class _Boom:
+        __name__ = "fs.read"
+
+        def __call__(self, **kw: Any) -> str:
+            raise ValueError("nope")
+
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["fs_read"] = _Boom()  # sanitised key, original __name__
+    is_error, msg = asyncio.run(
+        agent._execute_tool({"name": "fs_read", "input": {}})
+    )
+    assert is_error is True
+    assert "fs.read" in msg  # original name
+    assert "fs_read" not in msg  # wire name must not leak into diagnostics
 
 
 def test_request_messages_strips_assistant_metadata() -> None:
@@ -335,6 +427,25 @@ def test_run_returns_empty_on_end_turn_without_text(
 
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     assert asyncio.run(agent.run("hi")) == ""
+
+
+def test_run_empty_text_warning_carries_stop_reason_and_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The empty-text warning surfaces ``stop_reason`` and ``usage`` so the
+    user can diagnose (max-tokens cutoff vs end_turn) without guessing."""
+    agent = _patched_agent(monkeypatch)
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        return _msg_response([], stop_reason="end_turn")
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    with caplog.at_level(logging.WARNING, logger="cothis.agent"):
+        assert asyncio.run(agent.run("hi")) == ""
+    assert "stop_reason" in caplog.text
+    assert "end_turn" in caplog.text
+    assert "usage" in caplog.text
 
 
 def test_run_raises_max_iterations_on_persistent_tool_use(
@@ -630,7 +741,9 @@ async def test_run_stream_tool_turn_yields_event_then_final(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent = _patched_agent(monkeypatch)
-    agent._tool_map["add"] = lambda **kw: str(kw["a"] + kw["b"])
+    _add = lambda **kw: str(kw["a"] + kw["b"])  # noqa: E731
+    _add.__name__ = "add"  # ToolCallEvent.name restores the tool's __name__
+    agent._tool_map["add"] = _add
 
     def turn1() -> list[Any]:
         return [
@@ -668,6 +781,57 @@ async def test_run_stream_tool_turn_yields_event_then_final(
     assert out[0].name == "add"
     assert out[0].arguments == {"a": 2, "b": 3}
     assert out[1] == "5"
+
+
+@pytest.mark.asyncio
+async def test_run_stream_tool_call_event_uses_original_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ToolCallEvent.name`` is the tool's original ``__name__`` (``fs.read``),
+    not the wire-sanitised name the model echoes back (``fs_read``)."""
+
+    class _Dotted:
+        __name__ = "fs.read"
+
+        def __call__(self, **kw: Any) -> str:
+            return "ok"
+
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["fs_read"] = _Dotted()  # sanitised key, dotted __name__
+
+    def turn1() -> list[Any]:
+        return [
+            _message_start("m1"),
+            _block_start(
+                0, ToolUseBlock(type="tool_use", id="tu1", name="fs_read", input={})
+            ),
+            _block_delta(
+                0, InputJSONDelta(type="input_json_delta", partial_json="{}")
+            ),
+            _block_stop(0),
+            _msg_delta("tool_use"),
+            _msg_stop(),
+        ]
+
+    def turn2() -> list[Any]:
+        return [
+            _message_start("m2"),
+            _block_start(0, TextBlock(type="text", text="ok")),
+            _block_stop(0),
+            _msg_delta("end_turn"),
+            _msg_stop(),
+        ]
+
+    turn = {"i": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        turn["i"] += 1
+        return _stream_from(turn1() if turn["i"] == 1 else turn2())
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    out = await _drain(agent.run_stream("hi"))
+    assert isinstance(out[0], ToolCallEvent)
+    assert out[0].name == "fs.read"  # original, not wire-sanitised "fs_read"
 
 
 @pytest.mark.asyncio

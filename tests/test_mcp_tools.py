@@ -847,11 +847,11 @@ async def test_agent_separates_server_and_resolves_tools(
 
     await agent._ensure_mcp()
     try:
-        assert "test-server.add" in agent._tool_map
+        assert "test-server_add" in agent._tool_map
         schemas = agent._tool_schemas()
         assert schemas is not None
         names = [s["name"] for s in schemas]
-        assert "test-server.add" in names
+        assert "test-server_add" in names
     finally:
         await agent.aclose()
     # aclose tears the group down and re-arms resolution.
@@ -871,7 +871,7 @@ async def test_agent_dispatches_mcp_tool_via_execute(
         tools=[MCPServer(name="mcp:test-server", params=None)],
     )
     await agent._ensure_mcp()
-    tu = {"name": "test-server.add", "input": {"a": 5, "b": 6}}
+    tu = {"name": "test-server_add", "input": {"a": 5, "b": 6}}
     try:
         assert await agent._execute_tool(tu) == (False, "11")
     finally:
@@ -902,7 +902,7 @@ async def test_agent_mcp_failure_keeps_other_tools(
     await agent._ensure_mcp()
     try:
         assert "noop" in agent._tool_map
-        assert "test-server.add" not in agent._tool_map
+        assert "test-server_add" not in agent._tool_map
     finally:
         await agent.aclose()
 
@@ -962,19 +962,19 @@ async def test_agent_reconnects_after_aclose(monkeypatch: pytest.MonkeyPatch) ->
         provider="openrouter",
         tools=[MCPServer(name="mcp:test-server", params=None)],
     )
-    tu = {"name": "test-server.add", "input": {"a": 1, "b": 2}}
+    tu = {"name": "test-server_add", "input": {"a": 1, "b": 2}}
 
     await agent._ensure_mcp()
     assert await agent._execute_tool(tu) == (False, "3")
     await agent.aclose()
     # State is reset: no stale MCP tools, guard re-armed.
-    assert "test-server.add" not in agent._tool_map
+    assert "test-server_add" not in agent._tool_map
     assert agent._mcp_started is False
 
     # Second cycle reconnects and works again.
     await agent._ensure_mcp()
     try:
-        assert "test-server.add" in agent._tool_map
+        assert "test-server_add" in agent._tool_map
         assert await agent._execute_tool(tu) == (False, "3")
         assert len(calls) == 2
     finally:
@@ -1010,7 +1010,7 @@ async def test_duplicate_prefixed_tool_name_first_wins(
         await agent._ensure_mcp()
     try:
         # Only one ``test-server.add`` registered (first-write-wins).
-        assert sum(1 for n in agent._tool_map if n == "test-server.add") == 1
+        assert sum(1 for n in agent._tool_map if n == "test-server_add") == 1
         # The duplicate was logged at ERROR.
         assert "already registered" in caplog.text
         assert "test-server.add" in caplog.text
@@ -1047,8 +1047,8 @@ async def test_prefix_falls_back_to_yaml_label_when_server_name_empty(
     await agent._ensure_mcp()
     try:
         # Prefix falls back to the YAML label, not the empty server name.
-        assert "my-label.add" in agent._tool_map
-        assert "my-label.boom" in agent._tool_map
+        assert "my-label_add" in agent._tool_map
+        assert "my-label_boom" in agent._tool_map
         # No bare or dot-prefixed name leaked through.
         assert ".add" not in agent._tool_map
         assert "add" not in agent._tool_map
@@ -1089,9 +1089,9 @@ async def test_empty_name_prefix_stable_across_reacquire(
 
     await agent._ensure_mcp()
     try:
-        assert "aaa.add" in agent._tool_map
-        assert "zzz.add" in agent._tool_map
-        tool_a = agent._tool_map["aaa.add"]
+        assert "aaa_add" in agent._tool_map
+        assert "zzz_add" in agent._tool_map
+        tool_a = agent._tool_map["aaa_add"]
         cls_a = getattr(tool_a, "_handle_cls")
 
         # Reclaim aaa's session only; zzz stays live.
@@ -1165,9 +1165,9 @@ async def test_mcp_startup_adopts_session_into_pool(monkeypatch: pytest.MonkeyPa
         # One connect at startup.
         assert len(calls) == 1
         # The MCP tool is registered.
-        assert "test-server.add" in agent._tool_map
+        assert "test-server_add" in agent._tool_map
         # Its handle class is live in the pool.
-        mcp_tool = agent._tool_map["test-server.add"]
+        mcp_tool = agent._tool_map["test-server_add"]
         handle_cls = getattr(mcp_tool, "_handle_cls")
         assert handle_cls is not None
         assert handle_cls in agent._handle_manager._live
@@ -1185,7 +1185,7 @@ async def test_mcp_keepalive_reclaims_session(monkeypatch: pytest.MonkeyPatch) -
 
     await agent._ensure_mcp()
     try:
-        mcp_tool = agent._tool_map["test-server.add"]
+        mcp_tool = agent._tool_map["test-server_add"]
         handle_cls = getattr(mcp_tool, "_handle_cls")
         assert handle_cls in agent._handle_manager._live
 
@@ -1212,7 +1212,7 @@ async def test_mcp_self_heal_reconnects_on_next_call(
 
     await agent._ensure_mcp()
     try:
-        mcp_tool = agent._tool_map["test-server.add"]
+        mcp_tool = agent._tool_map["test-server_add"]
         handle_cls = getattr(mcp_tool, "_handle_cls")
 
         # Reclaim the session.
@@ -1241,7 +1241,7 @@ async def test_mcp_pin_session_not_reclaimed(monkeypatch: pytest.MonkeyPatch) ->
 
     await agent._ensure_mcp()
     try:
-        mcp_tool = agent._tool_map["test-server.add"]
+        mcp_tool = agent._tool_map["test-server_add"]
         handle_cls = getattr(mcp_tool, "_handle_cls")
 
         import time
@@ -1278,7 +1278,7 @@ async def test_mcp_self_heal_dispatch_after_reclaim(
     await agent._ensure_mcp()
     try:
         # Call 1 — works.
-        tu = {"name": "test-server.add", "input": {"a": 2, "b": 3}}
+        tu = {"name": "test-server_add", "input": {"a": 2, "b": 3}}
         is_error, result = await agent._execute_tool(tu)
         assert is_error is False
         assert "5" in result
@@ -1286,14 +1286,14 @@ async def test_mcp_self_heal_dispatch_after_reclaim(
         # Reclaim the session (idle past keepalive).
         import time
 
-        mcp_tool = agent._tool_map["test-server.add"]
+        mcp_tool = agent._tool_map["test-server_add"]
         handle_cls = getattr(mcp_tool, "_handle_cls")
         agent._handle_manager._last_used[handle_cls] = time.time() - 100
         await agent._handle_manager.reclaim_idle()
         assert handle_cls not in agent._handle_manager._live
 
         # Call 2 — self-heal: _execute_tool's ensure_handle_ready reconnects.
-        tu = {"name": "test-server.add", "input": {"a": 10, "b": 20}}
+        tu = {"name": "test-server_add", "input": {"a": 10, "b": 20}}
         is_error, result = await agent._execute_tool(tu)
         assert is_error is False
         assert "30" in result
