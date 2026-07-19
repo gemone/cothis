@@ -337,6 +337,9 @@ read automatically by `any-llm` based on the chosen provider.
 | `COTHIS_MODEL`             | Model identifier for the chosen provider. | `openai/gpt-oss-120b`  |
 | `COTHIS_MAX_TOKENS`        | Override the output-token cap (otherwise resolved per-model from bundled litellm metadata). | *(unset)* |
 | `COTHIS_TOOL_OUTPUT_FORMAT`| How `dict`/`list` tool results are serialised: `json`, `csv`, `tsv`, `yaml`. `str` results bypass this. | `json` |
+| `COTHIS_AGENTS_PATTERN`    | Comma-separated filenames scanned for the AGENTS.md context block (first match per layer wins). | `AGENTS.md` |
+| `COTHIS_AGENTS_ORDER`      | Ordered layer names for AGENTS.md assembly. Unknown names are skipped. | `user-agents,user-cothis,project` |
+| `COTHIS_AGENTS_USER_GLOBAL`| If falsy (`0`/`false`/`no`/`off`), skip the user-global layers (`~/.agents`, `~/.cothis`). | `1` |
 | `DEBUG`                    | If truthy, show all debug logs + tracebacks. | *(unset)*           |
 | `VERBOSE`                  | If truthy, show cothis tool-call I/O (no openai/httpx noise). | *(unset)* |
 

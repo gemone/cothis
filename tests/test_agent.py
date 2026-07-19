@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
@@ -53,11 +54,14 @@ from cothis.agent import (
     MaxIterationsError,
     ToolCallEvent,
     _apply_stream_delta,
+    _assemble_system,
     _assistant_msg_from_response,
     _coalesce_content,
     _concat_text,
     _finalize_stream_block,
     _init_stream_block,
+    _load_agents_md,
+    _read_first_matching,
     _request_messages,
     _system_param,
     _tool_result_block,
@@ -70,7 +74,12 @@ if TYPE_CHECKING:
 # --- pure helpers -----------------------------------------------------------
 
 
-def test_system_param_str_becomes_persona_block_with_cache_control() -> None:
+def test_system_param_str_becomes_persona_block_with_cache_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cothis.agent._load_agents_md", lambda: None
+    )
     assert _system_param("You are helpful.") == [
         {
             "type": "text",
@@ -356,6 +365,7 @@ def test_run_sends_system_param_and_anthropic_messages(
         return _msg_response([TextBlock(type="text", text="ok")])
 
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    monkeypatch.setattr("cothis.agent._load_agents_md", lambda: None)
     asyncio.run(agent.run("hi"))
     # system is a block list with cache_control, not a {role: system} message.
     assert seen["system"] == [
@@ -904,3 +914,314 @@ def test_coalesce_alternating_thinking_then_text_stays_separate() -> None:
     assert [b["type"] for b in out] == ["thinking", "text", "thinking", "text"]
     assert out[1]["text"] == "answer"
     assert out[3]["text"] == " continued"
+
+
+# --- system prompt assembly (#33) -------------------------------------------
+
+
+def test_assemble_system_persona_block_with_cache_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cothis.agent._load_agents_md", lambda: None)
+    blocks = _assemble_system("You are helpful.")
+    assert len(blocks) == 1
+    assert blocks[0] == {
+        "type": "text",
+        "text": "You are helpful.",
+        "cache_control": {"type": "ephemeral"},
+    }
+
+
+def test_assemble_system_includes_agents_md_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cothis.agent._load_agents_md", lambda: '<agents_md type="project">\nrules\n</agents_md>'
+    )
+    blocks = _assemble_system("persona")
+    assert len(blocks) == 2
+    assert blocks[0]["text"] == "persona"
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[1]["text"] == '<agents_md type="project">\nrules\n</agents_md>'
+    assert blocks[1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_assemble_system_omits_agents_md_when_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cothis.agent._load_agents_md", lambda: None)
+    blocks = _assemble_system("persona")
+    assert len(blocks) == 1
+
+
+def test_load_agents_md_three_layer_concat_xml_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3 layers → concatenated, XML-tagged in order."""
+    home = tmp_path / "home"
+    agents_dir = home / ".agents"
+    cothis_home = tmp_path / "cothis_home"
+    project = tmp_path / "project"
+    for d in (agents_dir, cothis_home, project):
+        d.mkdir(parents=True, exist_ok=True)
+
+    (agents_dir / "AGENTS.md").write_text("rule from agents")
+    (cothis_home / "AGENTS.md").write_text("rule from cothis")
+    (project / "AGENTS.md").write_text("rule from project")
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("COTHIS_HOME", str(cothis_home))
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: project)
+
+    result = _load_agents_md()
+    assert result is not None
+    assert '<agents_md type="user-agents">' in result
+    assert '<agents_md type="user-cothis">' in result
+    assert '<agents_md type="project">' in result
+    assert "rule from agents" in result
+    assert "rule from cothis" in result
+    assert "rule from project" in result
+    # Order: user-agents comes first
+    idx_agents = result.index("user-agents")
+    idx_cothis = result.index("user-cothis")
+    idx_project = result.index("project")
+    assert idx_agents < idx_cothis < idx_project
+
+
+def test_load_agents_md_omits_when_no_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    cothis_home = tmp_path / "cothis_home"
+    cothis_home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("COTHIS_HOME", str(cothis_home))
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: project)
+
+    assert _load_agents_md() is None
+
+
+def test_load_agents_md_custom_pattern(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "CODING.md").write_text("coding rules")
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: Path("/nonexistent"))
+    monkeypatch.setenv("COTHIS_HOME", "/nonexistent")
+    monkeypatch.setenv("COTHIS_AGENTS_PATTERN", "CODING.md,RULES.md")
+    monkeypatch.setenv("COTHIS_AGENTS_USER_GLOBAL", "0")
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: project)
+
+    result = _load_agents_md()
+    assert result is not None
+    assert "coding rules" in result
+    assert "CODING.md" not in result  # filename not in output, only content
+
+
+def test_load_agents_md_custom_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    cothis_home = tmp_path / "cothis_home"
+    for d in (project, cothis_home):
+        d.mkdir()
+
+    (project / "AGENTS.md").write_text("project rules")
+    (cothis_home / "AGENTS.md").write_text("cothis rules")
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: Path("/nonexistent"))
+    monkeypatch.setenv("COTHIS_HOME", str(cothis_home))
+    monkeypatch.setenv("COTHIS_AGENTS_ORDER", "project,user-cothis")
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: project)
+
+    result = _load_agents_md()
+    assert result is not None
+    idx_project = result.index("project")
+    idx_cothis = result.index("user-cothis")
+    assert idx_project < idx_cothis  # project comes first
+
+
+def test_load_agents_md_user_global_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agents_dir = tmp_path / "home" / ".agents"
+    cothis_home = tmp_path / "cothis_home"
+    project = tmp_path / "project"
+    for d in (agents_dir, cothis_home, project):
+        d.mkdir(parents=True, exist_ok=True)
+
+    (agents_dir / "AGENTS.md").write_text("agents rule")
+    (cothis_home / "AGENTS.md").write_text("cothis rule")
+    (project / "AGENTS.md").write_text("project rule")
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "home")
+    monkeypatch.setenv("COTHIS_HOME", str(cothis_home))
+    monkeypatch.setenv("COTHIS_AGENTS_USER_GLOBAL", "0")
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: project)
+
+    result = _load_agents_md()
+    assert result is not None
+    # Only project layer should be present
+    assert "user-agents" not in result
+    assert "user-cothis" not in result
+    assert "project" in result
+    assert "project rule" in result
+
+
+def test_load_agents_md_skips_empty_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("   \n  ")  # whitespace only
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: Path("/nonexistent"))
+    monkeypatch.setenv("COTHIS_HOME", "/nonexistent")
+    monkeypatch.setenv("COTHIS_AGENTS_USER_GLOBAL", "0")
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: project)
+
+    assert _load_agents_md() is None
+
+
+def test_read_first_matching_first_match_wins(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "A.md").write_text("first")
+    (tmp_path / "B.md").write_text("second")
+    result = _read_first_matching(tmp_path, ["A.md", "B.md"])
+    assert result == "first"
+
+
+def test_read_first_matching_falls_back_to_second(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "B.md").write_text("second")
+    result = _read_first_matching(tmp_path, ["A.md", "B.md"])
+    assert result == "second"
+
+
+def test_read_first_matching_returns_none_when_no_match(
+    tmp_path: Path,
+) -> None:
+    result = _read_first_matching(tmp_path, ["NOPE.md"])
+    assert result is None
+
+
+def test_read_first_matching_skips_empty_file(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "A.md").write_text("   \n  ")
+    result = _read_first_matching(tmp_path, ["A.md"])
+    assert result is None
+
+
+def test_system_param_str_calls_assembler_and_includes_agents_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: _system_param(str) → assembled blocks with AGENTS.md."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("project rules")
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: Path("/nonexistent"))
+    monkeypatch.setenv("COTHIS_HOME", "/nonexistent")
+    monkeypatch.setenv("COTHIS_AGENTS_USER_GLOBAL", "0")
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: project)
+
+    blocks = _system_param("be brief")
+    assert blocks is not None
+    assert len(blocks) == 2
+    assert blocks[0] == {
+        "type": "text",
+        "text": "be brief",
+        "cache_control": {"type": "ephemeral"},
+    }
+    assert "project rules" in blocks[1]["text"]
+    assert blocks[1]["cache_control"] == {"type": "ephemeral"}
+
+
+# --- regression: system prompt assembled once per run (#33 review) ----------
+
+
+def test_run_assembles_system_prompt_once_per_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A str persona must snapshot the system prompt, not re-read per turn.
+
+    Without the hoist, ``_load_agents_md`` runs every iteration → disk I/O
+    each turn and the persona/rules can drift if ``./AGENTS.md`` changes
+    mid-run (e.g. via a file tool). This test fails if the snapshot is
+    moved back inside the loop.
+    """
+    agent = _patched_agent(monkeypatch)
+    agent.system = "be brief"
+    agent._tool_map["echo"] = lambda **kw: "ok"
+    state = {"turn": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        state["turn"] += 1
+        if state["turn"] == 1:
+            return _msg_response(
+                [ToolUseBlock(type="tool_use", id="tu1", name="echo", input={})],
+                stop_reason="tool_use",
+            )
+        return _msg_response([TextBlock(type="text", text="done")])
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+
+    call_count = {"n": 0}
+
+    def counting_loader() -> None:
+        call_count["n"] += 1
+        return None
+
+    monkeypatch.setattr("cothis.agent._load_agents_md", counting_loader)
+    asyncio.run(agent.run("hi"))
+    # Two turns (tool call then final answer) → exactly one assembly.
+    assert state["turn"] == 2
+    assert call_count["n"] == 1
+
+
+# --- regression: COTHIS_HOME="" resolves to ~/.cothis, not cwd (#33 review) -
+
+
+def test_load_agents_md_empty_cothis_home_does_not_read_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``COTHIS_HOME=""`` must behave like cli.py: unset → ``~/.cothis``.
+
+    Without mirroring cli.py's resolution, the empty string became
+    ``Path('.')`` (cwd), so the project file was double-read under a
+    misleading ``<agents_md type="user-cothis">`` tag.
+    """
+    home = tmp_path / "home"
+    cothis_default = home / ".cothis"
+    project = tmp_path / "project"
+    for d in (home, cothis_default, project):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # Both layers present; the bug would tag project content as user-cothis.
+    (cothis_default / "AGENTS.md").write_text("real cothis rules")
+    (project / "AGENTS.md").write_text("project rules")
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("COTHIS_HOME", "")  # set-but-empty → must fall back
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: project)
+
+    result = _load_agents_md()
+    assert result is not None
+    # user-cothis layer must carry the ~/.cothis content, not the project's.
+    assert "real cothis rules" in result
+    # project layer still present and correctly tagged.
+    assert '<agents_md type="project">' in result
+    # And user-cothis did NOT accidentally read the project file.
+    cothis_block = result.split('<agents_md type="user-cothis">')[1].split(
+        "</agents_md>"
+    )[0]
+    assert "project rules" not in cothis_block

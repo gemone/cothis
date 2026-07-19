@@ -284,6 +284,32 @@ scattered across the directory tree (`.agents/tools/date/current.yaml`
 tool's declared `name:` field, not its file path.
 _Avoid_: group, category, module (overloaded with Python module).
 
+**System prompt assembly**:
+How `Agent` builds the `system` parameter for `amessages`. When
+`system` is a `str` (the persona), `_assemble_system` produces
+`[persona_block, agents_md_block?, catalog_slot?]`, each block
+carrying `cache_control: {type: ephemeral}`. A pre-built
+`list[dict]` is passed through unchanged; `None` omits the
+parameter entirely. The AGENTS.md block is sourced from
+`_load_agents_md` (see Context file); the catalog slot is reserved
+for #30 (no-op until skills land). Implemented in #33.
+_Avoid_: system prompt (collides with the raw persona text).
+
+**Context file (`AGENTS.md`)**:
+A Markdown file injected into the system prompt to give the model
+project-specific instructions. Read from three layers in
+`COTHIS_AGENTS_ORDER` (default `user-agents,user-cothis,project`):
+`~/.agents/` (user-agents), `~/.cothis/` (user-cothis), and `./`
+(project). Each layer matches the first filename in
+`COTHIS_AGENTS_PATTERN` (comma-separated, default `AGENTS.md`).
+User-global layers are toggled off by setting
+`COTHIS_AGENTS_USER_GLOBAL` to `0` / `false` / `no` / `off`. Layers
+are concatenated as one block, XML-tagged
+(`<agents_md type="layer-name">…</agents_md>`); the block is omitted
+entirely when no files are found. Empty files (after stripping) are
+skipped. Env/CLI only — no config file.
+_Avoid_: project file, rules file, instructions (too generic).
+
 **`if:` expression** *(removed)*:
 A previous design used GitHub-Actions-style `if:` expressions on command
 branches, with `has_shell()` / `has_exe()` predicates. Removed in the
