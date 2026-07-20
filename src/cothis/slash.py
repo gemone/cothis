@@ -1,17 +1,11 @@
 """``cothis.slash`` — chat REPL slash command dispatch.
 
-A small async registry mapping ``/cmd`` → handler. The REPL checks the
-leading ``/`` before calling the agent; non-slash input passes through
-untouched. Unknown commands print a local error listing available
-commands — no LLM round-trip.
-
-Handlers receive a :class:`SlashContext` carrying the session (and any
-context the second consumer needs; the surface stays minimal until then).
+Async registry mapping ``/cmd`` → handler. The REPL checks the leading
+``/`` before calling the agent; non-slash input passes through untouched.
 """
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -33,35 +27,15 @@ class SlashContext:
 
 
 class SlashHandler(Protocol):
-    """Async callable taking a :class:`SlashContext` (plus optional args
-    parsed off the input line) and returning an optional message string."""
+    """Async callable ``(ctx, args: str) -> str | None``."""
 
-    async def __call__(self, ctx: SlashContext, args: str = "") -> str | None: ...
+    async def __call__(self, ctx: SlashContext, args: str) -> str | None: ...
 
 
 @dataclass
 class _Entry:
     handler: Any  # SlashHandler (Protocol; can't bind the async type cleanly)
     summary: str
-    takes_args: bool
-
-
-def _handler_takes_args(handler: Any) -> bool:
-    """``True`` iff ``handler`` declares ``(ctx, args)`` (not just ``(ctx)``).
-
-    Detected once at register time so dispatch doesn't pay a signature
-    introspection per call. ``functools.partial`` and lambdas are
-    handled by ``inspect.signature``'s normal unwrap behaviour.
-    """
-    try:
-        sig = inspect.signature(handler)
-    except (TypeError, ValueError):
-        return False
-    params = [
-        p for p in sig.parameters.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-    ]
-    return len(params) >= 2
 
 
 class SlashRegistry:
@@ -78,12 +52,9 @@ class SlashRegistry:
     def register(
         self, name: str, handler: Any, *, summary: str = "",
     ) -> None:
-        """Map ``name`` to ``handler``. Re-registering replaces silently."""
-        self._entries[name] = _Entry(
-            handler=handler,
-            summary=summary,
-            takes_args=_handler_takes_args(handler),
-        )
+        # cothis: silent overwrite — simplest contract; upgrade to a
+        # warning if a real collision bites.
+        self._entries[name] = _Entry(handler=handler, summary=summary)
 
     def names(self) -> list[str]:
         return sorted(self._entries)
@@ -110,10 +81,7 @@ class SlashRegistry:
         if entry is None:
             return self._render_unknown(name)
         ctx.args = args
-        result = (
-            await entry.handler(ctx, args) if entry.takes_args
-            else await entry.handler(ctx)
-        )
+        result = await entry.handler(ctx, args)
         return "" if result is None else result
 
     def _render_help(self) -> str:

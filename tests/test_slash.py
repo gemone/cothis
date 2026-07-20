@@ -1,9 +1,4 @@
-"""Tests for ``cothis.slash`` — chat REPL slash command framework.
-
-A small dispatch registry: name → async handler. Lines starting with
-``/`` in the chat REPL go through here instead of the agent loop.
-Unknown commands produce a local error listing available commands.
-"""
+"""Tests for ``cothis.slash`` — chat REPL slash command framework."""
 
 from __future__ import annotations
 
@@ -16,18 +11,13 @@ from cothis.slash import SlashContext, SlashRegistry
 if TYPE_CHECKING:
     from cothis.session import Session
 
-# ---------------------------------------------------------------------
-# registry + dispatch
-# ---------------------------------------------------------------------
-
 
 @pytest.mark.asyncio
 async def test_known_command_dispatches_to_handler() -> None:
-    """A registered command's handler runs and its return value surfaces."""
     reg = SlashRegistry()
     seen: dict[str, object] = {}
 
-    async def hello(ctx: SlashContext) -> str:
+    async def hello(ctx: SlashContext, args: str) -> str:
         seen["called"] = True
         return "hi back"
 
@@ -39,7 +29,6 @@ async def test_known_command_dispatches_to_handler() -> None:
 
 @pytest.mark.asyncio
 async def test_known_command_with_args_passes_to_handler() -> None:
-    """Arguments after the command name reach the handler as a single string."""
     reg = SlashRegistry()
     received: dict[str, str] = {}
 
@@ -55,7 +44,6 @@ async def test_known_command_with_args_passes_to_handler() -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_command_lists_available() -> None:
-    """Unknown ``/cmd`` produces a local error message listing registered commands."""
     reg = SlashRegistry()
     reg.register("hello", _noop_handler, summary="say hi")
     reg.register("exit", _noop_handler, summary="exit the REPL")
@@ -67,13 +55,11 @@ async def test_unknown_command_lists_available() -> None:
     assert "/bogus" in result
     assert "hello" in result
     assert "exit" in result
-    # Not an LLM call — handler must not run.
-    assert "say hi" in result  # summary text leaks into the listing
+    assert "say hi" in result
 
 
 @pytest.mark.asyncio
 async def test_registry_empty_lists_nothing() -> None:
-    """Empty registry + unknown command → empty listing, not a crash."""
     reg = SlashRegistry()
     result = await reg.dispatch("/whatever")
     assert result is not None
@@ -82,7 +68,6 @@ async def test_registry_empty_lists_nothing() -> None:
 
 @pytest.mark.asyncio
 async def test_help_lists_all_commands_with_summaries() -> None:
-    """/help returns one line per registered command with each summary."""
     reg = SlashRegistry()
     reg.register("hello", _noop_handler, summary="say hi")
     reg.register("exit", _noop_handler, summary="exit the REPL")
@@ -96,16 +81,15 @@ async def test_help_lists_all_commands_with_summaries() -> None:
 
 @pytest.mark.asyncio
 async def test_handler_receives_session_context() -> None:
-    """The handler context carries the session the REPL is attached to."""
     reg = SlashRegistry()
     seen: dict[str, object] = {}
 
-    async def show_session(ctx: SlashContext) -> str:
+    async def show_session(ctx: SlashContext, args: str) -> str:
         seen["session"] = ctx.session
         return "ok"
 
     reg.register("show", show_session)
-    sentinel = cast("Session | None", object())  # stand-in for a real Session
+    sentinel = cast("Session | None", object())
     result = await reg.dispatch("/show", ctx=SlashContext(session=sentinel))
     assert seen["session"] is sentinel
     assert result == "ok"
@@ -113,25 +97,22 @@ async def test_handler_receives_session_context() -> None:
 
 @pytest.mark.asyncio
 async def test_non_slash_input_returns_none() -> None:
-    """The REPL passes every line through ``dispatch``; non-``/`` lines
-    return ``None`` so the REPL knows to send it to the agent instead."""
     reg = SlashRegistry()
     reg.register("hello", _noop_handler)
     assert await reg.dispatch("hello there") is None
     assert await reg.dispatch("") is None
-    assert await reg.dispatch("  /not-a-slash  ") is None  # leading whitespace
+    assert await reg.dispatch("  /not-a-slash  ") is None
 
 
 @pytest.mark.asyncio
 async def test_register_overwrites_prior_handler() -> None:
-    """Re-registering the same name replaces silently — handlers grow over time."""
     reg = SlashRegistry()
     calls: list[str] = []
 
-    async def first(ctx: SlashContext) -> str:
+    async def first(ctx: SlashContext, args: str) -> str:
         calls.append("first"); return "1"
 
-    async def second(ctx: SlashContext) -> str:
+    async def second(ctx: SlashContext, args: str) -> str:
         calls.append("second"); return "2"
 
     reg.register("cmd", first)
@@ -143,10 +124,9 @@ async def test_register_overwrites_prior_handler() -> None:
 
 @pytest.mark.asyncio
 async def test_handler_returning_none_prints_nothing() -> None:
-    """Handler returning ``None`` → registry returns ``""`` (REPL prints nothing)."""
     reg = SlashRegistry()
 
-    async def quiet(ctx: SlashContext) -> None:
+    async def quiet(ctx: SlashContext, args: str) -> None:
         return None
 
     reg.register("quiet", quiet)
@@ -154,10 +134,5 @@ async def test_handler_returning_none_prints_nothing() -> None:
     assert result == ""
 
 
-# ---------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------
-
-
-async def _noop_handler(ctx: SlashContext) -> str:
+async def _noop_handler(ctx: SlashContext, args: str) -> str:
     return "noop"
