@@ -56,6 +56,15 @@ from cothis.session.storage import BlockRow, SessionRow, Storage, is_visible
 
 logger = logging.getLogger(__name__)
 
+# Retry policy for transient ``write_atomic`` failures. 3 retries with
+# linear-ish backoff; worst-case drain latency 2.6s, within ``close``'s 5s
+# consumer join. Exhaustion → poison-row drop (same loss ceiling as kill -9).
+_WRITE_RETRY_BACKOFFS: tuple[float, ...] = (0.1, 0.5, 2.0)
+
+# close() join timeouts; see ADR-0009 for the lock-contract rationale.
+_CLOSE_JOIN_TIMEOUT: float = 5.0
+_CLOSE_GRACE_PERIOD: float = 1.0
+
 
 def _now_iso() -> str:
     """UTC now as ISO-8601. SQLite stores as TEXT; lexicographic == chronological."""
@@ -705,14 +714,14 @@ class Session:
             flush_sync=flush_sync,
         )
         session._lock = lock
-        # cothis: see ADR-0009 §3 for the eager fork-row write.
+        # cothis: see ADR-0010 §3 for the eager fork-row write.
         session._write_fork_row()
         return session
 
     def _write_fork_row(self) -> None:
         """Persist the sessions row eagerly so ``--resume <fork_id>`` works.
 
-        See ADR-0009 §3 for why this deviates from ``Session.new``'s
+        See ADR-0010 §3 for why this deviates from ``Session.new``'s
         lazy-row strategy.
         """
         updated_at = _now_iso()
@@ -916,6 +925,10 @@ class Session:
         first user-text block in ``self.messages``, write the ``.gitignore``
         if applicable, then ``write_atomic`` with a fresh ``SessionRow``.
         Subsequent calls / all ``load`` calls: pass ``session_row=None``.
+
+        Transient ``write_atomic`` failures retried per
+        ``_WRITE_RETRY_BACKOFFS``; poison rows dropped after exhaustion
+        (see module-top comment).
         """
         if not rows:
             return
@@ -940,23 +953,55 @@ class Session:
         # yet every subsequent INSERT into blocks hits the FK constraint —
         # silent total durability loss. The flag's job is to gate the lazy
         # row write, and that write is only done once it actually commits.
-        try:
-            self._storage.write_atomic(session_row, rows, updated_at)
-        except Exception:  # noqa: BLE001 — log + swallow so consumer survives
-            # ponytail: a failed write must not kill the consumer (would
-            # block all future enqueues). Log loudly; the Agent continues
-            # against the in-memory messages, so the turn isn't lost from
-            # the user's view, only from durability. Upgrade path: retry
-            # queue or fail-fast depending on the failure mode.
-            logger.exception(
-                "Session %s: write_atomic failed for %d block(s); data is "
-                "in memory but not durable.",
-                self._session_id,
-                len(rows),
-            )
+        # ponytail: this loop must not kill the consumer — a poison row is
+        # dropped after exhaustion so future enqueues still drain.
+        for attempt in range(len(_WRITE_RETRY_BACKOFFS) + 1):
+            try:
+                self._storage.write_atomic(session_row, rows, updated_at)
+            except Exception as exc:  # noqa: BLE001 — bounded + logged below
+                if attempt >= len(_WRITE_RETRY_BACKOFFS):
+                    # Poison row: exhausted retries. Drop the batch so
+                    # the consumer never deadlocks. Same loss ceiling as
+                    # kill -9 — see module-top comment.
+                    logger.critical(
+                        "Session %s: write_atomic failed %d times; dropping "
+                        "%d block(s) (seq %d-%d) to unblock the queue. "
+                        "Last error: %r",
+                        self._session_id,
+                        attempt + 1,
+                        len(rows),
+                        rows[0].seq,
+                        rows[-1].seq,
+                        exc,
+                    )
+                    return
+                backoff = _WRITE_RETRY_BACKOFFS[attempt]
+                logger.warning(
+                    "Session %s: write_atomic failed (attempt %d/%d); "
+                    "retrying in %.1fs. Error: %r",
+                    self._session_id,
+                    attempt + 1,
+                    len(_WRITE_RETRY_BACKOFFS) + 1,
+                    backoff,
+                    exc,
+                )
+                # _stop.wait returns True iff close() fired — bail to
+                # preserve close's 5s join ceiling.
+                if self._stop.wait(backoff):
+                    logger.warning(
+                        "Session %s: close() during write retry backoff; "
+                        "abandoning %d block(s) (seq %d-%d).",
+                        self._session_id,
+                        len(rows),
+                        rows[0].seq,
+                        rows[-1].seq,
+                    )
+                    return
+                continue
+            # Success — write committed, advance the lazy-row flag.
+            if session_row is not None:
+                self._session_row_written = True
             return
-        if session_row is not None:
-            self._session_row_written = True
 
     def _derive_title(self) -> str:
         """First user-text block across ``self.messages``; line+60 truncated."""
@@ -1009,44 +1054,36 @@ class Session:
     def close(self) -> None:
         """Drain the queue, join the consumer, close storage + lock.
 
-        Idempotent. Unregisters the atexit hook so the process-exit path
-        can't double-fire. The consumer is given 5s to drain; if it
-        hasn't finished by then (huge backlog, slow disk), the lock is
-        released but storage is left OPEN — closing a SQLite connection
-        from this thread while the daemon consumer is mid-``write_atomic``
-        would make its next write raise ``ProgrammingError`` (swallowed
-        by ``_drain_one``), losing the entire remaining queue. The
-        daemon finishes its residual drain on its own; SQLite's WAL
-        recovery handles any incomplete txn at process exit. Same loss
-        ceiling as ``kill -9``, strictly better than force-close.
+        Idempotent. Two-phase join (``_CLOSE_JOIN_TIMEOUT`` +
+        ``_CLOSE_GRACE_PERIOD``), then unconditional ``storage.close()``,
+        then lock release.
         """
         if self._closed:
             return
         self._closed = True
         atexit.unregister(self._drain_sync)
         self._stop.set()
-        consumer_alive = False
         if self._consumer is not None:
-            # 5s is generous: a single sqlite commit is 30-70ms (issue's
-            # measurement); 5s drains dozens of backlogged writes. If the
-            # consumer is somehow stuck (a bug), don't hang the CLI for
-            # half a minute — release the lock and let the daemon finish.
-            self._consumer.join(timeout=5)
-            consumer_alive = self._consumer.is_alive()
-            if consumer_alive:
+            # ponytail: the join timeouts cap CLI latency; storage is
+            # closed below regardless of whether the consumer finished,
+            # so the lock contract holds.
+            self._consumer.join(timeout=_CLOSE_JOIN_TIMEOUT)
+            if self._consumer.is_alive():
                 logger.warning(
-                    "Session %s: consumer still alive after 5s close; "
-                    "leaving storage open for daemon to finish draining "
-                    "(lock released; loss ceiling = kill -9).",
+                    "Session %s: consumer still alive after %.1fs close; "
+                    "joining %.1fs grace period then closing storage "
+                    "(residual writes will fail; loss ceiling = kill -9).",
                     self._session_id,
+                    _CLOSE_JOIN_TIMEOUT,
+                    _CLOSE_GRACE_PERIOD,
                 )
+                self._consumer.join(timeout=_CLOSE_GRACE_PERIOD)
         # Note: close() runs on the caller's thread (NOT via
         # asyncio.to_thread) — filelock's lock counter is thread-local,
         # so acquire (in new/load, on the main thread) and release must
         # be on the same thread. The blocking cost is bounded (drain +
-        # 5s join ceiling) and only paid once at session end.
+        # join + grace ceiling) and only paid once at session end.
         try:
-            if not consumer_alive:
-                self._storage.close()
+            self._storage.close()
         finally:
             self._release_lock()
