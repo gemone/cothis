@@ -50,6 +50,7 @@ from typing import Any
 
 from filelock import FileLock, Timeout
 
+from cothis.session.graph import SessionGraph, SessionNotFoundError
 from cothis.session.storage import BlockRow, SessionRow, Storage
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,22 @@ def _truncate_title(text: str) -> str:
     if len(first_line) <= 60:
         return first_line
     return first_line[:57] + "..."
+
+
+def _is_visible(session_cwd: Path, observer_cwd: Path) -> bool:
+    """``True`` iff ``session_cwd`` equals ``observer_cwd`` or is its ancestor.
+
+    ``cothis history`` shows project-root sessions from a subdirectory;
+    a session scoped to a deeper sub-project is hidden. Both paths are
+    resolved before comparison so symlinks and ``..`` segments don't
+    poison the ancestor check. ``Path.is_relative_to`` is the test.
+    """
+    try:
+        s = session_cwd.resolve()
+        o = observer_cwd.resolve()
+    except (OSError, ValueError):
+        return False
+    return o == s or o.is_relative_to(s)
 
 
 def _block_to_row(
@@ -302,6 +319,24 @@ class SessionLockedError(RuntimeError):
     """
 
 
+class SessionHasChildrenError(RuntimeError):
+    """``cothis delete`` was called on a non-leaf session node.
+
+    The fork tree's invariant is "no orphans": deleting a node with
+    living children would orphan them (their ``parent_id`` would dangle).
+    Delete the children first. The exception carries the offending id
+    and its direct children so the CLI can name them in the error.
+    """
+
+    def __init__(self, session_id: str, children: list[str]) -> None:
+        super().__init__(
+            f"session {session_id!r} has {len(children)} child fork(s); "
+            f"delete them first"
+        )
+        self.session_id = session_id
+        self.children = children
+
+
 class Session:
     """In-memory conversation state backed by SQLite.
 
@@ -343,6 +378,12 @@ class Session:
         self._created_at = created_at
         self.messages = messages  # public: Agent reads this after load
         self._session_row_written = session_row_written
+        # Fork-tree link. ``None`` on roots and on sessions loaded by id
+        # (``load`` reads the link from the sessions row, but doesn't
+        # need the in-memory copy — the ancestor chain is already
+        # assembled into ``messages`` at load time). Set by ``fork``.
+        self._parent_id: str | None = None
+        self._parent_seq: int | None = None
 
         # Index allocation state. Mutated only at enqueue (Agent thread).
         # Derived from the loaded rows on resume (see load()).
@@ -417,6 +458,7 @@ class Session:
         db_path: Path,
         session_id: str,
         *,
+        cwd: Path | None = None,
         flush_sync: bool = False,
     ) -> Session:
         """Resume an existing session by id.
@@ -426,6 +468,19 @@ class Session:
         drop-trailing), and starts the consumer. The ``sessions`` row
         already exists — no lazy write, no title computation, no
         ``.gitignore`` write.
+
+        For a forked session, ancestor-chain context is assembled here:
+        walk ``SessionGraph.ancestors(session_id)`` (root → parent),
+        load each ancestor's blocks through that link's ``parent_seq``
+        cap, run the orphan-truncate per segment, and prepend the
+        ancestor segments to this session's own messages. The result
+        is one flat ``messages`` list the Agent reads as if it were a
+        single linear conversation — git-branch semantics, no merge.
+
+        ``cwd`` (when given) enforces the visibility filter used by
+        ``cothis chat --resume``: a session whose ``cwd`` is neither
+        ``cwd`` nor an ancestor of it is treated as not-found
+        (``KeyError``), matching ``cothis history``'s listing scope.
         """
         db_path = db_path.expanduser()
         # Trust boundary: session_id becomes a filesystem path in
@@ -447,18 +502,23 @@ class Session:
             storage.close()
             lock.release()
             raise KeyError(f"session {session_id!r} not found")
+        if cwd is not None and not _is_visible(Path(sr.cwd), cwd):
+            storage.close()
+            lock.release()
+            raise KeyError(f"session {session_id!r} not found")
+        graph = SessionGraph(storage.list_sessions())
         rows = storage.load_blocks(session_id)
-        # Drop-trailing persistence: if _rebuild_messages drops an orphan
-        # tail, also DELETE those rows from blocks so a later reload
-        # doesn't re-truncate at the same point (and silently erase any
-        # messages appended between reloads — finding from review pass).
         messages, cut_msg_idx = _rebuild_messages(rows)
         if cut_msg_idx is not None:
             storage.delete_blocks_from_msg_idx(session_id, cut_msg_idx)
-            # Recompute rows so the counters below reflect the post-truncate
-            # state — otherwise next_seq/next_msg_idx stay ahead of the
-            # deleted rows (harmless, but the gap would confuse diagnostics).
             rows = [r for r in rows if r.msg_idx < cut_msg_idx]
+        # Ancestor chain: walk parents root → direct parent. For each
+        # ancestor, the child link's ``parent_seq`` is the inclusive
+        # ``seq`` cap on the ancestor's blocks (git-branch semantics —
+        # the fork does not see post-fork blocks).
+        if sr.parent_id is not None:
+            ancestor_segments = cls._assemble_ancestors(graph, storage, session_id)
+            messages = ancestor_segments + messages
         next_seq = (max(r.seq for r in rows) + 1) if rows else 0
         next_msg_idx = (max(r.msg_idx for r in rows) + 1) if rows else 0
         session = cls(
@@ -477,6 +537,235 @@ class Session:
         )
         session._lock = lock
         return session
+
+    @classmethod
+    def list_visible(
+        cls,
+        db_path: Path,
+        cwd: Path,
+    ) -> list[SessionRow]:
+        """Sessions visible from ``cwd`` — used by ``cothis history``.
+
+        Visible means: the session's ``cwd`` equals ``cwd`` or is an
+        ancestor of it (so project-root sessions are listed from a
+        subdirectory). No lock is taken — this is a read-only listing.
+        Sorted by ``updated_at`` descending.
+        """
+        db_path = db_path.expanduser()
+        storage = Storage(db_path)
+        try:
+            return storage.list_sessions_in_cwd_tree(cwd)
+        finally:
+            storage.close()
+
+    @classmethod
+    def delete(
+        cls,
+        db_path: Path,
+        session_id: str,
+    ) -> None:
+        """Leaf-only delete of ``session_id``.
+
+        Takes the cross-process lock (refuses if held), builds the
+        graph, refuses with :class:`SessionHasChildrenError` if the
+        node is not a leaf, then DELETEs the session's blocks + row.
+        Hot-DB only in this slice (#35); cold-DB delete lands in #36.
+        """
+        db_path = db_path.expanduser()
+        if len(session_id) != 32 or not all(
+            c in "0123456789abcdef" for c in session_id
+        ):
+            raise ValueError(f"invalid session_id: {session_id!r}")
+        lock = cls._take_lock(cls._lock_path(session_id))
+        try:
+            storage = Storage(db_path)
+        except BaseException:
+            lock.release()
+            raise
+        try:
+            target = storage.load_session(session_id)
+            if target is None:
+                raise KeyError(f"session {session_id!r} not found")
+            graph = SessionGraph(storage.list_sessions())
+            if not graph.is_leaf(session_id):
+                children = graph.children_of(session_id)
+                raise SessionHasChildrenError(session_id, children)
+            storage.delete_session(session_id)
+        finally:
+            storage.close()
+            lock.release()
+
+    @staticmethod
+    def _assemble_ancestors(
+        graph: SessionGraph,
+        storage: Storage,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        """Prepend ancestor segments to ``messages`` for a forked session.
+
+        Walks ``graph.ancestors(session_id)`` (root → direct parent). For
+        each ancestor ``A``, the cutoff is the ``parent_seq`` recorded on
+        the *child* link (the descendant that brought ``A`` into the
+        chain). Each segment is rebuilt via ``_rebuild_messages`` so
+        orphan-truncate fires per segment — a fork taken mid-tool-call
+        on an ancestor drops that ancestor's orphan tail rather than
+        poisoning the chain.
+
+        The current session's own blocks are NOT loaded here — the
+        caller already has them in ``messages`` and prepends this
+        method's output.
+        """
+        chain = graph.ancestors(session_id)
+        if not chain:
+            return []
+        # ``parent_seq`` for the link child → ancestor. The walk visits
+        # ancestors root → parent; for each, the cutoff is the
+        # parent_seq of its descendant in the chain (or session_id for
+        # the direct parent).
+        chain_with_self = chain + [session_id]
+        segments: list[list[dict[str, Any]]] = []
+        for i, ancestor_id in enumerate(chain):
+            child_id = chain_with_self[i + 1]
+            cap = graph.parent_seq_of(child_id)
+            if cap is None:
+                cap_rows: list[BlockRow] = []
+            else:
+                cap_rows = storage.load_blocks_through_seq(ancestor_id, cap)
+            seg_messages, _ = _rebuild_messages(cap_rows)
+            if seg_messages:
+                segments.append(seg_messages)
+        # Concatenate segments in chain order. Each segment already
+        # alternates user/assistant internally; concatenation may
+        # produce same-role adjacency across the segment boundary
+        # (e.g. ancestor ends in assistant, current starts with user —
+        # fine; or ancestor ends in user, current starts with user —
+        # Anthropic rejects consecutive user messages, so the caller's
+        # merge in ``_ensure_messages`` must handle this on first
+        # ``run`` after resume, same as the trailing-user case).
+        return [m for seg in segments for m in seg]
+
+    @classmethod
+    def fork(
+        cls,
+        db_path: Path,
+        parent_session_id: str,
+        parent_seq: int,
+        *,
+        cwd: Path,
+        model: str,
+        flush_sync: bool = False,
+    ) -> Session:
+        """Fork a new session from ``parent_session_id`` at ``parent_seq``.
+
+        The new session gets a fresh id, a fresh ``seq``/``msg_idx``
+        counter starting at 0 (independent numbering — git-branch
+        semantics, no merge), and ``parent_id``/``parent_seq`` set on
+        its lazy row so the fork tree records the link. Ancestor-chain
+        context is loaded eagerly so ``session.messages`` reads as one
+        flat conversation the Agent can resume from directly.
+
+        ``parent_seq`` is inclusive: blocks with ``seq <= parent_seq``
+        on the parent contribute to the fork's context. The caller is
+        responsible for picking a sensible fork point (e.g. via
+        ``cothis history <id>``'s picker).
+        """
+        db_path = db_path.expanduser()
+        if len(parent_session_id) != 32 or not all(
+            c in "0123456789abcdef" for c in parent_session_id
+        ):
+            raise ValueError(f"invalid parent_session_id: {parent_session_id!r}")
+        if parent_seq < 0:
+            raise ValueError(f"parent_seq must be >= 0, got {parent_seq}")
+        new_id = uuid.uuid4().hex
+        lock = cls._take_lock(cls._lock_path(new_id))
+        try:
+            storage = Storage(db_path)
+        except BaseException:
+            lock.release()
+            raise
+        parent_row = storage.load_session(parent_session_id)
+        if parent_row is None:
+            storage.close()
+            lock.release()
+            raise KeyError(f"parent session {parent_session_id!r} not found")
+        # Build the ancestor chain for the *parent*, then extend it
+        # with this fork's link. The new session's own blocks are empty
+        # (the fork starts a fresh numbering space); its context is the
+        # parent's chain capped at parent_seq.
+        graph = SessionGraph(storage.list_sessions())
+        graph.add(
+            SessionRow(
+                id=new_id,
+                parent_id=parent_session_id,
+                parent_seq=parent_seq,
+                cwd=str(cwd),
+                cli_version=_cli_version(),
+                model=model,
+                title="",
+                created_at=_now_iso(),
+                updated_at=_now_iso(),
+            )
+        )
+        ancestor_segments = cls._assemble_ancestors(graph, storage, new_id)
+        session = cls(
+            db_path=db_path,
+            session_id=new_id,
+            storage=storage,
+            cwd=cwd,
+            model=model,
+            cli_version=_cli_version(),
+            created_at=_now_iso(),
+            messages=list(ancestor_segments),
+            session_row_written=False,
+            next_seq=0,
+            next_msg_idx=0,
+            flush_sync=flush_sync,
+        )
+        session._lock = lock
+        session._parent_id = parent_session_id
+        session._parent_seq = parent_seq
+        # Eagerly write the sessions row so ``chat --resume <new_id>`` works
+        # before the user sends the first message. Title is derived from the
+        # ancestor chain's first user text (mirrors Session._drain_one's
+        # title derivation on a fresh session); empty when the ancestor
+        # chain had no user text (rare — the fork point had only
+        # assistant/tool blocks).
+        session._write_fork_row()
+        return session
+
+    def _write_fork_row(self) -> None:
+        """Persist the sessions row for a freshly-forked session.
+
+        Unlike the lazy row on ``Session.new``, the fork row is written
+        eagerly because: (a) the fork has a parent link that must be
+        durable so the tree is consistent across reloads and
+        ``--resume <fork_id>`` finds the session, and (b) the title is
+        already knowable from the ancestor chain (``Session.new`` has
+        no messages to derive from at construction time).
+        """
+        updated_at = _now_iso()
+        self._maybe_write_gitignore()
+        title = self._derive_title()
+        session_row = SessionRow(
+            id=self._session_id,
+            parent_id=self._parent_id,
+            parent_seq=self._parent_seq,
+            cwd=str(self._cwd),
+            cli_version=self._cli_version,
+            model=self._model,
+            title=title,
+            created_at=self._created_at,
+            updated_at=updated_at,
+        )
+        try:
+            self._storage.write_atomic(session_row, [], updated_at)
+        except Exception:  # noqa: BLE001 — log + continue; first block drain retries
+            logger.exception(
+                "Session %s: fork-row write failed; will retry on first append.",
+                self._session_id,
+            )
+            return
+        self._session_row_written = True
 
     # --- lock -----------------------------------------------------------
 
@@ -665,8 +954,8 @@ class Session:
             title = self._derive_title()
             session_row = SessionRow(
                 id=self._session_id,
-                parent_id=None,  # ponytail: fork tree lands in #35
-                parent_seq=None,
+                parent_id=self._parent_id,
+                parent_seq=self._parent_seq,
                 cwd=str(self._cwd),
                 cli_version=self._cli_version,
                 model=self._model,
