@@ -28,7 +28,10 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import pytest
 
@@ -1084,6 +1087,315 @@ def test_load_rejects_non_hex_session_id(tmp_path: Path) -> None:
     for bad in ["../etc/passwd", "deadbeef", "X" * 32, "a" * 31 + "g", ""]:
         with pytest.raises(ValueError):
             Session.load(db_path, bad, flush_sync=True)
+
+
+# ---------------------------------------------------------------------
+# 11. Fork tree + ancestor-chain context (#35)
+# ---------------------------------------------------------------------
+
+
+def test_fork_creates_new_session_with_parent_link_and_ancestor_context(
+    tmp_path: Path,
+) -> None:
+    """``Session.fork`` records the parent link and prepends ancestor context.
+
+    Forking a session with N messages yields a new session whose
+    ``messages`` mirror the ancestor's (capped at ``parent_seq``). The
+    new session has a fresh id, fresh ``seq``/``msg_idx`` counters
+    (independent numbering), and a parent link that is durably written
+    on the first drain.
+    """
+    db_path = tmp_path / "session.db"
+    parent = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    parent.append_message("user", [_user_text("hello ancestor")])
+    parent.append_message("assistant", [{"type": "text", "text": "hi"}])
+    parent.append_message("user", [_user_text("post-fork-Q")])
+    parent.append_message("assistant", [{"type": "text", "text": "post-fork-A"}])
+    parent.close()
+    # Fork at seq=1 (the assistant reply "hi") — git-branch semantics:
+    # fork should NOT see the post-fork Q+A.
+    parent_id = parent.session_id
+    parent_storage = Storage(db_path)
+    try:
+        parent_rows = parent_storage.load_blocks(parent_id)
+    finally:
+        parent_storage.close()
+    cap_seq = max(r.seq for r in parent_rows if r.msg_idx <= 1)
+
+    forked = Session.fork(
+        db_path, parent_id, cap_seq, cwd=tmp_path, model="m", flush_sync=True
+    )
+    try:
+        assert forked.session_id != parent_id
+        # Ancestor context (capped at cap_seq) is preloaded into messages.
+        texts = [
+            b.get("text")
+            for m in forked.messages
+            for b in m.get("content", [])
+            if b.get("type") == "text"
+        ]
+        assert "hello ancestor" in texts
+        assert "hi" in texts
+        # Post-fork blocks are NOT visible — git-branch, no merge.
+        assert "post-fork-Q" not in texts
+        assert "post-fork-A" not in texts
+        # Fork starts its own numbering at 0.
+        assert forked._next_seq == 0
+        assert forked._next_msg_idx == 0
+        # Writing the first message flushes the lazy row with the parent link.
+        forked.append_message("user", [_user_text("forked turn")])
+    finally:
+        forked.close()
+
+    # The parent link is durable on the forked session's row.
+    forked_id = forked.session_id
+    verify_storage = Storage(db_path)
+    try:
+        sr = verify_storage.load_session(forked_id)
+        assert sr is not None
+        assert sr.parent_id == parent_id
+        assert sr.parent_seq == cap_seq
+    finally:
+        verify_storage.close()
+
+
+def test_load_of_forked_session_assembles_ancestor_chain(tmp_path: Path) -> None:
+    """Reloading a forked session reconstructs ancestor context.
+
+    ``Session.load`` walks ``SessionGraph.ancestors`` and prepends each
+    ancestor's blocks (capped at the link's ``parent_seq``) before the
+    fork's own blocks. The Agent reads the result as one flat
+    conversation.
+    """
+    db_path = tmp_path / "session.db"
+    parent = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    parent.append_message("user", [_user_text("ancestor user")])
+    parent.append_message("assistant", [{"type": "text", "text": "ancestor reply"}])
+    parent.close()
+    parent_id = parent.session_id
+
+    # Fork at end (cap = parent's max seq) — full context.
+    ps = Storage(db_path)
+    try:
+        parent_rows = ps.load_blocks(parent_id)
+    finally:
+        ps.close()
+    cap = max(r.seq for r in parent_rows)
+
+    forked = Session.fork(
+        db_path, parent_id, cap, cwd=tmp_path, model="m", flush_sync=True
+    )
+    forked_id = forked.session_id
+    forked.append_message("user", [_user_text("forked user")])
+    forked.close()
+
+    # Reload from disk — ancestor chain must reconstruct identically.
+    reloaded = Session.load(db_path, forked_id, flush_sync=True)
+    try:
+        texts = [
+            b.get("text")
+            for m in reloaded.messages
+            for b in m.get("content", [])
+            if b.get("type") == "text"
+        ]
+        assert "ancestor user" in texts
+        assert "ancestor reply" in texts
+        assert "forked user" in texts
+    finally:
+        reloaded.close()
+
+
+def test_load_respects_cwd_visibility_filter(tmp_path: Path) -> None:
+    """``Session.load(cwd=...)`` hides sessions outside the cwd tree.
+
+    Mirrors ``cothis chat --resume``'s contract: a session scoped to a
+    directory the user is not currently inside (or descendant of) is
+    treated as not-found. Stops the user from accidentally resuming a
+    different project's session.
+    """
+    db_path = tmp_path / "session.db"
+    other_dir = tmp_path / "other-project"
+    other_dir.mkdir()
+    s = Session.new(db_path, cwd=other_dir, model="m", flush_sync=True)
+    sid = s.session_id
+    s.append_message("user", [_user_text("hi")])
+    s.close()
+
+    # Visible from inside other_dir.
+    visible = Session.load(db_path, sid, cwd=other_dir, flush_sync=True)
+    visible.close()
+
+    # Hidden from a sibling directory the session doesn't scope to.
+    sibling = tmp_path / "this-project"
+    sibling.mkdir()
+    with pytest.raises(KeyError):
+        Session.load(db_path, sid, cwd=sibling, flush_sync=True)
+
+
+def test_delete_refuses_non_leaf_session(tmp_path: Path) -> None:
+    """``Session.delete`` refuses nodes with children — no orphans."""
+    from cothis.session import SessionHasChildrenError
+
+    db_path = tmp_path / "session.db"
+    parent = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    parent.append_message("user", [_user_text("hi")])
+    parent.close()
+    parent_id = parent.session_id
+
+    ps = Storage(db_path)
+    try:
+        cap = max(r.seq for r in ps.load_blocks(parent_id))
+    finally:
+        ps.close()
+    forked = Session.fork(
+        db_path, parent_id, cap, cwd=tmp_path, model="m", flush_sync=True
+    )
+    # Flush the fork's lazy row so the parent has a recorded child.
+    forked.append_message("user", [_user_text("forked turn")])
+    forked.close()
+
+    with pytest.raises(SessionHasChildrenError):
+        Session.delete(db_path, parent_id)
+
+
+def test_delete_leaf_removes_session_and_blocks(tmp_path: Path) -> None:
+    """``Session.delete`` on a leaf removes the row + all blocks."""
+    db_path = tmp_path / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    sid = s.session_id
+    s.append_message("user", [_user_text("hello")])
+    s.close()
+
+    # Verify present.
+    ps = Storage(db_path)
+    try:
+        assert ps.load_session(sid) is not None
+        assert len(ps.load_blocks(sid)) >= 1
+    finally:
+        ps.close()
+
+    Session.delete(db_path, sid)
+
+    # Verify gone.
+    ps = Storage(db_path)
+    try:
+        assert ps.load_session(sid) is None
+        assert ps.load_blocks(sid) == []
+    finally:
+        ps.close()
+
+
+def test_delete_unknown_session_raises_keyerror(tmp_path: Path) -> None:
+    """Deleting a missing id surfaces a clear ``KeyError``."""
+    db_path = tmp_path / "session.db"
+    Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True).close()
+    with pytest.raises(KeyError):
+        Session.delete(db_path, "a" * 32)
+
+
+@pytest.mark.parametrize(
+    ("label", "expected_exc", "setup"),
+    [
+        (
+            "invalid_parent_id",
+            ValueError,
+            lambda db_path, cwd: None,
+        ),
+        (
+            "unknown_parent",
+            KeyError,
+            lambda db_path, cwd: Session.new(
+                db_path, cwd=cwd, model="m", flush_sync=True
+            ).close(),
+        ),
+        (
+            "negative_parent_seq",
+            ValueError,
+            lambda db_path, cwd: _seed_parent_with_message(db_path, cwd),
+        ),
+    ],
+)
+def test_fork_rejects_bad_input(
+    tmp_path: Path,
+    label: str,
+    expected_exc: type[Exception],
+    setup: Callable[[Path, Path], None],
+) -> None:
+    """``Session.fork`` rejects bad input — three error paths parametrised.
+
+    - invalid parent id (non-hex / wrong length) → ``ValueError``
+    - unknown parent id (not in db) → ``KeyError``
+    - negative ``parent_seq`` → ``ValueError``
+    """
+    db_path = tmp_path / "session.db"
+    parent_id, parent_seq = _fork_reject_args(label, db_path, tmp_path)
+    setup(db_path, tmp_path)
+    with pytest.raises(expected_exc):
+        Session.fork(
+            db_path,
+            parent_id,
+            parent_seq,
+            cwd=tmp_path,
+            model="m",
+            flush_sync=True,
+        )
+
+
+def _seed_parent_with_message(db_path: Path, cwd: Path) -> str:
+    """Create a parent session with one user message; return its id."""
+    parent = Session.new(db_path, cwd=cwd, model="m", flush_sync=True)
+    parent.append_message("user", [_user_text("hi")])
+    parent.close()
+    return parent.session_id
+
+
+def _fork_reject_args(label: str, db_path: Path, cwd: Path) -> tuple[str, int]:
+    if label == "invalid_parent_id":
+        return "../x", 0
+    if label == "unknown_parent":
+        return "a" * 32, 0
+    if label == "negative_parent_seq":
+        return _seed_parent_with_message(db_path, cwd), -1
+    raise AssertionError(f"unknown label {label!r}")
+
+
+def test_list_visible_filters_by_cwd_tree(tmp_path: Path) -> None:
+    """``Session.list_visible`` shows sessions whose cwd is current-or-ancestor."""
+    db_path = tmp_path / "session.db"
+    project = tmp_path / "proj"
+    project.mkdir()
+    sibling = tmp_path / "other"
+    sibling.mkdir()
+    sub = project / "src"
+    sub.mkdir()
+
+    s_project = Session.new(db_path, cwd=project, model="m", flush_sync=True)
+    s_project.append_message("user", [_user_text("proj")])
+    s_project.close()
+    s_sibling = Session.new(db_path, cwd=sibling, model="m", flush_sync=True)
+    s_sibling.append_message("user", [_user_text("other")])
+    s_sibling.close()
+
+    # From sub/: project session visible (project is ancestor), sibling not.
+    visible = Session.list_visible(db_path, sub)
+    ids = {r.id for r in visible}
+    assert s_project.session_id in ids
+    assert s_sibling.session_id not in ids
+
+
+def test_list_visible_ordered_by_updated_at_desc(tmp_path: Path) -> None:
+    """Most-recently-touched session is first."""
+    db_path = tmp_path / "session.db"
+    s1 = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s1.append_message("user", [_user_text("one")])
+    s1.close()
+    s2 = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s2.append_message("user", [_user_text("two")])
+    s2.close()
+
+    visible = Session.list_visible(db_path, tmp_path)
+    assert visible[0].id == s2.session_id
+    assert visible[1].id == s1.session_id
 
 
 def test_close_storage_closed_even_when_consumer_stuck(

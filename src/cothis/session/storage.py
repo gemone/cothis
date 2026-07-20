@@ -35,10 +35,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import subprocess
-from typing import TYPE_CHECKING, NamedTuple
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from pathlib import Path
+from typing import NamedTuple
 
 # cothis: schema_version is a pure placeholder in #34 — column writes 1 and
 # PRAGMA user_version is set to 1, but neither is read. Dispatch lands with
@@ -170,6 +168,46 @@ def _restrict_to_owner(path: str) -> None:
             os.chmod(path, 0o600)
         except OSError:
             pass  # e.g. FAT — best effort
+
+
+def is_visible(session_cwd: Path, observer_cwd: Path) -> bool:
+    """``True`` iff ``session_cwd`` equals ``observer_cwd`` or is its ancestor.
+
+    ``cothis history`` and ``cothis chat --resume`` hide sessions whose
+    ``cwd`` is neither ``observer_cwd`` nor an ancestor of it — a session
+    scoped to a sibling project is a different scope. Both paths are
+    resolved before comparison so symlinks and ``..`` segments don't
+    poison the ancestor check. ``Path.is_relative_to`` is the test.
+
+    Single source of truth: ``Storage.list_sessions_in_cwd_tree``,
+    ``Session.load(cwd=...)``, and the ``cothis history <id>`` picker
+    all call this helper.
+    """
+    try:
+        s = session_cwd.resolve()
+        o = observer_cwd.resolve()
+    except (OSError, ValueError):
+        return False
+    return o == s or o.is_relative_to(s)
+
+
+def display_cwd(session_cwd: Path, observer_cwd: Path) -> str:
+    """Path-display helper for ``cothis history``'s listing.
+
+    Returns ``session_cwd`` relative to ``observer_cwd`` when possible
+    (so a session at the cwd root shows as ``.``), or the absolute
+    resolved path otherwise (e.g. ancestor dir above the cwd). Falls
+    back to the raw value on resolve failure.
+    """
+    try:
+        s = session_cwd.resolve()
+        o = observer_cwd.resolve()
+    except (OSError, ValueError):
+        return str(session_cwd)
+    try:
+        return str(s.relative_to(o))
+    except ValueError:
+        return str(s)
 
 
 class Storage:
@@ -305,6 +343,99 @@ class Storage:
             (session_id,),
         )
         return [BlockRow(*row) for row in cur.fetchall()]
+
+    def load_blocks_through_seq(
+        self, session_id: str, max_seq: int
+    ) -> list[BlockRow]:
+        """Blocks for ``session_id`` where ``seq <= max_seq``.
+
+        Used by ancestor-chain context assembly: a fork pins the parent
+        at ``parent_seq``, and only the parent's blocks up to and
+        including that seq contribute to the forked session's context
+        (git-branch semantics — the fork does not see post-fork blocks).
+        Ordering matches :meth:`load_blocks` so the same rebuild path
+        applies.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT session_id, seq, msg_idx, block_idx, role, type, ts,
+                   content, signature, tool_id, tool_name, tool_input,
+                   tool_use_id, tool_output, image_source, summary,
+                   summarized_seq
+            FROM blocks WHERE session_id=? AND seq <= ?
+            ORDER BY msg_idx, block_idx
+            """,
+            (session_id, max_seq),
+        )
+        return [BlockRow(*row) for row in cur.fetchall()]
+
+    def list_sessions(self) -> list[SessionRow]:
+        """Every row in ``sessions``. Used to build a :class:`SessionGraph`.
+
+        No ordering guarantee; the graph builds its own structure. The
+        cost is one SELECT regardless of session count — measured at
+        ~9ms for 10k sessions in the issue's research.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT id, parent_id, parent_seq, cwd, cli_version, model,
+                   title, created_at, updated_at, schema_version
+            FROM sessions
+            """
+        )
+        return [SessionRow(*row) for row in cur.fetchall()]
+
+    def list_sessions_in_cwd_tree(
+        self, cwd: Path
+    ) -> list[SessionRow]:
+        """Sessions whose ``cwd`` equals ``cwd`` or is an ancestor of it.
+
+        ``cothis history`` shows project-root sessions when the user
+        runs it from a subdirectory — they're still relevant context.
+        A session whose ``cwd`` is a descendant of ``cwd`` (a deeper
+        sub-project) is *not* shown: it's a different scope.
+
+        Ordering: ``updated_at`` descending (most-recently-touched
+        first), matching what a user expects from a history listing.
+        Ties on ``updated_at`` (clock resolution, batch writes) fall
+        back to ``created_at`` desc, then ``id`` for determinism.
+        """
+        all_rows = self.list_sessions()
+        visible = [row for row in all_rows if is_visible(Path(row.cwd), cwd)]
+        visible.sort(key=lambda r: (r.updated_at, r.created_at, r.id), reverse=True)
+        return visible
+
+    def delete_session(self, session_id: str) -> None:
+        """DELETE ``session_id``'s blocks + sessions row in one txn.
+
+        Caller (:func:`cothis.cli.delete`) checks the leaf-only contract
+        via :func:`cothis.session.graph.is_leaf` before calling. The
+        blocks DELETE is explicit because the FK has no
+        ``ON DELETE CASCADE`` (the original schema predates the fork
+        tree and cascades would hide the leaf-only contract from a
+        manual ``sqlite3`` session).
+        """
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM blocks WHERE session_id=?", (session_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM sessions WHERE id=?", (session_id,)
+            )
+
+    def msg_idx_to_max_seq(self, session_id: str) -> dict[int, int]:
+        """Map each ``msg_idx`` to the max ``seq`` it contains.
+
+        ``cothis history <id>``'s fork picker uses this to translate a
+        chosen message index into the inclusive ``seq`` cap for the
+        fork's ``parent_seq``.
+        """
+        cur = self._conn.execute(
+            "SELECT msg_idx, MAX(seq) FROM blocks WHERE session_id=? "
+            "GROUP BY msg_idx",
+            (session_id,),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
 
     def delete_blocks_from_msg_idx(
         self, session_id: str, cut_msg_idx: int
