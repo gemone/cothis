@@ -1084,3 +1084,50 @@ def test_load_rejects_non_hex_session_id(tmp_path: Path) -> None:
     for bad in ["../etc/passwd", "deadbeef", "X" * 32, "a" * 31 + "g", ""]:
         with pytest.raises(ValueError):
             Session.load(db_path, bad, flush_sync=True)
+
+
+def test_close_storage_closed_even_when_consumer_stuck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock contract: close() must close storage before releasing the lock.
+
+    A stuck consumer thread (one that outlives the join timeout) must
+    not keep the storage open across close(). Releasing the cross-process
+    lock while a write is still in flight lets a second process acquire
+    the lock, load the same session, and interleave writes — defeating
+    the SessionLockedError contract.
+
+    The fix: close storage unconditionally. The consumer's next
+    write_atomic raises ProgrammingError, caught by _drain_one's
+    retry queue; the batch is dropped per poison-row semantics
+    (ADR-0008). Loss ceiling unchanged; lock contract restored.
+    """
+    db_path = tmp_path / "sessions" / "session.db"
+    # flush_sync=True avoids starting a real consumer; we inject a fake.
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+
+    storage_closed = {"called": False}
+    def tracking_close() -> None:
+        storage_closed["called"] = True
+    monkeypatch.setattr(s._storage, "close", tracking_close)
+
+    # Fake consumer that's still "alive" after the join timeout —
+    # simulates a stuck write_atomic (slow disk, retry storm, etc.).
+    class _StuckConsumer:
+        def is_alive(self) -> bool:
+            return True
+        def join(self, timeout: float | None = None) -> None:
+            return  # returns immediately, still alive
+    s._consumer = _StuckConsumer()
+
+    # Squash the join timeouts so the test doesn't sleep.
+    monkeypatch.setattr("cothis.session._CLOSE_JOIN_TIMEOUT", 0.0)
+    monkeypatch.setattr("cothis.session._CLOSE_GRACE_PERIOD", 0.0)
+
+    s.close()
+
+    assert storage_closed["called"], (
+        "close() must close storage even when consumer is stuck — "
+        "otherwise the lock is released while writes may still happen, "
+        "violating the SessionLockedError contract"
+    )
