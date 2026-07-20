@@ -23,19 +23,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-# Runtime imports of the Anthropic stream-event types: ``isinstance`` dispatch
-# in ``run_stream`` is how ty narrows the ``MessageStreamEvent`` union (it
-# can't narrow by string ``event.type`` comparison). The union is itself just
-# these anthropic SDK classes (any-llm re-exports them).
-from anthropic.types import (  # noqa: I001
-    RawContentBlockDeltaEvent,
-    RawContentBlockStartEvent,
-    RawContentBlockStopEvent,
-    RawMessageDeltaEvent,
-    RawMessageStartEvent,
-    RawMessageStopEvent,
-)
-from any_llm.types.messages import TextDelta
+# cothis: the Anthropic stream-event types (``RawMessageStartEvent`` etc.)
+# and ``TextDelta`` are imported lazily inside ``Agent.run_stream`` instead
+# of at module top. The ``anthropic`` SDK pulls in ``anthropic.lib.vertex``
+# and ``anthropic.lib.bedrock`` on first import (~1s); ``any_llm.types.messages``
+# hard-imports ``anthropic.types`` at top level (~1.5s more). Deferring both
+# to the first real LLM call keeps ``cothis --help`` / non-LLM paths from
+# paying ~2.5s of SDK load. The ``isinstance`` dispatch in ``run_stream``
+# is how ty narrows the ``MessageStreamEvent`` union (it can't narrow by
+# string ``event.type`` comparison). The union is itself just these
+# anthropic SDK classes (any-llm re-exports them).
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 # cothis: ``Tool`` must be runtime-imported (not TYPE_CHECKING-only) because
@@ -695,6 +692,21 @@ class Agent(BaseModel):
         self._ensure_messages(user_input)
         await self._ensure_mcp()
         await self._ensure_handles()
+
+        # Lazy import of the Anthropic stream-event types and ``TextDelta``.
+        # Loaded once per process (Python caches modules); deferred from
+        # module top so ``cothis --help`` and other non-LLM paths skip the
+        # ~2.5s ``anthropic`` + ``any_llm.types.messages`` load. See the
+        # note near the top of this module for the full rationale.
+        from anthropic.types import (  # noqa: I001
+            RawContentBlockDeltaEvent,
+            RawContentBlockStartEvent,
+            RawContentBlockStopEvent,
+            RawMessageDeltaEvent,
+            RawMessageStartEvent,
+            RawMessageStopEvent,
+        )
+        from any_llm.types.messages import TextDelta
 
         tool_schemas = self._tool_schemas()
         model = self.model
