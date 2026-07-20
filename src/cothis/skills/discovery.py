@@ -97,7 +97,6 @@ def format_catalog(skills: list[Skill]) -> str | None:
 
     Catalog text is XML-escaped: a malicious ``name`` or ``description``
     containing ``</available_skills>`` cannot break out of the block.
-    Pure function — callers can memoise on the discovered list.
     """
     if not skills:
         return None
