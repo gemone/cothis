@@ -1113,7 +1113,11 @@ def test_close_storage_closed_even_when_consumer_stuck(
 
     # Fake consumer that's still "alive" after the join timeout —
     # simulates a stuck write_atomic (slow disk, retry storm, etc.).
-    class _StuckConsumer:
+    # Subclasses Thread to satisfy the type checker; we override
+    # is_alive/join so no real thread lifecycle is involved.
+    class _StuckConsumer(threading.Thread):
+        def run(self) -> None:  # never started; never runs
+            pass
         def is_alive(self) -> bool:
             return True
         def join(self, timeout: float | None = None) -> None:
