@@ -688,6 +688,8 @@ class Session:
         # yet every subsequent INSERT into blocks hits the FK constraint —
         # silent total durability loss. The flag's job is to gate the lazy
         # row write, and that write is only done once it actually commits.
+        # ponytail: this loop must not kill the consumer — a poison row is
+        # dropped after exhaustion so future enqueues still drain.
         for attempt in range(len(_WRITE_RETRY_BACKOFFS) + 1):
             try:
                 self._storage.write_atomic(session_row, rows, updated_at)

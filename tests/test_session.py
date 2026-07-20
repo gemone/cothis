@@ -344,17 +344,15 @@ def test_reload_truncate_is_persisted_not_just_in_memory(
 def test_session_row_written_flag_set_after_successful_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Regression: lazy session-row flag set BEFORE write fails permanently.
+    """Lazy session-row flag stays False until the row actually commits.
 
-    Before the fix, if the first drain's ``write_atomic`` raised, the flag
-    was set to True anyway. The sessions row was never inserted, so every
-    later block INSERT hit the FK constraint and failed silently — total
-    durability loss. After the fix, a failed first drain retries on the
-    next enqueue (flag still False → session_row retried).
+    Pins the invariant that ``_session_row_written`` is set only after
+    ``write_atomic`` returns: setting it earlier would leave no sessions
+    row for the FK check, blocking every subsequent block INSERT.
 
-    Persistent failure across all retries is needed to exercise the flag
-    contract — a transient (single-shot) failure is now recovered in-line
-    by the retry queue (see test_transient_write_failure_recovered_by_retry).
+    Persistent failure across all retries is needed to reach this path —
+    transient failures are recovered by the retry queue
+    (see ``test_transient_write_failure_recovered_by_retry``).
     """
     # Squash retry backoff to zero so the test doesn't sleep ~2.6s on the
     # 3 retry attempts before the poison-row drop kicks in.
@@ -401,14 +399,9 @@ def test_session_row_written_flag_set_after_successful_write(
 def test_transient_write_failure_recovered_by_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A single transient ``write_atomic`` failure must not lose block data.
-
-    Before the retry queue, ``_drain_one`` swallowed any exception and
-    returned; the dequeued rows were gone. After the fix, the same
-    failure triggers an in-line retry — if the second attempt succeeds
-    (the realistic transient case: momentary I/O hiccup, brief lock
-    contention), the data is persisted as if the first attempt never
-    happened.
+    """A transient ``write_atomic`` failure triggers an in-line retry;
+    if the next attempt succeeds, both messages persist as if the first
+    attempt never happened.
     """
     # Zero backoff: the test isn't validating the backoff schedule, only
     # the recovery contract. Avoids a 100ms sleep per retry.
@@ -450,15 +443,9 @@ def test_transient_write_failure_recovered_by_retry(
 def test_persistent_write_failure_drops_after_retries_no_deadlock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Poison-row guard: a write that fails every retry must be dropped,
-    not retried forever.
-
-    Without this guard, a permanent error (corrupt schema, missing column,
-    unreachable disk) would have the consumer retry the same batch
-    indefinitely — every subsequent enqueue would queue up behind it,
-    and ``close`` would always time out. The contract: after
-    ``len(_WRITE_RETRY_BACKOFFS) + 1`` attempts the batch is dropped and
-    the consumer moves on.
+    """After ``len(_WRITE_RETRY_BACKOFFS) + 1`` attempts, a persistently-
+    failing batch is dropped and the consumer moves on; the next enqueue
+    must succeed.
     """
     monkeypatch.setattr(
         "cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0)
@@ -499,13 +486,8 @@ def test_persistent_write_failure_drops_after_retries_no_deadlock(
 def test_retry_backoff_interrupted_by_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """``close`` during a retry backoff abandons the batch and returns.
-
-    Without the ``_stop.wait`` (instead of ``time.sleep``), a long backoff
-    would always exceed ``close``'s 5s consumer-join ceiling — leaving the
-    consumer alive on every transient failure that hit the 2s backoff slot.
-    The contract: ``close`` interrupts backoff, the in-flight drain
-    returns, and the rows are lost (same loss ceiling as ``kill -9``).
+    """``close()`` during a retry backoff interrupts the wait via ``_stop``,
+    abandons the in-flight batch, and returns within ``close``'s 5s ceiling.
     """
     # Use a real backoff (so _stop.wait actually waits) — but we'll set
     # _stop immediately after the first failed attempt to simulate close.
