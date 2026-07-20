@@ -28,6 +28,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -1316,7 +1317,7 @@ def test_fork_rejects_bad_input(
     tmp_path: Path,
     label: str,
     expected_exc: type[Exception],
-    setup: object,
+    setup: Callable[[Path, Path], None],
 ) -> None:
     """``Session.fork`` rejects bad input — three error paths parametrised.
 
