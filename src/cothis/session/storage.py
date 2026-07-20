@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
@@ -134,6 +135,43 @@ class BlockRow(NamedTuple):
     summarized_seq: str | None = None
 
 
+def _restrict_to_owner(path: str) -> None:
+    """Tighten file permissions to owner-only, cross-platform.
+
+    Transcripts carry tool output (routinely secrets). SQLite creates db +
+    WAL/SHM via open() under the umask (0o644 typical), and the sidecars do
+    NOT inherit the main db's mode — so the caller chmod's each explicitly.
+
+    POSIX: ``os.chmod(0o600)`` — the Unix permission model.
+    Windows: ``os.chmod`` is near-useless (only toggles the read-only bit,
+    doesn't express owner-only). Use ``icacls`` to remove inherited ACEs
+    and grant only the current user full control. ``icacls`` ships with
+    every Windows since Vista, so no dependency is added.
+
+    Best-effort: filesystems without permission bits (FAT) or a missing
+    ``icacls`` silently log and continue — durability is still correct,
+    only the access-control tightening is skipped.
+    """
+    if os.name == "nt":
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+        if not user:
+            return
+        # /inheritance:r — remove inherited ACEs (drops Everyone/Users).
+        # /grant:r      — replace (not merge) with current-user full control.
+        cmd = ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:F"]
+        try:
+            subprocess.run(
+                cmd, check=True, capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass  # best-effort; access control tightened only if icacls works
+    else:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass  # e.g. FAT — best effort
+
+
 class Storage:
     """SQLite layer for one session's persistence.
 
@@ -169,25 +207,12 @@ class Storage:
         for stmt in _DDL:
             self._conn.execute(stmt)
         self._conn.commit()
-        # Transcripts carry tool output — routinely secrets. Tighten the
-        # db + WAL/SHM sidecars to owner-only. SQLite creates all three
-        # via open() under the process umask (0o644 under the typical
-        # 0o022), and sidecars do NOT inherit the main db's mode — chmod
-        # each explicitly. WAL holds un-checkpointed data (incl. secret
-        # tool output); SHM is the shared-memory index. Best-effort: fs
-        # without permission bits (FAT) silently ignores chmod.
-        # Transcripts carry tool output — routinely secrets. Tighten the
-        # db + WAL/SHM sidecars to owner-only. SQLite creates all three
-        # via open() under the process umask (0o644 under the typical
-        # 0o022), and sidecars do NOT inherit the main db's mode — chmod
-        # each explicitly. WAL holds un-checkpointed data (incl. secret
-        # tool output); SHM is the shared-memory index. Best-effort: fs
-        # without permission bits (FAT) silently ignores chmod.
+        # Tighten db + WAL/SHM sidecars to owner-only. SQLite creates all
+        # three via open() under the umask; sidecars do NOT inherit the
+        # main db's mode — restrict each explicitly. WAL holds
+        # un-checkpointed tool output (same secrets); SHM is the index.
         for suffix in ("", "-wal", "-shm"):
-            try:
-                os.chmod(f"{db_path}{suffix}", 0o600)
-            except OSError:
-                pass
+            _restrict_to_owner(f"{db_path}{suffix}")
 
     def write_atomic(
         self,

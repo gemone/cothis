@@ -919,13 +919,13 @@ def test_db_file_is_owner_only(tmp_path: Path) -> None:
     Checks while the Session is still open (sidecars exist) — close()
     checkpoints and deletes them.
 
-    POSIX-only: Windows has no Unix permission bits (chmod is a no-op
-    beyond the read-only flag, stat().st_mode doesn't reflect 0o600).
-    The production chmod call still runs on Windows (best-effort, harm
-    is nil), but we can't assert it there.
+    POSIX-only assertion: Windows uses icacls-based ACL restriction
+    (``_restrict_to_owner``) instead of Unix mode bits, so ``st_mode``
+    doesn't reflect 0o600 there. The ACL path is exercised on Windows
+    CI (no crash) but can't be asserted portably.
     """
     if os.name != "posix":
-        pytest.skip("Unix permission bits are POSIX-only")
+        pytest.skip("Unix mode bits are POSIX-only; Windows uses ACLs")
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     s.append_message("user", [_user_text("x")])
