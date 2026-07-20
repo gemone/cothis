@@ -1156,38 +1156,70 @@ def test_delete_unknown_session_raises_keyerror(tmp_path: Path) -> None:
         Session.delete(db_path, "a" * 32)
 
 
-def test_fork_rejects_invalid_parent_id(tmp_path: Path) -> None:
-    """``Session.fork`` validates the parent id like ``load`` does."""
+@pytest.mark.parametrize(
+    ("label", "expected_exc", "setup"),
+    [
+        (
+            "invalid_parent_id",
+            ValueError,
+            lambda db_path, cwd: None,
+        ),
+        (
+            "unknown_parent",
+            KeyError,
+            lambda db_path, cwd: Session.new(
+                db_path, cwd=cwd, model="m", flush_sync=True
+            ).close(),
+        ),
+        (
+            "negative_parent_seq",
+            ValueError,
+            lambda db_path, cwd: _seed_parent_with_message(db_path, cwd),
+        ),
+    ],
+)
+def test_fork_rejects_bad_input(
+    tmp_path: Path,
+    label: str,
+    expected_exc: type[Exception],
+    setup: object,
+) -> None:
+    """``Session.fork`` rejects bad input — three error paths parametrised.
+
+    - invalid parent id (non-hex / wrong length) → ``ValueError``
+    - unknown parent id (not in db) → ``KeyError``
+    - negative ``parent_seq`` → ``ValueError``
+    """
     db_path = tmp_path / "session.db"
-    with pytest.raises(ValueError):
-        Session.fork(db_path, "../x", 0, cwd=tmp_path, model="m", flush_sync=True)
-
-
-def test_fork_rejects_unknown_parent(tmp_path: Path) -> None:
-    """Forking from a session that doesn't exist surfaces ``KeyError``."""
-    db_path = tmp_path / "session.db"
-    Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True).close()
-    with pytest.raises(KeyError):
-        Session.fork(
-            db_path, "a" * 32, 0, cwd=tmp_path, model="m", flush_sync=True
-        )
-
-
-def test_fork_rejects_negative_parent_seq(tmp_path: Path) -> None:
-    """``parent_seq`` is an inclusive cap; negative would mean "include nothing"."""
-    db_path = tmp_path / "session.db"
-    parent = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
-    parent.append_message("user", [_user_text("hi")])
-    parent.close()
-    with pytest.raises(ValueError):
+    parent_id, parent_seq = _fork_reject_args(label, db_path, tmp_path)
+    setup(db_path, tmp_path)
+    with pytest.raises(expected_exc):
         Session.fork(
             db_path,
-            parent.session_id,
-            -1,
+            parent_id,
+            parent_seq,
             cwd=tmp_path,
             model="m",
             flush_sync=True,
         )
+
+
+def _seed_parent_with_message(db_path: Path, cwd: Path) -> str:
+    """Create a parent session with one user message; return its id."""
+    parent = Session.new(db_path, cwd=cwd, model="m", flush_sync=True)
+    parent.append_message("user", [_user_text("hi")])
+    parent.close()
+    return parent.session_id
+
+
+def _fork_reject_args(label: str, db_path: Path, cwd: Path) -> tuple[str, int]:
+    if label == "invalid_parent_id":
+        return "../x", 0
+    if label == "unknown_parent":
+        return "a" * 32, 0
+    if label == "negative_parent_seq":
+        return _seed_parent_with_message(db_path, cwd), -1
+    raise AssertionError(f"unknown label {label!r}")
 
 
 def test_list_visible_filters_by_cwd_tree(tmp_path: Path) -> None:

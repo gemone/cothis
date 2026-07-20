@@ -170,6 +170,27 @@ def _restrict_to_owner(path: str) -> None:
             pass  # e.g. FAT — best effort
 
 
+def is_visible(session_cwd: Path, observer_cwd: Path) -> bool:
+    """``True`` iff ``session_cwd`` equals ``observer_cwd`` or is its ancestor.
+
+    ``cothis history`` and ``cothis chat --resume`` hide sessions whose
+    ``cwd`` is neither ``observer_cwd`` nor an ancestor of it — a session
+    scoped to a sibling project is a different scope. Both paths are
+    resolved before comparison so symlinks and ``..`` segments don't
+    poison the ancestor check. ``Path.is_relative_to`` is the test.
+
+    Single source of truth: ``Storage.list_sessions_in_cwd_tree``,
+    ``Session.load(cwd=...)``, and the ``cothis history <id>`` picker
+    all call this helper.
+    """
+    try:
+        s = session_cwd.resolve()
+        o = observer_cwd.resolve()
+    except (OSError, ValueError):
+        return False
+    return o == s or o.is_relative_to(s)
+
+
 class Storage:
     """SQLite layer for one session's persistence.
 
@@ -360,20 +381,8 @@ class Storage:
         Ties on ``updated_at`` (clock resolution, batch writes) fall
         back to ``created_at`` desc, then ``id`` for determinism.
         """
-        # Resolve once so symlinks and ``..`` segments don't poison the
-        # ancestor check. ``Path.is_relative_to`` is the test.
-        cwd_resolved = cwd.resolve()
         all_rows = self.list_sessions()
-        visible: list[SessionRow] = []
-        for row in all_rows:
-            try:
-                row_cwd = Path(row.cwd).resolve()
-            except (OSError, ValueError):
-                continue
-            # ``row_cwd`` visible iff it equals ``cwd`` or is its ancestor:
-            # i.e. ``cwd`` is inside ``row_cwd``.
-            if cwd_resolved == row_cwd or cwd_resolved.is_relative_to(row_cwd):
-                visible.append(row)
+        visible = [row for row in all_rows if is_visible(Path(row.cwd), cwd)]
         visible.sort(key=lambda r: (r.updated_at, r.created_at, r.id), reverse=True)
         return visible
 

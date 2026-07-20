@@ -23,9 +23,8 @@ from cothis.session import (
     Session,
     SessionHasChildrenError,
     SessionLockedError,
-    _is_visible,
 )
-from cothis.session.storage import Storage
+from cothis.session.storage import Storage, is_visible
 from cothis.tools import discover_tools
 
 app = typer.Typer()
@@ -414,27 +413,16 @@ def history(
         rows = Session.list_visible(db_path, Path.cwd())
         _print_history_listing(rows)
         return
-    # Inspect one: peek_messages enforces the cwd visibility filter on Session.load.
+    # Inspect one: peek_messages enforces the cwd visibility filter when
+    # cwd= is passed, so the picker refuses out-of-scope sessions the same
+    # way Session.load(cwd=...) does.
     try:
-        messages = Session.peek_messages(db_path, session_id)
+        messages = Session.peek_messages(db_path, session_id, cwd=Path.cwd())
     except KeyError:
         raise typer.BadParameter(
             f"session {session_id!r} not found (or not in this directory's scope); "
             f"run `cothis history` to list"
         )
-        return
-    # Visibility is enforced at Session.load(cwd=...) — but peek_messages
-    # doesn't take cwd. Verify the same way here so the picker refuses
-    # out-of-scope sessions consistently with the load filter.
-    storage = Storage(db_path)
-    try:
-        sr = storage.load_session(session_id)
-        if sr is None or not _is_visible(Path(sr.cwd), Path.cwd()):
-            raise typer.BadParameter(
-                f"session {session_id!r} not in this directory's scope"
-            )
-    finally:
-        storage.close()
     if not messages:
         console.print("[dim]session is empty[/dim]")
         return

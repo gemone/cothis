@@ -52,7 +52,7 @@ from filelock import FileLock, Timeout
 
 from cothis.session import graph as _graph
 from cothis.session.graph import SessionNotFoundError
-from cothis.session.storage import BlockRow, SessionRow, Storage
+from cothis.session.storage import BlockRow, SessionRow, Storage, is_visible
 
 logger = logging.getLogger(__name__)
 
@@ -82,22 +82,6 @@ def _truncate_title(text: str) -> str:
     if len(first_line) <= 60:
         return first_line
     return first_line[:57] + "..."
-
-
-def _is_visible(session_cwd: Path, observer_cwd: Path) -> bool:
-    """``True`` iff ``session_cwd`` equals ``observer_cwd`` or is its ancestor.
-
-    ``cothis history`` shows project-root sessions from a subdirectory;
-    a session scoped to a deeper sub-project is hidden. Both paths are
-    resolved before comparison so symlinks and ``..`` segments don't
-    poison the ancestor check. ``Path.is_relative_to`` is the test.
-    """
-    try:
-        s = session_cwd.resolve()
-        o = observer_cwd.resolve()
-    except (OSError, ValueError):
-        return False
-    return o == s or o.is_relative_to(s)
 
 
 def _validate_session_id(sid: str, *, name: str = "session_id") -> None:
@@ -379,6 +363,8 @@ class Session:
         created_at: str,
         messages: list[dict[str, Any]],
         session_row_written: bool,
+        parent_id: str | None = None,
+        parent_seq: int | None = None,
         next_seq: int = 0,
         next_msg_idx: int = 0,
         flush_sync: bool = False,
@@ -393,11 +379,10 @@ class Session:
         self.messages = messages  # public: Agent reads this after load
         self._session_row_written = session_row_written
         # Fork-tree link. ``None`` on roots and on sessions loaded by id
-        # (``load`` reads the link from the sessions row, but doesn't
-        # need the in-memory copy — the ancestor chain is already
-        # assembled into ``messages`` at load time). Set by ``fork``.
-        self._parent_id: str | None = None
-        self._parent_seq: int | None = None
+        # (the ancestor chain is already assembled into ``messages`` at
+        # load time). ``fork`` passes both; ``new`` / ``load`` don't.
+        self._parent_id = parent_id
+        self._parent_seq = parent_seq
 
         # Index allocation state. Mutated only at enqueue (Agent thread).
         # Derived from the loaded rows on resume (see load()).
@@ -509,7 +494,7 @@ class Session:
             storage.close()
             lock.release()
             raise KeyError(f"session {session_id!r} not found")
-        if cwd is not None and not _is_visible(Path(sr.cwd), cwd):
+        if cwd is not None and not is_visible(Path(sr.cwd), cwd):
             storage.close()
             lock.release()
             raise KeyError(f"session {session_id!r} not found")
@@ -600,18 +585,24 @@ class Session:
         cls,
         db_path: Path,
         session_id: str,
+        *,
+        cwd: Path | None = None,
     ) -> list[dict[str, Any]]:
         """Read-only message preview for ``cothis history <id>``.
 
         No lock is taken (display only); the caller accepts that a session
         mid-write may show a partial last message. ``KeyError`` propagates
-        if the id is unknown so the CLI can surface "not found".
+        if the id is unknown OR (when ``cwd`` is passed) the session is
+        out of scope — same predicate as :meth:`load`.
         """
         db_path = db_path.expanduser()
         _validate_session_id(session_id)
         storage = Storage(db_path)
         try:
-            if storage.load_session(session_id) is None:
+            sr = storage.load_session(session_id)
+            if sr is None:
+                raise KeyError(f"session {session_id!r} not found")
+            if cwd is not None and not is_visible(Path(sr.cwd), cwd):
                 raise KeyError(f"session {session_id!r} not found")
             rows = storage.load_blocks(session_id)
             messages, _ = _rebuild_messages(rows)
@@ -707,31 +698,22 @@ class Session:
             created_at=_now_iso(),
             messages=list(ancestor_segments),
             session_row_written=False,
+            parent_id=parent_session_id,
+            parent_seq=parent_seq,
             next_seq=0,
             next_msg_idx=0,
             flush_sync=flush_sync,
         )
         session._lock = lock
-        session._parent_id = parent_session_id
-        session._parent_seq = parent_seq
-        # Eagerly write the sessions row so ``chat --resume <new_id>`` works
-        # before the user sends the first message. Title is derived from the
-        # ancestor chain's first user text (mirrors Session._drain_one's
-        # title derivation on a fresh session); empty when the ancestor
-        # chain had no user text (rare — the fork point had only
-        # assistant/tool blocks).
+        # cothis: see ADR-0009 §3 for the eager fork-row write.
         session._write_fork_row()
         return session
 
     def _write_fork_row(self) -> None:
-        """Persist the sessions row for a freshly-forked session.
+        """Persist the sessions row eagerly so ``--resume <fork_id>`` works.
 
-        Unlike the lazy row on ``Session.new``, the fork row is written
-        eagerly because: (a) the fork has a parent link that must be
-        durable so the tree is consistent across reloads and
-        ``--resume <fork_id>`` finds the session, and (b) the title is
-        already knowable from the ancestor chain (``Session.new`` has
-        no messages to derive from at construction time).
+        See ADR-0009 §3 for why this deviates from ``Session.new``'s
+        lazy-row strategy.
         """
         updated_at = _now_iso()
         self._maybe_write_gitignore()
