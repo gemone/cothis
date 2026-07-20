@@ -59,14 +59,7 @@ logger = logging.getLogger(__name__)
 # consumer join. Exhaustion → poison-row drop (same loss ceiling as kill -9).
 _WRITE_RETRY_BACKOFFS: tuple[float, ...] = (0.1, 0.5, 2.0)
 
-# Consumer join timeouts in ``close()``. The first join is generous (drains
-# dozens of backlogged writes at ~50ms each); the grace period is a short
-# final beat before close() closes storage on a still-alive consumer. Once
-# storage closes, the consumer's next ``write_atomic`` raises
-# ``ProgrammingError``, caught by ``_drain_one``'s retry queue and dropped
-# per poison-row semantics. Lock is released only after storage close —
-# releasing earlier would let a second process acquire the lock and
-# interleave writes while the consumer is still draining.
+# close() join timeouts; see ADR-0009 for the lock-contract rationale.
 _CLOSE_JOIN_TIMEOUT: float = 5.0
 _CLOSE_GRACE_PERIOD: float = 1.0
 
@@ -800,15 +793,9 @@ class Session:
     def close(self) -> None:
         """Drain the queue, join the consumer, close storage + lock.
 
-        Idempotent. Unregisters the atexit hook so the process-exit path
-        can't double-fire. The consumer is given ``_CLOSE_JOIN_TIMEOUT``
-        to drain, plus ``_CLOSE_GRACE_PERIOD`` as a final beat if it's
-        still alive. Storage is then closed unconditionally — a still-alive
-        consumer's next ``write_atomic`` raises ``ProgrammingError``,
-        caught by ``_drain_one``'s retry queue and dropped per poison-row
-        semantics. Lock is released only after storage close, preserving
-        the SessionLockedError contract (a second process can't acquire
-        the lock while writes may still be in flight).
+        Idempotent. Two-phase join (``_CLOSE_JOIN_TIMEOUT`` +
+        ``_CLOSE_GRACE_PERIOD``), then unconditional ``storage.close()``,
+        then lock release.
         """
         if self._closed:
             return
