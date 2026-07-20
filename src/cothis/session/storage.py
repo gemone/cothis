@@ -170,13 +170,24 @@ class Storage:
             self._conn.execute(stmt)
         self._conn.commit()
         # Transcripts carry tool output — routinely secrets. Tighten the
-        # db file to owner-only (sqlite creates it 0o644 via umask). WAL
-        # sidecars (-wal/-shm) inherit from the main file on creation.
-        # ponytail: os.chmod not in connect() args; idempotent on reopen.
-        try:
-            os.chmod(db_path, 0o600)
-        except OSError:
-            pass  # e.g. fs without permission bits (FAT) — best effort
+        # db + WAL/SHM sidecars to owner-only. SQLite creates all three
+        # via open() under the process umask (0o644 under the typical
+        # 0o022), and sidecars do NOT inherit the main db's mode — chmod
+        # each explicitly. WAL holds un-checkpointed data (incl. secret
+        # tool output); SHM is the shared-memory index. Best-effort: fs
+        # without permission bits (FAT) silently ignores chmod.
+        # Transcripts carry tool output — routinely secrets. Tighten the
+        # db + WAL/SHM sidecars to owner-only. SQLite creates all three
+        # via open() under the process umask (0o644 under the typical
+        # 0o022), and sidecars do NOT inherit the main db's mode — chmod
+        # each explicitly. WAL holds un-checkpointed data (incl. secret
+        # tool output); SHM is the shared-memory index. Best-effort: fs
+        # without permission bits (FAT) silently ignores chmod.
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.chmod(f"{db_path}{suffix}", 0o600)
+            except OSError:
+                pass
 
     def write_atomic(
         self,

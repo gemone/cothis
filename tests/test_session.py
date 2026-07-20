@@ -909,12 +909,30 @@ def test_crud_roundtrip_real_consumer_thread(tmp_path: Path) -> None:
 
 
 def test_db_file_is_owner_only(tmp_path: Path) -> None:
-    """Transcripts carry tool output (routinely secrets) → db 0o600."""
+    """Transcripts carry tool output (routinely secrets) → db 0o600.
+
+    Also covers WAL/SHM sidecars: SQLite creates them via open() under
+    the process umask (0o644), and they do NOT inherit the main db's
+    mode. WAL holds un-checkpointed data (same secrets); SHM is the
+    shared-memory index. All three must be tightened.
+
+    Checks while the Session is still open (sidecars exist) — close()
+    checkpoints and deletes them.
+    """
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
-    s.close()
-    mode = db_path.stat().st_mode & 0o777
-    assert mode == 0o600, f"db is {oct(mode)}, expected 0o600 (owner-only)"
+    s.append_message("user", [_user_text("x")])
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            f = db_path.with_name(db_path.name + suffix) if suffix else db_path
+            if not f.exists():
+                continue  # WAL may not exist yet if no writes pending
+            mode = f.stat().st_mode & 0o777
+            assert mode == 0o600, (
+                f"{f.name} is {oct(mode)}, expected 0o600 (owner-only)"
+            )
+    finally:
+        s.close()
 
 
 def test_load_rejects_non_hex_session_id(tmp_path: Path) -> None:
