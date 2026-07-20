@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+import pytest
+
 from cothis.agent import ToolCallEvent
 from cothis.cli import _format_tool_call
 from cothis.tools import discover_tools
@@ -435,3 +437,60 @@ def test_cothis_home_defaults_to_home_dotcothis(monkeypatch: Any) -> None:
         else:
             monkeypatch.delenv("COTHIS_HOME", raising=False)
         importlib.reload(cothis.cli)
+
+
+def test_main_keyboard_interrupt_exits_130(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C during ``app()`` surfaces as ``SystemExit(130)`` — the POSIX
+    convention for SIGINT (128 + 2). No ``Error:`` line on stderr.
+
+    Before the fix, ``except BaseException`` caught ``KeyboardInterrupt``
+    and ran the generic-error branch: ``Error: `` on stderr + ``sys.exit(1)``.
+    Scripts driving cothis couldn't tell "user cancelled" from "cothis failed".
+    """
+    import cothis.cli as cli_mod
+
+    def raise_kbi(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli_mod, "app", raise_kbi)
+    monkeypatch.setattr(cli_mod, "_debug", False)
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main()
+    assert exc_info.value.code == 130
+
+
+def test_main_keyboard_interrupt_with_debug_reraises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under ``--debug`` a Ctrl-C must surface the traceback rather than
+    be silently swallowed — developers want to see where the interrupt
+    landed."""
+    import cothis.cli as cli_mod
+
+    def raise_kbi(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli_mod, "app", raise_kbi)
+    monkeypatch.setattr(cli_mod, "_debug", True)
+    with pytest.raises(KeyboardInterrupt):
+        cli_mod.main()
+
+
+def test_main_generic_exception_still_error_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-KeyboardInterrupt exceptions still go through the ``Error:`` +
+    ``sys.exit(1)`` path — narrowing ``BaseException`` to ``Exception`` must
+    not regress the genuine-crash surface."""
+    import cothis.cli as cli_mod
+
+    def raise_value_error(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("genuine crash")
+
+    monkeypatch.setattr(cli_mod, "app", raise_value_error)
+    monkeypatch.setattr(cli_mod, "_debug", False)
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main()
+    assert exc_info.value.code == 1
