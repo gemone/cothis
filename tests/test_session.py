@@ -342,30 +342,35 @@ def test_reload_truncate_is_persisted_not_just_in_memory(
 
 
 def test_session_row_written_flag_set_after_successful_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Regression: lazy session-row flag set BEFORE write fails permanently.
+    """Lazy session-row flag stays False until the row actually commits.
 
-    Before the fix, if the first drain's ``write_atomic`` raised, the flag
-    was set to True anyway. The sessions row was never inserted, so every
-    later block INSERT hit the FK constraint and failed silently — total
-    durability loss. After the fix, a failed first drain retries on the
-    next enqueue (flag still False → session_row retried).
+    Pins the invariant that ``_session_row_written`` is set only after
+    ``write_atomic`` returns: setting it earlier would leave no sessions
+    row for the FK check, blocking every subsequent block INSERT.
+
+    Persistent failure across all retries is needed to reach this path —
+    transient failures are recovered by the retry queue
+    (see ``test_transient_write_failure_recovered_by_retry``).
     """
+    # Squash retry backoff to zero so the test doesn't sleep ~2.6s on the
+    # 3 retry attempts before the poison-row drop kicks in.
+    monkeypatch.setattr(
+        "cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0)
+    )
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
-    # First write_atomic: simulate transient failure.
-    call_count = {"n": 0}
+    # First write_atomic: fail every attempt so the row stays unwritten.
     real_write = s._storage.write_atomic
 
-    def flaky_write(session_row, block_rows, updated_at):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            raise sqlite3.OperationalError("disk I/O error (simulated)")
+    def persistently_failing_write(session_row, block_rows, updated_at):
+        raise sqlite3.OperationalError("disk I/O error (simulated)")
 
-    monkeypatch.setattr(s._storage, "write_atomic", flaky_write)
-    # This first enqueue hits the simulated error.
-    s.append_message("user", [_user_text("first")])
+    monkeypatch.setattr(s._storage, "write_atomic", persistently_failing_write)
+    # This first enqueue exhausts retries and drops the batch (poison row).
+    with caplog.at_level("CRITICAL", logger="cothis.session"):
+        s.append_message("user", [_user_text("first")])
     assert s._session_row_written is False, (
         "flag must not be set after a failed write — would permanently "
         "block the lazy row from ever being written"
@@ -377,8 +382,11 @@ def test_session_row_written_flag_set_after_successful_write(
     # The session row exists in the DB (FK would have blocked otherwise).
     sr = s._storage.load_session(s.session_id)
     assert sr is not None
-    # Both messages persisted (the failed one was in memory only; verify
-    # the assistant message landed after the retry).
+    # The first ("user") message was dropped by the poison-row guard;
+    # only the assistant message landed. The CRITICAL log records the loss.
+    drops = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert len(drops) == 1
+    assert "1 block(s)" in drops[0].getMessage()
     s.close()
     s2 = Session.load(db_path, s.session_id, flush_sync=True)
     try:
@@ -386,6 +394,132 @@ def test_session_row_written_flag_set_after_successful_write(
         assert s2.messages[0]["content"][0]["text"] == "second"
     finally:
         s2.close()
+
+
+def test_transient_write_failure_recovered_by_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A transient ``write_atomic`` failure triggers an in-line retry;
+    if the next attempt succeeds, both messages persist as if the first
+    attempt never happened.
+    """
+    # Zero backoff: the test isn't validating the backoff schedule, only
+    # the recovery contract. Avoids a 100ms sleep per retry.
+    monkeypatch.setattr(
+        "cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0)
+    )
+    db_path = tmp_path / "sessions" / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    real_write = s._storage.write_atomic
+    call_count = {"n": 0}
+
+    def one_shot_flaky_write(session_row, block_rows, updated_at):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise sqlite3.OperationalError("disk I/O error (simulated)")
+        return real_write(session_row, block_rows, updated_at)
+
+    monkeypatch.setattr(s._storage, "write_atomic", one_shot_flaky_write)
+    # Single enqueue: first attempt fails, first retry succeeds.
+    with caplog.at_level("CRITICAL", logger="cothis.session"):
+        s.append_message("user", [_user_text("first")])
+    assert call_count["n"] == 2, "retry must re-invoke write_atomic"
+    assert s._session_row_written is True
+    # No CRITICAL drop record on recovery — only the WARNING retry log.
+    drops = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert drops == [], "no rows dropped on recovery"
+    s.append_message("assistant", [{"type": "text", "text": "second"}])
+    s.close()
+    s2 = Session.load(db_path, s.session_id, flush_sync=True)
+    try:
+        # BOTH messages persisted — transient failure recovered.
+        assert [m["role"] for m in s2.messages] == ["user", "assistant"]
+        assert s2.messages[0]["content"][0]["text"] == "first"
+        assert s2.messages[1]["content"][0]["text"] == "second"
+    finally:
+        s2.close()
+
+
+def test_persistent_write_failure_drops_after_retries_no_deadlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """After ``len(_WRITE_RETRY_BACKOFFS) + 1`` attempts, a persistently-
+    failing batch is dropped and the consumer moves on; the next enqueue
+    must succeed.
+    """
+    monkeypatch.setattr(
+        "cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0)
+    )
+    db_path = tmp_path / "sessions" / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    real_write = s._storage.write_atomic
+    call_count = {"n": 0}
+
+    def persistently_failing_write(session_row, block_rows, updated_at):
+        call_count["n"] += 1
+        raise sqlite3.OperationalError("disk I/O error (simulated)")
+
+    monkeypatch.setattr(s._storage, "write_atomic", persistently_failing_write)
+    # First enqueue: persistent failure → 4 attempts (1 + 3 retries) → drop.
+    with caplog.at_level("CRITICAL", logger="cothis.session"):
+        s.append_message("user", [_user_text("doomed")])
+    assert call_count["n"] == 4
+    drops = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert len(drops) == 1
+    assert "1 block(s)" in drops[0].getMessage()
+    # Restore real write; the NEXT enqueue must succeed — the consumer is
+    # not deadlocked on the dropped batch.
+    monkeypatch.setattr(s._storage, "write_atomic", real_write)
+    s.append_message("assistant", [{"type": "text", "text": "recovered"}])
+    assert s._session_row_written is True
+    s.close()
+    s2 = Session.load(db_path, s.session_id, flush_sync=True)
+    try:
+        # Only the post-drop assistant message survived. The dropped "user"
+        # message is gone — that's the contract for persistent errors.
+        assert [m["role"] for m in s2.messages] == ["assistant"]
+        assert s2.messages[0]["content"][0]["text"] == "recovered"
+    finally:
+        s2.close()
+
+
+def test_retry_backoff_interrupted_by_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``close()`` during a retry backoff interrupts the wait via ``_stop``,
+    abandons the in-flight batch, and returns within ``close``'s 5s ceiling.
+    """
+    # Use a real backoff (so _stop.wait actually waits) — but we'll set
+    # _stop immediately after the first failed attempt to simulate close.
+    monkeypatch.setattr(
+        "cothis.session._WRITE_RETRY_BACKOFFS", (10.0, 10.0, 10.0)
+    )
+    db_path = tmp_path / "sessions" / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    call_count = {"n": 0}
+
+    def failing_then_signal_close(session_row, block_rows, updated_at):
+        call_count["n"] += 1
+        # Simulate close() happening between attempt 1 and the first retry:
+        # the consumer sets _stop, the in-flight _drain_one's _stop.wait
+        # returns True immediately, and the drain bails out.
+        s._stop.set()
+        raise sqlite3.OperationalError("disk I/O error (simulated)")
+
+    monkeypatch.setattr(s._storage, "write_atomic", failing_then_signal_close)
+    # First enqueue: fails once, _stop is set during the failure, the
+    # first _stop.wait returns True, drain abandons the batch.
+    with caplog.at_level("CRITICAL", logger="cothis.session"):
+        s.append_message("user", [_user_text("interrupted")])
+    assert call_count["n"] == 1, "must not retry after _stop is set"
+    # Close-path abandon does NOT emit a CRITICAL drop record — different
+    # loss category (kill -9 ceiling, not poison row).
+    drops = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert drops == []
+    # Session is still usable for further appends (in-memory), but the
+    # abandoned batch is lost.
+    s.append_message("assistant", [{"type": "text", "text": "after"}])
+    s.close()
 
 
 def test_reload_keeps_full_history_when_no_orphans(tmp_path: Path) -> None:
