@@ -32,11 +32,14 @@ positional mystery. They are storage-shaped, not Anthropic-shaped:
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import subprocess
 from pathlib import Path
 from typing import NamedTuple
+
+logger = logging.getLogger(__name__)
 
 # cothis: schema_version is a pure placeholder in #34 — column writes 1 and
 # PRAGMA user_version is set to 1, but neither is read. Dispatch lands with
@@ -147,12 +150,16 @@ def _restrict_to_owner(path: str) -> None:
     every Windows since Vista, so no dependency is added.
 
     Best-effort: filesystems without permission bits (FAT) or a missing
-    ``icacls`` silently log and continue — durability is still correct,
+    ``icacls`` log a warning and continue — durability is still correct,
     only the access-control tightening is skipped.
     """
     if os.name == "nt":
         user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
         if not user:
+            logger.warning(
+                "_restrict_to_owner: skipping (no USERNAME/USER env); "
+                "db remains default-umask: %s", path,
+            )
             return
         # /inheritance:r — remove inherited ACEs (drops Everyone/Users).
         # /grant:r      — replace (not merge) with current-user full control.
@@ -161,13 +168,24 @@ def _restrict_to_owner(path: str) -> None:
             subprocess.run(
                 cmd, check=True, capture_output=True, timeout=5,
             )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            pass  # best-effort; access control tightened only if icacls works
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            # Log only exception kind + returncode — str(exc) on
+            # CalledProcessError includes the full argv (path + user
+            # principal), which leaks OS username + absolute db path
+            # into shared log aggregators.
+            rc = getattr(exc, "returncode", "n/a")
+            logger.warning(
+                "_restrict_to_owner: icacls failed on %s: %s (rc=%s)",
+                path, type(exc).__name__, rc,
+            )
     else:
         try:
             os.chmod(path, 0o600)
-        except OSError:
-            pass  # e.g. FAT — best effort
+        except OSError as exc:
+            logger.warning(
+                "_restrict_to_owner: chmod 0o600 failed on %s: %s",
+                path, type(exc).__name__,
+            )
 
 
 def is_visible(session_cwd: Path, observer_cwd: Path) -> bool:

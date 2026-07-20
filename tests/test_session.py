@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1452,3 +1453,68 @@ def test_close_storage_closed_even_when_consumer_stuck(
         "lock must be released AFTER storage close — releasing earlier "
         "opens a race window for a second acquirer"
     )
+
+
+def test_restrict_to_owner_logs_warning_windows_no_user_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Windows + missing USERNAME/USER env: warn so the user knows tightening
+    was skipped (the db is left at default umask with potential secrets)."""
+    from cothis.session import storage as storage_mod
+
+    target = tmp_path / "file.db"
+    target.touch()
+    monkeypatch.setattr(storage_mod.os, "name", "nt")
+    monkeypatch.delenv("USERNAME", raising=False)
+    monkeypatch.delenv("USER", raising=False)
+
+    with caplog.at_level("WARNING", logger="cothis.session.storage"):
+        storage_mod._restrict_to_owner(str(target))
+
+    warnings = [r for r in caplog.records if "no USERNAME/USER" in r.getMessage()]
+    assert warnings, "must log a WARNING when tightening is skipped on Windows"
+
+
+def test_restrict_to_owner_logs_warning_windows_icacls_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Windows + icacls fails (missing binary / non-zero exit / timeout): warn
+    so the user sees the failure rather than believing tightening succeeded."""
+    from cothis.session import storage as storage_mod
+
+    target = tmp_path / "file.db"
+    target.touch()
+    monkeypatch.setattr(storage_mod.os, "name", "nt")
+    monkeypatch.setenv("USERNAME", "tester")
+
+    def failing_run(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["icacls"], output=b"", stderr=b"denied")
+    monkeypatch.setattr(storage_mod.subprocess, "run", failing_run)
+
+    with caplog.at_level("WARNING", logger="cothis.session.storage"):
+        storage_mod._restrict_to_owner(str(target))
+
+    warnings = [r for r in caplog.records if "icacls failed" in r.getMessage()]
+    assert warnings, "must log a WARNING when icacls fails"
+
+
+def test_restrict_to_owner_logs_warning_posix_chmod_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """POSIX + unexpected OSError from chmod: warn (real FS doesn't fail
+    here; a denial is environmental and the user can fix it)."""
+    from cothis.session import storage as storage_mod
+
+    target = tmp_path / "file.db"
+    target.touch()
+    monkeypatch.setattr(storage_mod.os, "name", "posix")
+
+    def chmod_fail(path: str, mode: int) -> None:
+        raise OSError(1, "Operation not permitted", path)
+    monkeypatch.setattr(storage_mod.os, "chmod", chmod_fail)
+
+    with caplog.at_level("WARNING", logger="cothis.session.storage"):
+        storage_mod._restrict_to_owner(str(target))
+
+    warnings = [r for r in caplog.records if "chmod 0o600 failed" in r.getMessage()]
+    assert warnings, "must log a WARNING when chmod fails on POSIX"
