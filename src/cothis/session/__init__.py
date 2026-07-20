@@ -54,6 +54,15 @@ from cothis.session.storage import BlockRow, SessionRow, Storage
 
 logger = logging.getLogger(__name__)
 
+# Retry policy for transient ``write_atomic`` failures.
+# 3 retries with linear-ish backoff covers momentary I/O hiccups
+# (sub-100ms), brief lock contention beyond ``busy_timeout`` (sub-500ms),
+# and short filesystem stalls (sub-2s). Beyond the third retry the error
+# is treated as persistent and the rows are dropped (poison-row guard).
+# Worst-case drain latency: 0.1 + 0.5 + 2.0 = 2.6s, within ``close``'s
+# 5s consumer join.
+_WRITE_RETRY_BACKOFFS: tuple[float, ...] = (0.1, 0.5, 2.0)
+
 
 def _now_iso() -> str:
     """UTC now as ISO-8601. SQLite stores as TEXT; lexicographic == chronological."""
@@ -351,6 +360,12 @@ class Session:
 
         self._closed = False
         self._flush_sync = flush_sync
+
+        # Diagnostics: blocks dropped after exhausting write retries.
+        # Surfaced in debug logs; future telemetry hook can read it from
+        # here. Never read for control flow — durability decisions are
+        # made inside _drain_one.
+        self._dropped_block_count = 0
 
         # Queue + consumer thread. Skipped entirely in flush_sync mode —
         # _drain_one is called inline from append_message instead.
@@ -655,6 +670,15 @@ class Session:
         first user-text block in ``self.messages``, write the ``.gitignore``
         if applicable, then ``write_atomic`` with a fresh ``SessionRow``.
         Subsequent calls / all ``load`` calls: pass ``session_row=None``.
+
+        Transient ``write_atomic`` failures (momentary I/O hiccup, brief
+        lock contention beyond ``busy_timeout``) are retried up to
+        ``len(_WRITE_RETRY_BACKOFFS)`` times. A persistently-failing write
+        is dropped after exhausting retries (poison-row guard) so the
+        consumer never deadlocks on a single bad batch — the Agent's
+        in-memory state still has the rows, but durability is lost for
+        them. The close-path stop flag interrupts backoff early so
+        ``Session.close`` isn't blocked by a sleeping retry.
         """
         if not rows:
             return
@@ -679,23 +703,57 @@ class Session:
         # yet every subsequent INSERT into blocks hits the FK constraint —
         # silent total durability loss. The flag's job is to gate the lazy
         # row write, and that write is only done once it actually commits.
-        try:
-            self._storage.write_atomic(session_row, rows, updated_at)
-        except Exception:  # noqa: BLE001 — log + swallow so consumer survives
-            # ponytail: a failed write must not kill the consumer (would
-            # block all future enqueues). Log loudly; the Agent continues
-            # against the in-memory messages, so the turn isn't lost from
-            # the user's view, only from durability. Upgrade path: retry
-            # queue or fail-fast depending on the failure mode.
-            logger.exception(
-                "Session %s: write_atomic failed for %d block(s); data is "
-                "in memory but not durable.",
-                self._session_id,
-                len(rows),
-            )
+        for attempt in range(len(_WRITE_RETRY_BACKOFFS) + 1):
+            try:
+                self._storage.write_atomic(session_row, rows, updated_at)
+            except Exception as exc:  # noqa: BLE001 — bounded + logged below
+                if attempt >= len(_WRITE_RETRY_BACKOFFS):
+                    # Poison row: exhausted retries. Drop this batch so the
+                    # consumer never deadlocks; bump the diagnostic counter
+                    # so ``cothis --debug`` (or future telemetry) can surface
+                    # it. Same data-loss ceiling as kill -9, only reached
+                    # after 3 retries (~2.6s of backoff).
+                    self._dropped_block_count += len(rows)
+                    logger.critical(
+                        "Session %s: write_atomic failed %d times; dropping "
+                        "%d block(s) (seq %d-%d) to unblock the queue. "
+                        "Last error: %r",
+                        self._session_id,
+                        attempt + 1,
+                        len(rows),
+                        rows[0].seq,
+                        rows[-1].seq,
+                        exc,
+                    )
+                    return
+                backoff = _WRITE_RETRY_BACKOFFS[attempt]
+                logger.warning(
+                    "Session %s: write_atomic failed (attempt %d/%d); "
+                    "retrying in %.1fs. Error: %r",
+                    self._session_id,
+                    attempt + 1,
+                    len(_WRITE_RETRY_BACKOFFS) + 1,
+                    backoff,
+                    exc,
+                )
+                # _stop.wait returns True iff the event is set (close()).
+                # Bailing mid-backoff preserves close()'s 5s join ceiling;
+                # the lost batch matches the kill -9 loss model.
+                if self._stop.wait(backoff):
+                    logger.warning(
+                        "Session %s: close() during write retry backoff; "
+                        "abandoning %d block(s) (seq %d-%d).",
+                        self._session_id,
+                        len(rows),
+                        rows[0].seq,
+                        rows[-1].seq,
+                    )
+                    return
+                continue
+            # Success — write committed, advance the lazy-row flag.
+            if session_row is not None:
+                self._session_row_written = True
             return
-        if session_row is not None:
-            self._session_row_written = True
 
     def _derive_title(self) -> str:
         """First user-text block across ``self.messages``; line+60 truncated."""
