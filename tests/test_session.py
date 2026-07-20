@@ -28,8 +28,10 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
-from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import pytest
 

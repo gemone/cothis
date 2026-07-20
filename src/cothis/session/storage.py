@@ -191,6 +191,25 @@ def is_visible(session_cwd: Path, observer_cwd: Path) -> bool:
     return o == s or o.is_relative_to(s)
 
 
+def display_cwd(session_cwd: Path, observer_cwd: Path) -> str:
+    """Path-display helper for ``cothis history``'s listing.
+
+    Returns ``session_cwd`` relative to ``observer_cwd`` when possible
+    (so a session at the cwd root shows as ``.``), or the absolute
+    resolved path otherwise (e.g. ancestor dir above the cwd). Falls
+    back to the raw value on resolve failure.
+    """
+    try:
+        s = session_cwd.resolve()
+        o = observer_cwd.resolve()
+    except (OSError, ValueError):
+        return str(session_cwd)
+    try:
+        return str(s.relative_to(o))
+    except ValueError:
+        return str(s)
+
+
 class Storage:
     """SQLite layer for one session's persistence.
 

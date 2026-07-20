@@ -24,7 +24,7 @@ from cothis.session import (
     SessionHasChildrenError,
     SessionLockedError,
 )
-from cothis.session.storage import Storage, is_visible
+from cothis.session.storage import Storage, display_cwd, is_visible
 from cothis.tools import discover_tools
 
 app = typer.Typer()
@@ -377,14 +377,10 @@ def _print_history_listing(rows: list) -> None:
     if not rows:
         console.print("[dim]no sessions in this directory's scope[/dim]")
         return
+    cwd = Path.cwd()
     for row in rows:
         title = row.title or "(no title)"
-        try:
-            cwd_display = str(
-                Path(row.cwd).resolve().relative_to(Path.cwd().resolve())
-            )
-        except ValueError:
-            cwd_display = row.cwd
+        cwd_display = display_cwd(Path(row.cwd), cwd)
         typer.echo(f"{row.id}  {row.updated_at}  {cwd_display}  {title}")
 
 
