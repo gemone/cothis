@@ -153,9 +153,7 @@ def _restrict_to_owner(path: str) -> None:
 
     Best-effort: filesystems without permission bits (FAT) or a missing
     ``icacls`` log a warning and continue — durability is still correct,
-    only the access-control tightening is skipped. Sibling
-    ``session/__init__.py`` follows the same convention on its best-effort
-    paths (.gitignore write, atexit drain).
+    only the access-control tightening is skipped.
     """
     if os.name == "nt":
         user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
@@ -173,15 +171,22 @@ def _restrict_to_owner(path: str) -> None:
                 cmd, check=True, capture_output=True, timeout=5,
             )
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            # Log only exception kind + returncode — str(exc) on
+            # CalledProcessError includes the full argv (path + user
+            # principal), which leaks OS username + absolute db path
+            # into shared log aggregators.
+            rc = getattr(exc, "returncode", "n/a")
             logger.warning(
-                "_restrict_to_owner: icacls failed on %s: %s", path, exc,
+                "_restrict_to_owner: icacls failed on %s: %s (rc=%s)",
+                path, type(exc).__name__, rc,
             )
     else:
         try:
             os.chmod(path, 0o600)
         except OSError as exc:
             logger.warning(
-                "_restrict_to_owner: chmod 0o600 failed on %s: %s", path, exc,
+                "_restrict_to_owner: chmod 0o600 failed on %s: %s",
+                path, type(exc).__name__,
             )
 
 

@@ -1159,7 +1159,7 @@ def test_restrict_to_owner_logs_warning_windows_no_user_env(
     with caplog.at_level("WARNING", logger="cothis.session.storage"):
         storage_mod._restrict_to_owner(str(target))
 
-    warnings = [r for r in caplog.records if "skipping" in r.getMessage() or "_restrict_to_owner" in r.getMessage()]
+    warnings = [r for r in caplog.records if "no USERNAME/USER" in r.getMessage()]
     assert warnings, "must log a WARNING when tightening is skipped on Windows"
 
 
@@ -1182,7 +1182,7 @@ def test_restrict_to_owner_logs_warning_windows_icacls_fails(
     with caplog.at_level("WARNING", logger="cothis.session.storage"):
         storage_mod._restrict_to_owner(str(target))
 
-    warnings = [r for r in caplog.records if "icacls" in r.getMessage() or "_restrict_to_owner" in r.getMessage()]
+    warnings = [r for r in caplog.records if "icacls failed" in r.getMessage()]
     assert warnings, "must log a WARNING when icacls fails"
 
 
@@ -1204,5 +1204,5 @@ def test_restrict_to_owner_logs_warning_posix_chmod_fails(
     with caplog.at_level("WARNING", logger="cothis.session.storage"):
         storage_mod._restrict_to_owner(str(target))
 
-    warnings = [r for r in caplog.records if "chmod" in r.getMessage() or "_restrict_to_owner" in r.getMessage()]
+    warnings = [r for r in caplog.records if "chmod 0o600 failed" in r.getMessage()]
     assert warnings, "must log a WARNING when chmod fails on POSIX"
