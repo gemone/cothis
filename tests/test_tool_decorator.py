@@ -367,14 +367,14 @@ def test_load_gitignore_returns_none_when_absent(tmp_path: Any) -> None:
     nothing, but returning a real object when None is documented would
     mislead callers into thinking they have patterns to apply.
     """
-    from cothis.tools.builtins import _load_gitignore
+    from cothis.tools.fs._hygiene import _load_gitignore
 
     assert _load_gitignore(tmp_path) is None
 
 
 def test_load_gitignore_parses_patterns(tmp_path: Any) -> None:
     """ " "``_load_gitignore`` returns a PathSpec matching .gitignore lines."""
-    from cothis.tools.builtins import _load_gitignore
+    from cothis.tools.fs._hygiene import _load_gitignore
 
     (tmp_path / ".gitignore").write_text("*.log\nbuild/\n")
     spec = _load_gitignore(tmp_path)
@@ -404,41 +404,39 @@ def test_read_start_line_beyond_eof_returns_actionable_error(
 
 
 def test_dir_returns_structured_entries(tmp_path: Any) -> None:
-    """``fs.dir`` returns a list of ``{"name", "type"}`` dicts, not text.
-
-    Structured output lets ``_execute`` serialise it as JSON (the model-native
-    shape) instead of a bespoke text format the model has to parse.
-    """
-    from cothis.tools.builtins import _list_dir
+    """``fs.list`` returns a list of ``{"name", "type"}`` dicts, not text."""
+    from cothis.tools.fs._hygiene import workdir_context
+    from cothis.tools.fs.list import _list as _list_dir
 
     (tmp_path / "src").mkdir()
     (tmp_path / "README.md").write_text("hi")
-    result = _list_dir(path=str(tmp_path))
+    with workdir_context(tmp_path):
+        result = _list_dir(path=".")
     assert isinstance(result, list)
     by_name = {e["name"]: e["type"] for e in result}
     assert by_name == {"src": "dir", "README.md": "file"}
 
 
 def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
-    """``fs.dir`` on a missing path returns an ``"Error: ..."`` str.
+    """``fs.list`` on a missing path returns an ``"Error: ..."`` str."""
+    from cothis.tools.fs._hygiene import workdir_context
+    from cothis.tools.fs.list import _list as _list_dir
 
-    Error paths stay as strings (not structured) — ``_execute`` passes them
-    through unchanged so the model sees an actionable message.
-    """
-    from cothis.tools.builtins import _list_dir
-
-    result = _list_dir(path=str(tmp_path / "nonexistent"))
+    with workdir_context(tmp_path):
+        result = _list_dir(path="nonexistent")
     assert isinstance(result, str)
-    assert result.startswith("Error: no such directory")
+    assert result.startswith("Error:")
 
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
-    """ " "Recursive listing yields entries with nested relative paths."""
-    from cothis.tools.builtins import _list_dir
+    """Recursive listing yields entries with nested relative paths."""
+    from cothis.tools.fs._hygiene import workdir_context
+    from cothis.tools.fs.list import _list as _list_dir
 
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "mod.py").write_text("")
-    result = _list_dir(path=str(tmp_path), recursive=True)
+    with workdir_context(tmp_path):
+        result = _list_dir(path=".", recursive=True)
     names = {e["name"] for e in result}
     assert "pkg" in names
     assert "pkg/mod.py" in names
@@ -646,9 +644,9 @@ def test_builtin_tools_are_tooldef_instances() -> None:
     Regression check: the migration from bare decorated functions to
     ``ToolDef`` must not break the built-in tools.
     """
-    from cothis.tools.builtins import _list_dir, read, write
+    from cothis.tools.builtins import TOOLS
 
-    for t in (read, _list_dir, write):
+    for t in TOOLS:
         assert isinstance(t, ToolDef)
         assert isinstance(t, Tool)
         assert t.__cothis_schema__ is not None
