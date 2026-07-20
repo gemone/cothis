@@ -381,10 +381,11 @@ class Storage:
         """DELETE ``session_id``'s blocks + sessions row in one txn.
 
         Caller (:func:`cothis.cli.delete`) checks the leaf-only contract
-        via :meth:`SessionGraph.is_leaf` before calling. The blocks
-        DELETE is explicit because the FK has no ``ON DELETE CASCADE``
-        (the original schema predates the fork tree and cascades would
-        hide the leaf-only contract from a manual ``sqlite3`` session).
+        via :func:`cothis.session.graph.is_leaf` before calling. The
+        blocks DELETE is explicit because the FK has no
+        ``ON DELETE CASCADE`` (the original schema predates the fork
+        tree and cascades would hide the leaf-only contract from a
+        manual ``sqlite3`` session).
         """
         with self._conn:
             self._conn.execute(
@@ -393,6 +394,20 @@ class Storage:
             self._conn.execute(
                 "DELETE FROM sessions WHERE id=?", (session_id,)
             )
+
+    def msg_idx_to_max_seq(self, session_id: str) -> dict[int, int]:
+        """Map each ``msg_idx`` to the max ``seq`` it contains.
+
+        ``cothis history <id>``'s fork picker uses this to translate a
+        chosen message index into the inclusive ``seq`` cap for the
+        fork's ``parent_seq``.
+        """
+        cur = self._conn.execute(
+            "SELECT msg_idx, MAX(seq) FROM blocks WHERE session_id=? "
+            "GROUP BY msg_idx",
+            (session_id,),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
 
     def delete_blocks_from_msg_idx(
         self, session_id: str, cut_msg_idx: int

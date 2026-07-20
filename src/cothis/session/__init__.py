@@ -50,7 +50,8 @@ from typing import Any
 
 from filelock import FileLock, Timeout
 
-from cothis.session.graph import SessionGraph, SessionNotFoundError
+from cothis.session import graph as _graph
+from cothis.session.graph import SessionNotFoundError
 from cothis.session.storage import BlockRow, SessionRow, Storage
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,19 @@ def _is_visible(session_cwd: Path, observer_cwd: Path) -> bool:
     except (OSError, ValueError):
         return False
     return o == s or o.is_relative_to(s)
+
+
+def _validate_session_id(sid: str, *, name: str = "session_id") -> None:
+    """Reject anything that isn't a 32-char lowercase hex string.
+
+    ``session_id`` becomes a filesystem path in ``_lock_path`` and a
+    SQLite primary key. Safe in ``Session.new`` (uuid4 hex, internal),
+    but ``load`` / ``delete`` / ``fork`` receive ids from callers — a
+    bad value here would either traverse the filesystem (``../``) or
+    fail an FK constraint deep in SQLite with a worse error message.
+    """
+    if len(sid) != 32 or not all(c in "0123456789abcdef" for c in sid):
+        raise ValueError(f"invalid {name}: {sid!r}")
 
 
 def _block_to_row(
@@ -483,14 +497,7 @@ class Session:
         (``KeyError``), matching ``cothis history``'s listing scope.
         """
         db_path = db_path.expanduser()
-        # Trust boundary: session_id becomes a filesystem path in
-        # _lock_path. Safe in new() (uuid4().hex, internal), but load()
-        # receives it from callers (future --resume). Reject anything
-        # that isn't exactly 32 lowercase hex — blocks ``../`` traversal.
-        if len(session_id) != 32 or not all(
-            c in "0123456789abcdef" for c in session_id
-        ):
-            raise ValueError(f"invalid session_id: {session_id!r}")
+        _validate_session_id(session_id)
         lock = cls._take_lock(cls._lock_path(session_id))
         try:
             storage = Storage(db_path)
@@ -506,16 +513,12 @@ class Session:
             storage.close()
             lock.release()
             raise KeyError(f"session {session_id!r} not found")
-        graph = SessionGraph(storage.list_sessions())
+        graph = _graph.build(storage.list_sessions())
         rows = storage.load_blocks(session_id)
         messages, cut_msg_idx = _rebuild_messages(rows)
         if cut_msg_idx is not None:
             storage.delete_blocks_from_msg_idx(session_id, cut_msg_idx)
             rows = [r for r in rows if r.msg_idx < cut_msg_idx]
-        # Ancestor chain: walk parents root → direct parent. For each
-        # ancestor, the child link's ``parent_seq`` is the inclusive
-        # ``seq`` cap on the ancestor's blocks (git-branch semantics —
-        # the fork does not see post-fork blocks).
         if sr.parent_id is not None:
             ancestor_segments = cls._assemble_ancestors(graph, storage, session_id)
             messages = ancestor_segments + messages
@@ -572,10 +575,7 @@ class Session:
         Hot-DB only in this slice (#35); cold-DB delete lands in #36.
         """
         db_path = db_path.expanduser()
-        if len(session_id) != 32 or not all(
-            c in "0123456789abcdef" for c in session_id
-        ):
-            raise ValueError(f"invalid session_id: {session_id!r}")
+        _validate_session_id(session_id)
         lock = cls._take_lock(cls._lock_path(session_id))
         try:
             storage = Storage(db_path)
@@ -586,62 +586,72 @@ class Session:
             target = storage.load_session(session_id)
             if target is None:
                 raise KeyError(f"session {session_id!r} not found")
-            graph = SessionGraph(storage.list_sessions())
-            if not graph.is_leaf(session_id):
-                children = graph.children_of(session_id)
+            graph = _graph.build(storage.list_sessions())
+            if not _graph.is_leaf(graph, session_id):
+                children = _graph.children_of(graph, session_id)
                 raise SessionHasChildrenError(session_id, children)
             storage.delete_session(session_id)
         finally:
             storage.close()
             lock.release()
 
-    @staticmethod
-    def _assemble_ancestors(
-        graph: SessionGraph,
-        storage: Storage,
+    @classmethod
+    def peek_messages(
+        cls,
+        db_path: Path,
         session_id: str,
     ) -> list[dict[str, Any]]:
-        """Prepend ancestor segments to ``messages`` for a forked session.
+        """Read-only message preview for ``cothis history <id>``.
 
-        Walks ``graph.ancestors(session_id)`` (root → direct parent). For
-        each ancestor ``A``, the cutoff is the ``parent_seq`` recorded on
-        the *child* link (the descendant that brought ``A`` into the
-        chain). Each segment is rebuilt via ``_rebuild_messages`` so
-        orphan-truncate fires per segment — a fork taken mid-tool-call
-        on an ancestor drops that ancestor's orphan tail rather than
-        poisoning the chain.
-
-        The current session's own blocks are NOT loaded here — the
-        caller already has them in ``messages`` and prepends this
-        method's output.
+        No lock is taken (display only); the caller accepts that a session
+        mid-write may show a partial last message. ``KeyError`` propagates
+        if the id is unknown so the CLI can surface "not found".
         """
-        chain = graph.ancestors(session_id)
-        if not chain:
-            return []
-        # ``parent_seq`` for the link child → ancestor. The walk visits
-        # ancestors root → parent; for each, the cutoff is the
-        # parent_seq of its descendant in the chain (or session_id for
-        # the direct parent).
-        chain_with_self = chain + [session_id]
+        db_path = db_path.expanduser()
+        _validate_session_id(session_id)
+        storage = Storage(db_path)
+        try:
+            if storage.load_session(session_id) is None:
+                raise KeyError(f"session {session_id!r} not found")
+            rows = storage.load_blocks(session_id)
+            messages, _ = _rebuild_messages(rows)
+            return messages
+        finally:
+            storage.close()
+
+    @staticmethod
+    def _assemble_ancestors(
+        graph: dict[str, SessionRow],
+        storage: Storage,
+        session_id: str,
+        *,
+        override_link: tuple[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load ancestor blocks (capped at each link's ``parent_seq``) and reuild.
+
+        ``override_link`` is ``(parent_id, parent_seq)`` for ``session_id``
+        when the new fork's row isn't in ``graph`` yet (the in-flight
+        case during ``Session.fork``). When ``session_id`` is in ``graph``,
+        the override is ignored.
+        """
+        start_parent_id: str | None = None
+        start_parent_seq: int | None = None
+        if session_id not in graph and override_link is not None:
+            start_parent_id, start_parent_seq = override_link
+        chain = _graph.walk_ancestors(
+            graph,
+            session_id,
+            start_parent_id=start_parent_id,
+            start_parent_seq=start_parent_seq,
+        )
         segments: list[list[dict[str, Any]]] = []
-        for i, ancestor_id in enumerate(chain):
-            child_id = chain_with_self[i + 1]
-            cap = graph.parent_seq_of(child_id)
+        for ancestor_id, cap in chain:
             if cap is None:
-                cap_rows: list[BlockRow] = []
-            else:
-                cap_rows = storage.load_blocks_through_seq(ancestor_id, cap)
+                continue
+            cap_rows = storage.load_blocks_through_seq(ancestor_id, cap)
             seg_messages, _ = _rebuild_messages(cap_rows)
             if seg_messages:
                 segments.append(seg_messages)
-        # Concatenate segments in chain order. Each segment already
-        # alternates user/assistant internally; concatenation may
-        # produce same-role adjacency across the segment boundary
-        # (e.g. ancestor ends in assistant, current starts with user —
-        # fine; or ancestor ends in user, current starts with user —
-        # Anthropic rejects consecutive user messages, so the caller's
-        # merge in ``_ensure_messages`` must handle this on first
-        # ``run`` after resume, same as the trailing-user case).
         return [m for seg in segments for m in seg]
 
     @classmethod
@@ -663,17 +673,9 @@ class Session:
         its lazy row so the fork tree records the link. Ancestor-chain
         context is loaded eagerly so ``session.messages`` reads as one
         flat conversation the Agent can resume from directly.
-
-        ``parent_seq`` is inclusive: blocks with ``seq <= parent_seq``
-        on the parent contribute to the fork's context. The caller is
-        responsible for picking a sensible fork point (e.g. via
-        ``cothis history <id>``'s picker).
         """
         db_path = db_path.expanduser()
-        if len(parent_session_id) != 32 or not all(
-            c in "0123456789abcdef" for c in parent_session_id
-        ):
-            raise ValueError(f"invalid parent_session_id: {parent_session_id!r}")
+        _validate_session_id(parent_session_id, name="parent_session_id")
         if parent_seq < 0:
             raise ValueError(f"parent_seq must be >= 0, got {parent_seq}")
         new_id = uuid.uuid4().hex
@@ -688,25 +690,13 @@ class Session:
             storage.close()
             lock.release()
             raise KeyError(f"parent session {parent_session_id!r} not found")
-        # Build the ancestor chain for the *parent*, then extend it
-        # with this fork's link. The new session's own blocks are empty
-        # (the fork starts a fresh numbering space); its context is the
-        # parent's chain capped at parent_seq.
-        graph = SessionGraph(storage.list_sessions())
-        graph.add(
-            SessionRow(
-                id=new_id,
-                parent_id=parent_session_id,
-                parent_seq=parent_seq,
-                cwd=str(cwd),
-                cli_version=_cli_version(),
-                model=model,
-                title="",
-                created_at=_now_iso(),
-                updated_at=_now_iso(),
-            )
+        graph = _graph.build(storage.list_sessions())
+        ancestor_segments = cls._assemble_ancestors(
+            graph,
+            storage,
+            new_id,
+            override_link=(parent_session_id, parent_seq),
         )
-        ancestor_segments = cls._assemble_ancestors(graph, storage, new_id)
         session = cls(
             db_path=db_path,
             session_id=new_id,

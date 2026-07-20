@@ -1,27 +1,21 @@
-"""In-memory session fork tree.
+"""In-memory session fork tree operations.
 
-Built once at startup from the ``sessions`` table's flat rows. The tree
-is stored as ``parent_id``/``parent_seq`` columns on each session row
-(``NULL`` on roots); this module layers tree operations on top without
-touching SQLite — every operation is a dict lookup or a stack walk, no
-SQL, no recursive CTE (measured 3-10x slower than the in-memory graph
-on a 10k-session fixture).
+Module of free functions over a flat ``dict[str, SessionRow]`` map.
+The tree is stored on the rows themselves (``parent_id`` /
+``parent_seq`` columns); these functions layer tree operations on top
+without touching SQLite. Every operation is a dict lookup or a stack
+walk — no SQL, no recursive CTE (measured 3-10x slower than the
+in-memory graph on a 10k-session fixture).
 
-Single-threaded by design: the CLI builds one ``SessionGraph`` per
-invocation, walks it to list/resume/fork/delete, then exits. The graph
-is mutable only through :meth:`add`, used after a fork to keep the
-in-memory tree consistent with the row the fork just wrote lazily; no
-concurrent mutation is supported.
-
-Each node is identified by its session id (a 32-char hex string). Edges
-point child → parent: ``_parent_of[child_id] == parent_id``. Roots have
-no entry. ``children_of`` is the inverse map, used by ``subtree`` and
-the leaf-only delete check.
+The map is built once at startup from :meth:`Storage.list_sessions`
+and treated as immutable by these functions. ``Session.fork`` does not
+mutate the map: it passes ``(parent_id, parent_seq)`` directly to
+:func:`walk_ancestors`, so the ancestor walk sees the in-flight fork
+link without synthesising a fake row.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -31,117 +25,109 @@ if TYPE_CHECKING:
 
 
 class SessionNotFoundError(KeyError):
-    """A session id passed to a graph operation is not in the graph."""
+    """A session id passed to a graph operation is not in the map."""
 
 
-class SessionGraph:
-    """In-memory directed tree of session forks.
+def build(rows: Iterable[SessionRow]) -> dict[str, SessionRow]:
+    """Index rows by ``id``. The returned map is the input to every other helper."""
+    return {row.id: row for row in rows}
 
-    Construct from :class:`~cothis.session.storage.SessionRow` instances
-    (any iterable; the graph does not own the rows). After construction,
-    call :meth:`add` when a fork lazily writes its row so subsequent
-    walks see the new node.
+
+def parent_of(graph: dict[str, SessionRow], sid: str) -> str | None:
+    """Direct parent id, or ``None`` if ``sid`` is a root."""
+    _require(graph, sid)
+    return graph[sid].parent_id
+
+
+def parent_seq_of(graph: dict[str, SessionRow], sid: str) -> int | None:
+    """``parent_seq`` cutoff for ``sid``'s parent, or ``None`` on roots."""
+    _require(graph, sid)
+    return graph[sid].parent_seq
+
+
+def children_of(graph: dict[str, SessionRow], sid: str) -> list[str]:
+    """Direct children of ``sid``. Empty for leaves."""
+    _require(graph, sid)
+    return [r.id for r in graph.values() if r.parent_id == sid]
+
+
+def is_leaf(graph: dict[str, SessionRow], sid: str) -> bool:
+    """``True`` if ``sid`` has no children — the only nodes ``delete`` accepts."""
+    _require(graph, sid)
+    return not any(r.parent_id == sid for r in graph.values())
+
+
+def roots(graph: dict[str, SessionRow]) -> list[str]:
+    """All root ids (sessions with no parent)."""
+    return [sid for sid, row in graph.items() if row.parent_id is None]
+
+
+def ancestors(graph: dict[str, SessionRow], sid: str) -> list[str]:
+    """``[root, …, direct_parent]`` — empty when ``sid`` is itself a root."""
+    _require(graph, sid)
+    chain: list[str] = []
+    current = graph[sid].parent_id
+    seen: set[str] = {sid}
+    while current is not None and current in graph and current not in seen:
+        chain.append(current)
+        seen.add(current)
+        current = graph[current].parent_id
+    chain.reverse()
+    return chain
+
+
+def subtree(graph: dict[str, SessionRow], sid: str) -> list[str]:
+    """``sid`` plus every descendant (BF order, ``sid`` first)."""
+    _require(graph, sid)
+    out: list[str] = [sid]
+    i = 0
+    while i < len(out):
+        current = out[i]
+        i += 1
+        out.extend(r.id for r in graph.values() if r.parent_id == current)
+    return out
+
+
+def walk_ancestors(
+    graph: dict[str, SessionRow],
+    start_id: str,
+    *,
+    start_parent_id: str | None = None,
+    start_parent_seq: int | None = None,
+) -> list[tuple[str, int | None]]:
+    """Ancestor chain for ``start_id``, root → direct parent.
+
+    Returns ``[(ancestor_id, seq_cap), …]`` where ``seq_cap`` is the
+    inclusive ``seq`` cutoff applied to ``ancestor_id``'s blocks during
+    context assembly. The cutoff comes from the *child* link's
+    ``parent_seq`` — i.e. the descendant that brought this ancestor
+    into the chain.
+
+    ``start_parent_id`` / ``start_parent_seq`` are used when
+    ``start_id`` is not yet in ``graph`` (an in-flight fork row that
+    hasn't been flushed). ``Session.fork`` passes the constructor
+    args here so the ancestor walk sees the link without mutating the
+    graph. When ``start_id`` IS in the graph, the overrides are
+    ignored — the graph's stored link is authoritative.
     """
+    if start_id in graph:
+        parent_id = graph[start_id].parent_id
+        cap = graph[start_id].parent_seq
+    else:
+        parent_id = start_parent_id
+        cap = start_parent_seq
+    out: list[tuple[str, int | None]] = []
+    seen: set[str] = {start_id}
+    while parent_id is not None and parent_id in graph and parent_id not in seen:
+        out.append((parent_id, cap))
+        seen.add(parent_id)
+        ancestor = graph[parent_id]
+        cap = ancestor.parent_seq
+        parent_id = ancestor.parent_id
+    out.reverse()
+    return out
 
-    def __init__(self, rows: Iterable[SessionRow]) -> None:
-        self._parent_of: dict[str, str] = {}
-        self._parent_seq_of: dict[str, int] = {}
-        self._children_of: dict[str, list[str]] = defaultdict(list)
-        self._known: set[str] = set()
-        for row in rows:
-            self._insert(row)
 
-    def _insert(self, row: SessionRow) -> None:
-        sid = row.id
-        self._known.add(sid)
-        if row.parent_id is not None:
-            self._parent_of[sid] = row.parent_id
-            self._parent_seq_of[sid] = (
-                row.parent_seq if row.parent_seq is not None else 0
-            )
-            self._children_of[row.parent_id].append(sid)
-
-    def add(self, row: SessionRow) -> None:
-        """Register a freshly-forked row so later walks see it.
-
-        Idempotent on the id: re-adding a known id is a no-op (the lazy
-        ``sessions`` row may already be in the graph if the user forked
-        from a session whose row was flushed before this method ran).
-        """
-        if row.id in self._known:
-            return
-        self._insert(row)
-
-    def __contains__(self, sid: object) -> bool:
-        return sid in self._known
-
-    def __len__(self) -> int:
-        return len(self._known)
-
-    def parent_of(self, sid: str) -> str | None:
-        """Direct parent id, or ``None`` if ``sid`` is a root."""
-        self._require(sid)
-        return self._parent_of.get(sid)
-
-    def parent_seq_of(self, sid: str) -> int | None:
-        """``parent_seq`` cutoff for ``sid``'s parent, or ``None`` on roots.
-
-        For a forked session, this is the inclusive ``seq`` cap applied
-        to the parent's blocks during ancestor-chain context assembly.
-        """
-        self._require(sid)
-        return self._parent_seq_of.get(sid)
-
-    def children_of(self, sid: str) -> list[str]:
-        """Direct children of ``sid`` (unordered). Empty for leaves."""
-        self._require(sid)
-        return list(self._children_of.get(sid, ()))
-
-    def is_leaf(self, sid: str) -> bool:
-        """``True`` if ``sid`` has no children — the only nodes ``delete`` accepts."""
-        self._require(sid)
-        return not self._children_of.get(sid)
-
-    def roots(self) -> list[str]:
-        """All root ids (sessions with no parent). Order is insertion order."""
-        return [sid for sid in self._known if sid not in self._parent_of]
-
-    def ancestors(self, sid: str) -> list[str]:
-        """``[root, …, direct_parent]`` — empty when ``sid`` is itself a root.
-
-        Walked via the ``_parent_of`` map (no SQL). The caller prepends
-        ``sid`` to assemble the full chain root → current. If a parent
-        id is missing from the graph (the row was deleted from the DB
-        without cascading to its children — should not happen given the
-        leaf-only delete contract, but defended against), the walk stops
-        at the deepest reachable ancestor.
-        """
-        self._require(sid)
-        chain: list[str] = []
-        current = self._parent_of.get(sid)
-        seen: set[str] = {sid}
-        while current is not None and current not in seen:
-            chain.append(current)
-            seen.add(current)
-            current = self._parent_of.get(current)
-        chain.reverse()
-        return chain
-
-    def subtree(self, sid: str) -> list[str]:
-        """``sid`` plus every descendant (BF order, ``sid`` first).
-
-        Used by tests and by future tree-pruning operations; ``delete``
-        only needs :meth:`is_leaf`.
-        """
-        self._require(sid)
-        out: list[str] = [sid]
-        i = 0
-        while i < len(out):
-            current = out[i]
-            i += 1
-            out.extend(self._children_of.get(current, ()))
-        return out
-
-    def _require(self, sid: str) -> None:
-        if sid not in self._known:
-            raise SessionNotFoundError(sid)
+def _require(graph: dict[str, SessionRow], sid: str) -> None:
+    if sid not in graph:
+        raise SessionNotFoundError(sid)

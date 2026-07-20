@@ -23,6 +23,7 @@ from cothis.session import (
     Session,
     SessionHasChildrenError,
     SessionLockedError,
+    _is_visible,
 )
 from cothis.session.storage import Storage
 from cothis.tools import discover_tools
@@ -413,24 +414,27 @@ def history(
         rows = Session.list_visible(db_path, Path.cwd())
         _print_history_listing(rows)
         return
-    # Inspect one: read-only load (no lock; build the messages preview).
+    # Inspect one: peek_messages enforces the cwd visibility filter on Session.load.
+    try:
+        messages = Session.peek_messages(db_path, session_id)
+    except KeyError:
+        raise typer.BadParameter(
+            f"session {session_id!r} not found (or not in this directory's scope); "
+            f"run `cothis history` to list"
+        )
+        return
+    # Visibility is enforced at Session.load(cwd=...) — but peek_messages
+    # doesn't take cwd. Verify the same way here so the picker refuses
+    # out-of-scope sessions consistently with the load filter.
     storage = Storage(db_path)
     try:
         sr = storage.load_session(session_id)
-        if sr is None:
-            raise typer.BadParameter(
-                f"session {session_id!r} not found; run `cothis history` to list"
-            )
-        if not _session_visible(sr.cwd, Path.cwd()):
+        if sr is None or not _is_visible(Path(sr.cwd), Path.cwd()):
             raise typer.BadParameter(
                 f"session {session_id!r} not in this directory's scope"
             )
-        rows = storage.load_blocks(session_id)
     finally:
         storage.close()
-    from cothis.session import _rebuild_messages  # local import: test hook
-
-    messages, _ = _rebuild_messages(rows)
     if not messages:
         console.print("[dim]session is empty[/dim]")
         return
@@ -453,24 +457,25 @@ def history(
         raise typer.BadParameter(f"expected a number or 'r', got {choice!r}")
     if not 0 <= idx < len(messages):
         raise typer.BadParameter(f"index {idx} out of range (0..{len(messages) - 1})")
-    # Map the in-memory message index back to the storage seq cap.
-    # Messages group by msg_idx in order; the i-th message occupies the
-    # i-th distinct msg_idx. The seq cap is the max seq across that
-    # message's blocks.
-    msg_idx_order: list[int] = []
-    seen: set[int] = set()
-    for r in rows:
-        if r.msg_idx not in seen:
-            seen.add(r.msg_idx)
-            msg_idx_order.append(r.msg_idx)
-    target_msg_idx = msg_idx_order[idx]
-    cap = max(r.seq for r in rows if r.msg_idx == target_msg_idx)
+    # Map the in-memory message index back to the storage seq cap. Each message
+    # occupies one distinct msg_idx; the seq cap is the max seq across
+    # that message's blocks.
+    storage = Storage(db_path)
+    try:
+        idx_to_max_seq = storage.msg_idx_to_max_seq(session_id)
+        sr = storage.load_session(session_id)
+        model = (sr.model if sr is not None else "") or ""
+    finally:
+        storage.close()
+    msg_idxs = sorted(idx_to_max_seq)
+    target_msg_idx = msg_idxs[idx]
+    cap = idx_to_max_seq[target_msg_idx]
     forked = Session.fork(
         db_path,
         session_id,
         cap,
         cwd=Path.cwd(),
-        model=sr.model or "",
+        model=model,
     )
     try:
         forked_id = forked.session_id
@@ -480,16 +485,6 @@ def history(
         f"forked as [cyan]{forked_id}[/cyan]; "
         f"run [cyan]cothis chat --resume {forked_id}[/cyan] to continue"
     )
-
-
-def _session_visible(session_cwd: str, observer_cwd: Path) -> bool:
-    """Visibility predicate mirroring ``Storage.list_sessions_in_cwd_tree``."""
-    try:
-        s = Path(session_cwd).resolve()
-        o = observer_cwd.resolve()
-    except (OSError, ValueError):
-        return False
-    return o == s or o.is_relative_to(s)
 
 
 @app.command(name="delete")
