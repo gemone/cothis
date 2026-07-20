@@ -9,10 +9,11 @@ subpackage is built up incrementally per #46's vertical slices:
 - slice 4–6 (#51–#53): ``fs.write`` signature + cwd boundary + atomicity.
 - slice 7–8 (#54–#55): ``fs.list`` (fd backend) + ``fs.search`` (rg backend).
 
-Exports grow slice by slice: ``read`` (#3), ``write`` (#4).
+Exports grow slice by slice: ``read`` (#3), ``write`` (#4), ``list`` (#7).
 """
 
+from cothis.tools.fs.list import list as fs_list
 from cothis.tools.fs.read import read
 from cothis.tools.fs.write import write
 
-__all__ = ["read", "write"]
+__all__ = ["read", "write", "fs_list"]

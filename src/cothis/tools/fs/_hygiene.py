@@ -22,6 +22,8 @@ import contextvars
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pathspec
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -82,3 +84,47 @@ def _resolve_under(path: str, cwd: Path) -> Path:
             f"path resolves outside cwd: {path!r} → {resolved}"
         ) from exc
     return resolved
+
+
+# ---------------------------------------------------------------------
+# Listing hygiene — shared by fs.list (#54) and fs.search (#55)
+# ---------------------------------------------------------------------
+
+_IGNORED_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".next",
+        "dist",
+        "build",
+        "target",
+        ".DS_Store",
+    }
+)
+
+_MAX_DIR_ENTRIES = 500
+
+
+def _load_gitignore(root: Path) -> pathspec.PathSpec | None:
+    """Load ``.gitignore`` patterns from ``root``.
+
+    Returns ``None`` if no ``.gitignore`` exists. Patterns resolve
+    relative to ``root`` — this is the simplest correct scope (no
+    upward walk; the common case is a single ``.gitignore`` at the
+    project root).
+    """
+    ignore_file = root / ".gitignore"
+    if not ignore_file.is_file():
+        return None
+    return pathspec.PathSpec.from_lines(
+        "gitignore", ignore_file.read_text(encoding="utf-8").splitlines()
+    )
