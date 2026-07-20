@@ -342,7 +342,7 @@ def test_reload_truncate_is_persisted_not_just_in_memory(
 
 
 def test_session_row_written_flag_set_after_successful_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Regression: lazy session-row flag set BEFORE write fails permanently.
 
@@ -371,7 +371,8 @@ def test_session_row_written_flag_set_after_successful_write(
 
     monkeypatch.setattr(s._storage, "write_atomic", persistently_failing_write)
     # This first enqueue exhausts retries and drops the batch (poison row).
-    s.append_message("user", [_user_text("first")])
+    with caplog.at_level("CRITICAL", logger="cothis.session"):
+        s.append_message("user", [_user_text("first")])
     assert s._session_row_written is False, (
         "flag must not be set after a failed write — would permanently "
         "block the lazy row from ever being written"
@@ -383,10 +384,11 @@ def test_session_row_written_flag_set_after_successful_write(
     # The session row exists in the DB (FK would have blocked otherwise).
     sr = s._storage.load_session(s.session_id)
     assert sr is not None
-    # The first ("user") message was dropped by the poison-row guard; only
-    # the assistant message landed. ``_dropped_block_count`` records the
-    # loss for diagnostics.
-    assert s._dropped_block_count == 1
+    # The first ("user") message was dropped by the poison-row guard;
+    # only the assistant message landed. The CRITICAL log records the loss.
+    drops = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert len(drops) == 1
+    assert "1 block(s)" in drops[0].getMessage()
     s.close()
     s2 = Session.load(db_path, s.session_id, flush_sync=True)
     try:
@@ -397,7 +399,7 @@ def test_session_row_written_flag_set_after_successful_write(
 
 
 def test_transient_write_failure_recovered_by_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A single transient ``write_atomic`` failure must not lose block data.
 
@@ -426,10 +428,13 @@ def test_transient_write_failure_recovered_by_retry(
 
     monkeypatch.setattr(s._storage, "write_atomic", one_shot_flaky_write)
     # Single enqueue: first attempt fails, first retry succeeds.
-    s.append_message("user", [_user_text("first")])
+    with caplog.at_level("CRITICAL", logger="cothis.session"):
+        s.append_message("user", [_user_text("first")])
     assert call_count["n"] == 2, "retry must re-invoke write_atomic"
     assert s._session_row_written is True
-    assert s._dropped_block_count == 0, "no rows dropped on recovery"
+    # No CRITICAL drop record on recovery — only the WARNING retry log.
+    drops = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert drops == [], "no rows dropped on recovery"
     s.append_message("assistant", [{"type": "text", "text": "second"}])
     s.close()
     s2 = Session.load(db_path, s.session_id, flush_sync=True)
@@ -443,7 +448,7 @@ def test_transient_write_failure_recovered_by_retry(
 
 
 def test_persistent_write_failure_drops_after_retries_no_deadlock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Poison-row guard: a write that fails every retry must be dropped,
     not retried forever.
@@ -469,9 +474,12 @@ def test_persistent_write_failure_drops_after_retries_no_deadlock(
 
     monkeypatch.setattr(s._storage, "write_atomic", persistently_failing_write)
     # First enqueue: persistent failure → 4 attempts (1 + 3 retries) → drop.
-    s.append_message("user", [_user_text("doomed")])
+    with caplog.at_level("CRITICAL", logger="cothis.session"):
+        s.append_message("user", [_user_text("doomed")])
     assert call_count["n"] == 4
-    assert s._dropped_block_count == 1
+    drops = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert len(drops) == 1
+    assert "1 block(s)" in drops[0].getMessage()
     # Restore real write; the NEXT enqueue must succeed — the consumer is
     # not deadlocked on the dropped batch.
     monkeypatch.setattr(s._storage, "write_atomic", real_write)
@@ -489,7 +497,7 @@ def test_persistent_write_failure_drops_after_retries_no_deadlock(
 
 
 def test_retry_backoff_interrupted_by_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """``close`` during a retry backoff abandons the batch and returns.
 
@@ -519,12 +527,13 @@ def test_retry_backoff_interrupted_by_close(
     monkeypatch.setattr(s._storage, "write_atomic", failing_then_signal_close)
     # First enqueue: fails once, _stop is set during the failure, the
     # first _stop.wait returns True, drain abandons the batch.
-    s.append_message("user", [_user_text("interrupted")])
+    with caplog.at_level("CRITICAL", logger="cothis.session"):
+        s.append_message("user", [_user_text("interrupted")])
     assert call_count["n"] == 1, "must not retry after _stop is set"
-    assert s._dropped_block_count == 0, (
-        "close-path abandon does not bump the drop counter (different "
-        "loss category — kill -9 ceiling, not poison row)"
-    )
+    # Close-path abandon does NOT emit a CRITICAL drop record — different
+    # loss category (kill -9 ceiling, not poison row).
+    drops = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert drops == []
     # Session is still usable for further appends (in-memory), but the
     # abandoned batch is lost.
     s.append_message("assistant", [{"type": "text", "text": "after"}])

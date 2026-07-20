@@ -54,13 +54,9 @@ from cothis.session.storage import BlockRow, SessionRow, Storage
 
 logger = logging.getLogger(__name__)
 
-# Retry policy for transient ``write_atomic`` failures.
-# 3 retries with linear-ish backoff covers momentary I/O hiccups
-# (sub-100ms), brief lock contention beyond ``busy_timeout`` (sub-500ms),
-# and short filesystem stalls (sub-2s). Beyond the third retry the error
-# is treated as persistent and the rows are dropped (poison-row guard).
-# Worst-case drain latency: 0.1 + 0.5 + 2.0 = 2.6s, within ``close``'s
-# 5s consumer join.
+# Retry policy for transient ``write_atomic`` failures. 3 retries with
+# linear-ish backoff; worst-case drain latency 2.6s, within ``close``'s 5s
+# consumer join. Exhaustion → poison-row drop (same loss ceiling as kill -9).
 _WRITE_RETRY_BACKOFFS: tuple[float, ...] = (0.1, 0.5, 2.0)
 
 
@@ -360,12 +356,6 @@ class Session:
 
         self._closed = False
         self._flush_sync = flush_sync
-
-        # Diagnostics: blocks dropped after exhausting write retries.
-        # Surfaced in debug logs; future telemetry hook can read it from
-        # here. Never read for control flow — durability decisions are
-        # made inside _drain_one.
-        self._dropped_block_count = 0
 
         # Queue + consumer thread. Skipped entirely in flush_sync mode —
         # _drain_one is called inline from append_message instead.
@@ -671,14 +661,9 @@ class Session:
         if applicable, then ``write_atomic`` with a fresh ``SessionRow``.
         Subsequent calls / all ``load`` calls: pass ``session_row=None``.
 
-        Transient ``write_atomic`` failures (momentary I/O hiccup, brief
-        lock contention beyond ``busy_timeout``) are retried up to
-        ``len(_WRITE_RETRY_BACKOFFS)`` times. A persistently-failing write
-        is dropped after exhausting retries (poison-row guard) so the
-        consumer never deadlocks on a single bad batch — the Agent's
-        in-memory state still has the rows, but durability is lost for
-        them. The close-path stop flag interrupts backoff early so
-        ``Session.close`` isn't blocked by a sleeping retry.
+        Transient ``write_atomic`` failures retried per
+        ``_WRITE_RETRY_BACKOFFS``; poison rows dropped after exhaustion
+        (see module-top comment).
         """
         if not rows:
             return
@@ -708,12 +693,9 @@ class Session:
                 self._storage.write_atomic(session_row, rows, updated_at)
             except Exception as exc:  # noqa: BLE001 — bounded + logged below
                 if attempt >= len(_WRITE_RETRY_BACKOFFS):
-                    # Poison row: exhausted retries. Drop this batch so the
-                    # consumer never deadlocks; bump the diagnostic counter
-                    # so ``cothis --debug`` (or future telemetry) can surface
-                    # it. Same data-loss ceiling as kill -9, only reached
-                    # after 3 retries (~2.6s of backoff).
-                    self._dropped_block_count += len(rows)
+                    # Poison row: exhausted retries. Drop the batch so
+                    # the consumer never deadlocks. Same loss ceiling as
+                    # kill -9 — see module-top comment.
                     logger.critical(
                         "Session %s: write_atomic failed %d times; dropping "
                         "%d block(s) (seq %d-%d) to unblock the queue. "
@@ -736,9 +718,8 @@ class Session:
                     backoff,
                     exc,
                 )
-                # _stop.wait returns True iff the event is set (close()).
-                # Bailing mid-backoff preserves close()'s 5s join ceiling;
-                # the lost batch matches the kill -9 loss model.
+                # _stop.wait returns True iff close() fired — bail to
+                # preserve close's 5s join ceiling.
                 if self._stop.wait(backoff):
                     logger.warning(
                         "Session %s: close() during write retry backoff; "
