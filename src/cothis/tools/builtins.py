@@ -9,6 +9,7 @@ import pathspec
 
 from cothis.tools.core import Tool, tool
 from cothis.tools.fs.read import read
+from cothis.tools.fs.write import write
 
 _IGNORED_DIRS = frozenset(
     {
@@ -138,28 +139,6 @@ def _list_dir(
     if truncated_count > 0:
         return {"entries": entries, "truncated": truncated_count}
     return entries
-
-
-@tool("fs.write")
-def write(path: str, content: str) -> str:
-    """Write text to a file on the filesystem, creating it if needed.
-
-    Parent directories are created automatically. Existing files are
-    overwritten.
-
-    Args:
-        path: Path to the file to write.
-            eg. "notes.txt", "src/generated.py", "./output/result.json".
-        content: The text to write to the file.
-            eg. "hello world", a full source file's text.
-
-    Returns:
-        A short confirmation with the number of characters written.
-    """
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return f"Wrote {len(content)} characters to {path}"
 
 
 TOOLS: list[Tool] = [read, _list_dir, write]
