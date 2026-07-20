@@ -8,16 +8,14 @@ lands in slice #5.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 from cothis.tools.fs._hygiene import workdir_context
 from cothis.tools.fs.patch import PatchError
 from cothis.tools.fs.write import write
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_write_add_creates_new_file(tmp_path: Path) -> None:
@@ -31,7 +29,7 @@ def test_write_add_creates_new_file(tmp_path: Path) -> None:
     with workdir_context(tmp_path):
         result = write(content=patch)
     assert (tmp_path / "new.txt").read_text() == "hello world\n"
-    assert "added 1" in result
+    assert "added new.txt" in result
 
 
 def test_write_update_splices_pre_image(tmp_path: Path) -> None:
@@ -62,7 +60,7 @@ def test_write_delete_removes_file(tmp_path: Path) -> None:
     with workdir_context(tmp_path):
         result = write(content=patch)
     assert not (tmp_path / "stale.txt").exists()
-    assert "deleted 1" in result
+    assert "deleted stale.txt" in result
 
 
 def test_write_add_on_existing_raises_patch_error(tmp_path: Path) -> None:
@@ -151,9 +149,9 @@ def test_write_summary_counts_all_three_op_kinds(tmp_path: Path) -> None:
 """
     with workdir_context(tmp_path):
         result = write(content=patch)
-    assert "added 1" in result
-    assert "updated 1" in result
-    assert "deleted 1" in result
+    assert "added n.txt" in result
+    assert "updated u.txt" in result
+    assert "deleted d.txt" in result
 
 
 # ---------------------------------------------------------------------
@@ -255,3 +253,127 @@ def test_write_boundary_check_runs_before_any_disk_write(tmp_path: Path) -> None
             write(content=patch)
     # safe.txt untouched (pre-flight raised before commit).
     assert (tmp_path / "safe.txt").read_text() == "orig\n"
+
+
+# ---------------------------------------------------------------------
+# atomic commit + rollback (slice #6 / #53)
+# ---------------------------------------------------------------------
+
+
+def test_write_returns_file_list_with_verbs(tmp_path: Path) -> None:
+    """Return value lists each affected file with its verb — not just counts."""
+    (tmp_path / "u.txt").write_text("a\n", encoding="utf-8")
+    (tmp_path / "d.txt").write_text("b\n", encoding="utf-8")
+    patch = """\
+*** Begin Patch
+*** Add File: n.txt
++new
+*** Update File: u.txt
+@@
+-a
++A
+*** Delete File: d.txt
+*** End Patch
+"""
+    with workdir_context(tmp_path):
+        result = write(content=patch)
+    # Each file listed with its verb.
+    assert "added n.txt" in result
+    assert "updated u.txt" in result
+    assert "deleted d.txt" in result
+    # No diff preview (information duplication with the patch already in model context).
+    assert "+new" not in result
+    assert "-a" not in result
+
+
+def test_write_rollback_on_oserror_mid_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OSError on the Nth target's write rolls back prior commits in reverse."""
+    import cothis.tools.fs.write as write_mod
+
+    (tmp_path / "a.txt").write_text("alpha\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("beta\n", encoding="utf-8")
+    patch = """\
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++ALPHA
+*** Update File: b.txt
+@@
+-beta
++BETA
+*** Add File: c.txt
++gamma
+*** End Patch
+"""
+    # Inject OSError on the second write_text call (b.txt's commit).
+    real_write_text = Path.write_text
+    call_count = {"n": 0}
+
+    def failing_write_text(self: Path, data: str, **kw: str | None) -> int:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise OSError("simulated disk full")
+        return real_write_text(self, data, **kw)
+
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    with workdir_context(tmp_path):
+        with pytest.raises(OSError, match="disk full"):
+            write(content=patch)
+
+    # Rollback: a.txt's content restored, c.txt (added then rolled back) gone.
+    assert (tmp_path / "a.txt").read_text() == "alpha\n"
+    assert (tmp_path / "b.txt").read_text() == "beta\n"
+    assert not (tmp_path / "c.txt").exists()
+
+
+def test_write_rollback_failure_logs_and_reraises_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If rollback itself fails on a target, logger.error records it; the
+    *primary* OSError is what propagates (rollback error doesn't mask it)."""
+    import cothis.tools.fs.write as write_mod
+
+    (tmp_path / "a.txt").write_text("alpha\n", encoding="utf-8")
+    patch = """\
+*** Begin Patch
+*** Update File: a.txt
+@@
+-alpha
++ALPHA
+*** Add File: b.txt
++beta
+*** End Patch
+"""
+    real_write_text = Path.write_text
+    real_write_bytes = Path.write_bytes
+    primary_raised = {"n": 0}
+
+    def write_then_fail(self: Path, data: str, **kw: str | None) -> int:
+        primary_raised["n"] += 1
+        # b.txt commit (second call) raises primary OSError.
+        if primary_raised["n"] == 2:
+            raise OSError("primary disk error")
+        return real_write_text(self, data, **kw)
+
+    def rollback_fail(self: Path, data: bytes) -> int:
+        # Rollback path: always fail.
+        raise OSError("rollback failure")
+
+    monkeypatch.setattr(Path, "write_text", write_then_fail)
+    monkeypatch.setattr(Path, "write_bytes", rollback_fail)
+
+    with workdir_context(tmp_path):
+        with pytest.raises(OSError, match="primary disk error"):
+            with caplog.at_level("ERROR", logger=write_mod.__name__):
+                write(content=patch)
+
+    # Rollback failure logged.
+    rollback_errors = [
+        r for r in caplog.records
+        if "rollback" in r.getMessage().lower()
+    ]
+    assert rollback_errors, "rollback failure must be logged at ERROR"

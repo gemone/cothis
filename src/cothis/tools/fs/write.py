@@ -14,11 +14,15 @@ followed (a link target inside cwd is allowed, outside is rejected).
 
 Resolved paths are cached at preflight and reused at commit so a
 symlink swap between the two steps can't bypass the boundary (TOCTOU
-window closed; atomic rollback lands in slice #6).
+window closed). Disk commits are atomic via snapshot-and-reverse
+rollback: an ``OSError`` mid-commit reverses every prior target to
+its pre-call state (best-effort; rollback failure is logged but does
+not mask the primary error).
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from cothis.tools.core import tool
@@ -33,10 +37,12 @@ from cothis.tools.fs.patch import (
     parse_patch,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _check_one_op_per_path(ops: list[AddFile | UpdateFile | DeleteFile]) -> None:
     """Reject patches with two ops on the same path."""
-    seen: dict[str, int] = {}
+    seen: set[str] = set()
     for op in ops:
         path = getattr(op, "path")
         if path in seen:
@@ -44,7 +50,7 @@ def _check_one_op_per_path(ops: list[AddFile | UpdateFile | DeleteFile]) -> None
                 f"more than one op on path {path!r} — split into separate calls",
                 file=path,
             )
-        seen[path] = 1
+        seen.add(path)
 
 
 def _preflight(
@@ -89,35 +95,75 @@ def _preflight(
     return state, resolved_paths
 
 
-def _commit(
+def _snapshot(resolved_paths: dict[str, Path]) -> dict[str, bytes | None]:
+    """Capture each target's prior state as bytes (or ``None`` if missing).
+
+    Used by ``_commit`` to reverse writes on OSError. Bytes (not str)
+    because the reverse path uses ``write_bytes`` — decoding isn't
+    necessary for rollback, and avoids any UTF-8 edge case in the
+    snapshot pass.
+    """
+    snap: dict[str, bytes | None] = {}
+    for rel, resolved in resolved_paths.items():
+        try:
+            snap[rel] = resolved.read_bytes()
+        except FileNotFoundError:
+            snap[rel] = None
+    return snap
+
+
+def _commit_atomic(
     prior: dict[str, str],
     post: dict[str, str],
     resolved_paths: dict[str, Path],
-) -> tuple[int, int, int]:
-    """Write the post-apply state back to disk. Returns ``(added, updated, deleted)``.
+) -> list[tuple[str, str]]:
+    """Write the post-apply state to disk atomically.
 
-    Diffs ``prior`` (pre-apply) against ``post`` (post-apply):
-    - path in both, content differs → update.
-    - path in post only → add (parent dir already verified by _preflight).
-    - path in prior only → delete.
-
-    Reuses ``resolved_paths`` from ``_preflight`` rather than re-resolving —
-    closes the TOCTOU window where a symlink swap between preflight and
-    commit would bypass the boundary (the cached path is the one checked).
+    Returns ``[(verb, rel_path), ...]`` for the summary (verb is
+    ``added`` / ``updated`` / ``deleted``). On ``OSError`` mid-commit,
+    reverses every committed target in reverse order to its snapshot
+    state, then re-raises the original ``OSError``. Rollback failure
+    on any target is logged at ERROR but does not mask the primary
+    error.
     """
-    # cothis: slice #6 (#53) will wrap this in snapshot+reverse; current
-    # shape leaves partial state on crash mid-loop. Grep-able from the
-    # atomicity wiring.
-    added = updated = deleted = 0
+    snapshot = _snapshot(resolved_paths)
+    committed: list[tuple[str, str]] = []
+
+    def _rollback(primary: BaseException) -> None:
+        """Reverse every committed target in reverse order, best-effort."""
+        for verb, rel in reversed(committed):
+            resolved = resolved_paths[rel]
+            prior_bytes = snapshot[rel]
+            try:
+                if prior_bytes is None:
+                    # Was added; remove it.
+                    resolved.unlink()
+                else:
+                    # Was updated or deleted; restore prior bytes.
+                    resolved.write_bytes(prior_bytes)
+            except OSError as rollback_err:
+                logger.error(
+                    "fs.write rollback FAILED for %s: %s (primary error: %s)",
+                    rel, rollback_err, primary,
+                )
+
     for path in post:
         resolved = resolved_paths[path]
         if path in prior:
             if post[path] != prior[path]:
-                resolved.write_text(post[path], encoding="utf-8")
-                updated += 1
+                try:
+                    resolved.write_text(post[path], encoding="utf-8")
+                except OSError as exc:
+                    _rollback(exc)
+                    raise
+                committed.append(("updated", path))
         else:
-            resolved.write_text(post[path], encoding="utf-8")
-            added += 1
+            try:
+                resolved.write_text(post[path], encoding="utf-8")
+            except OSError as exc:
+                _rollback(exc)
+                raise
+            committed.append(("added", path))
     for path in prior:
         if path not in post:
             resolved = resolved_paths[path]
@@ -125,9 +171,11 @@ def _commit(
                 resolved.unlink()
             except FileNotFoundError:
                 pass  # idempotent — file already gone
-            else:
-                deleted += 1
-    return added, updated, deleted
+            except OSError as exc:
+                _rollback(exc)
+                raise
+            committed.append(("deleted", path))
+    return committed
 
 
 @tool("fs.write")
@@ -141,6 +189,11 @@ def write(content: str) -> str:
     multi-file patch is atomic at the in-memory layer: either every op
     commits or none do.
 
+    Disk commits are atomic via snapshot-and-reverse rollback: an
+    ``OSError`` mid-commit reverses every prior target to its pre-call
+    state (best-effort; rollback failure is logged but does not mask
+    the primary error).
+
     Paths resolve against the Agent's cwd (``WORKDIR``). Absolute paths
     and ``..`` escapes are rejected; in-cwd symlinks are followed
     (``Path.resolve()``), matching the hermes path-security pattern.
@@ -149,12 +202,15 @@ def write(content: str) -> str:
         content: A codex ``apply_patch`` document.
 
     Returns:
-        A summary like ``"fs.write: added N, updated M, deleted K"``.
+        A summary listing each affected file with its verb, e.g.
+        ``"fs.write: updated a.py, added lib.py"``. No diff preview —
+        the patch is already in the model's context.
     """
     cwd = WORKDIR.get() or Path.cwd()
     ops = parse_patch(content)
     _check_one_op_per_path(ops)
     prior, resolved_paths = _preflight(ops, cwd)
     post = apply_patch(prior, ops)  # raises ApplyError on pre-image miss etc.
-    added, updated, deleted = _commit(prior, post, resolved_paths)
-    return f"fs.write: added {added}, updated {updated}, deleted {deleted}"
+    committed = _commit_atomic(prior, post, resolved_paths)
+    summary = ", ".join(f"{verb} {path}" for verb, path in committed)
+    return f"fs.write: {summary}" if summary else "fs.write: no changes"
