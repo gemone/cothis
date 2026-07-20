@@ -443,12 +443,7 @@ def test_main_keyboard_interrupt_exits_130(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Ctrl-C during ``app()`` surfaces as ``SystemExit(130)`` — the POSIX
-    convention for SIGINT (128 + 2). No ``Error:`` line on stderr.
-
-    Before the fix, ``except BaseException`` caught ``KeyboardInterrupt``
-    and ran the generic-error branch: ``Error: `` on stderr + ``sys.exit(1)``.
-    Scripts driving cothis couldn't tell "user cancelled" from "cothis failed".
-    """
+    convention for SIGINT (128 + 2). No ``Error:`` line on stderr."""
     import cothis.cli as cli_mod
 
     def raise_kbi(*args: Any, **kwargs: Any) -> None:
@@ -481,9 +476,8 @@ def test_main_keyboard_interrupt_with_debug_reraises(
 def test_main_generic_exception_still_error_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-KeyboardInterrupt exceptions still go through the ``Error:`` +
-    ``sys.exit(1)`` path — narrowing ``BaseException`` to ``Exception`` must
-    not regress the genuine-crash surface."""
+    """Non-``KeyboardInterrupt`` exceptions surface as ``Error: <msg>`` on
+    stderr with exit code 1."""
     import cothis.cli as cli_mod
 
     def raise_value_error(*args: Any, **kwargs: Any) -> None:

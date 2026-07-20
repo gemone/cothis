@@ -345,9 +345,9 @@ def main() -> None:
         raise
     except KeyboardInterrupt:
         # POSIX convention: SIGINT → exit status 130 (128 + 2). Silent
-        # unless --debug, mirroring git/ssh/python -c. The inner >>> prompt
-        # handler at _chat_session already exits silently on Ctrl-C — this
-        # mirrors that contract for the streaming path.
+        # unless --debug, mirroring git/ssh/python -c.
+        # _chat_session's inner prompt handler exits silently on Ctrl-C;
+        # this branch mirrors that contract for the streaming path.
         if _debug:
             raise
         sys.exit(130)
