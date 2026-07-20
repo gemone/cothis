@@ -83,6 +83,7 @@ def test_system_param_str_becomes_persona_block_with_cache_control(
     monkeypatch.setattr(
         "cothis.agent._load_agents_md", lambda: None
     )
+    monkeypatch.setattr("cothis.agent._load_skill_catalog", lambda: None)
     assert _system_param("You are helpful.") == [
         {
             "type": "text",
@@ -493,6 +494,7 @@ def test_run_sends_system_param_and_anthropic_messages(
 
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     monkeypatch.setattr("cothis.agent._load_agents_md", lambda: None)
+    monkeypatch.setattr("cothis.agent._load_skill_catalog", lambda: None)
     asyncio.run(agent.run("hi"))
     # system is a block list with cache_control, not a {role: system} message.
     assert seen["system"] == [
@@ -1103,6 +1105,7 @@ def test_assemble_system_persona_block_with_cache_control(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("cothis.agent._load_agents_md", lambda: None)
+    monkeypatch.setattr("cothis.agent._load_skill_catalog", lambda: None)
     blocks = _assemble_system("You are helpful.")
     assert len(blocks) == 1
     assert blocks[0] == {
@@ -1118,6 +1121,7 @@ def test_assemble_system_includes_agents_md_when_present(
     monkeypatch.setattr(
         "cothis.agent._load_agents_md", lambda: '<agents_md type="project">\nrules\n</agents_md>'
     )
+    monkeypatch.setattr("cothis.agent._load_skill_catalog", lambda: None)
     blocks = _assemble_system("persona")
     assert len(blocks) == 2
     assert blocks[0]["text"] == "persona"
@@ -1130,6 +1134,7 @@ def test_assemble_system_omits_agents_md_when_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("cothis.agent._load_agents_md", lambda: None)
+    monkeypatch.setattr("cothis.agent._load_skill_catalog", lambda: None)
     blocks = _assemble_system("persona")
     assert len(blocks) == 1
 
@@ -1395,6 +1400,7 @@ def test_run_assembles_system_prompt_once_per_run(
         return None
 
     monkeypatch.setattr("cothis.agent._load_agents_md", counting_loader)
+    monkeypatch.setattr("cothis.agent._load_skill_catalog", lambda: None)
     asyncio.run(agent.run("hi"))
     # Two turns (tool call then final answer) → exactly one assembly.
     assert state["turn"] == 2

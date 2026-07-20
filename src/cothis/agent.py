@@ -43,6 +43,8 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
 from cothis.model_metadata import resolve_max_tokens
+from cothis.skills import discover_skills as _discover_skills
+from cothis.skills import format_catalog as _format_skill_catalog
 from cothis.tools import (
     AfterExecuteError,
     HandleManager,
@@ -90,7 +92,7 @@ def _assemble_system(persona: str) -> list[dict[str, Any]]:
 
     Each block carries ``cache_control: {type: ephemeral}``. The AGENTS.md
     block is included only when at least one file is found; the catalog
-    block slot is reserved for #30 (no-op until skills land).
+    block is included only when at least one Agent Skill is discovered.
     """
     blocks: list[dict[str, Any]] = [
         {"type": "text", "text": persona, "cache_control": {"type": "ephemeral"}}
@@ -104,9 +106,27 @@ def _assemble_system(persona: str) -> list[dict[str, Any]]:
                 "cache_control": {"type": "ephemeral"},
             }
         )
-    # ponytail: catalog block slot reserved for #30 — append a catalog block
-    # here when skills land.
+    catalog = _load_skill_catalog()
+    if catalog is not None:
+        blocks.append(
+            {
+                "type": "text",
+                "text": catalog,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
     return blocks
+
+
+def _load_skill_catalog() -> str | None:
+    """Discover Agent Skills and render the ``<available_skills>`` block.
+
+    Returns ``None`` when no skills are discovered (catalog slot omitted
+    entirely — no token cost when skills are absent). Failures during
+    discovery are logged at WARNING inside :func:`discover_skills`; the
+    catalog still renders from whatever skills *did* parse.
+    """
+    return _format_skill_catalog(_discover_skills())
 
 
 def _load_agents_md() -> str | None:

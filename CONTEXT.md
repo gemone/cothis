@@ -360,3 +360,21 @@ reload drops any trailing partial turn that would leave an orphan
 `tool_use` (no matching `tool_result`).
 _Avoid_: chunk, fragment, entry (all too generic); node (collides with
 the fork tree's session node, #35).
+
+**Agent Skill**:
+An on-demand knowledge bundle the model activates mid-conversation. A
+skill is a directory containing a `SKILL.md` whose YAML frontmatter
+declares `name` and `description` (the catalog entry the model sees)
+and whose body carries the skill's full instructions (delivered on
+`load_skill`). Discovery scans three layer dirs (lowest precedence
+first): `~/.agents/skills/` (user-agents, cross-tool convention),
+`~/.cothis/skills/` (user-cothis), `<cwd>/.agents/skills/` (project,
+shadows user). Discovery is lenient: unparseable YAML, empty
+description, or unreadable file → skipped with a WARNING; missing
+`name` defaults to the directory name. The *catalog* (`<available_skills>`
+block in `system`) is included only when ≥1 skill is discovered,
+omitted entirely otherwise — no token cost when skills are absent.
+`format_catalog` is a pure function of the discovered list.
+_Avoid_: plugin (too generic, collides with MCP); module (collides with
+Python module); snippet (too narrow — a skill is structured, not a
+fragment).
