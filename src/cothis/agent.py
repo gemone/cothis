@@ -43,6 +43,8 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
 from cothis.model_metadata import resolve_max_tokens
+from cothis.skills import discover_skills as _discover_skills
+from cothis.skills import format_catalog as _format_skill_catalog
 from cothis.tools import (
     AfterExecuteError,
     HandleManager,
@@ -124,9 +126,7 @@ def _load_skill_catalog() -> str | None:
     discovery are logged at WARNING inside :func:`discover_skills`; the
     catalog still renders from whatever skills *did* parse.
     """
-    from cothis.skills import discover_skills, format_catalog
-
-    return format_catalog(discover_skills())
+    return _format_skill_catalog(_discover_skills())
 
 
 def _load_agents_md() -> str | None:
