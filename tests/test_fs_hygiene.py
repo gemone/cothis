@@ -170,20 +170,23 @@ def test_agent_run_stream_body_wraps_workdir_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_workdir_injection_through_probe_tool(tmp_path: Path) -> None:
-    """The injection chain Agent → workdir_context → WORKDIR → tool works.
+async def test_workdir_injection_through_real_tool(tmp_path: Path) -> None:
+    """The injection chain Agent → workdir_context → WORKDIR → fs tool works.
 
-    Drives the same path Agent.run takes (workdir_context wrap + a tool
-    that reads WORKDIR) without constructing a real Agent (which would
-    require an any-llm API key).
+    Drives the same path Agent.run takes (workdir_context wrap) with a
+    real fs tool (``read``) instead of the deleted probe. The tool reads
+    WORKDIR via ``_resolve_under``; a relative path inside the turn's
+    cwd resolves, proving the full injection.
     """
-    from cothis.tools.fs._hygiene import _cwd_probe, workdir_context, workdir_path
+    from cothis.tools.fs._hygiene import workdir_context, workdir_path
+    from cothis.tools.fs.read import read
 
     assert workdir_path() is None
 
+    (tmp_path / "hello.txt").write_text("hello\n", encoding="utf-8")
     with workdir_context(tmp_path):
-        result = _cwd_probe()
-        assert result == str(tmp_path)
+        result = read(path="hello.txt")
+        assert "hello" in result
         assert workdir_path() == tmp_path
 
     assert workdir_path() is None

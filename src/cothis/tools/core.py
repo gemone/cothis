@@ -585,13 +585,19 @@ def _build_schema(
         ):
             continue
         annotation = hints.get(pname, param.annotation)
-        # Unwrap ``int | None`` → ``int`` so the type map sees the real type.
-        # Handles both ``typing.Union[X, None]`` (origin is ``typing.Union``) and
-        # PEP 604 ``X | None`` (origin is ``types.UnionType``).
+        # Unwrap ``Optional[X]`` (one non-None member) → ``X`` so the type
+        # map sees the real type. Handles both ``typing.Union[X, None]``
+        # (origin is ``typing.Union``) and PEP 604 ``X | None`` (origin is
+        # ``types.UnionType``). Genuine multi-type unions (``str | list[str]``)
+        # are left intact so ``TypeAdapter`` emits ``anyOf`` — the model
+        # needs to see every accepted shape.
         origin = typing.get_origin(annotation)
         if origin in (typing.Union, types.UnionType, type(None)):
             non_none = [a for a in typing.get_args(annotation) if a is not type(None)]
-            annotation = non_none[0] if non_none else str
+            if len(non_none) == 1:
+                annotation = non_none[0]
+            elif not non_none:
+                annotation = str
         prop: dict[str, Any]
         try:
             # ``TypeAdapter`` honours ``Annotated[T, Field(...)]`` constraints

@@ -394,10 +394,11 @@ def test_read_start_line_beyond_eof_returns_actionable_error(
     nothing to act on. The error names the requested line and actual length.
     """
     from cothis.tools import read
+    from cothis.tools.fs._hygiene import workdir_context
 
-    f = tmp_path / "small.txt"
-    f.write_text("line1\nline2\nline3\n")
-    result = read(path=str(f), start_line=100, end_line=200)
+    (tmp_path / "small.txt").write_text("line1\nline2\nline3\n")
+    with workdir_context(tmp_path):
+        result = read(path="small.txt", start_line=100, end_line=200)
     assert result.startswith("Error: start_line 100 is beyond EOF")
     assert "3 lines" in result  # names the actual length
 
@@ -1273,3 +1274,60 @@ def test_no_duplicate_names_loads_normally(tmp_path: Any) -> None:
     )
     tools = load_tools_from_layer(tmp_path)
     assert len(tools) == 2
+
+
+# ---------------------------------------------------------------------
+# _build_schema — union handling (anyOf for multi-type, unwrap for Optional)
+# ---------------------------------------------------------------------
+
+
+def test_schema_union_two_types_emits_anyof() -> None:
+    """A genuine multi-type union (``str | list[str]``) must reach the
+    LLM schema as ``anyOf`` — not collapse to its first member."""
+    @tool("multi")
+    def multi(path: str | list[str]) -> str:
+        """Multi.
+
+        Args:
+            path: single or list.
+        """
+        return str(path)
+
+    prop = multi.__cothis_schema__["input_schema"]["properties"]["path"]
+    assert "anyOf" in prop, f"expected anyOf, got {prop}"
+    types_in_schema = [s.get("type") for s in prop["anyOf"]]
+    assert "string" in types_in_schema
+    assert "array" in types_in_schema
+
+
+def test_schema_optional_unwrap_still_works() -> None:
+    """``Optional[X]`` (one non-None member) still unwraps to ``X`` —
+    regression check on the union-collapse fix."""
+    @tool("opt")
+    def opt(x: int | None = None) -> str:
+        """Opt.
+
+        Args:
+            x: optional int.
+        """
+        return str(x)
+
+    prop = opt.__cothis_schema__["input_schema"]["properties"]["x"]
+    assert prop.get("type") == "integer", f"expected integer, got {prop}"
+    assert "anyOf" not in prop
+
+
+def test_schema_pep604_optional_unwrap_still_works() -> None:
+    """``X | None`` (PEP 604 form) also unwraps to ``X``."""
+    @tool("pep604")
+    def pep604(name: str | None = None) -> str:
+        """Pep604.
+
+        Args:
+            name: optional name.
+        """
+        return name or ""
+
+    prop = pep604.__cothis_schema__["input_schema"]["properties"]["name"]
+    assert prop.get("type") == "string"
+    assert "anyOf" not in prop
