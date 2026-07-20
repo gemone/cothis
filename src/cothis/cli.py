@@ -132,6 +132,7 @@ def ask(
             system=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
             max_tokens=max_tokens,
+            cwd=Path.cwd(),
         )
     with console.status("thinking...", spinner="dots"):
         answer = asyncio.run(_run_and_close(agent, prompt))
@@ -241,6 +242,7 @@ async def _chat_session(
                 system=DEFAULT_SYSTEM_PROMPT,
                 max_iterations=max_iterations,
                 max_tokens=max_tokens,
+                cwd=Path.cwd(),
             )
             agent.attach_session(session)
 

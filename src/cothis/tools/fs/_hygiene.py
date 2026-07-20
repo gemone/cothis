@@ -1,0 +1,99 @@
+"""``cothis.tools.fs._hygiene`` — WORKDIR ContextVar + path boundary.
+
+The injection spine every fs tool reads from. The Agent sets WORKDIR
+on turn entry (try/finally) so every tool call inside the turn sees
+the same cwd; tools resolve user-supplied paths through
+:func:`_resolve_under` which rejects absolute paths and cwd escapes.
+
+Pure: no disk I/O. The temporary ``fs._cwd_probe`` tool proves the
+wiring end-to-end; slice #3 deletes it once the first real fs tool
+arrives.
+
+cothis: ADR deferred per PRD #46 — current shape is the floor, not
+the ceiling. ``contextvars`` over a schema param / ``injects=``
+mechanism is the load-bearing choice; documenting it formally waits
+until a second consumer validates the shape.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import contextvars
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from cothis.tools.core import tool
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+WORKDIR: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "cothis.tools.fs.WORKDIR", default=None,
+)
+
+
+class PathBoundaryError(ValueError):
+    """Raised by :func:`_resolve_under` when a path escapes cwd.
+
+    Sibling modules (e.g. ``patch``) that surface errors to the LLM
+    catch this and translate to their own error type. Owned here so
+    the foundation module doesn't import upward.
+    """
+
+
+def workdir_path() -> Path | None:
+    """Return the cwd active for the current turn, or ``None`` outside a turn."""
+    return WORKDIR.get()
+
+
+@contextlib.contextmanager
+def workdir_context(cwd: Path | None) -> Iterator[Path]:
+    """Set WORKDIR for the duration of the block; reset on exit.
+
+    The Agent wraps each ``run`` / ``run_stream`` body in this so tool
+    calls see a consistent cwd. ``None`` falls back to ``Path.cwd()``.
+
+    cothis: cwd is Agent-owned, never tool-schema-supplied — schema
+    input would defeat the boundary (model could fill any path).
+    """
+    actual = cwd if cwd is not None else Path.cwd()
+    token = WORKDIR.set(actual)
+    try:
+        yield actual
+    finally:
+        WORKDIR.reset(token)
+
+
+def _resolve_under(path: str, cwd: Path) -> Path:
+    """Resolve ``path`` against ``cwd``; reject absolute + cwd-escape.
+
+    Coalesces two layers: syntactic (absolute path → reject up front)
+    and post-resolve (``relative_to`` after ``resolve()`` rejects
+    symlink + ``..`` escapes). Path components are the only authority.
+    """
+    if path.startswith("/"):
+        raise PathBoundaryError(
+            f"absolute paths not allowed; use paths relative to cwd: {path!r}"
+        )
+    cwd_resolved = cwd.resolve()
+    resolved = (cwd / path).resolve()
+    try:
+        resolved.relative_to(cwd_resolved)
+    except ValueError as exc:
+        raise PathBoundaryError(
+            f"path resolves outside cwd: {path!r} → {resolved}"
+        ) from exc
+    return resolved
+
+
+# cothis: slice #3 deletes _cwd_probe — first real fs tool replaces it.
+# Grep this marker when wiring fs.read/fs.write to WORKDIR.
+@tool
+def _cwd_probe() -> str:
+    """Return the cwd active for the current turn.
+
+    Temporary: exists only to prove WORKDIR injection end-to-end.
+    Returns ``"<unset>"`` when called outside an Agent turn.
+    """
+    wd = workdir_path()
+    return str(wd) if wd is not None else "<unset>"
