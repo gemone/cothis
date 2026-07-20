@@ -42,7 +42,8 @@ trailing-ws is out of scope (#46).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+
+_ERR_PREVIEW_LIMIT = 80
 
 
 class PatchError(Exception):
@@ -59,12 +60,15 @@ class PatchError(Exception):
         self.line = line
 
     def __str__(self) -> str:
-        bits = [super().__str__()]
+        msg = super().__str__()
+        if self.file is None and not self.line:
+            return msg
+        parts = [msg]
         if self.file is not None:
-            bits.append(f"file={self.file}")
+            parts.append(f"file={self.file}")
         if self.line:
-            bits.append(f"line={self.line}")
-        return " (".join(bits[:1]) + "".join(f", {b}" for b in bits[1:]) + (")" if len(bits) > 1 else "")
+            parts.append(f"line={self.line}")
+        return ", ".join(parts)
 
 
 class ParseError(PatchError):
@@ -106,6 +110,9 @@ class DeleteFile:
     path: str
 
 
+Op = AddFile | UpdateFile | DeleteFile
+
+
 # ---------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------
@@ -118,7 +125,7 @@ _UPDATE_PREFIX = "*** Update File: "
 _DELETE_PREFIX = "*** Delete File: "
 
 
-def parse_patch(text: str) -> list[Any]:
+def parse_patch(text: str) -> list[Op]:
     """Parse v4 diff text into a list of ops.
 
     Ops are ``AddFile`` / ``UpdateFile`` / ``DeleteFile`` instances.
@@ -137,7 +144,7 @@ def parse_patch(text: str) -> list[Any]:
             line=len(lines),
         )
 
-    ops: list[Any] = []
+    ops: list[Op] = []
     i = 1  # skip Begin Patch
     n = len(lines)
     while i < n and lines[i] != _END:
@@ -155,13 +162,17 @@ def parse_patch(text: str) -> list[Any]:
             ops.append(DeleteFile(path=path))
             i += 1
         elif line.startswith("*** ") and line.endswith(":"):
+            # cothis: scope ceiling — Rename/Move op is intentionally
+            # out of scope per #46 PRD ("Out of Scope: Rename/Move op").
+            # Upgrade path: add a MoveFile dataclass + arm parse_patch
+            # and apply_patch when cross-issue demand lands.
             raise ParseError(
-                f"unknown op marker: {line}",
+                f"unknown op marker: {_preview(line)}",
                 line=i + 1,
             )
         else:
             raise ParseError(
-                f"unexpected line outside any op: {line!r}",
+                f"unexpected line outside any op: {_preview(repr(line))}",
                 line=i + 1,
             )
     return ops
@@ -170,7 +181,7 @@ def parse_patch(text: str) -> list[Any]:
 def _collect_add_body(
     lines: list[str], header_idx: int,
 ) -> tuple[str, str, int]:
-    """Return (path, content, next_i) for an Add File op.
+    """Return ``(path, content, next_i)`` for an Add File op.
 
     ``content`` is the joined ``+`` lines with a trailing newline.
     ``next_i`` points at the next op marker or ``*** End Patch``.
@@ -183,7 +194,7 @@ def _collect_add_body(
         line = lines[i]
         if not line.startswith("+"):
             raise ParseError(
-                f"Add File body line must start with '+': {line!r}",
+                f"Add File body line must start with '+': {_preview(repr(line))}",
                 file=path,
                 line=i + 1,
             )
@@ -196,7 +207,7 @@ def _collect_add_body(
 def _collect_update_body(
     lines: list[str], header_idx: int,
 ) -> tuple[str, list[Hunk], int]:
-    """Return (path, hunks, next_i) for an Update File op.
+    """Return ``(path, hunks, next_i)`` for an Update File op.
 
     ``next_i`` points at the next op marker or ``*** End Patch`` so the
     caller can continue the outer loop without re-scanning this op's body.
@@ -206,20 +217,20 @@ def _collect_update_body(
     hunks: list[Hunk] = []
     i = header_idx + 1
     n = len(lines)
-    while i < n and lines[i] != _END and not _is_other_op_marker(lines[i]):
+    while i < n and lines[i] != _END and not _is_op_marker(lines[i]):
         line = lines[i]
         if line.startswith("@@"):
             hunk, i = _collect_one_hunk(lines, i, path)
             hunks.append(hunk)
         elif line.startswith("-") or line.startswith("+"):
             raise ParseError(
-                f"Update File body line outside any @@ hunk: {line!r}",
+                f"Update File body line outside any @@ hunk: {_preview(repr(line))}",
                 file=path,
                 line=i + 1,
             )
         else:
             raise ParseError(
-                f"unexpected line in Update File body: {line!r}",
+                f"unexpected line in Update File body: {_preview(repr(line))}",
                 file=path,
                 line=i + 1,
             )
@@ -237,7 +248,7 @@ def _collect_one_hunk(
 ) -> tuple[Hunk, int]:
     """Collect one hunk starting at ``lines[start_idx]`` (a ``@@`` line).
 
-    Returns (hunk, next_idx_after_hunk). ``@@`` may be bare or carry
+    Returns ``(hunk, next_idx_after_hunk)``. ``@@`` may be bare or carry
     trailing context text (stripped); bare ``@@`` yields no context line.
     """
     context: list[str] = []
@@ -267,11 +278,21 @@ def _collect_one_hunk(
 
 
 def _is_op_marker(line: str) -> bool:
-    return line.startswith(_ADD_PREFIX) or line.startswith(_UPDATE_PREFIX) or line.startswith(_DELETE_PREFIX)
+    return (
+        line.startswith(_ADD_PREFIX)
+        or line.startswith(_UPDATE_PREFIX)
+        or line.startswith(_DELETE_PREFIX)
+    )
 
 
-def _is_other_op_marker(line: str) -> bool:
-    return _is_op_marker(line)
+def _preview(value: object) -> str:
+    """Truncate stringified value to keep log/UI lines short — patch
+    lines may carry pasted secrets, and full ``repr`` of a 1KB line
+    is not actionable to the LLM either."""
+    text = str(value)
+    if len(text) <= _ERR_PREVIEW_LIMIT:
+        return text
+    return text[:_ERR_PREVIEW_LIMIT - 3] + "..."
 
 
 # ---------------------------------------------------------------------
@@ -280,7 +301,7 @@ def _is_other_op_marker(line: str) -> bool:
 
 
 def apply_patch(
-    files: dict[str, str], ops: list[Any],
+    files: dict[str, str], ops: list[Op],
 ) -> dict[str, str]:
     """Apply parsed ops to a ``{path: content}`` snapshot.
 
@@ -297,7 +318,7 @@ def apply_patch(
             _apply_update(result, op)
         elif isinstance(op, DeleteFile):
             _apply_delete(result, op)
-        else:  # pragma: no cover — defensive; parser only emits the three
+        else:  # pragma: no cover — exhaustiveness check via Op union
             raise ApplyError(f"unknown op type: {type(op).__name__}")
     return result
 
@@ -338,15 +359,19 @@ def _apply_update(files: dict[str, str], op: UpdateFile) -> None:
 def _apply_hunk(content: str, path: str, hunk: Hunk) -> str:
     """Apply one hunk to ``content``; return the new content.
 
-    Algorithm: locate the pre-image block (``removes`` lines, in order)
-    within ``content``, with trailing-ws tolerance on both sides. Replace
-    that block with ``adds``. The optional ``context`` lines anchor the
-    match position — find the first occurrence of context followed by
-    removes; if no context, find removes directly.
+    Locate the pre-image block (``removes`` lines, in order) within
+    ``content``, with trailing-ws tolerance on both sides. Replace that
+    block with ``adds``. The optional ``context`` lines anchor the match
+    position — find the first occurrence of context followed by removes;
+    if no context, find removes directly.
     """
     lines = content.splitlines(keepends=True)
-    # Normalise for trailing-ws comparison: strip rstrip on each line.
-    norm_lines = [l.rstrip() for l in lines]
+    # cothis: scope ceiling — trailing-ws tolerance is the only fuzz
+    # applied. Indentation/leading-ws changes are real diffs and must
+    # round-trip verbatim (per #46 PRD "Out of Scope: patch fuzz
+    # beyond trailing-ws"). Upgrade path: plug in a config to opt into
+    # difflib's SequenceMatcher fuzzy matching if a real need surfaces.
+    norm_lines = [ln.rstrip() for ln in lines]
 
     if hunk.context:
         anchor = [c.rstrip() for c in hunk.context]
@@ -370,11 +395,9 @@ def _apply_hunk(content: str, path: str, hunk: Hunk) -> str:
                 file=path,
                 line=search_from + 1,
             )
-        # Replace lines[idx : idx+len(removes_norm)] with adds.
         replacement = [a + "\n" for a in hunk.adds]
         new_lines = lines[:idx] + replacement + lines[idx + len(removes_norm):]
     else:
-        # Pure insertion (no removes) — insert adds right after the anchor.
         replacement = [a + "\n" for a in hunk.adds]
         new_lines = lines[:search_from] + replacement + lines[search_from:]
     return "".join(new_lines)

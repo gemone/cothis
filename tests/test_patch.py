@@ -54,6 +54,7 @@ def test_parse_add_file_multi_line() -> None:
 *** End Patch
 """
     ops = parse_patch(text)
+    assert isinstance(ops[0], AddFile)
     assert ops[0].content == "line one\nline two\nline three\n"
 
 
@@ -102,6 +103,7 @@ def test_parse_update_file_multi_hunk() -> None:
 *** End Patch
 """
     ops = parse_patch(text)
+    assert isinstance(ops[0], UpdateFile)
     assert len(ops[0].hunks) == 2
 
 
@@ -256,6 +258,22 @@ def test_apply_update_trailing_whitespace_tolerant() -> None:
     (and vice versa). Editors strip trailing ws; patches shouldn't fail
     purely on that."""
     files = {"app.py": "x = 1\n"}  # no trailing ws
+    ops = parse_patch("""\
+*** Begin Patch
+*** Update File: app.py
+@@
+-x = 1
++x = 2
+*** End Patch
+""")
+    result = apply_patch(files, ops)
+    assert result["app.py"] == "x = 2\n"
+
+
+def test_apply_update_trailing_whitespace_tolerant_reverse() -> None:
+    """Reverse direction: patch pre-image has no trailing ws but the file
+    does. The matching must still succeed (both sides are rstrip-ed)."""
+    files = {"app.py": "x = 1   \n"}  # trailing spaces in file
     ops = parse_patch("""\
 *** Begin Patch
 *** Update File: app.py
