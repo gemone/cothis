@@ -35,8 +35,9 @@ def test_write_add_creates_new_file(tmp_path: Path) -> None:
 
 
 def test_write_add_in_nested_subdir_mkdirs_parents(tmp_path: Path) -> None:
-    """``*** Add File: a/b/c.txt`` creates intermediate dirs (kept for
-    slice #4; #5 removes automatic ``mkdir(parents=True)``)."""
+    """Pre-#52 behavior created intermediate dirs; #52 removed that —
+    Add File into a missing parent dir is now rejected. Test name kept
+    to minimise diff churn; body asserts the new boundary."""
     patch = """\
 *** Begin Patch
 *** Add File: a/b/c.txt
@@ -44,8 +45,9 @@ def test_write_add_in_nested_subdir_mkdirs_parents(tmp_path: Path) -> None:
 *** End Patch
 """
     with workdir_context(tmp_path):
-        write(content=patch)
-    assert (tmp_path / "a" / "b" / "c.txt").read_text() == "deep\n"
+        with pytest.raises(PatchError, match="parent"):
+            write(content=patch)
+    assert not (tmp_path / "a").exists()
 
 
 def test_write_update_splices_pre_image(tmp_path: Path) -> None:
@@ -168,3 +170,104 @@ def test_write_summary_counts_all_three_op_kinds(tmp_path: Path) -> None:
     assert "added 1" in result
     assert "updated 1" in result
     assert "deleted 1" in result
+
+
+# ---------------------------------------------------------------------
+# cwd boundary enforcement (slice #5 / #52)
+# ---------------------------------------------------------------------
+
+
+def test_write_rejects_absolute_path(tmp_path: Path) -> None:
+    """Absolute path in patch → PatchError; nothing written."""
+    patch = """\
+*** Begin Patch
+*** Add File: /etc/cothis-test-target
++evil
+*** End Patch
+"""
+    with workdir_context(tmp_path):
+        with pytest.raises(PatchError, match="absolute"):
+            write(content=patch)
+
+
+def test_write_rejects_parent_traversal(tmp_path: Path) -> None:
+    """``..`` that escapes cwd → PatchError; nothing written."""
+    (tmp_path / "real.txt").write_text("orig\n", encoding="utf-8")
+    patch = """\
+*** Begin Patch
+*** Update File: ../secret
++x
+*** End Patch
+"""
+    with workdir_context(tmp_path):
+        with pytest.raises(PatchError, match="cwd|outside"):
+            write(content=patch)
+
+
+def test_write_rejects_symlink_escape(tmp_path: Path) -> None:
+    """Symlink pointing outside cwd → PatchError; nothing written."""
+    outside = tmp_path.parent / "outside-target"
+    outside.write_text("outside\n", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(outside)
+
+    patch = """\
+*** Begin Patch
+*** Update File: link
++x
+*** End Patch
+"""
+    with workdir_context(tmp_path):
+        with pytest.raises(PatchError):
+            write(content=patch)
+
+
+def test_write_add_missing_parent_dir_rejected(tmp_path: Path) -> None:
+    """Add File targeting a path whose parent dir doesn't exist →
+    PatchError naming the missing parent; no directory created."""
+    patch = """\
+*** Begin Patch
+*** Add File: newdir/a.py
++x
+*** End Patch
+"""
+    with workdir_context(tmp_path):
+        with pytest.raises(PatchError, match="parent"):
+            write(content=patch)
+    # Parent not created.
+    assert not (tmp_path / "newdir").exists()
+
+
+def test_write_add_into_existing_subdir_ok(tmp_path: Path) -> None:
+    """Add File into an existing subdir → creates file (no regression)."""
+    (tmp_path / "existing").mkdir()
+    patch = """\
+*** Begin Patch
+*** Add File: existing/a.py
++x
+*** End Patch
+"""
+    with workdir_context(tmp_path):
+        write(content=patch)
+    assert (tmp_path / "existing" / "a.py").read_text() == "x\n"
+
+
+def test_write_boundary_check_runs_before_any_disk_write(tmp_path: Path) -> None:
+    """A boundary violation in a multi-op patch leaves NO files on disk —
+    pre-flight check runs entirely before commit."""
+    (tmp_path / "safe.txt").write_text("orig\n", encoding="utf-8")
+    patch = """\
+*** Begin Patch
+*** Update File: safe.txt
+@@
+-orig
++modified
+*** Add File: /etc/cothis-evil
++evil
+*** End Patch
+"""
+    with workdir_context(tmp_path):
+        with pytest.raises(PatchError):
+            write(content=patch)
+    # safe.txt untouched (pre-flight raised before commit).
+    assert (tmp_path / "safe.txt").read_text() == "orig\n"
