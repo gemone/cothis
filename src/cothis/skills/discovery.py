@@ -45,17 +45,24 @@ _CATALOG_HEADER = (
 
 
 @dataclass(frozen=True)
-class SkillRecord:
-    """One discovered skill."""
+class Skill:
+    """One discovered skill.
+
+    ``base_dir`` is the skill's directory (the parent of ``SKILL.md``);
+    ``load_skill`` reads assets under it. ``location`` names the layer
+    the skill was discovered in (``project`` / ``user-cothis`` /
+    ``user-agents``) so shadow warnings and future trust gates can
+    name the source.
+    """
 
     name: str
     description: str
-    path: Path
+    location: str
     body: str
-    layer: str
+    base_dir: Path
 
 
-def discover_skills() -> list[SkillRecord]:
+def discover_skills() -> list[Skill]:
     """Scan the three layer dirs; return skills ordered by name.
 
     Project shadows user-cothis shadows user-agents. Same-name shadows
@@ -63,7 +70,7 @@ def discover_skills() -> list[SkillRecord]:
     (each skill lives in its own directory).
     """
     layer_dirs = _layer_dirs()
-    records: dict[str, SkillRecord] = {}
+    records: dict[str, Skill] = {}
     for layer in reversed(_LAYER_ORDER):
         layer_dir = layer_dirs.get(layer)
         if layer_dir is None:
@@ -75,16 +82,16 @@ def discover_skills() -> list[SkillRecord]:
                     "Skill %r in layer %r shadows the same name in layer %r "
                     "(%s); the lower-precedence copy is hidden from the catalog.",
                     record.name,
-                    winner.layer,
+                    winner.location,
                     layer,
-                    record.path,
+                    record.base_dir / _SKILL_FILE,
                 )
                 continue
             records[record.name] = record
     return sorted(records.values(), key=lambda r: r.name)
 
 
-def format_catalog(skills: list[SkillRecord]) -> str | None:
+def format_catalog(skills: list[Skill]) -> str | None:
     """Render the ``<available_skills>`` block, or ``None`` when empty.
 
     Catalog text is XML-escaped: a malicious ``name`` or ``description``
@@ -123,11 +130,11 @@ def _layer_dirs() -> dict[str, Path]:
     return layer_dirs
 
 
-def _scan_layer(layer_dir: Path, layer: str) -> list[SkillRecord]:
-    """Return one ``SkillRecord`` per ``SKILL.md`` under ``layer_dir``."""
+def _scan_layer(layer_dir: Path, layer: str) -> list[Skill]:
+    """Return one :class:`Skill` per ``SKILL.md`` under ``layer_dir``."""
     if not layer_dir.is_dir():
         return []
-    out: list[SkillRecord] = []
+    out: list[Skill] = []
     for entry in sorted(layer_dir.iterdir()):
         if not entry.is_dir() or entry.is_symlink():
             continue
@@ -140,11 +147,9 @@ def _scan_layer(layer_dir: Path, layer: str) -> list[SkillRecord]:
     return out
 
 
-def _parse_skill_md(path: Path, layer: str) -> SkillRecord | None:
+def _parse_skill_md(path: Path, layer: str) -> Skill | None:
     """Parse one ``SKILL.md``; return ``None`` + WARN on any failure."""
     try:
-        # Cap reads at _MAX_SKILL_BYTES so a planted multi-GB file can't
-        # OOM the agent at startup.
         with path.open("r", encoding="utf-8") as f:
             text = f.read(_MAX_SKILL_BYTES + 1)
         if len(text) > _MAX_SKILL_BYTES:
@@ -200,10 +205,10 @@ def _parse_skill_md(path: Path, layer: str) -> SkillRecord | None:
             path, frontmatter["name"], dir_name,
         )
 
-    return SkillRecord(
+    return Skill(
         name=name.strip(),
         description=description.strip(),
-        path=path,
+        location=layer,
         body=body,
-        layer=layer,
+        base_dir=path.parent,
     )

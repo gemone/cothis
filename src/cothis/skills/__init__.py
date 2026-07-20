@@ -9,6 +9,6 @@ lives next to the data shape it consumes.
 
 from __future__ import annotations
 
-from cothis.skills.discovery import SkillRecord, discover_skills, format_catalog
+from cothis.skills.discovery import Skill, discover_skills, format_catalog
 
-__all__ = ["SkillRecord", "discover_skills", "format_catalog"]
+__all__ = ["Skill", "discover_skills", "format_catalog"]
