@@ -918,7 +918,14 @@ def test_db_file_is_owner_only(tmp_path: Path) -> None:
 
     Checks while the Session is still open (sidecars exist) — close()
     checkpoints and deletes them.
+
+    POSIX-only: Windows has no Unix permission bits (chmod is a no-op
+    beyond the read-only flag, stat().st_mode doesn't reflect 0o600).
+    The production chmod call still runs on Windows (best-effort, harm
+    is nil), but we can't assert it there.
     """
+    if os.name != "posix":
+        pytest.skip("Unix permission bits are POSIX-only")
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     s.append_message("user", [_user_text("x")])
