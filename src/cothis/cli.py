@@ -328,6 +328,10 @@ def main() -> None:
     ourselves whether to surface tracebacks. Click's own usage/abort
     errors are still formatted nicely; everything else is printed as
     ``Error: <message>`` (no traceback) unless ``--debug`` is set.
+
+    KeyboardInterrupt (Ctrl-C) is handled explicitly: silent exit with
+    the POSIX-conventional code 130 (128 + SIGINT), or re-raised under
+    ``--debug`` so the traceback surfaces.
     """
     try:
         app(standalone_mode=False)
@@ -339,7 +343,15 @@ def main() -> None:
         sys.exit(1)
     except SystemExit:
         raise
-    except BaseException as exc:
+    except KeyboardInterrupt:
+        # POSIX convention: SIGINT → exit status 130 (128 + 2). Silent
+        # unless --debug, mirroring git/ssh/python -c.
+        # _chat_session's inner prompt handler exits silently on Ctrl-C;
+        # this branch mirrors that contract for the streaming path.
+        if _debug:
+            raise
+        sys.exit(130)
+    except Exception as exc:
         if _debug:
             raise
         typer.echo(f"Error: {exc}", err=True)
