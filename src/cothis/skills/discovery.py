@@ -19,6 +19,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from xml.sax.saxutils import escape
 
 import yaml
@@ -147,6 +148,77 @@ def _scan_layer(layer_dir: Path, layer: str) -> list[Skill]:
     return out
 
 
+_UNQUOTED_VALUE_COLON_RE = re.compile(
+    r"^(?P<key>[A-Za-z_][\w-]*):\s+(?P<value>.+)$"
+)
+
+
+def _parse_yaml_lenient(raw_yaml: str, path: Path) -> dict[str, Any] | None:
+    """Parse skill frontmatter with one quote-retry on colon-in-value errors.
+
+    Real-world ``SKILL.md`` files often write values like
+    ``description: An agent for: doing things`` where the bare ``: `` breaks
+    YAML's mapping parser. Catch the parse error, wrap each unquoted value
+    containing ``:`` in double quotes, retry once. If the retry also fails
+    or the result isn't a mapping, log + return ``None``.
+    """
+    try:
+        loaded = yaml.safe_load(raw_yaml) or {}
+    except (yaml.YAMLError, RecursionError):
+        retried = _quote_unquoted_values_with_colons(raw_yaml)
+        if retried is None:
+            logger.warning(
+                "Skill %s has unparseable YAML frontmatter; skipped.", path
+            )
+            return None
+        try:
+            loaded = yaml.safe_load(retried) or {}
+        except (yaml.YAMLError, RecursionError) as exc:
+            logger.warning(
+                "Skill %s has unparseable YAML frontmatter (even after "
+                "quote-retry: %s); skipped.", path, exc,
+            )
+            return None
+    if not isinstance(loaded, dict):
+        logger.warning(
+            "Skill %s frontmatter is not a mapping (got %s); skipped.",
+            path, type(loaded).__name__,
+        )
+        return None
+    return loaded
+
+
+def _quote_unquoted_values_with_colons(raw_yaml: str) -> str | None:
+    """Rewrite ``key: value: with colon`` → ``key: "value: with colon"``.
+
+    Returns ``None`` when the rewrite is a no-op (no line matched) so the
+    caller can decide whether to retry at all. Existing double-quoted and
+    single-quoted values pass through unchanged.
+    """
+    out_lines: list[str] = []
+    matched = False
+    for line in raw_yaml.splitlines():
+        m = _UNQUOTED_VALUE_COLON_RE.match(line)
+        if m is None:
+            out_lines.append(line)
+            continue
+        value = m.group("value").strip()
+        is_block = value.endswith(":")
+        already_quoted = (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in ('"', "'")
+        )
+        # ``:`` inside a value confuses YAML's mapping parser only when
+        # followed by space or EOL. A bare ``http://`` is fine.
+        if is_block or already_quoted or ": " not in value and not value.endswith(":"):
+            out_lines.append(line)
+            continue
+        out_lines.append(f'{m.group("key")}: "{value}"')
+        matched = True
+    return "\n".join(out_lines) if matched else None
+
+
 def _parse_skill_md(path: Path, layer: str) -> Skill | None:
     """Parse one ``SKILL.md``; return ``None`` + WARN on any failure."""
     try:
@@ -168,20 +240,10 @@ def _parse_skill_md(path: Path, layer: str) -> Skill | None:
     else:
         raw_yaml = match.group("yaml")
         body = match.group("body") or ""
-        try:
-            loaded = yaml.safe_load(raw_yaml) or {}
-        except (yaml.YAMLError, RecursionError) as exc:
-            logger.warning(
-                "Skill %s has unparseable YAML frontmatter (%s); skipped.",
-                path, exc,
-            )
+        loaded = _parse_yaml_lenient(raw_yaml, path)
+        if loaded is None:
             return None
-        if not isinstance(loaded, dict):
-            logger.warning(
-                "Skill %s frontmatter is not a mapping (got %s); skipped.",
-                path, type(loaded).__name__,
-            )
-            return None
+        frontmatter = loaded
         frontmatter = loaded
 
     dir_name = path.parent.name

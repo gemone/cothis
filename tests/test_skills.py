@@ -187,6 +187,56 @@ def test_unparseable_yaml_is_skipped_with_warning(
     assert len(skip_msgs) == 1
 
 
+def test_colon_in_unquoted_value_retries_with_quotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``description: An agent for: doing things`` recovers via quote-retry.
+
+    Bare ``: `` inside a value breaks YAML's mapping parser. The lenient
+    pass detects this and wraps the value in double quotes — one retry,
+    then skip if still broken. The skill loads with the full description
+    intact.
+    """
+    _, _, project = _isolate_layers(monkeypatch, tmp_path)
+    skill_dir = project / ".agents" / "skills" / "colon-value"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: colon-value\n"
+        "description: An agent for: doing things\n"
+        "---\n"
+        "body\n",
+        encoding="utf-8",
+    )
+
+    skills = discover_skills()
+    assert len(skills) == 1
+    assert skills[0].name == "colon-value"
+    assert skills[0].description == "An agent for: doing things"
+
+
+def test_unquoted_colon_still_breaking_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    """A value the quote-retry can't fix (e.g. tab-indent) is skipped."""
+    _, _, project = _isolate_layers(monkeypatch, tmp_path)
+    skill_dir = project / ".agents" / "skills" / "tabs"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: tabs\n"
+        "description: still broken\n"
+        "\tnested: with-tab\n"
+        "---\n"
+        "body\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="cothis.skills"):
+        skills = discover_skills()
+    assert skills == []
+
+
 def test_missing_skill_md_is_silently_ignored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
