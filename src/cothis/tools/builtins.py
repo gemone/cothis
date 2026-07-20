@@ -8,49 +8,7 @@ from typing import Any
 import pathspec
 
 from cothis.tools.core import Tool, tool
-
-
-@tool("fs.read")
-def read(
-    path: str,
-    start_line: int | None = None,
-    end_line: int | None = None,
-) -> str:
-    """Read the contents of a UTF-8 text file, optionally a line range.
-
-    Use this to inspect an existing file before reading or modifying it.
-    Without ``start_line`` / ``end_line``, returns the whole file. With
-    them, returns the slice (1-based, inclusive on both ends).
-
-    Output carries 1-based line numbers (right-aligned, tab-separated) so
-    the model can reference exact lines in follow-up calls (e.g. a
-    precise ``start_line`` / ``end_line`` for a large file).
-
-    Args:
-        path: Path to the file to read. Relative paths are resolved
-            against the current working directory.
-            eg. "src/main.py", "./README.md", "/etc/hostname".
-        start_line: 1-based line number to start reading from (inclusive).
-            Omit or pass null to read from the beginning of the file.
-            eg. 10, 1.
-        end_line: 1-based line number to stop reading at (inclusive).
-            Omit or pass null to read to the end of the file.
-            eg. 20, 100.
-
-    Returns:
-        The requested line range with 1-based line-number prefixes.
-    """
-    text = Path(path).read_text(encoding="utf-8")
-    lines = text.splitlines()
-    total = len(lines)
-    start = max(1, start_line or 1)
-    end = min(total, end_line or total)
-    if start > total:
-        return f"Error: start_line {start} is beyond EOF (file has {total} lines)"
-    width = len(str(end))
-    selected = [f"{i:>{width}}\t{lines[i - 1]}" for i in range(start, end + 1)]
-    return "\n".join(selected)
-
+from cothis.tools.fs.read import read
 
 _IGNORED_DIRS = frozenset(
     {

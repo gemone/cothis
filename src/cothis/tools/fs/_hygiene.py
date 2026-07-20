@@ -5,9 +5,9 @@ on turn entry (try/finally) so every tool call inside the turn sees
 the same cwd; tools resolve user-supplied paths through
 :func:`_resolve_under` which rejects absolute paths and cwd escapes.
 
-Pure: no disk I/O. The temporary ``fs._cwd_probe`` tool proves the
-wiring end-to-end; slice #3 deletes it once the first real fs tool
-arrives.
+Pure: no disk I/O. The first real consumer (``fs.read``) exercises
+the WORKDIR contract; the temporary probe tool shipped in slice #2
+has been removed.
 
 cothis: ADR deferred per PRD #46 — current shape is the floor, not
 the ceiling. ``contextvars`` over a schema param / ``injects=``
@@ -21,8 +21,6 @@ import contextlib
 import contextvars
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-from cothis.tools.core import tool
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -84,16 +82,3 @@ def _resolve_under(path: str, cwd: Path) -> Path:
             f"path resolves outside cwd: {path!r} → {resolved}"
         ) from exc
     return resolved
-
-
-# cothis: slice #3 deletes _cwd_probe — first real fs tool replaces it.
-# Grep this marker when wiring fs.read/fs.write to WORKDIR.
-@tool
-def _cwd_probe() -> str:
-    """Return the cwd active for the current turn.
-
-    Temporary: exists only to prove WORKDIR injection end-to-end.
-    Returns ``"<unset>"`` when called outside an Agent turn.
-    """
-    wd = workdir_path()
-    return str(wd) if wd is not None else "<unset>"
