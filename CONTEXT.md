@@ -378,3 +378,19 @@ omitted entirely otherwise — no token cost when skills are absent.
 _Avoid_: plugin (too generic, collides with MCP); module (collides with
 Python module); snippet (too narrow — a skill is structured, not a
 fragment).
+
+**Branch (session fork)**:
+A session created by forking another at a chosen point — git-branch
+semantics, no merge. Each session carries `parent_id` and `parent_seq`
+on its `sessions` row (NULL on roots). The fork tree is stored as flat
+rows; an in-memory `SessionGraph` (stdlib `dict` + functions: `roots`,
+`ancestors`, `subtree`, `children_of`, `is_leaf`) layers tree operations
+on top — measured 3-10x faster than a recursive CTE on a 10k-session
+fixture. Forked sessions number `seq`/`msg_idx`/`block_idx` from 0
+(independent numbering); `Session.load` walks the ancestor chain
+(root → parent), loads each ancestor's blocks through that link's
+`parent_seq` cap (inclusive), and prepends them to the fork's own
+messages so the Agent reads one flat conversation. Forks do NOT see the
+parent's post-fork blocks. `cothis delete` is leaf-only: a node with
+living children is refused with `SessionHasChildrenError` (no orphans).
+_Avoid_: thread (collides with OS thread); copy (too generic); clone.

@@ -19,7 +19,12 @@ from rich.live import Live
 from rich.markdown import Markdown
 
 from cothis.agent import Agent, MaxIterationsError, ToolCallEvent
-from cothis.session import Session, SessionLockedError
+from cothis.session import (
+    Session,
+    SessionHasChildrenError,
+    SessionLockedError,
+)
+from cothis.session.storage import Storage, display_cwd, is_visible
 from cothis.tools import discover_tools
 
 app = typer.Typer()
@@ -170,6 +175,12 @@ def chat(
         envvar="COTHIS_MAX_TOKENS",
         help="Output-token cap. Default: resolved from bundled litellm metadata for the model.",
     ),
+    resume: str | None = typer.Option(
+        None,
+        "--resume",
+        "-r",
+        help="Resume a session by id (shortcut to the end of main; no picker).",
+    ),
 ) -> None:
     """Run an interactive multi-turn chat session.
 
@@ -177,6 +188,10 @@ def chat(
     accumulates. The final answer of each turn is streamed token-by-token
     and rendered live as Markdown; intermediate tool-calling turns are
     covered by a ``thinking...`` spinner (no per-tool status today).
+
+    ``--resume <id>`` shortcuts to the end of ``main``: no interactive
+    picker. Errors with "not found, run ``cothis history``" if the id is
+    missing or out of this directory's scope.
     """
     asyncio.run(
         _chat_session(
@@ -184,6 +199,7 @@ def chat(
             provider=provider,
             max_iterations=max_iterations,
             max_tokens=max_tokens,
+            resume=resume,
         )
     )
 
@@ -194,6 +210,7 @@ async def _chat_session(
     provider: str,
     max_iterations: int,
     max_tokens: int | None,
+    resume: str | None = None,
 ) -> None:
     # ``chat`` is the only command that persists. ``Session.new`` takes the
     # cross-process lock eagerly; the sessions row + title are written
@@ -201,7 +218,20 @@ async def _chat_session(
     # Session (ephemeral). ``SessionLockedError`` from new() propagates
     # through asyncio.run → main()'s BaseException handler → "Error: …" +
     # exit 1.
-    session = Session.new(_resolve_db_path(), cwd=Path.cwd(), model=model)
+    db_path = _resolve_db_path()
+    if resume is not None:
+        # Resume path: load by id (errors out cleanly if missing). The
+        # cwd filter is enforced inside Session.load via the storage
+        # row's cwd; the picker in ``history <id>`` already did the
+        # scoping, so we don't re-check here.
+        try:
+            session = Session.load(db_path, resume, cwd=Path.cwd())
+        except KeyError:
+            raise typer.BadParameter(
+                f"session {resume!r} not found; run `cothis history` to list"
+            )
+    else:
+        session = Session.new(db_path, cwd=Path.cwd(), model=model)
     try:
         with console.status("loading...", spinner="dots"):
             agent = Agent(
@@ -321,6 +351,146 @@ def _format_tool_call(event: ToolCallEvent) -> str:
     return f"calling {event.name}({args})"
 
 
+# ---------------------------------------------------------------------
+# history / delete commands
+# ---------------------------------------------------------------------
+
+
+def _preview_message(msg: dict) -> str:
+    """One-line preview for ``cothis history <id>``'s listing.
+
+    Shows the first text block's first line, prefixed by role. Falls
+    back to a block-type summary when no text is present (e.g. a
+    pure ``tool_result`` user message).
+    """
+    role = msg.get("role", "?")
+    for block in msg.get("content", []):
+        if block.get("type") == "text" and block.get("text"):
+            text = block["text"].splitlines()[0]
+            return f"[{role}] {text[:80]}"
+    types = sorted({b.get("type", "?") for b in msg.get("content", [])})
+    return f"[{role}] <{','.join(types)}>"
+
+
+def _print_history_listing(rows: list) -> None:
+    """Print ``id  timestamp  cwd  title`` rows, one per line."""
+    if not rows:
+        console.print("[dim]no sessions in this directory's scope[/dim]")
+        return
+    cwd = Path.cwd()
+    for row in rows:
+        title = row.title or "(no title)"
+        cwd_display = display_cwd(Path(row.cwd), cwd)
+        typer.echo(f"{row.id}  {row.updated_at}  {cwd_display}  {title}")
+
+
+@app.command()
+def history(
+    session_id: str | None = typer.Argument(
+        None, help="Show this session's messages and pick a resume/fork point."
+    ),
+) -> None:
+    """List sessions visible from the current directory, or inspect one.
+
+    Without an argument: list every session whose ``cwd`` is the current
+    directory or an ancestor of it (project-root sessions are visible
+    from subdirectories). Each row shows ``id, updated_at, cwd, title``.
+
+    With an argument: print the session's full message list numbered,
+    then prompt for an index. ``r`` (or Enter on the last) resumes at
+    the end of ``main``; a number forks a new session from that message
+    (git-branch semantics — the original is untouched).
+    """
+    db_path = _resolve_db_path()
+    if not db_path.exists():
+        console.print("[dim]no sessions database yet[/dim]")
+        return
+    if session_id is None:
+        rows = Session.list_visible(db_path, Path.cwd())
+        _print_history_listing(rows)
+        return
+    # Inspect one: peek_messages enforces the cwd visibility filter when
+    # cwd= is passed, so the picker refuses out-of-scope sessions the same
+    # way Session.load(cwd=...) does.
+    try:
+        messages = Session.peek_messages(db_path, session_id, cwd=Path.cwd())
+    except KeyError:
+        raise typer.BadParameter(
+            f"session {session_id!r} not found (or not in this directory's scope); "
+            f"run `cothis history` to list"
+        )
+    if not messages:
+        console.print("[dim]session is empty[/dim]")
+        return
+    for i, msg in enumerate(messages):
+        console.print(f"[magenta]{i:3d}[/magenta]  {_preview_message(msg)}")
+    console.print()
+    choice = console.input(
+        "[bold]r[/bold]esume at end, [bold]<n>[/bold] to fork at message n, [bold]q[/bold]uit > "
+    ).strip().lower()
+    if choice in ("", "r", "q"):
+        if choice == "q":
+            return
+        console.print(
+            f"run [cyan]cothis chat --resume {session_id}[/cyan] to continue"
+        )
+        return
+    try:
+        idx = int(choice)
+    except ValueError:
+        raise typer.BadParameter(f"expected a number or 'r', got {choice!r}")
+    if not 0 <= idx < len(messages):
+        raise typer.BadParameter(f"index {idx} out of range (0..{len(messages) - 1})")
+    # Map the in-memory message index back to the storage seq cap. Each message
+    # occupies one distinct msg_idx; the seq cap is the max seq across
+    # that message's blocks.
+    storage = Storage(db_path)
+    try:
+        idx_to_max_seq = storage.msg_idx_to_max_seq(session_id)
+        sr = storage.load_session(session_id)
+        model = (sr.model if sr is not None else "") or ""
+    finally:
+        storage.close()
+    msg_idxs = sorted(idx_to_max_seq)
+    target_msg_idx = msg_idxs[idx]
+    cap = idx_to_max_seq[target_msg_idx]
+    forked = Session.fork(
+        db_path,
+        session_id,
+        cap,
+        cwd=Path.cwd(),
+        model=model,
+    )
+    try:
+        forked_id = forked.session_id
+    finally:
+        forked.close()
+    console.print(
+        f"forked as [cyan]{forked_id}[/cyan]; "
+        f"run [cyan]cothis chat --resume {forked_id}[/cyan] to continue"
+    )
+
+
+@app.command(name="delete")
+def delete_cmd(
+    session_id: str = typer.Argument(..., help="Session id to delete (must be a leaf)."),
+) -> None:
+    """Delete a session from the local database.
+
+    Refuses if the session has any forked children — deleting a non-leaf
+    node would orphan them. Delete the children first (use
+    ``cothis history`` to find them). Hot-DB only in this slice; cold-DB
+    delete lands in a follow-up.
+    """
+    try:
+        Session.delete(_resolve_db_path(), session_id)
+    except SessionHasChildrenError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"deleted session [cyan]{session_id}[/cyan]")
+
+
 def main() -> None:
     """Console-script entry point.
 
@@ -328,6 +498,10 @@ def main() -> None:
     ourselves whether to surface tracebacks. Click's own usage/abort
     errors are still formatted nicely; everything else is printed as
     ``Error: <message>`` (no traceback) unless ``--debug`` is set.
+
+    KeyboardInterrupt (Ctrl-C) is handled explicitly: silent exit with
+    the POSIX-conventional code 130 (128 + SIGINT), or re-raised under
+    ``--debug`` so the traceback surfaces.
     """
     try:
         app(standalone_mode=False)
@@ -339,7 +513,15 @@ def main() -> None:
         sys.exit(1)
     except SystemExit:
         raise
-    except BaseException as exc:
+    except KeyboardInterrupt:
+        # POSIX convention: SIGINT → exit status 130 (128 + 2). Silent
+        # unless --debug, mirroring git/ssh/python -c.
+        # _chat_session's inner prompt handler exits silently on Ctrl-C;
+        # this branch mirrors that contract for the streaming path.
+        if _debug:
+            raise
+        sys.exit(130)
+    except Exception as exc:
         if _debug:
             raise
         typer.echo(f"Error: {exc}", err=True)

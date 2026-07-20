@@ -50,7 +50,9 @@ from typing import Any
 
 from filelock import FileLock, Timeout
 
-from cothis.session.storage import BlockRow, SessionRow, Storage
+from cothis.session import graph as _graph
+from cothis.session.graph import SessionNotFoundError
+from cothis.session.storage import BlockRow, SessionRow, Storage, is_visible
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,10 @@ logger = logging.getLogger(__name__)
 # linear-ish backoff; worst-case drain latency 2.6s, within ``close``'s 5s
 # consumer join. Exhaustion → poison-row drop (same loss ceiling as kill -9).
 _WRITE_RETRY_BACKOFFS: tuple[float, ...] = (0.1, 0.5, 2.0)
+
+# close() join timeouts; see ADR-0009 for the lock-contract rationale.
+_CLOSE_JOIN_TIMEOUT: float = 5.0
+_CLOSE_GRACE_PERIOD: float = 1.0
 
 
 def _now_iso() -> str:
@@ -85,6 +91,19 @@ def _truncate_title(text: str) -> str:
     if len(first_line) <= 60:
         return first_line
     return first_line[:57] + "..."
+
+
+def _validate_session_id(sid: str, *, name: str = "session_id") -> None:
+    """Reject anything that isn't a 32-char lowercase hex string.
+
+    ``session_id`` becomes a filesystem path in ``_lock_path`` and a
+    SQLite primary key. Safe in ``Session.new`` (uuid4 hex, internal),
+    but ``load`` / ``delete`` / ``fork`` receive ids from callers — a
+    bad value here would either traverse the filesystem (``../``) or
+    fail an FK constraint deep in SQLite with a worse error message.
+    """
+    if len(sid) != 32 or not all(c in "0123456789abcdef" for c in sid):
+        raise ValueError(f"invalid {name}: {sid!r}")
 
 
 def _block_to_row(
@@ -307,6 +326,24 @@ class SessionLockedError(RuntimeError):
     """
 
 
+class SessionHasChildrenError(RuntimeError):
+    """``cothis delete`` was called on a non-leaf session node.
+
+    The fork tree's invariant is "no orphans": deleting a node with
+    living children would orphan them (their ``parent_id`` would dangle).
+    Delete the children first. The exception carries the offending id
+    and its direct children so the CLI can name them in the error.
+    """
+
+    def __init__(self, session_id: str, children: list[str]) -> None:
+        super().__init__(
+            f"session {session_id!r} has {len(children)} child fork(s); "
+            f"delete them first"
+        )
+        self.session_id = session_id
+        self.children = children
+
+
 class Session:
     """In-memory conversation state backed by SQLite.
 
@@ -335,6 +372,8 @@ class Session:
         created_at: str,
         messages: list[dict[str, Any]],
         session_row_written: bool,
+        parent_id: str | None = None,
+        parent_seq: int | None = None,
         next_seq: int = 0,
         next_msg_idx: int = 0,
         flush_sync: bool = False,
@@ -348,6 +387,11 @@ class Session:
         self._created_at = created_at
         self.messages = messages  # public: Agent reads this after load
         self._session_row_written = session_row_written
+        # Fork-tree link. ``None`` on roots and on sessions loaded by id
+        # (the ancestor chain is already assembled into ``messages`` at
+        # load time). ``fork`` passes both; ``new`` / ``load`` don't.
+        self._parent_id = parent_id
+        self._parent_seq = parent_seq
 
         # Index allocation state. Mutated only at enqueue (Agent thread).
         # Derived from the loaded rows on resume (see load()).
@@ -422,6 +466,7 @@ class Session:
         db_path: Path,
         session_id: str,
         *,
+        cwd: Path | None = None,
         flush_sync: bool = False,
     ) -> Session:
         """Resume an existing session by id.
@@ -431,16 +476,22 @@ class Session:
         drop-trailing), and starts the consumer. The ``sessions`` row
         already exists — no lazy write, no title computation, no
         ``.gitignore`` write.
+
+        For a forked session, ancestor-chain context is assembled here:
+        walk ``SessionGraph.ancestors(session_id)`` (root → parent),
+        load each ancestor's blocks through that link's ``parent_seq``
+        cap, run the orphan-truncate per segment, and prepend the
+        ancestor segments to this session's own messages. The result
+        is one flat ``messages`` list the Agent reads as if it were a
+        single linear conversation — git-branch semantics, no merge.
+
+        ``cwd`` (when given) enforces the visibility filter used by
+        ``cothis chat --resume``: a session whose ``cwd`` is neither
+        ``cwd`` nor an ancestor of it is treated as not-found
+        (``KeyError``), matching ``cothis history``'s listing scope.
         """
         db_path = db_path.expanduser()
-        # Trust boundary: session_id becomes a filesystem path in
-        # _lock_path. Safe in new() (uuid4().hex, internal), but load()
-        # receives it from callers (future --resume). Reject anything
-        # that isn't exactly 32 lowercase hex — blocks ``../`` traversal.
-        if len(session_id) != 32 or not all(
-            c in "0123456789abcdef" for c in session_id
-        ):
-            raise ValueError(f"invalid session_id: {session_id!r}")
+        _validate_session_id(session_id)
         lock = cls._take_lock(cls._lock_path(session_id))
         try:
             storage = Storage(db_path)
@@ -452,18 +503,19 @@ class Session:
             storage.close()
             lock.release()
             raise KeyError(f"session {session_id!r} not found")
+        if cwd is not None and not is_visible(Path(sr.cwd), cwd):
+            storage.close()
+            lock.release()
+            raise KeyError(f"session {session_id!r} not found")
+        graph = _graph.build(storage.list_sessions())
         rows = storage.load_blocks(session_id)
-        # Drop-trailing persistence: if _rebuild_messages drops an orphan
-        # tail, also DELETE those rows from blocks so a later reload
-        # doesn't re-truncate at the same point (and silently erase any
-        # messages appended between reloads — finding from review pass).
         messages, cut_msg_idx = _rebuild_messages(rows)
         if cut_msg_idx is not None:
             storage.delete_blocks_from_msg_idx(session_id, cut_msg_idx)
-            # Recompute rows so the counters below reflect the post-truncate
-            # state — otherwise next_seq/next_msg_idx stay ahead of the
-            # deleted rows (harmless, but the gap would confuse diagnostics).
             rows = [r for r in rows if r.msg_idx < cut_msg_idx]
+        if sr.parent_id is not None:
+            ancestor_segments = cls._assemble_ancestors(graph, storage, session_id)
+            messages = ancestor_segments + messages
         next_seq = (max(r.seq for r in rows) + 1) if rows else 0
         next_msg_idx = (max(r.msg_idx for r in rows) + 1) if rows else 0
         session = cls(
@@ -482,6 +534,219 @@ class Session:
         )
         session._lock = lock
         return session
+
+    @classmethod
+    def list_visible(
+        cls,
+        db_path: Path,
+        cwd: Path,
+    ) -> list[SessionRow]:
+        """Sessions visible from ``cwd`` — used by ``cothis history``.
+
+        Visible means: the session's ``cwd`` equals ``cwd`` or is an
+        ancestor of it (so project-root sessions are listed from a
+        subdirectory). No lock is taken — this is a read-only listing.
+        Sorted by ``updated_at`` descending.
+        """
+        db_path = db_path.expanduser()
+        storage = Storage(db_path)
+        try:
+            return storage.list_sessions_in_cwd_tree(cwd)
+        finally:
+            storage.close()
+
+    @classmethod
+    def delete(
+        cls,
+        db_path: Path,
+        session_id: str,
+    ) -> None:
+        """Leaf-only delete of ``session_id``.
+
+        Takes the cross-process lock (refuses if held), builds the
+        graph, refuses with :class:`SessionHasChildrenError` if the
+        node is not a leaf, then DELETEs the session's blocks + row.
+        Hot-DB only in this slice (#35); cold-DB delete lands in #36.
+        """
+        db_path = db_path.expanduser()
+        _validate_session_id(session_id)
+        lock = cls._take_lock(cls._lock_path(session_id))
+        try:
+            storage = Storage(db_path)
+        except BaseException:
+            lock.release()
+            raise
+        try:
+            target = storage.load_session(session_id)
+            if target is None:
+                raise KeyError(f"session {session_id!r} not found")
+            graph = _graph.build(storage.list_sessions())
+            if not _graph.is_leaf(graph, session_id):
+                children = _graph.children_of(graph, session_id)
+                raise SessionHasChildrenError(session_id, children)
+            storage.delete_session(session_id)
+        finally:
+            storage.close()
+            lock.release()
+
+    @classmethod
+    def peek_messages(
+        cls,
+        db_path: Path,
+        session_id: str,
+        *,
+        cwd: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read-only message preview for ``cothis history <id>``.
+
+        No lock is taken (display only); the caller accepts that a session
+        mid-write may show a partial last message. ``KeyError`` propagates
+        if the id is unknown OR (when ``cwd`` is passed) the session is
+        out of scope — same predicate as :meth:`load`.
+        """
+        db_path = db_path.expanduser()
+        _validate_session_id(session_id)
+        storage = Storage(db_path)
+        try:
+            sr = storage.load_session(session_id)
+            if sr is None:
+                raise KeyError(f"session {session_id!r} not found")
+            if cwd is not None and not is_visible(Path(sr.cwd), cwd):
+                raise KeyError(f"session {session_id!r} not found")
+            rows = storage.load_blocks(session_id)
+            messages, _ = _rebuild_messages(rows)
+            return messages
+        finally:
+            storage.close()
+
+    @staticmethod
+    def _assemble_ancestors(
+        graph: dict[str, SessionRow],
+        storage: Storage,
+        session_id: str,
+        *,
+        override_link: tuple[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load ancestor blocks (capped at each link's ``parent_seq``) and reuild.
+
+        ``override_link`` is ``(parent_id, parent_seq)`` for ``session_id``
+        when the new fork's row isn't in ``graph`` yet (the in-flight
+        case during ``Session.fork``). When ``session_id`` is in ``graph``,
+        the override is ignored.
+        """
+        start_parent_id: str | None = None
+        start_parent_seq: int | None = None
+        if session_id not in graph and override_link is not None:
+            start_parent_id, start_parent_seq = override_link
+        chain = _graph.walk_ancestors(
+            graph,
+            session_id,
+            start_parent_id=start_parent_id,
+            start_parent_seq=start_parent_seq,
+        )
+        segments: list[list[dict[str, Any]]] = []
+        for ancestor_id, cap in chain:
+            if cap is None:
+                continue
+            cap_rows = storage.load_blocks_through_seq(ancestor_id, cap)
+            seg_messages, _ = _rebuild_messages(cap_rows)
+            if seg_messages:
+                segments.append(seg_messages)
+        return [m for seg in segments for m in seg]
+
+    @classmethod
+    def fork(
+        cls,
+        db_path: Path,
+        parent_session_id: str,
+        parent_seq: int,
+        *,
+        cwd: Path,
+        model: str,
+        flush_sync: bool = False,
+    ) -> Session:
+        """Fork a new session from ``parent_session_id`` at ``parent_seq``.
+
+        The new session gets a fresh id, a fresh ``seq``/``msg_idx``
+        counter starting at 0 (independent numbering — git-branch
+        semantics, no merge), and ``parent_id``/``parent_seq`` set on
+        its lazy row so the fork tree records the link. Ancestor-chain
+        context is loaded eagerly so ``session.messages`` reads as one
+        flat conversation the Agent can resume from directly.
+        """
+        db_path = db_path.expanduser()
+        _validate_session_id(parent_session_id, name="parent_session_id")
+        if parent_seq < 0:
+            raise ValueError(f"parent_seq must be >= 0, got {parent_seq}")
+        new_id = uuid.uuid4().hex
+        lock = cls._take_lock(cls._lock_path(new_id))
+        try:
+            storage = Storage(db_path)
+        except BaseException:
+            lock.release()
+            raise
+        parent_row = storage.load_session(parent_session_id)
+        if parent_row is None:
+            storage.close()
+            lock.release()
+            raise KeyError(f"parent session {parent_session_id!r} not found")
+        graph = _graph.build(storage.list_sessions())
+        ancestor_segments = cls._assemble_ancestors(
+            graph,
+            storage,
+            new_id,
+            override_link=(parent_session_id, parent_seq),
+        )
+        session = cls(
+            db_path=db_path,
+            session_id=new_id,
+            storage=storage,
+            cwd=cwd,
+            model=model,
+            cli_version=_cli_version(),
+            created_at=_now_iso(),
+            messages=list(ancestor_segments),
+            session_row_written=False,
+            parent_id=parent_session_id,
+            parent_seq=parent_seq,
+            next_seq=0,
+            next_msg_idx=0,
+            flush_sync=flush_sync,
+        )
+        session._lock = lock
+        # cothis: see ADR-0010 §3 for the eager fork-row write.
+        session._write_fork_row()
+        return session
+
+    def _write_fork_row(self) -> None:
+        """Persist the sessions row eagerly so ``--resume <fork_id>`` works.
+
+        See ADR-0010 §3 for why this deviates from ``Session.new``'s
+        lazy-row strategy.
+        """
+        updated_at = _now_iso()
+        self._maybe_write_gitignore()
+        title = self._derive_title()
+        session_row = SessionRow(
+            id=self._session_id,
+            parent_id=self._parent_id,
+            parent_seq=self._parent_seq,
+            cwd=str(self._cwd),
+            cli_version=self._cli_version,
+            model=self._model,
+            title=title,
+            created_at=self._created_at,
+            updated_at=updated_at,
+        )
+        try:
+            self._storage.write_atomic(session_row, [], updated_at)
+        except Exception:  # noqa: BLE001 — log + continue; first block drain retries
+            logger.exception(
+                "Session %s: fork-row write failed; will retry on first append.",
+                self._session_id,
+            )
+            return
+        self._session_row_written = True
 
     # --- lock -----------------------------------------------------------
 
@@ -674,8 +939,8 @@ class Session:
             title = self._derive_title()
             session_row = SessionRow(
                 id=self._session_id,
-                parent_id=None,  # ponytail: fork tree lands in #35
-                parent_seq=None,
+                parent_id=self._parent_id,
+                parent_seq=self._parent_seq,
                 cwd=str(self._cwd),
                 cli_version=self._cli_version,
                 model=self._model,
@@ -789,44 +1054,36 @@ class Session:
     def close(self) -> None:
         """Drain the queue, join the consumer, close storage + lock.
 
-        Idempotent. Unregisters the atexit hook so the process-exit path
-        can't double-fire. The consumer is given 5s to drain; if it
-        hasn't finished by then (huge backlog, slow disk), the lock is
-        released but storage is left OPEN — closing a SQLite connection
-        from this thread while the daemon consumer is mid-``write_atomic``
-        would make its next write raise ``ProgrammingError`` (swallowed
-        by ``_drain_one``), losing the entire remaining queue. The
-        daemon finishes its residual drain on its own; SQLite's WAL
-        recovery handles any incomplete txn at process exit. Same loss
-        ceiling as ``kill -9``, strictly better than force-close.
+        Idempotent. Two-phase join (``_CLOSE_JOIN_TIMEOUT`` +
+        ``_CLOSE_GRACE_PERIOD``), then unconditional ``storage.close()``,
+        then lock release.
         """
         if self._closed:
             return
         self._closed = True
         atexit.unregister(self._drain_sync)
         self._stop.set()
-        consumer_alive = False
         if self._consumer is not None:
-            # 5s is generous: a single sqlite commit is 30-70ms (issue's
-            # measurement); 5s drains dozens of backlogged writes. If the
-            # consumer is somehow stuck (a bug), don't hang the CLI for
-            # half a minute — release the lock and let the daemon finish.
-            self._consumer.join(timeout=5)
-            consumer_alive = self._consumer.is_alive()
-            if consumer_alive:
+            # ponytail: the join timeouts cap CLI latency; storage is
+            # closed below regardless of whether the consumer finished,
+            # so the lock contract holds.
+            self._consumer.join(timeout=_CLOSE_JOIN_TIMEOUT)
+            if self._consumer.is_alive():
                 logger.warning(
-                    "Session %s: consumer still alive after 5s close; "
-                    "leaving storage open for daemon to finish draining "
-                    "(lock released; loss ceiling = kill -9).",
+                    "Session %s: consumer still alive after %.1fs close; "
+                    "joining %.1fs grace period then closing storage "
+                    "(residual writes will fail; loss ceiling = kill -9).",
                     self._session_id,
+                    _CLOSE_JOIN_TIMEOUT,
+                    _CLOSE_GRACE_PERIOD,
                 )
+                self._consumer.join(timeout=_CLOSE_GRACE_PERIOD)
         # Note: close() runs on the caller's thread (NOT via
         # asyncio.to_thread) — filelock's lock counter is thread-local,
         # so acquire (in new/load, on the main thread) and release must
         # be on the same thread. The blocking cost is bounded (drain +
-        # 5s join ceiling) and only paid once at session end.
+        # join + grace ceiling) and only paid once at session end.
         try:
-            if not consumer_alive:
-                self._storage.close()
+            self._storage.close()
         finally:
             self._release_lock()
