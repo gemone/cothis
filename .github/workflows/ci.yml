@@ -23,6 +23,13 @@ jobs:
 
             - name: Install uv
               uses: astral-sh/setup-uv@v6
+              # Pin uv version: without this the action queries the
+              # GitHub releases API for "latest", which fails hard (no
+              # retry) during GitHub API outages — every ubuntu/windows
+              # run died at this step while macos scraped through. A
+              # pinned version downloads directly, skipping that lookup.
+              with:
+                version: "0.11.19"
 
             - name: Set up Python
               run: uv python install

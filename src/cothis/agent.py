@@ -66,6 +66,8 @@ if TYPE_CHECKING:
     from any_llm import AnyLLM
     from any_llm.types.messages import MessageResponse, MessageStreamEvent
 
+    from cothis.session import Session
+
 
 Message = dict[str, Any]
 
@@ -262,6 +264,22 @@ def _tool_result_block(
     if is_error:
         block["is_error"] = True
     return block
+
+
+def _append_merged(
+    messages: list[dict[str, Any]], role: str, block: dict[str, Any]
+) -> None:
+    """Append ``block`` to ``messages``, merging into the last same-role message.
+
+    Anthropic requires strict user/assistant alternation, so per-execution
+    ``tool_result`` blocks (all ``role="user"`` from one assistant turn) must
+    land in ONE user message, not N. If the last message is already
+    ``role``, extend its ``content``; otherwise open a new message.
+    """
+    if messages and messages[-1]["role"] == role:
+        messages[-1]["content"].append(block)
+    else:
+        messages.append({"role": role, "content": [block]})
 
 
 def _sanitize_tool_name(name: str) -> str:
@@ -475,6 +493,12 @@ class Agent(BaseModel):
     _mcp_tool_names: set[str] = PrivateAttr(default_factory=set)
     _mcp_started: bool = PrivateAttr(default=False)
     _handles_started: bool = PrivateAttr(default=False)
+    # Optional persistence sink. ``ask`` leaves this ``None`` (ephemeral,
+    # no Session constructed); ``chat`` calls ``attach_session`` after
+    # construction. The three enqueue points (``_ensure_messages`` for the
+    # user turn, post-MessageStop for the assistant content, per-execution
+    # inside the tool loop for ``tool_result``) all guard on this.
+    _session: Session | None = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
         from any_llm import AnyLLM
@@ -512,6 +536,33 @@ class Agent(BaseModel):
         # Tools without ``_handle_cls`` are skipped by ``bind``.
         for tool in self._tool_map.values():
             self._handle_manager.bind(tool)
+
+    def attach_session(self, session: Session) -> None:
+        """Bind a :class:`~cothis.session.Session` for persistence.
+
+        ``ask`` never calls this (ephemeral); ``chat`` calls it after
+        construction with a fresh or resumed ``Session``. After this,
+        ``run_stream``'s three enqueue points fire on every user input,
+        every per-execution ``tool_result``, and every assistant
+        MessageStop. ``aclose`` drains + closes the session.
+
+        For a **resumed** session (``Session.load``), the loaded
+        ``session.messages`` seed ``self._messages`` so the model sees
+        prior history on its next ``amessages`` call — without this,
+        resume would be amnesiac (the Session has the history but the
+        Agent would send an empty conversation). A fresh session
+        (``Session.new``) has empty ``messages`` and the seed is a no-op.
+        """
+        self._session = session
+        if session.messages:
+            # Replace, not extend: a fresh Agent has no history of its own,
+            # and the Session's messages are the ground truth. Rebuild is
+            # a shallow copy of each block dict so accidental in-place
+            # mutation in one doesn't poison the other.
+            self._messages = [
+                {"role": m["role"], "content": list(m["content"])}
+                for m in session.messages
+            ]
 
     def _effective_max_tokens(self) -> int:
         """The ``max_tokens`` to pass to ``amessages`` for this Agent.
@@ -574,16 +625,20 @@ class Agent(BaseModel):
             )
             msg = _assistant_msg_from_response(response)
             self._messages.append(msg)
+            # Assistant atomic enqueue (mirror of run_stream; see R3 revised —
+            # both methods persist identically so attaching a Session to a
+            # ``run``-using Agent doesn't silently lose history).
+            if self._session is not None:
+                self._session.append_message("assistant", msg["content"])
 
             tool_uses = _tool_uses_in(msg["content"])
             if tool_uses:
-                result_blocks: list[dict[str, Any]] = []
                 for block in tool_uses:
                     is_error, output = await self._execute_tool(block)
-                    result_blocks.append(
-                        _tool_result_block(block["id"], output, is_error)
-                    )
-                self._messages.append({"role": "user", "content": result_blocks})
+                    result_block = _tool_result_block(block["id"], output, is_error)
+                    _append_merged(self._messages, "user", result_block)
+                    if self._session is not None:
+                        self._session.append_block("user", result_block)
                 continue
 
             # Non-tool turn: final answer (text concat; empty → "").
@@ -725,9 +780,17 @@ class Agent(BaseModel):
                     else None,
                 }
             )
+            # Assistant atomic enqueue (Q2-A): the whole content list shares
+            # one txn on drain, so a crash can never leave an orphan
+            # ``tool_use`` without its sibling blocks. The stored dict
+            # strips the per-inspection metadata (id/model/stop_reason/usage)
+            # — Session stores block fields, not message-level metadata
+            # (Q11-none: those are None on reload anyway, and
+            # ``_request_messages`` strips them before send).
+            if self._session is not None:
+                self._session.append_message("assistant", content)
 
             if _tool_uses_in(content):
-                result_blocks = []
                 for block in content:
                     if block.get("type") != "tool_use":
                         continue
@@ -740,10 +803,15 @@ class Agent(BaseModel):
                     )
                     yield ToolCallEvent(name=display_name, arguments=block["input"])
                     is_error, output = await self._execute_tool(block)
-                    result_blocks.append(
-                        _tool_result_block(block["id"], output, is_error)
-                    )
-                self._messages.append({"role": "user", "content": result_blocks})
+                    result_block = _tool_result_block(block["id"], output, is_error)
+                    # Per-execution durability (Q22): each tool_result lands
+                    # in ``_messages`` and the Session immediately on
+                    # completion, not batched at end-of-turn. Same-role
+                    # merge keeps all tool_results from one assistant turn
+                    # in a single user message (Anthropic alternation).
+                    _append_merged(self._messages, "user", result_block)
+                    if self._session is not None:
+                        self._session.append_block("user", result_block)
                 continue
 
             # Non-tool turn: final answer streamed already; just end the loop.
@@ -853,17 +921,29 @@ class Agent(BaseModel):
                 self._mcp_tool_names.add(name)
 
     async def aclose(self) -> None:
-        """Close the MCP session group and reset for safe reuse.
+        """Close the attached Session, MCP session group, and reset for safe reuse.
 
         ``ask`` calls this after its single ``run``; ``chat`` calls it when
-        the session ends. Tears down the ``ClientSessionGroup`` (idempotent —
-        no-op if never started), drops the resolved ``MCPClientTool`` entries
-        from ``_tool_map`` (tracked by name in ``_mcp_tool_names``, so no
+        the session ends. Order: drain + close the Session first (user
+        writes are the data the user cares about), then MCP teardown. Tears
+        down the ``ClientSessionGroup`` (idempotent — no-op if never
+        started), drops the resolved ``MCPClientTool`` entries from
+        ``_tool_map`` (tracked by name in ``_mcp_tool_names``, so no
         ``isinstance`` walk), and clears the ``_mcp_started`` guard, so a
         later ``run`` on the same Agent reconnects with fresh sessions
         instead of dispatching against closed ones. Safe to call more than
         once.
         """
+        # Drain + close the Session first (R13). ``Session.close`` is sync
+        # but cheap (drain + join + sqlite close); we call it directly
+        # rather than via ``asyncio.to_thread`` because filelock's lock
+        # counter is thread-local — acquiring on the main thread (at
+        # ``Session.new``) and releasing on a worker thread would leave
+        # the OS lock held forever. ``ask`` path: ``_session is None``,
+        # no-op.
+        if self._session is not None:
+            self._session.close()
+            self._session = None
         # Release handles first: MCP-session handles disconnect their own
         # sessions via ``disconnect_from_server``. Then exit the group
         # context (closes whatever group-level resources remain). Reversed
@@ -911,10 +991,22 @@ class Agent(BaseModel):
         (see ``_system_param``), never as a ``{role: system}`` message, so
         this only ever appends a user message. ``chat`` reuses one Agent
         across turns, so each call extends the in-memory history.
+
+        If a Session is attached, the user message is enqueued for durable
+        write here (R2) — one site covers both ``run`` and ``run_stream``;
+        ``ask``'s ``_session is None`` skips it cheaply.
+
+        Uses ``_append_merged`` (not raw ``append``): a resumed session
+        can legitimately end in ``role="user"`` (crash mid-LLM-call, or
+        trailing ``tool_result`` with no final assistant), and Anthropic
+        rejects consecutive same-role messages with HTTP 400. Merging
+        mirrors ``Session.append_block``'s semantics so ``_messages`` and
+        ``session.messages`` stay consistent.
         """
-        self._messages.append(
-            {"role": "user", "content": [{"type": "text", "text": user_input}]}
-        )
+        block = {"type": "text", "text": user_input}
+        _append_merged(self._messages, "user", block)
+        if self._session is not None:
+            self._session.append_block("user", block)
 
     async def _execute_tool(self, tool_use: dict[str, Any]) -> tuple[bool, str]:
         """Dispatch a single ``tool_use`` block; return ``(is_error, output)``.

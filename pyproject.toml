@@ -11,6 +11,7 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "any-llm-sdk[all]>=1.17.0",
+    "filelock>=3.13",
     "griffe>=2.1.0",
     "mcp>=1.28.1",
     "pathspec>=0.12.1",
