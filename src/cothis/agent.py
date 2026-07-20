@@ -55,6 +55,7 @@ from cothis.tools import (
     run_hooks_safe,
     schema_for,
 )
+from cothis.tools.fs._hygiene import workdir_context
 from cothis.tools.mcp import MCPSessionHandle
 
 if TYPE_CHECKING:
@@ -473,6 +474,7 @@ class Agent(BaseModel):
     max_tokens: int | None = None
     api_key: str | None = None
     api_base: str | None = None
+    cwd: Path | None = None
 
     # Runtime-only state: not validated, not serialised.
     _llm: AnyLLM = PrivateAttr()
@@ -580,6 +582,15 @@ class Agent(BaseModel):
     async def run(self, user_input: str) -> str:
         """Run the agent loop to completion and return the final answer.
 
+        Wraps the body in ``workdir_context(self.cwd)`` so every tool call
+        inside the turn sees the same cwd.
+        """
+        with workdir_context(self.cwd):
+            return await self._run_inner(user_input)
+
+    async def _run_inner(self, user_input: str) -> str:
+        """Run the agent loop to completion and return the final answer.
+
         Non-streaming: the full ReAct loop runs to completion before this
         returns. Use ``run_stream`` when the caller wants the final answer
         token-by-token (e.g. ``cothis chat``).
@@ -660,6 +671,16 @@ class Agent(BaseModel):
         )
 
     async def run_stream(self, user_input: str) -> AsyncIterator[str | ToolCallEvent]:
+        """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
+
+        Wraps the body in ``workdir_context(self.cwd)`` so every tool call
+        inside the turn sees the same cwd.
+        """
+        with workdir_context(self.cwd):
+            async for event in self._run_stream_inner(user_input):
+                yield event
+
+    async def _run_stream_inner(self, user_input: str) -> AsyncIterator[str | ToolCallEvent]:
         """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
 
         Yields:
