@@ -483,10 +483,9 @@ def test_cothis_sessions_dir_env_creates_split_layout(
     assert (override / "session.db").exists()
     # Lock lives in cache dir, NOT under <override>/
     cache_dir = tmp_path / "cache" / "cothis"
-    assert (cache_dir / f"{sid}.lock").exists() or not (cache_dir / f"{sid}.lock").exists()
     # The cache-dir lock was created during the session; filelock removes
-    # it on release. Either state is acceptable — the assertion is that
-    # the lock was NEVER at <override>/<sid>.lock.
+    # it on release. The invariant is that the lock was NEVER at
+    # <override>/<sid>.lock — asserted on the next line.
     assert not (override / f"{sid}.lock").exists()
 
 
@@ -902,3 +901,27 @@ def test_crud_roundtrip_real_consumer_thread(tmp_path: Path) -> None:
         assert s2.messages[3]["content"][0]["text"] == "final answer"
     finally:
         s2.close()
+
+
+# ---------------------------------------------------------------------
+# 6. Security: db file permissions + session_id traversal guard
+# ---------------------------------------------------------------------
+
+
+def test_db_file_is_owner_only(tmp_path: Path) -> None:
+    """Transcripts carry tool output (routinely secrets) → db 0o600."""
+    db_path = tmp_path / "sessions" / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s.close()
+    mode = db_path.stat().st_mode & 0o777
+    assert mode == 0o600, f"db is {oct(mode)}, expected 0o600 (owner-only)"
+
+
+def test_load_rejects_non_hex_session_id(tmp_path: Path) -> None:
+    """session_id becomes a filesystem path — reject traversal attempts."""
+    db_path = tmp_path / "sessions" / "session.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.touch()
+    for bad in ["../etc/passwd", "deadbeef", "X" * 32, "a" * 31 + "g", ""]:
+        with pytest.raises(ValueError):
+            Session.load(db_path, bad, flush_sync=True)

@@ -388,7 +388,7 @@ class Session:
         the cache dir (see ``_lock_path``), decoupled from the db location.
         """
         db_path = db_path.expanduser()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         session_id = uuid.uuid4().hex
         lock = cls._take_lock(cls._lock_path(session_id))
         try:
@@ -428,6 +428,14 @@ class Session:
         ``.gitignore`` write.
         """
         db_path = db_path.expanduser()
+        # Trust boundary: session_id becomes a filesystem path in
+        # _lock_path. Safe in new() (uuid4().hex, internal), but load()
+        # receives it from callers (future --resume). Reject anything
+        # that isn't exactly 32 lowercase hex — blocks ``../`` traversal.
+        if len(session_id) != 32 or not all(
+            c in "0123456789abcdef" for c in session_id
+        ):
+            raise ValueError(f"invalid session_id: {session_id!r}")
         lock = cls._take_lock(cls._lock_path(session_id))
         try:
             storage = Storage(db_path)

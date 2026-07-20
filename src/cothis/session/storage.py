@@ -32,6 +32,7 @@ positional mystery. They are storage-shaped, not Anthropic-shaped:
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -168,6 +169,14 @@ class Storage:
         for stmt in _DDL:
             self._conn.execute(stmt)
         self._conn.commit()
+        # Transcripts carry tool output — routinely secrets. Tighten the
+        # db file to owner-only (sqlite creates it 0o644 via umask). WAL
+        # sidecars (-wal/-shm) inherit from the main file on creation.
+        # ponytail: os.chmod not in connect() args; idempotent on reopen.
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            pass  # e.g. fs without permission bits (FAT) — best effort
 
     def write_atomic(
         self,
