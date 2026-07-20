@@ -59,6 +59,10 @@ logger = logging.getLogger(__name__)
 # consumer join. Exhaustion → poison-row drop (same loss ceiling as kill -9).
 _WRITE_RETRY_BACKOFFS: tuple[float, ...] = (0.1, 0.5, 2.0)
 
+# close() join timeouts; see ADR-0009 for the lock-contract rationale.
+_CLOSE_JOIN_TIMEOUT: float = 5.0
+_CLOSE_GRACE_PERIOD: float = 1.0
+
 
 def _now_iso() -> str:
     """UTC now as ISO-8601. SQLite stores as TEXT; lexicographic == chronological."""
@@ -789,44 +793,36 @@ class Session:
     def close(self) -> None:
         """Drain the queue, join the consumer, close storage + lock.
 
-        Idempotent. Unregisters the atexit hook so the process-exit path
-        can't double-fire. The consumer is given 5s to drain; if it
-        hasn't finished by then (huge backlog, slow disk), the lock is
-        released but storage is left OPEN — closing a SQLite connection
-        from this thread while the daemon consumer is mid-``write_atomic``
-        would make its next write raise ``ProgrammingError`` (swallowed
-        by ``_drain_one``), losing the entire remaining queue. The
-        daemon finishes its residual drain on its own; SQLite's WAL
-        recovery handles any incomplete txn at process exit. Same loss
-        ceiling as ``kill -9``, strictly better than force-close.
+        Idempotent. Two-phase join (``_CLOSE_JOIN_TIMEOUT`` +
+        ``_CLOSE_GRACE_PERIOD``), then unconditional ``storage.close()``,
+        then lock release.
         """
         if self._closed:
             return
         self._closed = True
         atexit.unregister(self._drain_sync)
         self._stop.set()
-        consumer_alive = False
         if self._consumer is not None:
-            # 5s is generous: a single sqlite commit is 30-70ms (issue's
-            # measurement); 5s drains dozens of backlogged writes. If the
-            # consumer is somehow stuck (a bug), don't hang the CLI for
-            # half a minute — release the lock and let the daemon finish.
-            self._consumer.join(timeout=5)
-            consumer_alive = self._consumer.is_alive()
-            if consumer_alive:
+            # ponytail: the join timeouts cap CLI latency; storage is
+            # closed below regardless of whether the consumer finished,
+            # so the lock contract holds.
+            self._consumer.join(timeout=_CLOSE_JOIN_TIMEOUT)
+            if self._consumer.is_alive():
                 logger.warning(
-                    "Session %s: consumer still alive after 5s close; "
-                    "leaving storage open for daemon to finish draining "
-                    "(lock released; loss ceiling = kill -9).",
+                    "Session %s: consumer still alive after %.1fs close; "
+                    "joining %.1fs grace period then closing storage "
+                    "(residual writes will fail; loss ceiling = kill -9).",
                     self._session_id,
+                    _CLOSE_JOIN_TIMEOUT,
+                    _CLOSE_GRACE_PERIOD,
                 )
+                self._consumer.join(timeout=_CLOSE_GRACE_PERIOD)
         # Note: close() runs on the caller's thread (NOT via
         # asyncio.to_thread) — filelock's lock counter is thread-local,
         # so acquire (in new/load, on the main thread) and release must
         # be on the same thread. The blocking cost is bounded (drain +
-        # 5s join ceiling) and only paid once at session end.
+        # join + grace ceiling) and only paid once at session end.
         try:
-            if not consumer_alive:
-                self._storage.close()
+            self._storage.close()
         finally:
             self._release_lock()

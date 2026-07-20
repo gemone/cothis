@@ -1084,3 +1084,59 @@ def test_load_rejects_non_hex_session_id(tmp_path: Path) -> None:
     for bad in ["../etc/passwd", "deadbeef", "X" * 32, "a" * 31 + "g", ""]:
         with pytest.raises(ValueError):
             Session.load(db_path, bad, flush_sync=True)
+
+
+def test_close_storage_closed_even_when_consumer_stuck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock contract: close() must close storage before releasing the lock.
+
+    A stuck consumer (one that outlives the join timeout) must not keep
+    storage open across close() — otherwise the cross-process lock is
+    released while writes may still be in flight, defeating the
+    ``SessionLockedError`` contract.
+    """
+    db_path = tmp_path / "sessions" / "session.db"
+    # flush_sync=True avoids starting a real consumer; we inject a fake.
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+
+    storage_closed = {"called": False}
+    release_called_after = {"ok": False}
+    def tracking_close() -> None:
+        storage_closed["called"] = True
+    monkeypatch.setattr(s._storage, "close", tracking_close)
+    real_release = s._release_lock
+    def tracking_release() -> None:
+        if storage_closed["called"]:
+            release_called_after["ok"] = True
+        real_release()
+    monkeypatch.setattr(s, "_release_lock", tracking_release)
+
+    # Fake consumer that's still "alive" after the join timeout —
+    # simulates a stuck write_atomic (slow disk, retry storm, etc.).
+    # Subclasses Thread to satisfy the type checker; we override
+    # is_alive/join so no real thread lifecycle is involved.
+    class _StuckConsumer(threading.Thread):
+        def run(self) -> None:  # never started; never runs
+            pass
+        def is_alive(self) -> bool:
+            return True
+        def join(self, timeout: float | None = None) -> None:
+            return  # returns immediately, still alive
+    s._consumer = _StuckConsumer()
+
+    # Squash the join timeouts so the test doesn't sleep.
+    monkeypatch.setattr("cothis.session._CLOSE_JOIN_TIMEOUT", 0.0)
+    monkeypatch.setattr("cothis.session._CLOSE_GRACE_PERIOD", 0.0)
+
+    s.close()
+
+    assert storage_closed["called"], (
+        "close() must close storage even when consumer is stuck — "
+        "otherwise the lock is released while writes may still happen, "
+        "violating the SessionLockedError contract"
+    )
+    assert release_called_after["ok"], (
+        "lock must be released AFTER storage close — releasing earlier "
+        "opens a race window for a second acquirer"
+    )
