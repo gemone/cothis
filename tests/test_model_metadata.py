@@ -116,11 +116,10 @@ def test_legacy_max_tokens_skipped_when_max_input_tokens_present(
 
 
 def test_real_sonar_entry_does_not_inflate_output_cap() -> None:
-    """Regression guard: bundled perplexity/sonar returns fallback, not 128k.
+    """Bundled perplexity/sonar resolves to ``_FALLBACK_MAX_TOKENS``.
 
-    Pre-#64 this returned 128000 (the input cap, misclassified as the
-    output cap via the legacy ``max_tokens`` field) and the first
-    ``amessages`` call 400'd.
+    The legacy ``max_tokens`` field carries the input cap, not the
+    output cap; resolving it would 400 the first ``amessages`` call.
     """
     assert (
         resolve_max_tokens("sonar", "perplexity") == _FALLBACK_MAX_TOKENS
