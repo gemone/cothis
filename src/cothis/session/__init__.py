@@ -271,24 +271,48 @@ def _rebuild_messages(
         messages.append({"role": current_role, "content": current_blocks})
 
     cut_at = _orphan_truncate_index(messages)
-    if cut_at is None:
-        return messages, None
-    # Map the in-memory message index back to a msg_idx (the storage-side
-    # identifier). messages[i] came from the i-th distinct msg_idx group;
-    # walk rows once to recover that map.
-    msg_idx_of_message: list[int] = []
-    seen: set[int] = set()
-    for r in rows:
-        if r.msg_idx not in seen:
-            seen.add(r.msg_idx)
-            msg_idx_of_message.append(r.msg_idx)
-    cut_msg_idx = msg_idx_of_message[cut_at]
-    logger.warning(
-        "Session reload: dropping %d trailing message(s) with unpaired "
-        "tool_use (crash recovery, Q2-A); persisting the truncate.",
-        len(messages) - cut_at,
-    )
-    return messages[:cut_at], cut_msg_idx
+    if cut_at is not None:
+        # Map the in-memory message index back to a msg_idx (the storage-side
+        # identifier). messages[i] came from the i-th distinct msg_idx group;
+        # walk rows once to recover that map.
+        msg_idx_of_message: list[int] = []
+        seen: set[int] = set()
+        for r in rows:
+            if r.msg_idx not in seen:
+                seen.add(r.msg_idx)
+                msg_idx_of_message.append(r.msg_idx)
+        cut_msg_idx = msg_idx_of_message[cut_at]
+        logger.warning(
+            "Session reload: dropping %d trailing message(s) with unpaired "
+            "tool_use (crash recovery, Q2-A); persisting the truncate.",
+            len(messages) - cut_at,
+        )
+        messages = messages[:cut_at]
+    else:
+        cut_msg_idx = None
+
+    # cothis: assistant-first guard (#146, ADR-0008 follow-up). If the
+    # first message is not ``role="user"``, the user-row write was lost
+    # (poison-drop on first drain). Anthropic's Messages API rejects
+    # assistant-first sequences; insert a sentinel so resume works, and
+    # log CRITICAL so the user sees the repair.
+    if messages and messages[0].get("role") != "user":
+        logger.critical(
+            "Session reload: first message is role=%r (expected 'user'); "
+            "inserting a sentinel user turn. This indicates a poison-drop "
+            "on first drain (ADR-0008). The session is resumable but may "
+            "be missing the first user turn's content.",
+            messages[0].get("role"),
+        )
+        messages.insert(0, {
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "(session history repaired — first user turn was lost)",
+            }],
+        })
+
+    return messages, cut_msg_idx
 
 
 def _orphan_truncate_index(
@@ -1073,13 +1097,25 @@ class Session:
             cold_index = ArchiveIndex(
                 self._db_path.parent / "archive" / "index.json"
             )
-            promote_session(
-                hot_db_path=self._db_path,
-                archive_dir=self._db_path.parent / "archive",
-                session_id=self._session_id,
-                index=cold_index,
-                now_iso=updated_at,
-            )
+            try:
+                promote_session(
+                    hot_db_path=self._db_path,
+                    archive_dir=self._db_path.parent / "archive",
+                    session_id=self._session_id,
+                    index=cold_index,
+                    now_iso=updated_at,
+                )
+            except Exception as exc:  # noqa: BLE001 — promote failure must not kill the consumer
+                logger.critical(
+                    "Session %s: promote_session failed; dropping %d "
+                    "block(s) (seq %d-%d) to unblock the queue. Error: %r",
+                    self._session_id,
+                    len(rows),
+                    rows[0].seq,
+                    rows[-1].seq,
+                    exc,
+                )
+                return
             self._cold = False
         session_row: SessionRow | None = None
         if not self._session_row_written:

@@ -394,8 +394,11 @@ def test_session_row_written_flag_set_after_successful_write(
     s.close()
     s2 = Session.load(db_path, s.session_id, flush_sync=True)
     try:
-        assert [m["role"] for m in s2.messages] == ["assistant"]
-        assert s2.messages[0]["content"][0]["text"] == "second"
+        # The sentinel user turn is inserted (#146) so the session is
+        # resumable despite the poison-drop.
+        assert [m["role"] for m in s2.messages] == ["user", "assistant"]
+        assert "repair" in s2.messages[0]["content"][0]["text"].lower()
+        assert s2.messages[1]["content"][0]["text"] == "second"
     finally:
         s2.close()
 
@@ -479,10 +482,10 @@ def test_persistent_write_failure_drops_after_retries_no_deadlock(
     s.close()
     s2 = Session.load(db_path, s.session_id, flush_sync=True)
     try:
-        # Only the post-drop assistant message survived. The dropped "user"
-        # message is gone — that's the contract for persistent errors.
-        assert [m["role"] for m in s2.messages] == ["assistant"]
-        assert s2.messages[0]["content"][0]["text"] == "recovered"
+        # Sentinel user turn inserted (#146) so the session is resumable.
+        assert [m["role"] for m in s2.messages] == ["user", "assistant"]
+        assert "repair" in s2.messages[0]["content"][0]["text"].lower()
+        assert s2.messages[1]["content"][0]["text"] == "recovered"
     finally:
         s2.close()
 
@@ -543,6 +546,44 @@ def test_reload_keeps_full_history_when_no_orphans(tmp_path: Path) -> None:
         "user", "assistant", "user", "assistant",
     ]
     s2.close()
+
+
+def test_reload_inserts_sentinel_when_first_message_is_assistant(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_rebuild_messages`` inserts a sentinel user turn when the first
+    message is assistant (#146, ADR-0008 follow-up).
+
+    Simulates a poison-drop on first drain: the user-row write fails
+    exhaustively, the assistant-row write succeeds. On reload the
+    rebuilt list starts with assistant, which Anthropic's API rejects
+    with 400. The guard inserts a sentinel user message and logs
+    CRITICAL so the user sees the repair.
+    """
+    import logging
+
+    db_path = tmp_path / "sessions" / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    sid = s.session_id
+    # Write only an assistant message — no user first. Simulates the
+    # poison-drop scenario (user row lost, assistant row survived).
+    s.append_message("assistant", [_user_text("hi from assistant")])
+    s.close()
+
+    with caplog.at_level(logging.CRITICAL, logger="cothis.session"):
+        s2 = Session.load(db_path, sid, flush_sync=True)
+    try:
+        # First message must be a sentinel user turn, not assistant.
+        assert s2.messages[0]["role"] == "user"
+        assert "repair" in s2.messages[0]["content"][0]["text"].lower()
+        # The original assistant message follows.
+        assert s2.messages[1]["role"] == "assistant"
+        # CRITICAL was logged naming the repair.
+        critical = [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+        assert len(critical) >= 1
+        assert "assistant" in critical[0].message.lower()
+    finally:
+        s2.close()
 
 
 # ---------------------------------------------------------------------
