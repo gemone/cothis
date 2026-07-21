@@ -1438,3 +1438,93 @@ def test_load_agents_md_empty_cothis_home_does_not_read_cwd(
         "</agents_md>"
     )[0]
     assert "project rules" not in cothis_block
+
+
+@pytest.mark.asyncio
+async def test_aclose_isolates_cleanup_steps_on_session_failure() -> None:
+    """``aclose`` runs every cleanup step + state reset even when Session.close raises (#140).
+
+    Pre-#140 ``aclose`` had no isolation between steps — a raise from
+    ``Session.close`` (or ``release_all``) propagated straight out,
+    leaving the MCP group + handles open and ``_mcp_started`` set,
+    so a later ``run`` re-dispatched against a torn-down group.
+    """
+    from unittest.mock import MagicMock
+
+    agent = Agent.__new__(Agent)  # bypass __init__
+    session_mock = MagicMock()
+    session_mock.close.side_effect = RuntimeError("simulated storage close failure")
+    agent._session = session_mock
+    agent._handle_manager = MagicMock()
+
+    async def _noop_release():
+        return None
+
+    release_mock = MagicMock(side_effect=_noop_release)
+    agent._handle_manager.release_all = release_mock
+    agent._mcp_group = MagicMock()
+
+    async def _noop_aexit(*args):
+        return None
+
+    aexit_mock = MagicMock(side_effect=_noop_aexit)
+    agent._mcp_group.__aexit__ = aexit_mock
+    agent._tool_map = {"mcp_x": "fake"}
+    agent._mcp_tool_names = {"mcp_x"}
+    agent._mcp_started = True
+    agent._handles_started = True
+
+    # Must not raise — the failure is logged, cleanup continues.
+    await agent.aclose()
+
+    # Every cleanup step ran despite the Session.close failure.
+    assert session_mock.close.called
+    assert release_mock.called
+    assert aexit_mock.called
+    # State reset always runs.
+    assert agent._session is None
+    assert agent._mcp_group is None
+    assert agent._mcp_started is False
+    assert agent._handles_started is False
+    assert agent._mcp_tool_names == set()
+    assert "mcp_x" not in agent._tool_map
+
+
+@pytest.mark.asyncio
+async def test_aclose_isolates_cleanup_steps_on_release_failure() -> None:
+    """Same isolation when ``release_all`` raises instead of ``Session.close`` (#140)."""
+    from unittest.mock import MagicMock
+
+    agent = Agent.__new__(Agent)
+    session_mock = MagicMock()
+    agent._session = session_mock
+    agent._handle_manager = MagicMock()
+
+    async def _failing_release():
+        raise RuntimeError("simulated handle release failure")
+
+    release_mock = MagicMock(side_effect=_failing_release)
+    agent._handle_manager.release_all = release_mock
+    agent._mcp_group = MagicMock()
+
+    async def _noop_aexit(*args):
+        return None
+
+    aexit_mock = MagicMock(side_effect=_noop_aexit)
+    agent._mcp_group.__aexit__ = aexit_mock
+    agent._tool_map = {"mcp_x": "fake"}
+    agent._mcp_tool_names = {"mcp_x"}
+    agent._mcp_started = True
+    agent._handles_started = True
+
+    await agent.aclose()
+
+    # Session.close ran first (succeeded); release_all ran (failed);
+    # MCP group teardown ran anyway; state reset ran.
+    assert session_mock.close.called
+    assert release_mock.called
+    assert aexit_mock.called
+    assert agent._session is None
+    assert agent._mcp_group is None
+    assert agent._mcp_started is False
+    assert agent._handles_started is False
