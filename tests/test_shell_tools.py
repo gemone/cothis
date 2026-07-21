@@ -62,9 +62,11 @@ def _shell_tool(yaml_text: str) -> _ShellTool:
 
 def test_argv_no_args_runs_command() -> None:
     """A no-arg argv tool runs its command verbatim and returns stdout."""
+    import asyncio
+
     tool = load_yaml_tools('name: hi\ncommand: ["echo", "hello"]\n')[0]
     assert tool.__name__ == "hi"
-    assert tool() == "hello\n"
+    assert asyncio.run(tool()) == "hello\n"
 
 
 def test_argv_arg_substituted_into_element() -> None:
@@ -78,7 +80,8 @@ args:
     type: int
     description: The number.
 """
-    assert load_yaml_tools(yaml_text)[0](n=7) == "7\n"
+    import asyncio
+    assert asyncio.run(load_yaml_tools(yaml_text)[0](n=7)) == "7\n"
 
 
 def test_argv_spaces_in_value_safe_without_quote() -> None:
@@ -96,7 +99,8 @@ args:
   - name: path
     type: str
 """
-    assert load_yaml_tools(yaml_text)[0](path="my file") == "my file\n"
+    import asyncio
+    assert asyncio.run(load_yaml_tools(yaml_text)[0](path="my file")) == "my file\n"
 
 
 def test_argv_empty_list_rejected() -> None:
@@ -397,7 +401,8 @@ platforms:
   linux:
     command: ["echo", "from-linux"]
 """
-    assert load_yaml_tools(yaml_text)[0]() == "from-linux\n"
+    import asyncio
+    assert asyncio.run(load_yaml_tools(yaml_text)[0]()) == "from-linux\n"
 
 
 def test_unix_covers_linux_and_macos(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,9 +418,11 @@ platforms:
     command: ["echo", "from-unix"]
 """
     monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "linux")
-    assert load_yaml_tools(yaml_text)[0]() == "from-unix\n"
+    import asyncio
+    assert asyncio.run(load_yaml_tools(yaml_text)[0]()) == "from-unix\n"
     monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "macos")
-    assert load_yaml_tools(yaml_text)[0]() == "from-unix\n"
+    import asyncio
+    assert asyncio.run(load_yaml_tools(yaml_text)[0]()) == "from-unix\n"
 
 
 def test_exact_platform_wins_over_unix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -431,7 +438,8 @@ platforms:
   linux:
     command: ["echo", "from-linux"]
 """
-    assert load_yaml_tools(yaml_text)[0]() == "from-linux\n"
+    import asyncio
+    assert asyncio.run(load_yaml_tools(yaml_text)[0]()) == "from-linux\n"
 
 
 def test_platform_inherits_top_level_command_when_omitted(
@@ -446,7 +454,8 @@ command: ["echo", "inherited"]
 platforms:
   linux: {}
 """
-    assert load_yaml_tools(yaml_text)[0]() == "inherited\n"
+    import asyncio
+    assert asyncio.run(load_yaml_tools(yaml_text)[0]()) == "inherited\n"
 
 
 def test_unknown_platform_key_rejected() -> None:
@@ -761,8 +770,9 @@ def test_load_tools_from_layer_finds_yaml_files(tmp_path: Path) -> None:
     tools = load_tools_from_layer(tools_dir)
     by_name = {t.__name__: t for t in tools}
     assert set(by_name) == {"hello", "bye"}
-    assert by_name["hello"]() == "hello\n"
-    assert by_name["bye"]() == "bye\n"
+    import asyncio
+    assert asyncio.run(by_name["hello"]()) == "hello\n"
+    assert asyncio.run(by_name["bye"]()) == "bye\n"
 
 
 def test_load_tools_from_layer_finds_nested_yaml(tmp_path: Path) -> None:
@@ -860,7 +870,8 @@ def test_nonzero_exit_returns_error_with_stderr() -> None:
     tool = load_yaml_tools(
         'name: failer\ncommand: ["sh", "-c", "echo boom >&2; exit 3"]\n'
     )[0]
-    result = tool()
+    import asyncio
+    result = asyncio.run(tool())
     assert "exit code 3" in result
     assert "boom" in result
 
@@ -1008,3 +1019,48 @@ def test_non_ascii_accented_name_stripped() -> None:
     yaml_text = 'name: "déploy"\ncommand: ["echo", "hi"]\n'
     tool = load_yaml_tools(yaml_text)[0]
     assert tool.__name__ == "dploy"
+
+
+# ====================================================================
+# Async dispatch — _ShellTool.__call__ must not block the loop (#90)
+# ====================================================================
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_does_not_block_event_loop() -> None:
+    """A long subprocess must not freeze concurrent async tasks (#90).
+
+    Pre-#90 ``_ShellTool.__call__`` ran ``subprocess.run`` inline on
+    the loop thread; a 1-second ``sleep`` stalled a concurrent ticker
+    task by exactly the subprocess duration. The fix routes the
+    subprocess through ``asyncio.to_thread`` so the loop stays
+    responsive.
+    """
+    import asyncio
+    import time
+
+    tool = load_yaml_tools('name: sleep1\ncommand: ["sleep", "1"]\n')[0]
+    ticks: list[float] = []
+    start = time.perf_counter()
+
+    async def ticker() -> None:
+        for _ in range(6):
+            await asyncio.sleep(0.2)
+            ticks.append(round(time.perf_counter() - start, 2))
+
+    task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.1)  # let the ticker start
+    # mimics agent.py:1087 — tool() returns a coroutine; agent awaits.
+    result = tool()
+    if hasattr(result, "__await__"):
+        await result
+    await task
+
+    # The ticker fires roughly every 0.2s. With the fix, several
+    # ticks land *during* the 1s sleep (before t=1.0). Without the
+    # fix the loop blocks for the full second and the first tick
+    # lands at ~1.1s — i.e. zero ticks before t=1.0.
+    ticks_during_sleep = [t for t in ticks if t < 1.0]
+    assert len(ticks_during_sleep) >= 2, (
+        f"loop stalled during subprocess: ticks={ticks}"
+    )

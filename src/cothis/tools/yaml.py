@@ -18,6 +18,7 @@ function-level).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import shlex
 import shutil
@@ -505,16 +506,20 @@ class _ShellTool(_HookableTool):
         # None in argv mode — subprocess re-resolves argv[0] via PATH itself.
         self._shell_path = shell_path
 
-    def __call__(self, **kwargs: Any) -> str:
+    async def __call__(self, **kwargs: Any) -> str:
         rendered = self._block.render(**kwargs)
+        # cothis: park the blocking ``subprocess.run`` off the loop
+        # thread (#90). Inline call stalled concurrent async tasks
+        # for the full subprocess lifetime and broke Ctrl-C handling.
         if isinstance(rendered, list):
-            proc = subprocess.run(rendered, shell=False, capture_output=True, text=True)
+            proc = await asyncio.to_thread(
+                subprocess.run, rendered, shell=False,
+                capture_output=True, text=True,
+            )
         else:
-            proc = subprocess.run(
-                rendered,
-                shell=True,
-                capture_output=True,
-                text=True,
+            proc = await asyncio.to_thread(
+                subprocess.run, rendered, shell=True,
+                capture_output=True, text=True,
                 executable=self._shell_path,
             )
         return _format_proc_result(proc)
