@@ -36,10 +36,7 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
     """
     cwd = WORKDIR.get() or Path.cwd()
     resolved = _resolve_under(path, cwd)
-    # cothis: stat-then-bounded-read (#134). Pre-#134 the path loaded
-    # the full file into memory (str + bytes), then truncated — peak
-    # memory scaled with file size, not the cap. Stat first; on
-    # over-cap files read only ``_MAX_BYTES``.
+    # Stat first to bound peak memory at _MAX_BYTES, not file size (#134).
     size = resolved.stat().st_size
     if size > _MAX_BYTES:
         with resolved.open("rb") as fh:
@@ -54,6 +51,8 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
                 truncated = truncated[:-1]
         else:
             head = ""
+        # Re-encode head (which may be shorter than the cap after
+        # rstrip) so the dropped count is in bytes, matching ``size``.
         dropped = size - len(head.encode("utf-8"))
         return head + f"\n… (truncated, {dropped} more bytes)"
     text = resolved.read_text(encoding="utf-8")
