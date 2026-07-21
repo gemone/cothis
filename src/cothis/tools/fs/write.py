@@ -26,7 +26,13 @@ import logging
 from pathlib import Path
 
 from cothis.tools.core import tool
-from cothis.tools.fs._hygiene import WORKDIR, PathBoundaryError, _resolve_under
+from cothis.tools.fs._hygiene import (
+    _MAX_BYTES,
+    _MAX_PATHS,
+    WORKDIR,
+    PathBoundaryError,
+    _resolve_under,
+)
 from cothis.tools.fs.patch import (
     AddFile,
     ApplyError,
@@ -207,7 +213,22 @@ def write(content: str) -> str:
         the patch is already in the model's context.
     """
     cwd = WORKDIR.get() or Path.cwd()
+    # cothis: resource caps (#95). Patch-string byte cap fires first
+    # (cheaper than parsing then rejecting); op count fires after
+    # parse. Both surface actionable errors before any disk write.
+    total_bytes = len(content.encode("utf-8"))
+    if total_bytes > _MAX_BYTES:
+        raise ValueError(
+            f"fs.write patch is {total_bytes} bytes; "
+            f"cap is {_MAX_BYTES // (1024 * 1024)} MiB. Split into "
+            f"smaller patches."
+        )
     ops = parse_patch(content)
+    if len(ops) > _MAX_PATHS:
+        raise ValueError(
+            f"fs.write patch has {len(ops)} ops; "
+            f"cap is {_MAX_PATHS} per call. Split into smaller patches."
+        )
     _check_one_op_per_path(ops)
     prior, resolved_paths = _preflight(ops, cwd)
     post = apply_patch(prior, ops)  # raises ApplyError on pre-image miss etc.

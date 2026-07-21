@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from cothis.tools.core import tool
-from cothis.tools.fs._hygiene import WORKDIR, PathBoundaryError, _resolve_under
+from cothis.tools.fs._hygiene import (
+    _MAX_BYTES,
+    _MAX_PATHS,
+    WORKDIR,
+    PathBoundaryError,
+    _resolve_under,
+)
 
 
 def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
@@ -24,10 +30,31 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
 
     Returns the formatted block; the caller handles multi-file assembly.
     Path resolution failures bubble up as :class:`PathBoundaryError`.
+    Per-file byte cap ``_MAX_BYTES`` is enforced here: bodies past the
+    cap are truncated with a trailing ``… (truncated, N more bytes)``
+    line (#95).
     """
     cwd = WORKDIR.get() or Path.cwd()
     resolved = _resolve_under(path, cwd)
     text = resolved.read_text(encoding="utf-8")
+    if len(text.encode("utf-8")) > _MAX_BYTES:
+        dropped = len(text.encode("utf-8")) - _MAX_BYTES
+        # Truncate at the byte boundary, then decode whatever survived.
+        # ``text[:_MAX_BYTES]`` may split a multi-byte char; rstrip the
+        # tail bytes until decode succeeds.
+        blob = text.encode("utf-8")[:_MAX_BYTES]
+        while blob:
+            try:
+                head = blob.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                blob = blob[:-1]
+        else:
+            head = ""
+        return (
+            head
+            + f"\n… (truncated, {dropped} more bytes)"
+        )
     lines = text.splitlines()
     total = len(lines)
     start = max(1, start_line or 1)
@@ -69,6 +96,13 @@ def read(
     """
     if isinstance(path, str):
         return _read_one(path, start_line, end_line)
+
+    if len(path) > _MAX_PATHS:
+        return (
+            f"Error: too many paths ({len(path)}); "
+            f"cap is {_MAX_PATHS} per call. Read in smaller batches "
+            f"or use a more specific path."
+        )
 
     blocks: list[str] = []
     for p in path:
