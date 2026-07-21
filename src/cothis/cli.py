@@ -6,6 +6,7 @@ import asyncio
 import gzip
 import logging
 import os
+import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -559,6 +560,8 @@ def archive_cmd(
             raise typer.BadParameter("compress requires a file path")
         file_path = (archive_dir / target).resolve()
         # cothis: prevent path escape — compress must stay inside archive_dir.
+        # TOCTOU: resolve() → exists() → open() has a symlink-swap window;
+        # acceptable for single-user CLI (no adversary on the same fs).
         try:
             file_path.relative_to(archive_dir.resolve())
         except ValueError:
@@ -568,7 +571,7 @@ def archive_cmd(
             raise typer.Exit(code=1)
         out_path = file_path.with_suffix(file_path.suffix + ".gz")
         with file_path.open("rb") as src, gzip.open(out_path, "wb") as dst:
-            dst.write(src.read())
+            shutil.copyfileobj(src, dst)
         console.print(f"compressed to [cyan]{out_path.name}[/cyan]")
     else:
         now_iso = datetime.now(UTC).isoformat()
