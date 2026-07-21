@@ -558,6 +558,9 @@ def archive_cmd(
     elif action == "compress":
         if not target:
             raise typer.BadParameter("compress requires a file path")
+        if not target.endswith(".db"):
+            console.print(f"[red]Error:[/red] file must end in .db: {target}")
+            raise typer.Exit(code=1)
         file_path = (archive_dir / target).resolve()
         # cothis: prevent path escape — compress must stay inside archive_dir.
         # TOCTOU: resolve() → exists() → open() has a symlink-swap window;
@@ -565,7 +568,8 @@ def archive_cmd(
         try:
             file_path.relative_to(archive_dir.resolve())
         except ValueError:
-            raise typer.BadParameter(f"file must be inside {archive_dir}")
+            console.print(f"[red]Error:[/red] file must be inside {archive_dir}")
+            raise typer.Exit(code=1)
         if not file_path.exists():
             console.print(f"[red]Error:[/red] no such file: {target}")
             raise typer.Exit(code=1)
