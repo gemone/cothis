@@ -7,6 +7,7 @@ import gzip
 import logging
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Must run before cothis.agent imports any_llm.
@@ -518,8 +519,11 @@ def archive_cmd(
         cothis archive restore <id> # promote archived session back
         cothis archive compress <file>  # gzip a cold DB file
     """
-    from datetime import UTC, datetime
-
+    # cothis: hand-rolled dispatch instead of nested typer.Typer() because
+    # the first positional arg is either a subcommand (restore/compress)
+    # or a session id — Typer's subcommand model can't express that
+    # ambiguity. Nested Typer would force `cothis archive session <id>`,
+    # adding a word to the common path.
     db_path = _resolve_db_path()
     archive_dir = db_path.parent / "archive"
 
@@ -548,19 +552,20 @@ def archive_cmd(
         if ok:
             console.print(f"restored session [cyan]{target}[/cyan]")
         else:
-            raise typer.BadParameter(
-                f"session {target!r} not found in archive index"
-            )
+            console.print(f"[red]Error:[/red] session {target!r} not found in archive index")
+            raise typer.Exit(code=1)
     elif action == "compress":
         if not target:
             raise typer.BadParameter("compress requires a file path")
         file_path = (archive_dir / target).resolve()
+        # cothis: prevent path escape — compress must stay inside archive_dir.
         try:
             file_path.relative_to(archive_dir.resolve())
         except ValueError:
             raise typer.BadParameter(f"file must be inside {archive_dir}")
         if not file_path.exists():
-            raise typer.BadParameter(f"no such file: {target}")
+            console.print(f"[red]Error:[/red] no such file: {target}")
+            raise typer.Exit(code=1)
         out_path = file_path.with_suffix(file_path.suffix + ".gz")
         with file_path.open("rb") as src, gzip.open(out_path, "wb") as dst:
             dst.write(src.read())
