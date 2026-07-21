@@ -85,10 +85,13 @@ most — one per archived session).
 - The index is the source of truth for "is this session cold?".
   `Session.load` consults it on hot miss (ADR-0011 §2);
   `Session.delete` consults it for the cold path (ADR-0012 §1).
-- Drift is self-healing: `delete_cold_session` and `_read_cold_session`
-  both gate on `is_file()` and drop the index entry if the cold DB
-  is gone. The next `run_archival_pass` won't re-archive a session
-  the index still tracks.
+- Drift is self-healing: `delete_cold_session` (`archive.py`) and
+  `Session.load`'s cold-miss branch (`session/__init__.py`) both drop
+  the index entry when the cold DB file is gone. `_read_cold_session`
+  itself only gates on `is_file()` and returns `None`; the drop lives
+  at its caller because the function has no `index` parameter to
+  mutate. The next `run_archival_pass` won't re-archive a session the
+  index still tracks.
 
 ## 3. Promote-back-on-first-write
 
