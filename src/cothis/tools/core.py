@@ -28,7 +28,6 @@ from typing import (
     runtime_checkable,
 )
 
-import griffe
 from pydantic import TypeAdapter
 
 if TYPE_CHECKING:
@@ -114,6 +113,14 @@ def _parse_docstring(doc: str | None) -> tuple[str, dict[str, str]]:
     """
     if not doc:
         return "", {}
+    # cothis: deferred import (#81) — griffe costs ~84ms to import and
+    # is only needed when a ``@tool`` is decorated (or ``schema_for``
+    # falls back to a bare callable). CLI flag paths (``--help``,
+    # ``--version``, completions) import ``cothis.tools.core`` without
+    # triggering either, so the tax is paid only by code that actually
+    # builds tool schemas.
+    import griffe
+
     # griffe logs "No type or annotation for parameter" warnings when
     # ``parent`` is None; we silence them because types come from
     # ``inspect.signature``, not griffe's cross-check.
