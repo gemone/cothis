@@ -427,9 +427,9 @@ def test_cothis_home_picks_up_late_env_change(
 ) -> None:
     """Changing ``COTHIS_HOME`` after import is reflected without reload (#66).
 
-    The pre-#66 constants froze the value at import; a wrapper script
-    that set the env after import got the stale path. The lazy
-    functions read the env on every call.
+    ``_cothis_home`` reads ``$COTHIS_HOME`` on every call; a wrapper
+    script that sets the env after import sees the new path without
+    ``importlib.reload``.
     """
     from pathlib import Path
 
