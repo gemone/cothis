@@ -586,6 +586,34 @@ def test_reload_inserts_sentinel_when_first_message_is_assistant(
         s2.close()
 
 
+def test_sentinel_is_idempotent_on_repeated_load(
+    tmp_path: Path,
+) -> None:
+    """Loading twice inserts exactly one sentinel, not one per load (#146).
+
+    The sentinel is rebuilt at load time (not persisted). A second
+    ``load`` finds the same assistant-first DB and inserts one
+    sentinel again — not two, because the check fires before the
+    sentinel is in the list.
+    """
+    db_path = tmp_path / "sessions" / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    sid = s.session_id
+    s.append_message("assistant", [_user_text("hi")])
+    s.close()
+
+    s2 = Session.load(db_path, sid, flush_sync=True)
+    s2.close()
+
+    s3 = Session.load(db_path, sid, flush_sync=True)
+    try:
+        user_msgs = [m for m in s3.messages if m["role"] == "user"]
+        assert len(user_msgs) == 1  # one sentinel, not two
+        assert "repair" in user_msgs[0]["content"][0]["text"].lower()
+    finally:
+        s3.close()
+
+
 # ---------------------------------------------------------------------
 # 4. COTHIS_SESSIONS_DIR override + auto .gitignore
 # ---------------------------------------------------------------------
