@@ -543,9 +543,9 @@ async def test_connect_into_fails_loud_when_sdk_tools_shape_changes() -> None:
     server = MCPServer(name="mcp:test-server", params=None)
     # Synthetic group whose ``tools`` is a list, not a dict — simulates
     # an SDK upgrade that drops the prefixed-name keying.
-    fake_group = SimpleNamespace(tools=[])  # type: ignore[arg-type]
+    fake_group = SimpleNamespace(tools=[])
     with pytest.raises(RuntimeError, match="ClientSessionGroup.tools"):
-        await server.connect_into(fake_group)  # type: ignore[arg-type]
+        await server.connect_into(fake_group)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
 
 
 @pytest.mark.asyncio
@@ -554,9 +554,9 @@ async def test_connect_into_fails_loud_when_sdk_tools_attr_missing() -> None:
     from types import SimpleNamespace
 
     server = MCPServer(name="mcp:test-server", params=None)
-    fake_group = SimpleNamespace()  # type: ignore[arg-type]
+    fake_group = SimpleNamespace()
     with pytest.raises(RuntimeError, match="ClientSessionGroup.tools"):
-        await server.connect_into(fake_group)  # type: ignore[arg-type]
+        await server.connect_into(fake_group)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
 
 
 @pytest.mark.asyncio
