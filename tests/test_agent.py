@@ -1442,12 +1442,11 @@ def test_load_agents_md_empty_cothis_home_does_not_read_cwd(
 
 @pytest.mark.asyncio
 async def test_aclose_isolates_cleanup_steps_on_session_failure() -> None:
-    """``aclose`` runs every cleanup step + state reset even when Session.close raises (#140).
+    """``aclose`` isolates each cleanup step in its own try/except (#140).
 
-    Pre-#140 ``aclose`` had no isolation between steps — a raise from
-    ``Session.close`` (or ``release_all``) propagated straight out,
-    leaving the MCP group + handles open and ``_mcp_started`` set,
-    so a later ``run`` re-dispatched against a torn-down group.
+    A raise from ``Session.close`` logs WARNING and the remaining steps
+    (release_all, MCP group teardown) still run. State resets move to a
+    finally block so a subsequent ``run`` sees a clean slate.
     """
     from unittest.mock import MagicMock
 
@@ -1492,7 +1491,7 @@ async def test_aclose_isolates_cleanup_steps_on_session_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_aclose_isolates_cleanup_steps_on_release_failure() -> None:
-    """Same isolation when ``release_all`` raises instead of ``Session.close`` (#140)."""
+    """``release_all`` failure is also isolated; MCP group teardown + state reset still run (#140)."""
     from unittest.mock import MagicMock
 
     agent = Agent.__new__(Agent)
