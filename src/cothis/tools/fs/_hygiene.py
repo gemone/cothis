@@ -118,6 +118,16 @@ _IGNORED_DIRS = frozenset(
 # to bound the agent's turn budget (token + wall-clock).
 _MAX_DIR_ENTRIES = 500
 
+# Resource caps for multi-path fs ops (#95). One source of truth so
+# every fs tool reads the same numbers.
+# 64 — a focused call references a few files; hundreds in one call is
+# almost always a mistake (the LLM can't act on 64+ paths in one turn).
+_MAX_PATHS = 64
+# 1 MiB — keeps a single ``fs.read`` / ``fs.write`` call from
+# saturating the agent's context budget. Larger files should be read
+# in slices (``start_line`` / ``end_line``) or written in chunks.
+_MAX_BYTES = 1024 * 1024
+
 
 def _load_gitignore(root: Path) -> pathspec.PathSpec | None:
     """Load ``.gitignore`` patterns from ``root``.
