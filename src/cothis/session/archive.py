@@ -145,6 +145,7 @@ def archive_session(
     archive_db_name: str,
     archived_at: str,
     index: ArchiveIndex,
+    vacuum: bool = True,
 ) -> None:
     """Move ``session_id``'s rows from the hot DB to ``archive_dir / archive_db_name``.
 
@@ -193,7 +194,8 @@ def archive_session(
                 )
         finally:
             conn.execute("DETACH DATABASE arch")
-        conn.execute("VACUUM")
+        if vacuum:
+            conn.execute("VACUUM")
     finally:
         conn.close()
 
@@ -252,8 +254,16 @@ def run_archival_pass(
             archive_db_name=f"{_month_bucket(updated_at)}.db",
             archived_at=now_iso,
             index=index,
+            vacuum=False,
         )
         archived += 1
+
+    if archived > 0:
+        vacuum_conn = sqlite3.connect(hot_db_path)
+        try:
+            vacuum_conn.execute("VACUUM")
+        finally:
+            vacuum_conn.close()
 
     conn = sqlite3.connect(hot_db_path)
     try:
