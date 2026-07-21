@@ -376,3 +376,24 @@ messages so the Agent reads one flat conversation. Forks do NOT see the
 parent's post-fork blocks. `cothis delete` is leaf-only: a node with
 living children is refused with `SessionHasChildrenError` (no orphans).
 _Avoid_: thread (collides with OS thread); copy (too generic); clone.
+
+**Hot/cold archive**:
+The two-tier session-storage layout introduced by #36 (ADR-0013). The
+*hot* DB is the one `Storage` opens at `~/.cothis/agents.db` (or the
+project split); sessions idle past a threshold (default 90 days) move
+to *cold* — monthly SQLite files under `<db_path parent>/archive/
+YYYY-MM.db`. Each move is one atomic cross-DB transaction
+(`ATTACH 'archive/YYYY-MM.db' AS arch; INSERT INTO arch.* SELECT * FROM
+main.*; DELETE FROM main.*; VACUUM; DETACH`). `archive/index.json` maps
+`session_id → {archive_db, archived_at}` so cold lookup doesn't scan
+every monthly file. `run_archival_pass` runs once per 24h per process,
+wired into `Session.new` / `Session.load` startup (ADR-0011). Cold
+sessions are read in place via a separate sqlite3 connection on
+`Session.load`; the first new write promotes them back to hot with
+`updated_at = now` and drops the index entry (so a freshly-touched
+session isn't immediately re-archived). `cothis delete` spans both DBs
+— leaf-only check applies across hot and cold (ADR-0012). The CLI
+exposes the layer: `cothis archive` (run the pass), `cothis archive
+<id>` (archive one), `cothis archive restore <id>` (promote-back),
+`cothis archive compress <file>` (gzip a cold DB for transport).
+_Avoid_: backup (implies offline copies); tier (too generic); freezer.
