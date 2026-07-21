@@ -342,6 +342,22 @@ class Storage:
         row = cur.fetchone()
         return SessionRow(*row) if row is not None else None
 
+    def has_children(self, session_id: str) -> bool:
+        """True iff any session has parent_id == session_id."""
+        cur = self._conn.execute(
+            "SELECT 1 FROM sessions WHERE parent_id=? LIMIT 1",
+            (session_id,),
+        )
+        return cur.fetchone() is not None
+
+    def children_of(self, session_id: str) -> list[str]:
+        """Ids of every session whose parent_id == session_id."""
+        cur = self._conn.execute(
+            "SELECT id FROM sessions WHERE parent_id=?",
+            (session_id,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
     def load_blocks(self, session_id: str) -> list[BlockRow]:
         """All blocks for ``session_id`` ordered for Anthropic-shape rebuild.
 

@@ -580,9 +580,8 @@ class Session:
             target = storage.load_session(session_id)
             if target is None:
                 raise KeyError(f"session {session_id!r} not found")
-            graph = _graph.build(storage.list_sessions())
-            if not _graph.is_leaf(graph, session_id):
-                children = _graph.children_of(graph, session_id)
+            if storage.has_children(session_id):
+                children = storage.children_of(session_id)
                 raise SessionHasChildrenError(session_id, children)
             storage.delete_session(session_id)
         finally:
