@@ -210,7 +210,7 @@ def _quote_unquoted_values_with_colons(raw_yaml: str) -> str | None:
         )
         # ``:`` inside a value confuses YAML's mapping parser only when
         # followed by space or EOL. A bare ``http://`` is fine.
-        if is_block or already_quoted or ": " not in value and not value.endswith(":"):
+        if is_block or already_quoted or ": " not in value:
             out_lines.append(line)
             continue
         out_lines.append(f'{m.group("key")}: "{value}"')
@@ -242,7 +242,6 @@ def _parse_skill_md(path: Path, layer: str) -> Skill | None:
         loaded = _parse_yaml_lenient(raw_yaml, path)
         if loaded is None:
             return None
-        frontmatter = loaded
         frontmatter = loaded
 
     dir_name = path.parent.name
