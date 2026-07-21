@@ -441,16 +441,58 @@ def test_normalize_error_prefixed() -> None:
     assert _normalize_mcp_result(result) == "Error: bad"
 
 
-def test_normalize_nontext_only_content_is_no_output() -> None:
-    """A non-empty result carrying only non-text blocks collapses to
-    ``(no output)`` for a text-only agent (documented ceiling in
-    ``_normalize_mcp_result``: text-less == nothing-to-say)."""
-    # An image block has no ``.text`` attribute.
+def test_normalize_image_only_returns_size_placeholder() -> None:
+    """Image-only result returns a placeholder describing the bytes (#92).
+
+    The agent loop is text-only; the model can't see image bytes. But
+    it needs to know the tool *did* return an image so it can describe
+    the call, ask for a path, or proceed accordingly. The placeholder
+    names the mime type + base64 byte count.
+    """
     result = CallToolResult(
         content=[ImageContent(type="image", data="<bytes>", mimeType="image/png")],
         isError=False,
     )
-    assert _normalize_mcp_result(result) == "(no output)"
+    out = _normalize_mcp_result(result)
+    assert "image" in out
+    assert "image/png" in out
+    assert "7 bytes base64" in out  # len("<bytes>") == 7
+
+
+def test_normalize_resource_block_returns_placeholder() -> None:
+    """EmbeddedResource blocks get a placeholder naming the resource."""
+    from mcp.types import EmbeddedResource, TextResourceContents
+    from pydantic import AnyUrl
+
+    resource = TextResourceContents(
+        uri=AnyUrl("https://example.com/hostname.txt"),
+        mimeType="text/plain",
+        text="example.com",
+    )
+    result = CallToolResult(
+        content=[EmbeddedResource(type="resource", resource=resource)],
+        isError=False,
+    )
+    out = _normalize_mcp_result(result)
+    assert "embedded resource" in out
+    # Resource URI travels in the placeholder so the model can ask for it.
+    assert "example.com/hostname.txt" in out
+
+
+def test_normalize_mixed_text_and_image_keeps_both() -> None:
+    """Text blocks join as before; non-text blocks get inline placeholders."""
+    result = CallToolResult(
+        content=[
+            TextContent(type="text", text="screenshot saved:"),
+            ImageContent(type="image", data="<bytes>", mimeType="image/png"),
+        ],
+        isError=False,
+    )
+    out = _normalize_mcp_result(result)
+    lines = out.splitlines()
+    assert lines[0] == "screenshot saved:"
+    assert "image/png" in lines[1]
+    assert "7 bytes base64" in lines[1]
 
 
 # --- connect_into + dispatch -------------------------------------------

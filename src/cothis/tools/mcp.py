@@ -47,25 +47,33 @@ def _normalize_mcp_result(result: CallToolResult) -> str:
     """Flatten an MCP ``CallToolResult`` into a single string for the LLM.
 
     - Join every content block's ``.text`` with newlines.
+    - Non-text blocks (image, embedded resource) get a placeholder
+      describing their shape — the agent loop is text-only today, but
+      the model still needs to know *that* content was returned.
     - Empty content list → ``"(no output)"`` (the tool ran but said nothing).
     - ``isError`` true → prefix ``"Error: "`` so the model sees it as a
       failure it can act on.
-
-    Non-text content blocks (images, embedded resources) are skipped — cothis
-    surfaces text to the model today.
-    cothis: ceiling — image/resource blocks are dropped, not base64-inlined,
-    so ``"(no output)"`` covers *two* cases the spec names as one: a truly
-    empty content list, AND a non-empty list that carries only non-text
-    blocks (both look like "nothing to say" to a text-only agent). Upgrade
-    path: map non-text blocks into the message content array once the agent
-    loop carries multimodal tool results — then the two cases diverge and
-    text-less-but-non-empty results stop collapsing to ``"(no output)"``.
     """
     parts: list[str] = []
     for block in result.content:
         text = getattr(block, "text", None)
         if text is not None:
             parts.append(text)
+            continue
+        # cothis: non-text placeholder (#92). The agent loop carries
+        # strings today; image/resource blocks would otherwise vanish
+        # and the model would see "(no output)" for a tool that
+        # returned a 70-byte PNG.
+        btype = getattr(block, "type", "unknown")
+        if btype == "image":
+            mime = getattr(block, "mimeType", "unknown")
+            size = len(getattr(block, "data", "") or "")
+            parts.append(f"[image: mime={mime}, {size} bytes base64]")
+        elif btype == "resource":
+            resource = getattr(block, "resource", None)
+            parts.append(f"[embedded resource: {resource!r}]")
+        else:
+            parts.append(f"[non-text block: type={btype}]")
     body = "\n".join(parts) if parts else "(no output)"
     # ``isError`` is camelCase on the MCP pydantic model (verified against
     # mcp 1.28.1 — ``CallToolResult`` fields: content/structuredContent/isError).
