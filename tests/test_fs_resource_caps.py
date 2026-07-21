@@ -151,3 +151,43 @@ def test_parse_patch_returns_addfile_for_single_add() -> None:
 
 # Silence unused-import in case the suite is collected piecemeal.
 _ = pytest
+
+
+# ---------------------------------------------------------------------
+# Bounded-read memory (#134)
+# ---------------------------------------------------------------------
+
+
+def test_read_large_file_does_not_materialise_full_file(
+    tmp_path: Path,
+) -> None:
+    """Reading a file many times the cap peaks near the cap, not file size (#134).
+
+    Pre-#134 ``_read_one`` loaded the entire file as ``str`` + re-encoded
+    to ``bytes`` before applying the cap — a 50 MB file peaked at
+    ~100 MB even though only 1 MiB was returned. The stat-then-read
+    path bounds peak memory to ~``_MAX_BYTES``.
+    """
+    import tracemalloc
+
+    from cothis.tools.fs.read import _read_one
+
+    # ~5 MiB file — well over the 1 MiB cap, small enough to run in CI.
+    payload = "line of text content here\n" * 200000  # ~5.2 MB
+    (tmp_path / "big.txt").write_text(payload)
+
+    with workdir_context(tmp_path):
+        tracemalloc.start()
+        _read_one("big.txt", None, None)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+    # Peak must stay near the cap. Pre-fix this peaked at 2× file size
+    # (~10 MB for a 5 MB file); post-fix it stays close to the 1 MiB
+    # cap plus allocator overhead. 5× cap leaves headroom for the
+    # truncated-bytes copy + Python allocator slack while still
+    # catching a regression to the full-file-load path.
+    assert peak < 5 * _MAX_BYTES, (
+        f"peak memory {peak / 1024:.0f} KiB exceeded 5× cap; "
+        f"file was materialised in full (#134 regression)"
+    )
