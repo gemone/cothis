@@ -50,10 +50,8 @@ _PROJECT_TOOLS_DIR = Path(".agents/tools")
 
 
 # cothis: ``_cothis_home`` / ``_user_tools_dir`` read ``$COTHIS_HOME``
-# lazily per call (#66). Pre-#66 module-level constants froze the
-# value at import, breaking wrapper scripts that set the env late
-# and forcing tests to ``importlib.reload``. Mirrors the lazy pattern
-# already used by ``_resolve_db_path``.
+# lazily per call (#66). Mirrors the lazy pattern used by
+# ``_resolve_db_path``.
 def _cothis_home() -> Path:
     """``$COTHIS_HOME`` or ``~/.cothis``. Read lazily per call."""
     return Path(
