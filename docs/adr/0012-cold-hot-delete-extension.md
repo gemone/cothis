@@ -64,6 +64,14 @@ and queries each — a child can be in any monthly bucket.
 - A hot parent whose children were archived still appears in the hot
   DB — `cothis history` shows it until the cold children are deleted
   and the parent itself becomes a leaf.
+- **Cross-DB leaf-only TOCTOU.** Between `cold_session_children(...)`
+  returning `[]` and `delete_cold_session` committing, a second
+  process can `Session.new(parent_id=...)` in a monthly cold DB. The
+  hot `FileLock` serializes same-process work but the cold DBs have
+  no `FileLock`. **Invariant assumed: single active writer per
+  workspace** (the same invariant `Storage.write_atomic`'s
+  deferred-transaction fairness relies on, validated in #34's
+  research). Multi-writer CLI usage is unsupported.
 
 ## 3. Storage-layer helpers, not CLI flags
 

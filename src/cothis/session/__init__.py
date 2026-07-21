@@ -681,27 +681,14 @@ class Session:
         archive_dir = db_path.parent / "archive"
         try:
             target = storage.load_session(session_id)
-            if target is not None:
-                # Hot path. Leaf-only spans both DBs (#87): a hot
-                # parent may still have children that sank to cold.
-                hot_children = (
-                    storage.children_of(session_id)
-                    if storage.has_children(session_id) else []
-                )
-                cold_children = cold_session_children(
-                    archive_dir=archive_dir, session_id=session_id,
-                )
-                if hot_children or cold_children:
-                    raise SessionHasChildrenError(
-                        session_id, hot_children + cold_children,
-                    )
-                storage.delete_session(session_id)
-                return
-
-            # Cold path (#87). Hot miss → archive index → delete in cold.
-            index = ArchiveIndex(archive_dir / "index.json")
-            if index.get(session_id) is None:
-                raise KeyError(f"session {session_id!r} not found")
+            if target is None:
+                # Cold miss → confirm via archive index before raising.
+                index = ArchiveIndex(archive_dir / "index.json")
+                if index.get(session_id) is None:
+                    raise KeyError(f"session {session_id!r} not found")
+            # Leaf-only check spans both DBs (#87): a parent in either
+            # DB may have children in either DB. Run once for both
+            # branches so the dispatch below can't forget to repeat it.
             hot_children = (
                 storage.children_of(session_id)
                 if storage.has_children(session_id) else []
@@ -713,6 +700,12 @@ class Session:
                 raise SessionHasChildrenError(
                     session_id, hot_children + cold_children,
                 )
+
+            if target is not None:
+                storage.delete_session(session_id)
+                return
+
+            # Cold path (#87). Hot miss + index hit → delete in cold.
             deleted = delete_cold_session(
                 hot_db_path=db_path,
                 archive_dir=archive_dir,
@@ -1072,6 +1065,10 @@ class Session:
             return
         updated_at = _now_iso()
         # cothis: cold-session promote-on-first-write (#86, ADR-0011 §3).
+        # The session was loaded from the cold DB; hot has no rows for
+        # it. ``promote_session`` moves rows cold→hot atomically with
+        # ``updated_at=now`` so the 90-day threshold doesn't immediately
+        # re-archive it; index entry dropped; subsequent writes are hot.
         if self._cold:
             cold_index = ArchiveIndex(
                 self._db_path.parent / "archive" / "index.json"
