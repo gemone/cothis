@@ -1073,13 +1073,25 @@ class Session:
             cold_index = ArchiveIndex(
                 self._db_path.parent / "archive" / "index.json"
             )
-            promote_session(
-                hot_db_path=self._db_path,
-                archive_dir=self._db_path.parent / "archive",
-                session_id=self._session_id,
-                index=cold_index,
-                now_iso=updated_at,
-            )
+            try:
+                promote_session(
+                    hot_db_path=self._db_path,
+                    archive_dir=self._db_path.parent / "archive",
+                    session_id=self._session_id,
+                    index=cold_index,
+                    now_iso=updated_at,
+                )
+            except Exception as exc:  # noqa: BLE001 — promote failure must not kill the consumer
+                logger.critical(
+                    "Session %s: promote_session failed; dropping %d "
+                    "block(s) (seq %d-%d) to unblock the queue. Error: %r",
+                    self._session_id,
+                    len(rows),
+                    rows[0].seq,
+                    rows[-1].seq,
+                    exc,
+                )
+                return
             self._cold = False
         session_row: SessionRow | None = None
         if not self._session_row_written:
