@@ -1,9 +1,7 @@
 """``cothis.tools.fs.search`` — content search across files.
 
 Regex-based content search returning ``[{file, line, text}]`` entries.
-Uses the gated ripgrep backend when available (``rg --json``); falls
-back to stdlib ``re.compile`` walker otherwise. The backend choice
-is logged once at DEBUG on first use.
+Uses the stdlib ``re.compile`` walker; gated ripgrep backend deferred.
 
 Security mitigations: per-file size cap, per-line length cap, total
 files-scanned cap, and a sensitive-name denylist that blocks search
@@ -16,7 +14,7 @@ import fnmatch
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from cothis.tools.core import tool
 from cothis.tools.fs._hygiene import (
@@ -26,13 +24,8 @@ from cothis.tools.fs._hygiene import (
     _resolve_under,
 )
 
-if TYPE_CHECKING:
-    import pathspec
-
 logger = logging.getLogger(__name__)
 
-# Best-effort, not thread-safe.
-_backend_logged = False
 _MAX_PATTERN_LEN = 256
 _MAX_FILE_BYTES = 1_048_576  # 1 MiB — larger files are skipped entirely.
 _MAX_LINE_LEN = 4096  # skip long lines (ReDoS / log noise).
@@ -64,13 +57,6 @@ _SENSITIVE_PATTERNS = (
     "*.p12",
     "*.keystore",
 )
-
-
-def _log_backend_choice(backend: str) -> None:
-    global _backend_logged
-    if not _backend_logged:
-        logger.debug("fs tools: fs.search using backend %s", backend)
-        _backend_logged = True
 
 
 def _is_sensitive(name: str) -> bool:
@@ -122,7 +108,7 @@ def _search(
     if not root.is_dir():
         return f"Error: not a directory: {path}"
 
-    _log_backend_choice("stdlib")
+    logger.debug("fs.search: stdlib backend")
 
     gitignore = _load_gitignore(root)
     results: list[dict[str, str]] = []
