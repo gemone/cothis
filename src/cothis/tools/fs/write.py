@@ -7,10 +7,14 @@ Single-argument signature: ``fs.write(content: str) -> str`` where
 patch, pre-image miss, two-ops-on-one-path) raise before any disk
 write — multi-file patches are atomic at the in-memory layer.
 
-Paths resolve against the Agent's cwd (``WORKDIR``) via
-:func:`cothis.tools.fs._hygiene._resolve_under`. Absolute paths and
-``..`` escapes are rejected before any disk write; in-cwd symlinks
+Paths resolve against the Agent's cwd (``WORKDIR``) using the
+``_resolve_under`` helper from the ``_hygiene`` module. Absolute paths
+and ``..`` escapes are rejected before any disk write; in-cwd symlinks
 are followed (a link target inside cwd is allowed, outside is rejected).
+
+Resolved paths are cached at preflight and reused at commit so a
+symlink swap between the two steps can't bypass the boundary (TOCTOU
+window closed; atomic rollback lands in slice #6).
 """
 
 from __future__ import annotations
@@ -45,36 +49,50 @@ def _check_one_op_per_path(ops: list[AddFile | UpdateFile | DeleteFile]) -> None
 
 def _preflight(
     ops: list[AddFile | UpdateFile | DeleteFile], cwd: Path,
-) -> dict[str, str]:
-    """Resolve every op.path against ``cwd`` and read current disk state.
+) -> tuple[dict[str, str], dict[str, Path]]:
+    """Resolve every ``op.path`` against ``cwd`` and read current disk state.
 
     Runs all boundary checks (``_resolve_under``) before any disk write,
     so a violation leaves the working tree untouched. Add ops targeting
     a path whose parent directory doesn't exist are rejected — the
     model must target an existing directory (security over convenience).
 
-    Returns ``{rel_path: content}`` for every existing file the patch
-    touches. Missing files stay out so Add sees the path as absent.
+    Returns ``(state, resolved_paths)``:
+    - ``state``: ``{rel_path: content}`` for every existing file the patch
+      touches. Missing files stay out so Add sees the path as absent.
+    - ``resolved_paths``: ``{rel_path: resolved_path}`` cached for
+      ``_commit`` to reuse — closes the TOCTOU window where a symlink
+      swap between preflight and commit would bypass the boundary.
+
+    User-facing error messages keep paths relative; absolute resolved
+    paths land in ``PatchError.file`` for log-only diagnostics.
     """
     state: dict[str, str] = {}
+    resolved_paths: dict[str, Path] = {}
     for op in ops:
         rel = op.path
         try:
             resolved = _resolve_under(rel, cwd)
         except PathBoundaryError as exc:
-            raise PatchError(str(exc), file=rel) from exc
+            raise PatchError(
+                f"absolute path or '../' escape outside cwd not allowed: {rel!r}",
+                file=rel,
+            ) from exc
+        resolved_paths[rel] = resolved
         if isinstance(op, AddFile) and not resolved.parent.is_dir():
             raise PatchError(
-                f"parent directory does not exist: {resolved.parent}",
+                f"parent directory does not exist: {rel!r}",
                 file=rel,
             )
         if resolved.is_file():
             state[rel] = resolved.read_text(encoding="utf-8")
-    return state
+    return state, resolved_paths
 
 
 def _commit(
-    prior: dict[str, str], post: dict[str, str], cwd: Path,
+    prior: dict[str, str],
+    post: dict[str, str],
+    resolved_paths: dict[str, Path],
 ) -> tuple[int, int, int]:
     """Write the post-apply state back to disk. Returns ``(added, updated, deleted)``.
 
@@ -83,24 +101,27 @@ def _commit(
     - path in post only → add (parent dir already verified by _preflight).
     - path in prior only → delete.
 
+    Reuses ``resolved_paths`` from ``_preflight`` rather than re-resolving —
+    closes the TOCTOU window where a symlink swap between preflight and
+    commit would bypass the boundary (the cached path is the one checked).
+
     cothis: slice #6 (#53) will wrap this in snapshot+reverse; current
     shape leaves partial state on crash mid-loop. Marked so a grep finds
     the deferral when wiring atomicity.
     """
     added = updated = deleted = 0
     for path in post:
-        resolved = (cwd / path).resolve()
+        resolved = resolved_paths[path]
         if path in prior:
             if post[path] != prior[path]:
                 resolved.write_text(post[path], encoding="utf-8")
                 updated += 1
         else:
-            # _preflight already verified resolved.parent.is_dir().
             resolved.write_text(post[path], encoding="utf-8")
             added += 1
     for path in prior:
         if path not in post:
-            resolved = (cwd / path).resolve()
+            resolved = resolved_paths[path]
             try:
                 resolved.unlink()
             except FileNotFoundError:
@@ -134,7 +155,7 @@ def write(content: str) -> str:
     cwd = WORKDIR.get() or Path.cwd()
     ops = parse_patch(content)
     _check_one_op_per_path(ops)
-    prior = _preflight(ops, cwd)
+    prior, resolved_paths = _preflight(ops, cwd)
     post = apply_patch(prior, ops)  # raises ApplyError on pre-image miss etc.
-    added, updated, deleted = _commit(prior, post, cwd)
+    added, updated, deleted = _commit(prior, post, resolved_paths)
     return f"fs.write: added {added}, updated {updated}, deleted {deleted}"

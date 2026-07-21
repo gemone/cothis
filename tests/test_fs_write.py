@@ -34,7 +34,7 @@ def test_write_add_creates_new_file(tmp_path: Path) -> None:
     assert "added 1" in result
 
 
-def test_write_add_in_nested_subdir_mkdirs_parents(tmp_path: Path) -> None:
+def test_write_add_in_missing_parent_dir_rejected(tmp_path: Path) -> None:
     """Pre-#52 behavior created intermediate dirs; #52 removed that —
     Add File into a missing parent dir is now rejected. Test name kept
     to minimise diff churn; body asserts the new boundary."""
