@@ -374,10 +374,7 @@ def _apply_hunk(content: str, path: str, hunk: Hunk) -> str:
     norm_lines = [ln.rstrip() for ln in lines]
 
     # cothis: detect dominant line ending + tail-newline state so
-    # replacement lines match the file's convention (#96). Pre-#96
-    # hardcoded ``"\n"`` produced mixed-endings on CRLF files, added
-    # spurious trailing newlines, and concatenated lines on pure
-    # insertions at EOF.
+    # replacement lines match the file's convention (#96).
     sample = content
     nl = "\r\n" if "\r\n" in sample else "\n"
     tail_unterminated = bool(lines) and not lines[-1].endswith(("\r\n", "\n"))
