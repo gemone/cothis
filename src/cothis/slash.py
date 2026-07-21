@@ -6,11 +6,14 @@ Async registry mapping ``/cmd`` → handler. The REPL checks the leading
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from cothis.session import Session
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,11 +47,13 @@ _entries: dict[str, _Entry] = {}
 
 
 def register(name: str, handler: SlashHandler, *, summary: str = "") -> None:
-    """Map ``name`` to ``handler``. Re-registering replaces silently.
-
-    cothis: silent overwrite — simplest contract; upgrade to a
-    warning if a real collision bites.
-    """
+    """Map ``name`` to ``handler``. Re-registering replaces prior; warns on collision."""
+    if name in _entries:
+        logger.warning(
+            "slash.register: command %r already registered; "
+            "the new handler (%r) shadows the old.",
+            name, getattr(handler, "__name__", "<anonymous>"),
+        )
     _entries[name] = _Entry(handler=handler, summary=summary)
 
 

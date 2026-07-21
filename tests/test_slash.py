@@ -122,6 +122,49 @@ async def test_register_overwrites_prior_handler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_register_collision_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Re-registering an existing name logs a WARNING naming both handlers (#112).
+
+    Behaviour is unchanged (last-write-wins); the warning surfaces the
+    collision so a plugin shadowing a framework command is discoverable.
+    """
+    import logging
+
+    async def first(ctx: SlashContext, args: str) -> str:
+        return "1"
+
+    async def second(ctx: SlashContext, args: str) -> str:
+        return "2"
+
+    register("collide", first)
+    with caplog.at_level(logging.WARNING, logger="cothis.slash"):
+        register("collide", second)
+    # Collision warning names the colliding command.
+    warning_text = " ".join(r.message for r in caplog.records)
+    assert "collide" in warning_text
+    # Last-write-wins still holds.
+    assert await dispatch("/collide") == "2"
+
+
+@pytest.mark.asyncio
+async def test_register_no_warning_on_first_use(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A first-time registration doesn't emit a warning."""
+    import logging
+
+    async def handler(ctx: SlashContext, args: str) -> str:
+        return "ok"
+
+    with caplog.at_level(logging.WARNING, logger="cothis.slash"):
+        register("fresh", handler)
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == []
+
+
+@pytest.mark.asyncio
 async def test_handler_returning_none_prints_nothing() -> None:
     async def quiet(ctx: SlashContext, args: str) -> None:
         return None
