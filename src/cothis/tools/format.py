@@ -69,7 +69,9 @@ def to_tabular(data: Any, delimiter: str) -> str | None:
         # model-parseable instead of Python repr.
         writer.writerow(
             {
-                k: v if isinstance(v, str) else ("" if v is None else json.dumps(v))
+                k: v if isinstance(v, str) else (
+                    "" if v is None else json.dumps(v, ensure_ascii=False)
+                )
                 for k, v in row.items()
             }
         )
@@ -97,4 +99,8 @@ def format_tool_output(result: Any) -> str:
         # preserves insertion order so the model sees fields in the author's
         # intended order.
         return yaml.dump(result, allow_unicode=True, sort_keys=False).rstrip("\n")
-    return json.dumps(result)
+    # cothis: ensure_ascii=False matches the YAML path's allow_unicode
+    # posture (#108). Default ``ensure_ascii=True`` escapes every CJK
+    # / emoji codepoint to ``\\uXXXX`` — 6 chars per non-Latin char
+    # and ~1.5x token cost under common BPE tokenizers.
+    return json.dumps(result, ensure_ascii=False)
