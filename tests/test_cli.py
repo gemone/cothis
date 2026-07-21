@@ -161,7 +161,8 @@ def test_shadow_project_local_wins(tmp_path: Any) -> None:
     by_name = {t.__name__: t for t in tools}
     assert "shared.tool" in by_name
     # Project-local won — its output is "proj", not "user".
-    assert by_name["shared.tool"]() == "proj\n"
+    import asyncio
+    assert asyncio.run(by_name["shared.tool"]()) == "proj\n"
 
 
 def test_shadow_custom_overrides_builtin(tmp_path: Any) -> None:
@@ -177,7 +178,8 @@ def test_shadow_custom_overrides_builtin(tmp_path: Any) -> None:
     by_name = {t.__name__: t for t in tools}
     assert "fs.read" in by_name
     # Custom won — its output is "fake", not the builtin fs.read behavior.
-    assert by_name["fs.read"]() == "fake\n"
+    import asyncio
+    assert asyncio.run(by_name["fs.read"]()) == "fake\n"
 
 
 def test_shadow_emits_warning_both_layers(tmp_path: Any, caplog: Any) -> None:
@@ -273,7 +275,8 @@ def test_chained_shadow_three_layers_two_warnings(tmp_path: Any, caplog: Any) ->
     # Final winner is project-local (its output is "proj", not the builtin
     # behavior, not the user-global "user").
     by_name = {t.__name__: t for t in tools}
-    assert by_name["fs.read"]() == "proj\n"
+    import asyncio
+    assert asyncio.run(by_name["fs.read"]()) == "proj\n"
 
 
 def test_no_shadow_loads_both(tmp_path: Any, caplog: Any) -> None:
@@ -297,8 +300,9 @@ def test_no_shadow_loads_both(tmp_path: Any, caplog: Any) -> None:
     names = {t.__name__: t for t in tools}
     assert "proj.deploy" in names
     assert "user.hello" in names
-    assert names["proj.deploy"]() == "deploy\n"
-    assert names["user.hello"]() == "hi\n"
+    import asyncio
+    assert asyncio.run(names["proj.deploy"]()) == "deploy\n"
+    assert asyncio.run(names["user.hello"]()) == "hi\n"
     # No shadow warnings emitted.
     shadow_warnings = [r for r in caplog.records if "shadows" in r.message]
     assert shadow_warnings == []
@@ -390,7 +394,8 @@ def test_shadowed_tool_load_hooks_never_fire(tmp_path: Any, monkeypatch: Any) ->
 
     # Winner is registered (project-local YAML), loser is not.
     by_name = {t.__name__: t for t in tools}
-    assert by_name["shared.tool"]() == "proj\n"
+    import asyncio
+    assert asyncio.run(by_name["shared.tool"]()) == "proj\n"
     # The loser's after_load hook must NOT have fired — no marker file.
     assert not marker.exists()
 
