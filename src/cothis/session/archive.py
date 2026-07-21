@@ -23,15 +23,22 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pathlib import Path
-    from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# cothis: archive filenames are ``YYYY-MM.db`` (monthly bucketing). The
+# regex is the validation gate for index.json entries — a tampered index
+# that points at ``../../etc/passwd`` is rejected before any ATTACH.
+_ARCHIVE_DB_RE = re.compile(r"^\d{4}-\d{2}\.db$")
 
 
 @dataclass(frozen=True)
@@ -49,10 +56,16 @@ class ArchiveIndex:
     small — one entry per archived session, hundreds at most). Callers
     load once at startup, mutate in memory, save after each archival /
     promote / delete.
+
+    On load, each entry's ``archive_db`` is validated against
+    ``_ARCHIVE_DB_RE`` and bound to the index's directory. Entries that
+    fail validation are dropped with a warning (defensive against a
+    tampered or hand-edited index).
     """
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._archive_dir = path.parent.resolve()
         self._entries: dict[str, ArchivedEntry] = {}
         if path.is_file():
             try:
@@ -65,14 +78,22 @@ class ArchiveIndex:
                 return
             if isinstance(raw, dict):
                 for sid, entry in raw.items():
-                    if (
+                    if not (
                         isinstance(entry, dict)
                         and isinstance(entry.get("archive_db"), str)
                         and isinstance(entry.get("archived_at"), str)
                     ):
-                        self._entries[sid] = ArchivedEntry(
-                            entry["archive_db"], entry["archived_at"]
+                        continue
+                    if not _validate_archive_db(entry["archive_db"], self._archive_dir):
+                        logger.warning(
+                            "Archive index %s: entry for session %s references "
+                            "unsafe archive_db %r; dropping.",
+                            path, sid, entry["archive_db"],
                         )
+                        continue
+                    self._entries[sid] = ArchivedEntry(
+                        entry["archive_db"], entry["archived_at"]
+                    )
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -96,6 +117,19 @@ class ArchiveIndex:
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+
+def _validate_archive_db(name: str, archive_dir: Path) -> bool:
+    """``True`` iff ``name`` matches ``YYYY-MM.db`` and resolves inside
+    ``archive_dir``. Blocks path traversal via tampered index entries."""
+    if not _ARCHIVE_DB_RE.match(name):
+        return False
+    resolved = (archive_dir / name).resolve()
+    try:
+        resolved.relative_to(archive_dir)
+    except ValueError:
+        return False
+    return True
 
 
 def _month_bucket(iso_ts: str) -> str:
@@ -123,14 +157,15 @@ def archive_session(
     cold_db_path = archive_dir / archive_db_name
     _ensure_cold_schema(cold_db_path)
 
-    conn = sqlite3.connect(hot_db_path)
+    conn = sqlite3.connect(hot_db_path, isolation_level="IMMEDIATE")
     try:
-        conn.execute(f"ATTACH DATABASE '{cold_db_path.as_posix()}' AS arch")
+        # Parameter-bound ATTACH: the filename is a bound value, not
+        # string-interpolated. A path supplied by a tampered index or a
+        # future CLI flag can't escape into SQL.
+        conn.execute("ATTACH DATABASE ? AS arch", (str(cold_db_path),))
         try:
-            with conn:  # BEGIN/COMMIT
-                # Guard: only copy + delete when the hot DB still has the
-                # rows. Idempotent re-runs (hot already drained) leave the
-                # cold copy alone.
+            with conn:
+                # Guard: hot already drained on re-run — nothing to do.
                 has_session = conn.execute(
                     "SELECT 1 FROM main.sessions WHERE id=?", (session_id,)
                 ).fetchone() is not None
@@ -183,14 +218,17 @@ def run_archival_pass(
     if index is None:
         index = ArchiveIndex(archive_dir / "index.json")
 
+    now_dt = datetime.fromisoformat(now_iso)
+
+    # Single connection for throttle check + idle SELECT + last_run UPDATE.
+    # The archival loop calls ``archive_session`` (its own connection with
+    # ATTACH); holding this conn open across the loop would serialize the
+    # ATTACH transactions.
     conn = sqlite3.connect(hot_db_path)
     try:
         last_run = conn.execute(
             "SELECT value FROM archive_state WHERE key='last_run'"
         ).fetchone()
-        from datetime import datetime, timedelta
-
-        now_dt = datetime.fromisoformat(now_iso)
         if last_run is not None:
             last_dt = datetime.fromisoformat(last_run[0])
             if (now_dt - last_dt) < timedelta(hours=24):
@@ -217,7 +255,6 @@ def run_archival_pass(
         )
         archived += 1
 
-    # Record the run.
     conn = sqlite3.connect(hot_db_path)
     try:
         conn.execute(
@@ -249,8 +286,6 @@ def promote_session(
     if entry is None:
         return False
     if now_iso is None:
-        from datetime import UTC, datetime
-
         now_iso = datetime.now(UTC).isoformat()
 
     cold_db_path = archive_dir / entry.archive_db
@@ -266,7 +301,7 @@ def promote_session(
 
     conn = sqlite3.connect(hot_db_path)
     try:
-        conn.execute(f"ATTACH DATABASE '{cold_db_path.as_posix()}' AS arch")
+        conn.execute("ATTACH DATABASE ? AS arch", (str(cold_db_path),))
         try:
             with conn:
                 # Explicit copy so we control updated_at (overwritten to
@@ -353,8 +388,3 @@ def _ensure_cold_schema(cold_db_path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
-
-
-def _24h_ago(now_iso: str) -> str:
-    """Placeholder kept for the dead branch above; returns ``now_iso`` as-is."""
-    return now_iso
