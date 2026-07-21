@@ -7,7 +7,7 @@ Async registry mapping ``/cmd`` → handler. The REPL checks the leading
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from cothis.session import Session
@@ -34,72 +34,70 @@ class SlashHandler(Protocol):
 
 @dataclass
 class _Entry:
-    handler: Any  # SlashHandler (Protocol; can't bind the async type cleanly)
+    handler: SlashHandler
     summary: str
 
 
-class SlashRegistry:
-    """``/cmd`` → async handler map + dispatch.
+# Module-level registry — no class wrapping needed (AGENTS.md #56 precedent:
+# dict with no real invariant → module-level functions, not a class shell).
+_entries: dict[str, _Entry] = {}
 
-    Register with :meth:`register`, dispatch with :meth:`dispatch`. The
-    REPL passes every typed line through ``dispatch``; non-slash lines
-    return ``None`` so the REPL forwards them to the agent loop instead.
+
+def register(name: str, handler: SlashHandler, *, summary: str = "") -> None:
+    """Map ``name`` to ``handler``. Re-registering replaces silently.
+
+    cothis: silent overwrite — simplest contract; upgrade to a
+    warning if a real collision bites.
     """
+    _entries[name] = _Entry(handler=handler, summary=summary)
 
-    def __init__(self) -> None:
-        self._entries: dict[str, _Entry] = {}
 
-    def register(
-        self, name: str, handler: Any, *, summary: str = "",
-    ) -> None:
-        # cothis: silent overwrite — simplest contract; upgrade to a
-        # warning if a real collision bites.
-        self._entries[name] = _Entry(handler=handler, summary=summary)
+def names() -> list[str]:
+    """Return registered command names, sorted."""
+    return sorted(_entries)
 
-    def names(self) -> list[str]:
-        return sorted(self._entries)
 
-    async def dispatch(
-        self, line: str, *, ctx: SlashContext | None = None,
-    ) -> str | None:
-        """Route ``line`` to its handler. Returns the handler's message
-        (``""`` if the handler returned ``None``), or ``None`` if ``line``
-        is not a slash command (REPL should forward to the agent).
+async def dispatch(line: str, *, ctx: SlashContext | None = None) -> str | None:
+    """Route ``line`` to its handler. Returns the handler's message
+    (``""`` if the handler returned ``None``), or ``None`` if ``line``
+    is not a slash command (REPL should forward to the agent).
 
-        Unknown ``/cmd`` produces a local listing of registered commands.
-        """
-        if not line.startswith("/"):
-            return None
-        ctx = ctx if ctx is not None else SlashContext()
-        name, _, args = line[1:].partition(" ")
-        name = name.strip()
-        if not name:
-            return None
-        if name == "help":
-            return self._render_help()
-        entry = self._entries.get(name)
-        if entry is None:
-            return self._render_unknown(name)
-        ctx.args = args
-        result = await entry.handler(ctx, args)
-        return "" if result is None else result
+    Unknown ``/cmd`` produces a local listing of registered commands.
+    """
+    if not line.startswith("/"):
+        return None
+    ctx = ctx if ctx is not None else SlashContext()
+    name, _, args = line[1:].partition(" ")
+    name = name.strip()
+    if not name:
+        return None
+    if name == "help":
+        return _render_help()
+    entry = _entries.get(name)
+    if entry is None:
+        return _render_unknown(name)
+    ctx.args = args
+    result = await entry.handler(ctx, args)
+    return "" if result is None else result
 
-    def _render_help(self) -> str:
-        if not self._entries:
-            return "No slash commands registered."
-        lines = ["/help — show this listing"]
-        for name in self.names():
-            summary = self._entries[name].summary
-            tail = f" — {summary}" if summary else ""
-            lines.append(f"/{name}{tail}")
-        return "\n".join(lines)
 
-    def _render_unknown(self, name: str) -> str:
-        if not self._entries:
-            return f"unknown slash command: /{name} (no commands registered)"
-        lines = [f"unknown slash command: /{name}", "available:"]
-        for n in self.names():
-            summary = self._entries[n].summary
-            tail = f" — {summary}" if summary else ""
-            lines.append(f"  /{n}{tail}")
-        return "\n".join(lines)
+def _render_help() -> str:
+    if not _entries:
+        return "No slash commands registered."
+    lines = ["/help — show this listing"]
+    for name in names():
+        summary = _entries[name].summary
+        tail = f" — {summary}" if summary else ""
+        lines.append(f"/{name}{tail}")
+    return "\n".join(lines)
+
+
+def _render_unknown(name: str) -> str:
+    if not _entries:
+        return f"unknown slash command: /{name} (no commands registered)"
+    lines = [f"unknown slash command: /{name}", "available:"]
+    for n in names():
+        summary = _entries[n].summary
+        tail = f" — {summary}" if summary else ""
+        lines.append(f"  /{n}{tail}")
+    return "\n".join(lines)
