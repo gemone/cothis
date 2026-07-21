@@ -1178,13 +1178,13 @@ async def test_empty_name_prefix_stable_across_reacquire(
         # Reclaim aaa's session only; zzz stays live.
         import time
 
-        agent._handle_manager._last_used[cls_a] = time.time() - 9999
+        agent._handle_manager._slots[cls_a].last_used = time.time() - 9999
         await agent._handle_manager.reclaim_idle()
-        assert cls_a not in agent._handle_manager._live
+        assert not agent._handle_manager._slots[cls_a].is_live
 
         # Re-acquire: tools must come back under aaa.* and dispatch works.
         await agent._handle_manager.ensure_acquired(tool_a)
-        assert cls_a in agent._handle_manager._live
+        assert agent._handle_manager._slots[cls_a].is_live
         assert await tool_a(a=2, b=3) == "5"
     finally:
         await agent.aclose()
@@ -1251,7 +1251,7 @@ async def test_mcp_startup_adopts_session_into_pool(monkeypatch: pytest.MonkeyPa
         mcp_tool = agent._tool_map["test-server_add"]
         handle_cls = getattr(mcp_tool, "_handle_cls")
         assert handle_cls is not None
-        assert handle_cls in agent._handle_manager._live
+        assert agent._handle_manager._slots[handle_cls].is_live
     finally:
         await agent.aclose()
 
@@ -1268,14 +1268,14 @@ async def test_mcp_keepalive_reclaims_session(monkeypatch: pytest.MonkeyPatch) -
     try:
         mcp_tool = agent._tool_map["test-server_add"]
         handle_cls = getattr(mcp_tool, "_handle_cls")
-        assert handle_cls in agent._handle_manager._live
+        assert agent._handle_manager._slots[handle_cls].is_live
 
         import time
 
-        agent._handle_manager._last_used[handle_cls] = time.time() - 100
+        agent._handle_manager._slots[handle_cls].last_used = time.time() - 100
         reclaimed = await agent._handle_manager.reclaim_idle()
         assert reclaimed >= 1
-        assert handle_cls not in agent._handle_manager._live
+        assert not agent._handle_manager._slots[handle_cls].is_live
     finally:
         await agent.aclose()
 
@@ -1299,14 +1299,14 @@ async def test_mcp_self_heal_reconnects_on_next_call(
         # Reclaim the session.
         import time
 
-        agent._handle_manager._last_used[handle_cls] = time.time() - 100
+        agent._handle_manager._slots[handle_cls].last_used = time.time() - 100
         await agent._handle_manager.reclaim_idle()
-        assert handle_cls not in agent._handle_manager._live
+        assert not agent._handle_manager._slots[handle_cls].is_live
         connect_count_after_reclaim = len(calls)
 
         # Self-heal: ensure_acquired re-connects.
         await agent._handle_manager.ensure_acquired(mcp_tool)
-        assert handle_cls in agent._handle_manager._live
+        assert agent._handle_manager._slots[handle_cls].is_live
         assert len(calls) == connect_count_after_reclaim + 1
     finally:
         await agent.aclose()
@@ -1327,10 +1327,10 @@ async def test_mcp_pin_session_not_reclaimed(monkeypatch: pytest.MonkeyPatch) ->
 
         import time
 
-        agent._handle_manager._last_used[handle_cls] = time.time() - 9999
+        agent._handle_manager._slots[handle_cls].last_used = time.time() - 9999
         reclaimed = await agent._handle_manager.reclaim_idle()
         assert reclaimed == 0
-        assert handle_cls in agent._handle_manager._live
+        assert agent._handle_manager._slots[handle_cls].is_live
     finally:
         await agent.aclose()
 
@@ -1369,9 +1369,9 @@ async def test_mcp_self_heal_dispatch_after_reclaim(
 
         mcp_tool = agent._tool_map["test-server_add"]
         handle_cls = getattr(mcp_tool, "_handle_cls")
-        agent._handle_manager._last_used[handle_cls] = time.time() - 100
+        agent._handle_manager._slots[handle_cls].last_used = time.time() - 100
         await agent._handle_manager.reclaim_idle()
-        assert handle_cls not in agent._handle_manager._live
+        assert not agent._handle_manager._slots[handle_cls].is_live
 
         # Call 2 — self-heal: _execute_tool's ensure_handle_ready reconnects.
         tu = {"name": "test-server_add", "input": {"a": 10, "b": 20}}

@@ -379,10 +379,10 @@ async def test_inflight_handle_not_reclaimed_mid_call() -> None:
     # Past keepalive, but in-flight → not reclaimed.
     import time
 
-    mgr._last_used[H] = time.time() - 100
+    mgr._slots[H].last_used = time.time() - 100
     reclaimed = await mgr.reclaim_idle()
     assert reclaimed == 0
-    assert H in mgr._live
+    assert mgr._slots[H].is_live
     await mgr.release_all()
 
 
@@ -410,11 +410,11 @@ async def test_call_done_refreshes_last_used() -> None:
     import time
 
     old = time.time() - 100
-    mgr._last_used[H] = old
+    mgr._slots[H].last_used = old
     mgr.call_done(t)
 
-    assert mgr._inflight[H] == 0
-    assert mgr._last_used[H] > old
+    assert mgr._slots[H].inflight == 0
+    assert mgr._slots[H].last_used > old
     await mgr.release_all()
 
 
@@ -471,7 +471,7 @@ async def test_inflight_balanced_when_repr_raises(
     assert "Error" in result
     # The fix: mark_inflight is inside the try, so the finally ran and the
     # refcount balanced. Pre-fix this would be 1 (leaked).
-    assert mgr._inflight.get(H, 0) == 0
+    assert mgr._slots[H].inflight == 0
     await agent.aclose()
 
 
@@ -498,9 +498,9 @@ async def test_eager_acquired_on_start() -> None:
 
     mgr = HandleManager()
     mgr.bind(t)
-    assert H not in mgr._live
+    assert not mgr._slots[H].is_live
     await mgr.start_eager()
-    assert H in mgr._live
+    assert mgr._slots[H].is_live
     assert calls == ["acquire"]
     await mgr.release_all()
 
@@ -524,7 +524,7 @@ async def test_non_eager_not_started() -> None:
     mgr = HandleManager()
     mgr.bind(t)
     await mgr.start_eager()
-    assert H not in mgr._live
+    assert not mgr._slots[H].is_live
 
 
 @pytest.mark.asyncio
@@ -546,14 +546,14 @@ async def test_pin_exempt_from_reclaim_idle() -> None:
     mgr = HandleManager()
     mgr.bind(t)
     await mgr.start_eager()
-    assert H in mgr._live
+    assert mgr._slots[H].is_live
 
     import time
 
-    mgr._last_used[H] = time.time() - 9999
+    mgr._slots[H].last_used = time.time() - 9999
     reclaimed = await mgr.reclaim_idle()
     assert reclaimed == 0
-    assert H in mgr._live
+    assert mgr._slots[H].is_live
     await mgr.release_all()
 
 
@@ -593,13 +593,13 @@ async def test_pin_exempt_from_eviction_and_budget() -> None:
 
     # Pinned handle fills the "budget" (but doesn't count).
     await mgr.start_eager()
-    assert Pinned in mgr._live
+    assert mgr._slots[Pinned].is_live
 
     # Normal handle still acquires despite max_handles=1 — pinned doesn't
     # count against the budget.
     await ensure_handle_ready(n)
-    assert Normal in mgr._live
-    assert Pinned in mgr._live  # pinned was not evicted
+    assert mgr._slots[Normal].is_live
+    assert mgr._slots[Pinned].is_live  # pinned was not evicted
     await mgr.release_all()
 
 
@@ -638,8 +638,8 @@ async def test_adopt_seeds_live_instance() -> None:
     mgr = HandleManager()
     instance = H()
     mgr.adopt(H, instance)
-    assert H in mgr._live
-    assert mgr._instances[H] is instance
+    assert mgr._slots[H].is_live
+    assert mgr._slots[H].instance is instance
     assert calls == []  # adopt never calls acquire
 
     # ensure_acquired finds it already live → no re-acquire.
