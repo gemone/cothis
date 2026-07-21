@@ -70,8 +70,16 @@ def _normalize_mcp_result(result: CallToolResult) -> str:
             size = len(getattr(block, "data", "") or "")
             parts.append(f"[image: mime={mime}, {size} bytes base64]")
         elif btype == "resource":
+            # cothis: placeholder carries only the URI + mime type — not
+            # the body. ``resource!r`` would serialise the full pydantic
+            # model (uri + text/blob), leaking file contents of an
+            # EmbeddedResource wrapping a local file.
             resource = getattr(block, "resource", None)
-            parts.append(f"[embedded resource: {resource!r}]")
+            uri = getattr(resource, "uri", "unknown")
+            mime = getattr(resource, "mimeType", "unknown")
+            parts.append(
+                f"[embedded resource: uri={uri!s}, mime={mime}]"
+            )
         else:
             parts.append(f"[non-text block: type={btype}]")
     body = "\n".join(parts) if parts else "(no output)"

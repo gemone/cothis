@@ -460,14 +460,19 @@ def test_normalize_image_only_returns_size_placeholder() -> None:
 
 
 def test_normalize_resource_block_returns_placeholder() -> None:
-    """EmbeddedResource blocks get a placeholder naming the resource."""
+    """EmbeddedResource blocks get a placeholder naming the resource.
+
+    The placeholder carries only the URI + mime — never the body. A
+    server returning a local file (``file:///home/user/secret.key``)
+    must not leak the file's text to the LLM.
+    """
     from mcp.types import EmbeddedResource, TextResourceContents
     from pydantic import AnyUrl
 
     resource = TextResourceContents(
         uri=AnyUrl("https://example.com/hostname.txt"),
         mimeType="text/plain",
-        text="example.com",
+        text="TOPSECRET-CONTENT",
     )
     result = CallToolResult(
         content=[EmbeddedResource(type="resource", resource=resource)],
@@ -475,8 +480,11 @@ def test_normalize_resource_block_returns_placeholder() -> None:
     )
     out = _normalize_mcp_result(result)
     assert "embedded resource" in out
-    # Resource URI travels in the placeholder so the model can ask for it.
+    # URI + mime travel so the model can ask for the resource by name.
     assert "example.com/hostname.txt" in out
+    assert "text/plain" in out
+    # Body must NOT leak — that's the contract this placeholder enforces.
+    assert "TOPSECRET-CONTENT" not in out
 
 
 def test_normalize_mixed_text_and_image_keeps_both() -> None:
