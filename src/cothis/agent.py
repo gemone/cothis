@@ -974,27 +974,41 @@ class Agent(BaseModel):
         # ``Session.new``) and releasing on a worker thread would leave
         # the OS lock held forever. ``ask`` path: ``_session is None``,
         # no-op.
-        if self._session is not None:
-            self._session.close()
-            self._session = None
-        # Release handles first: MCP-session handles disconnect their own
-        # sessions via ``disconnect_from_server``. Then exit the group
-        # context (closes whatever group-level resources remain). Reversed
-        # from the prior order so MCP handles never call
-        # ``disconnect_from_server`` on sessions the group already tore down.
-        await self._handle_manager.release_all()
-        if self._mcp_group is not None:
+        try:
+            # cothis: each cleanup step runs in isolation (#140). A raise
+            # in one step is logged and the next step still runs; the
+            # state reset at the end is wrapped in ``finally`` so it
+            # always runs, even if every cleanup raised.
+            if self._session is not None:
+                try:
+                    self._session.close()
+                except Exception as exc:  # noqa: BLE001 — teardown must not raise
+                    logger.warning("Session close failed: %s", exc)
+                self._session = None
+            # Release handles first: MCP-session handles disconnect their own
+            # sessions via ``disconnect_from_server``. Then exit the group
+            # context (closes whatever group-level resources remain). Reversed
+            # from the prior order so MCP handles never call
+            # ``disconnect_from_server`` on sessions the group already tore down.
             try:
-                await self._mcp_group.__aexit__(None, None, None)
-            except Exception as exc:  # noqa: BLE001 — teardown must not raise
-                logger.debug("MCP group close error: %s", exc)
-            self._mcp_group = None
-        # Remove the MCP-expanded tools by tracked name.
-        for name in self._mcp_tool_names:
-            self._tool_map.pop(name, None)
-        self._mcp_tool_names.clear()
-        self._mcp_started = False
-        self._handles_started = False
+                await self._handle_manager.release_all()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("handle release failed: %s", exc)
+            if self._mcp_group is not None:
+                try:
+                    await self._mcp_group.__aexit__(None, None, None)
+                except Exception as exc:  # noqa: BLE001 — teardown must not raise
+                    logger.debug("MCP group close error: %s", exc)
+                self._mcp_group = None
+        finally:
+            # Remove the MCP-expanded tools by tracked name + reset
+            # state — always runs so a later ``run`` reconnects cleanly
+            # even if any cleanup raised.
+            for name in self._mcp_tool_names:
+                self._tool_map.pop(name, None)
+            self._mcp_tool_names.clear()
+            self._mcp_started = False
+            self._handles_started = False
 
     def _tool_schemas(self) -> list[Any] | None:
         """Tools in Anthropic shape (``{name, description, input_schema}``) for ``amessages``.
