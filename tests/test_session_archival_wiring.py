@@ -314,3 +314,65 @@ def test_promote_bumps_updated_at_to_now(tmp_path: Path) -> None:
         assert sr.updated_at > "2026-07-20T00:00:00+00:00"
     finally:
         hot.close()
+
+
+def test_drain_one_survives_promote_failure(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """``_drain_one`` logs + drops rows on promote_session failure (#144).
+
+    The cold-promote block is isolated: a raise from ``promote_session``
+    (e.g. KeyError when the cold DB row was hand-deleted) drops the
+    current batch with a ``CRITICAL`` log and the consumer stays alive
+    for subsequent writes.
+    """
+    db_path = tmp_path / "session.db"
+    sid = _seed_session(db_path, tmp_path, texts=["archived"])
+    archive_dir = db_path.parent / "archive"
+    index = ArchiveIndex(archive_dir / "index.json")
+    archive_session(
+        hot_db_path=db_path, archive_dir=archive_dir, session_id=sid,
+        archive_db_name="2026-07.db",
+        archived_at="2026-07-20T00:00:00+00:00", index=index,
+    )
+
+    # Load the session from cold (sets _cold=True).
+    s = Session.load(db_path, sid, flush_sync=True)
+    try:
+        assert s._cold is True
+
+        # Patch promote_session to raise — simulates a corrupt cold DB.
+        # ``promote_session`` is imported by name into ``cothis.session``
+        # (``__init__.py``), so patch at that level, not in ``archive``.
+        def _failing_promote(**kwargs: object) -> None:
+            raise KeyError("session not in cold DB")
+
+        monkeypatch.setattr(
+            "cothis.session.promote_session", _failing_promote
+        )
+
+        # First write: promote fails. The row is dropped (not written
+        # to hot), but the call doesn't raise.
+        s.append_message("user", [_user_text("after-promote-failure")])
+
+        # _cold is still True — promote didn't succeed.
+        assert s._cold is True
+
+        # Second write: restore promote_session. The consumer is still
+        # alive — this write drains normally.
+        monkeypatch.undo()
+
+        s.append_message("user", [_user_text("second-write")])
+        # _cold cleared on the successful promote.
+        assert s._cold is False
+    finally:
+        s.close()
+
+    # Hot DB now has the second write (promote succeeded on retry).
+    hot = Storage(db_path)
+    try:
+        blocks = hot.load_blocks(sid)
+        texts = [b.content for b in blocks if b.content]
+        assert "second-write" in texts
+    finally:
+        hot.close()
