@@ -10,7 +10,6 @@ Covers the storage-layer operations:
   {archive_db, archived_at}``; lookup doesn't scan every archive.
 - **Promote-back**: the first new write moves the session back to the
   hot DB atomically with ``updated_at = now`` and updates the index.
-- **Hot-or-cold delete**: ``cothis delete`` works regardless of location.
 
 Tests are offline (no LLM, no network) — they build temp DBs and verify
 the SQL + JSON contracts directly.
@@ -95,16 +94,12 @@ def test_archive_index_round_trip(tmp_path: Path) -> None:
     assert entry.archived_at == "2026-07-20T00:00:00+00:00"
 
 
-def test_archive_index_get_unknown_returns_none(tmp_path: Path) -> None:
-    """Unknown id → ``None`` (caller surfaces "not archived")."""
-    index = ArchiveIndex(tmp_path / "archive" / "index.json")
-    assert index.get("a" * 32) is None
-
-
-def test_archive_index_remove_drops_entry(tmp_path: Path) -> None:
-    """Promote-back discards the index entry; cold lookup no longer hits."""
+def test_archive_index_get_remove_round_trip(tmp_path: Path) -> None:
+    """Unknown id → ``None``; set → known; remove → ``None`` again."""
     index_path = tmp_path / "archive" / "index.json"
     index = ArchiveIndex(index_path)
+    # Unknown before any set.
+    assert index.get("a" * 32) is None
     index.set("a" * 32, "2026-07.db", "2026-07-20T00:00:00+00:00")
     index.save()
 
@@ -336,3 +331,27 @@ def test_promote_session_sets_updated_at_now(tmp_path: Path) -> None:
         assert sr.updated_at == "2026-09-01T00:00:00+00:00"
     finally:
         hot.close()
+
+
+def test_validate_archive_db_rejects_traversal(tmp_path: Path) -> None:
+    """Index entries pointing outside archive_dir are rejected by
+    ``_validate_archive_db`` — blocks path traversal via tampered index."""
+    from cothis.session.archive import _validate_archive_db
+
+    archive_dir = (tmp_path / "archive").resolve()
+    archive_dir.mkdir(parents=True)
+
+    # Happy paths: monthly bucket inside archive_dir.
+    assert _validate_archive_db("2026-07.db", archive_dir) is True
+    assert _validate_archive_db("1999-12.db", archive_dir) is True
+
+    # Reject: bad format (no .db, wrong month format, etc.).
+    assert _validate_archive_db("2026-07.txt", archive_dir) is False
+    assert _validate_archive_db("2026-7.db", archive_dir) is False
+    assert _validate_archive_db("archive.db", archive_dir) is False
+
+    # Reject: traversal attempts that match the regex but resolve outside.
+    # The regex gate stops most of these; the resolve() check is defence
+    # in depth for symlinked archives the regex happens to allow.
+    assert _validate_archive_db("../../etc/passwd", archive_dir) is False
+    assert _validate_archive_db("/etc/passwd", archive_dir) is False
