@@ -56,7 +56,7 @@ def _is_excluded(
 
 
 @tool("fs.list")
-def list(  # noqa: A001 — shadows builtin by design (matches tool name)
+def _list(
     path: str = ".",
     pattern: str | None = None,
     type: str | None = None,  # noqa: A002 — matches user-facing param name

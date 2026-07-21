@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from cothis.tools.fs.list import list as _list
+from cothis.tools.fs.list import _list
 from cothis.tools.fs.read import read
 from cothis.tools.fs.write import write
 

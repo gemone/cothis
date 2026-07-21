@@ -409,7 +409,7 @@ def test_dir_returns_structured_entries(tmp_path: Any) -> None:
     Structured output lets ``_execute`` serialise it as JSON (the model-native
     shape) instead of a bespoke text format the model has to parse.
     """
-    from cothis.tools.fs.list import list as _list_dir
+    from cothis.tools.fs.list import _list as _list_dir
 
     (tmp_path / "src").mkdir()
     (tmp_path / "README.md").write_text("hi")
@@ -425,7 +425,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
     Error paths stay as strings (not structured) — ``_execute`` passes them
     through unchanged so the model sees an actionable message.
     """
-    from cothis.tools.fs.list import list as _list_dir
+    from cothis.tools.fs.list import _list as _list_dir
 
     result = _list_dir(path=str(tmp_path / "nonexistent"))
     assert isinstance(result, str)
@@ -434,7 +434,7 @@ def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
     """ " "Recursive listing yields entries with nested relative paths."""
-    from cothis.tools.fs.list import list as _list_dir
+    from cothis.tools.fs.list import _list as _list_dir
 
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "mod.py").write_text("")

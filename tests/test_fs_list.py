@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from cothis.tools.fs._hygiene import workdir_context
-from cothis.tools.fs.list import list as fs_list
+from cothis.tools.fs.list import _list as fs_list
 
 if TYPE_CHECKING:
     from pathlib import Path

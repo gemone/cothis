@@ -12,7 +12,7 @@ subpackage is built up incrementally per #46's vertical slices:
 Exports grow slice by slice: ``read`` (#3), ``write`` (#4), ``list`` (#7).
 """
 
-from cothis.tools.fs.list import list as fs_list
+from cothis.tools.fs.list import _list as fs_list
 from cothis.tools.fs.read import read
 from cothis.tools.fs.write import write
 
