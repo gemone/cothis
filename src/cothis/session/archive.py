@@ -151,7 +151,7 @@ def archive_session(
     archive_db_name: str,
     archived_at: str,
     index: ArchiveIndex,
-) -> None:
+) -> bool | None:
     """Move ``session_id``'s rows from the hot DB to ``archive_dir / archive_db_name``.
 
     Atomic per session: ATTACH the cold DB, INSERT rows, DELETE from
@@ -205,6 +205,7 @@ def archive_session(
 
     index.set(session_id, archive_db_name, archived_at)
     index.save()
+    return True
 
 
 def run_archival_pass(

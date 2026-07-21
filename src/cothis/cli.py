@@ -594,7 +594,10 @@ def archive_cmd(
         _validate_session_id_arg(action)
         now_iso = datetime.now(UTC).isoformat()
         index = ArchiveIndex(archive_dir / "index.json")
-        archive_session(
+        # cothis: surface missing-id as BadParameter (#121). Previously
+        # the CLI unconditionally printed success even when the session
+        # wasn't in the hot DB (archive_session no-ops silently).
+        result = archive_session(
             hot_db_path=db_path,
             archive_dir=archive_dir,
             session_id=action,
@@ -602,6 +605,12 @@ def archive_cmd(
             archived_at=now_iso,
             index=index,
         )
+        if result is None:
+            raise typer.BadParameter(
+                f"session {action!r} not found in hot db; "
+                f"did you mean 'cothis archive restore {action}'? "
+                f"run 'cothis history' to list hot sessions"
+            )
         console.print(f"archived session [cyan]{action}[/cyan]")
 
 
