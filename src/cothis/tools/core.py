@@ -572,16 +572,20 @@ def _build_schema(
     """
     summary, arg_descs = _parse_docstring(inspect.getdoc(fn))
     sig = inspect.signature(fn)
-    # cothis: ceiling — unresolved annotations silently become "string"
-    # in the schema rather than failing loudly. Acceptable today because
-    # every shipped tool uses builtins; upgrade path: surface unresolved
-    # annotations as a load-time warning so a typo in a type hint
-    # doesn't silently mistype a parameter for the model.
+    # cothis: surface hint-resolution failure as a load-time WARNING (#80).
+    # Silent fallback to ``string`` made the most common authoring typo
+    # (a misnamed type in a quoted annotation) invisible; a warning
+    # makes it discoverable without blocking load of the rest of the layer.
     try:
         # ``include_extras=True`` preserves ``Annotated[T, Field(...)]`` metadata
         # so ``TypeAdapter`` below can extract constraints (story 4).
         hints = typing.get_type_hints(fn, include_extras=True)
-    except Exception:  # noqa: BLE001 — any hint-resolution failure is non-fatal
+    except Exception as exc:  # noqa: BLE001 — any hint-resolution failure is non-fatal
+        logger.warning(
+            "tool %r: could not resolve type hints (%s); parameters "
+            "will fall back to 'string' in the LLM schema",
+            fn.__name__, exc,
+        )
         hints = {}
     properties: dict[str, dict[str, Any]] = {}
     required: list[str] = []
@@ -616,7 +620,17 @@ def _build_schema(
             # so the LLM schema is well-formed.
             if "type" not in prop:
                 prop["type"] = _PY_JSON_TYPE.get(annotation, "string")
-        except Exception:  # noqa: BLE001 — unresolved/forward-ref types fall back
+        except Exception as exc:  # noqa: BLE001 — unresolved/forward-ref types fall back
+            # cothis: per-parameter WARNING (#80). Hint resolution may
+            # have succeeded but the annotation itself can be a forward
+            # ref pydantic can't resolve (``"DoesNotExist"``), or carry
+            # a constraint pydantic rejects. Surface it instead of
+            # silently dropping the constraint.
+            logger.warning(
+                "tool %r parameter %r: could not build schema for %r "
+                "(%s); falling back to 'string'",
+                fn.__name__, pname, annotation, exc,
+            )
             prop = {"type": _PY_JSON_TYPE.get(annotation, "string")}
         desc = arg_descs.get(pname)
         if desc:
