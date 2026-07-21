@@ -21,12 +21,12 @@ if TYPE_CHECKING:
 
 
 def test_fast_path_scans_2000_lines_quickly(tmp_path: Path) -> None:
-    """2000-line scan stays well under the executor-overhead bound (#111).
+    """A 2000-line scan finishes well under the ``_DEADLINE_SECONDS`` cap (#111).
 
-    Pre-#111 the per-line executor round-trip cost ~12µs/line →
-    ~24.9ms for 2000 lines. Direct ``regex.search`` is ~0.4ms.
-    The test asserts the scan finishes in <100ms (well above the
-    direct baseline, well below the executor bound).
+    The scan must complete fast enough that the deadline never fires
+    on typical inputs. The 100ms budget leaves headroom for CI
+    variance while still catching a regression to per-line thread
+    overhead.
     """
     # 2000-line file, 1 match per line so the inner body fires too.
     lines = "\n".join(f"foo_{i} match" for i in range(2000))

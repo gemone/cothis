@@ -31,11 +31,9 @@ _MAX_PATTERN_LEN = 256
 _MAX_FILE_BYTES = 1_048_576  # 1 MiB — larger files are skipped entirely.
 _MAX_LINE_LEN = 4096  # skip long lines (ReDoS / log noise).
 _MAX_FILES_SCANNED = 5000  # total work cap — bounds traversal even with 0 matches.
-# cothis: wall-clock cap on the whole call (#111). Per-line
-# ``ThreadPoolExecutor`` timeouts didn't actually bound wall time —
-# Python can't kill a hung worker thread, and ``__exit__`` waits for
-# it. The deadline is checked at the outer (per-file) and inner
-# (per-line) loop boundaries; on hit, the call returns partial results.
+# cothis: wall-clock cap on the whole call (#111). The deadline is
+# checked at the outer (per-file) and inner (per-line) loop
+# boundaries; on hit, the call returns partial results.
 _DEADLINE_SECONDS = 5.0
 
 # Denylist of filename patterns that carry secrets. Checked independently
@@ -159,11 +157,6 @@ def _search(
                         break
                     if len(line) > _MAX_LINE_LEN:
                         continue
-                    # cothis: direct ``regex.search`` — the executor
-                    # round-trip added ~12µs/line of thread overhead
-                    # with no real ReDoS protection (Python can't
-                    # kill the worker). The wall-clock deadline above
-                    # is the actual backstop (#111).
                     if regex.search(line):
                         results.append(
                             {"file": rel_str, "line": str(i), "text": line.rstrip("\n")}
