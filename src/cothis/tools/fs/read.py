@@ -37,18 +37,19 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
     cwd = WORKDIR.get() or Path.cwd()
     resolved = _resolve_under(path, cwd)
     text = resolved.read_text(encoding="utf-8")
-    if len(text.encode("utf-8")) > _MAX_BYTES:
-        dropped = len(text.encode("utf-8")) - _MAX_BYTES
+    blob = text.encode("utf-8")
+    if len(blob) > _MAX_BYTES:
+        dropped = len(blob) - _MAX_BYTES
         # Truncate at the byte boundary, then decode whatever survived.
-        # ``text[:_MAX_BYTES]`` may split a multi-byte char; rstrip the
+        # ``blob[:_MAX_BYTES]`` may split a multi-byte char; rstrip the
         # tail bytes until decode succeeds.
-        blob = text.encode("utf-8")[:_MAX_BYTES]
-        while blob:
+        truncated = blob[:_MAX_BYTES]
+        while truncated:
             try:
-                head = blob.decode("utf-8")
+                head = truncated.decode("utf-8")
                 break
             except UnicodeDecodeError:
-                blob = blob[:-1]
+                truncated = truncated[:-1]
         else:
             head = ""
         return (
