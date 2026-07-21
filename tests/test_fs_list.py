@@ -113,8 +113,13 @@ def test_list_noise_dirs_always_excluded(tmp_path: Path) -> None:
 
 
 def test_list_truncates_past_cap(tmp_path: Path) -> None:
-    """Past 500 entries, returns ``{"entries": [...], "truncated": -1}``
-    (sentinel — ``-1`` means "more exist" without exhausting the walker)."""
+    """Past 500 entries, returns the actual dropped count (#116).
+
+    The walker stops materialising entries at ``_MAX_DIR_ENTRIES``;
+    a second pass counts the remaining qualifying entries without
+    building their dicts. ``truncated`` is the count of dropped
+    entries (10 here), not a ``-1`` sentinel.
+    """
     for i in range(510):
         (tmp_path / f"f{i:03d}.txt").write_text("x")
 
@@ -122,5 +127,28 @@ def test_list_truncates_past_cap(tmp_path: Path) -> None:
         result = fs_list(path=".")
     assert isinstance(result, dict)
     assert "entries" in result
+    assert len(result["entries"]) == 500
     assert "truncated" in result
-    assert result["truncated"] == -1
+    assert result["truncated"] == 10
+
+
+def test_list_truncation_count_respects_filters(tmp_path: Path) -> None:
+    """The truncated count only includes entries that pass the filters.
+
+    Seeds 500 ``.txt`` files (under cap) + 50 ``.log`` files (under cap)
+    + 30 more ``.txt`` files (over cap). With ``pattern="*.txt"`` the
+    walker materialises the first 500 ``.txt``, then the second pass
+    counts the remaining 30 ``.txt`` — the 50 ``.log`` don't count.
+    """
+    for i in range(500):
+        (tmp_path / f"a{i:03d}.txt").write_text("x")
+    for i in range(50):
+        (tmp_path / f"b{i:03d}.log").write_text("x")
+    for i in range(30):
+        (tmp_path / f"c{i:03d}.txt").write_text("x")
+
+    with workdir_context(tmp_path):
+        result = fs_list(path=".", pattern="*.txt")
+    assert isinstance(result, dict)
+    assert len(result["entries"]) == 500
+    assert result["truncated"] == 30
