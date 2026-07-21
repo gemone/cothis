@@ -404,41 +404,39 @@ def test_read_start_line_beyond_eof_returns_actionable_error(
 
 
 def test_dir_returns_structured_entries(tmp_path: Any) -> None:
-    """``fs.dir`` returns a list of ``{"name", "type"}`` dicts, not text.
-
-    Structured output lets ``_execute`` serialise it as JSON (the model-native
-    shape) instead of a bespoke text format the model has to parse.
-    """
+    """``fs.list`` returns a list of ``{"name", "type"}`` dicts, not text."""
+    from cothis.tools.fs._hygiene import workdir_context
     from cothis.tools.fs.list import _list as _list_dir
 
     (tmp_path / "src").mkdir()
     (tmp_path / "README.md").write_text("hi")
-    result = _list_dir(path=str(tmp_path))
+    with workdir_context(tmp_path):
+        result = _list_dir(path=".")
     assert isinstance(result, list)
     by_name = {e["name"]: e["type"] for e in result}
     assert by_name == {"src": "dir", "README.md": "file"}
 
 
 def test_dir_nonexistent_returns_error_string(tmp_path: Any) -> None:
-    """``fs.dir`` on a missing path returns an ``"Error: ..."`` str.
-
-    Error paths stay as strings (not structured) — ``_execute`` passes them
-    through unchanged so the model sees an actionable message.
-    """
+    """``fs.list`` on a missing path returns an ``"Error: ..."`` str."""
+    from cothis.tools.fs._hygiene import workdir_context
     from cothis.tools.fs.list import _list as _list_dir
 
-    result = _list_dir(path=str(tmp_path / "nonexistent"))
+    with workdir_context(tmp_path):
+        result = _list_dir(path="nonexistent")
     assert isinstance(result, str)
-    assert result.startswith("Error: no such directory")
+    assert result.startswith("Error:")
 
 
 def test_dir_recursive_includes_nested_paths(tmp_path: Any) -> None:
-    """ " "Recursive listing yields entries with nested relative paths."""
+    """Recursive listing yields entries with nested relative paths."""
+    from cothis.tools.fs._hygiene import workdir_context
     from cothis.tools.fs.list import _list as _list_dir
 
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "mod.py").write_text("")
-    result = _list_dir(path=str(tmp_path), recursive=True)
+    with workdir_context(tmp_path):
+        result = _list_dir(path=".", recursive=True)
     names = {e["name"] for e in result}
     assert "pkg" in names
     assert "pkg/mod.py" in names

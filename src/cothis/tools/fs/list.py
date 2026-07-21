@@ -3,9 +3,14 @@
 Replaces ``fs.dir``. Supports name-glob filtering, type filtering,
 recursive walks, dotfile/gitignore hygiene, and a 500-entry cap.
 
-Backend: stdlib ``pathlib`` walker today; gated ``fd`` subprocess
-lands as a follow-up. The backend choice is logged once at DEBUG
-level on first use.
+cothis: fd subprocess backend + ADR deferred per PRD #46. Current
+shape uses the stdlib pathlib walker exclusively; the backend choice
+is logged once at DEBUG on first use.
+
+``Path.rglob`` does not follow symlinks by default (Python 3.13+).
+Symlink-loop risk is zero without an explicit ``follow_symlinks=True``
+opt-in; if a future version adds one, a visited-realpath set will be
+required.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from cothis.tools.fs._hygiene import (
     _MAX_DIR_ENTRIES,
     WORKDIR,
     _load_gitignore,
+    _resolve_under,
 )
 
 if TYPE_CHECKING:
@@ -32,7 +38,6 @@ _backend_logged = False
 
 
 def _log_backend_choice() -> None:
-    """Log the backend choice once per process at DEBUG level."""
     global _backend_logged
     if not _backend_logged:
         logger.debug("fs tools: fs.list using backend stdlib")
@@ -40,17 +45,18 @@ def _log_backend_choice() -> None:
 
 
 def _is_excluded(
-    p: Path, root: Path, gitignore: pathspec.PathSpec | None, all: bool,
+    rel_parts: tuple[str, ...],
+    gitignore: pathspec.PathSpec | None,
+    rel_str: str,
+    all: bool,
 ) -> bool:
-    """True if ``p`` should be omitted from the listing."""
-    rel = p.relative_to(root)
-    if any(part in _IGNORED_DIRS for part in rel.parts):
+    if any(part in _IGNORED_DIRS for part in rel_parts):
         return True
     if all:
         return False
-    if any(part.startswith(".") for part in rel.parts):
+    if any(part.startswith(".") for part in rel_parts):
         return True
-    if gitignore is not None and gitignore.match_file(rel.as_posix()):
+    if gitignore is not None and gitignore.match_file(rel_str):
         return True
     return False
 
@@ -59,7 +65,7 @@ def _is_excluded(
 def _list(
     path: str = ".",
     pattern: str | None = None,
-    type: str | None = None,  # noqa: A002 — matches user-facing param name
+    type: str | None = None,  # noqa: A002
     recursive: bool = False,
     all: bool = False,  # noqa: A002
 ) -> list[dict[str, str]] | dict[str, Any] | str:
@@ -70,6 +76,9 @@ def _list(
     ``recursive=True`` for nested paths. Dotfiles and gitignore-excluded
     entries are hidden by default; pass ``all=True`` to show them
     (noise dirs like ``.git`` / ``__pycache__`` are always excluded).
+
+    Paths resolve against the Agent's cwd via the boundary helper;
+    absolute paths and ``..`` escapes are rejected.
 
     Args:
         path: Directory to list. Relative to cwd.
@@ -84,8 +93,10 @@ def _list(
     """
     _log_backend_choice()
     cwd = WORKDIR.get() or Path.cwd()
-    root = (cwd / path).resolve() if not Path(path).is_absolute() else Path(path)
-
+    try:
+        root = _resolve_under(path, cwd)
+    except Exception:
+        return f"Error: path outside cwd boundary: {path}"
     if not root.exists():
         return f"Error: no such directory: {path}"
     if not root.is_dir():
@@ -93,28 +104,26 @@ def _list(
 
     gitignore = None if all else _load_gitignore(root)
 
-    if recursive:
-        raw = sorted(
-            (p for p in root.rglob("*") if not _is_excluded(p, root, gitignore, all)),
-            key=lambda p: str(p.relative_to(root)),
-        )
-    else:
-        raw = sorted(
-            (p for p in root.iterdir() if not _is_excluded(p, root, gitignore, all)),
-            key=lambda p: p.name,
-        )
-
     entries: list[dict[str, str]] = []
-    for p in raw:
-        rel_name = p.relative_to(root).as_posix()
+    truncated = 0
+
+    walker = root.rglob("*") if recursive else root.iterdir()
+    for p in walker:
+        if len(entries) >= _MAX_DIR_ENTRIES:
+            truncated = sum(1 for _ in walker) + 1
+            break
+        rel = p.relative_to(root)
+        rel_str = rel.as_posix()
+        if _is_excluded(rel.parts, gitignore, rel_str, all):
+            continue
         p_type = "dir" if p.is_dir() else "file"
         if pattern and not fnmatch.fnmatch(p.name, pattern):
             continue
         if type and p_type != type:
             continue
-        entries.append({"name": rel_name, "type": p_type})
+        entries.append({"name": rel_str, "type": p_type})
 
-    truncated_count = len(entries) - _MAX_DIR_ENTRIES
-    if truncated_count > 0:
-        return {"entries": entries[:_MAX_DIR_ENTRIES], "truncated": truncated_count}
-    return entries
+    if truncated > 0:
+        entries.sort(key=lambda e: e["name"])
+        return {"entries": entries[:_MAX_DIR_ENTRIES], "truncated": truncated}
+    return sorted(entries, key=lambda e: e["name"])

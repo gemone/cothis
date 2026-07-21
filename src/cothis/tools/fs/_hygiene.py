@@ -111,6 +111,8 @@ _IGNORED_DIRS = frozenset(
     }
 )
 
+# 500 — a sane project fits well under this; larger listings truncate
+# to bound the agent's turn budget (token + wall-clock).
 _MAX_DIR_ENTRIES = 500
 
 
