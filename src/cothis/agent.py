@@ -832,7 +832,7 @@ class Agent(BaseModel):
     # --- internals -----------------------------------------------------
 
     def _react_setup(self, user_input: str) -> list[dict[str, Any]] | None:
-        """Shared setup for ``_run_inner`` and ``_run_stream_inner`` (#58).
+        """Shared setup for ``_run_inner`` and ``_run_stream_inner``.
 
         Ensures messages, then returns the snapshot system prompt.
         Callers await ``_ensure_mcp`` / ``_ensure_handles`` after.
@@ -843,12 +843,11 @@ class Agent(BaseModel):
     def _merge_tool_result(
         self, block_id: str, output: str, is_error: bool
     ) -> None:
-        """Merge a ``tool_result`` into ``_messages`` + Session (#58).
+        """Merge a ``tool_result`` into ``_messages`` + Session.
 
         Shared by ``_run_inner`` and ``_run_stream_inner`` — the
-        per-execution result enqueue was duplicated verbatim (including
-        the Session append). Single source now; adding per-result
-        logic (telemetry, hooks) is a one-site edit.
+        per-execution result enqueue was duplicated verbatim. Single
+        source now; adding per-result logic is a one-site edit.
         """
         result_block = _tool_result_block(block_id, output, is_error)
         _append_merged(self._messages, "user", result_block)
