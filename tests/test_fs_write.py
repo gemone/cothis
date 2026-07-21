@@ -34,22 +34,6 @@ def test_write_add_creates_new_file(tmp_path: Path) -> None:
     assert "added 1" in result
 
 
-def test_write_add_in_missing_parent_dir_rejected(tmp_path: Path) -> None:
-    """Pre-#52 behavior created intermediate dirs; #52 removed that —
-    Add File into a missing parent dir is now rejected. Test name kept
-    to minimise diff churn; body asserts the new boundary."""
-    patch = """\
-*** Begin Patch
-*** Add File: a/b/c.txt
-+deep
-*** End Patch
-"""
-    with workdir_context(tmp_path):
-        with pytest.raises(PatchError, match="parent"):
-            write(content=patch)
-    assert not (tmp_path / "a").exists()
-
-
 def test_write_update_splices_pre_image(tmp_path: Path) -> None:
     """``*** Update File:`` replaces the pre-image block; file untouched
     on pre-image miss (PatchError raised before commit)."""

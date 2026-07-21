@@ -7,10 +7,10 @@ Single-argument signature: ``fs.write(content: str) -> str`` where
 patch, pre-image miss, two-ops-on-one-path) raise before any disk
 write — multi-file patches are atomic at the in-memory layer.
 
-Paths resolve against the Agent's cwd (``WORKDIR``) using the
-``_resolve_under`` helper from the ``_hygiene`` module. Absolute paths
-and ``..`` escapes are rejected before any disk write; in-cwd symlinks
-are followed (a link target inside cwd is allowed, outside is rejected).
+Paths resolve against the Agent's cwd (``WORKDIR``) via the path
+boundary helper in the ``_hygiene`` module. Absolute paths and ``..``
+escapes are rejected before any disk write; in-cwd symlinks are
+followed (a link target inside cwd is allowed, outside is rejected).
 
 Resolved paths are cached at preflight and reused at commit so a
 symlink swap between the two steps can't bypass the boundary (TOCTOU
@@ -52,10 +52,10 @@ def _preflight(
 ) -> tuple[dict[str, str], dict[str, Path]]:
     """Resolve every ``op.path`` against ``cwd`` and read current disk state.
 
-    Runs all boundary checks (``_resolve_under``) before any disk write,
-    so a violation leaves the working tree untouched. Add ops targeting
-    a path whose parent directory doesn't exist are rejected — the
-    model must target an existing directory (security over convenience).
+    Runs all boundary checks before any disk write, so a violation
+    leaves the working tree untouched. Add ops targeting a path whose
+    parent directory doesn't exist are rejected — the model must target
+    an existing directory (security over convenience).
 
     Returns ``(state, resolved_paths)``:
     - ``state``: ``{rel_path: content}`` for every existing file the patch
@@ -104,11 +104,10 @@ def _commit(
     Reuses ``resolved_paths`` from ``_preflight`` rather than re-resolving —
     closes the TOCTOU window where a symlink swap between preflight and
     commit would bypass the boundary (the cached path is the one checked).
-
-    cothis: slice #6 (#53) will wrap this in snapshot+reverse; current
-    shape leaves partial state on crash mid-loop. Marked so a grep finds
-    the deferral when wiring atomicity.
     """
+    # cothis: slice #6 (#53) will wrap this in snapshot+reverse; current
+    # shape leaves partial state on crash mid-loop. Grep-able from the
+    # atomicity wiring.
     added = updated = deleted = 0
     for path in post:
         resolved = resolved_paths[path]
