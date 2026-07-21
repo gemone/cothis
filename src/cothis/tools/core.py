@@ -20,6 +20,7 @@ import logging
 import time
 import types
 import typing
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -927,6 +928,34 @@ def handle_call_done(tool: Any) -> None:
     manager.call_done(tool)
 
 
+@dataclass
+class _HandleSlot:
+    """Per-handle lifecycle state for ``HandleManager`` (#60).
+
+    Collapses the four parallel dicts (``_instances``, ``_live``,
+    ``_last_used``, ``_inflight``) into a single dataclass keyed by
+    handle type. Predicates (``is_live``, ``is_pinned``, ``is_evictable``)
+    are the single source of truth for eligibility rules.
+    """
+
+    instance: ResourceHandle
+    live_at: float | None = None
+    last_used: float = 0.0
+    inflight: int = 0
+
+    @property
+    def is_live(self) -> bool:
+        return self.live_at is not None
+
+    @property
+    def is_pinned(self) -> bool:
+        return getattr(type(self.instance), "pin", False)
+
+    @property
+    def is_evictable(self) -> bool:
+        return self.is_live and self.inflight == 0 and not self.is_pinned
+
+
 class HandleManager:
     """Owns the lifecycle of every ``ResourceHandle`` instance in an Agent.
 
@@ -938,17 +967,15 @@ class HandleManager:
     ``reaper_interval``); ``ensure_acquired`` is the synchronous self-heal on
     the dispatch path.
 
-    ``last_used`` is a wall-clock timestamp (``time.time()``) per handle
-    instance; any tool calling ``ensure_acquired`` refreshes it.
+    Per-handle state lives in ``_HandleSlot`` — a single dataclass that
+    carries the instance, live timestamp, last-used timestamp, and in-flight
+    counter (#60). Single source of truth vs the prior four parallel dicts.
     """
 
     def __init__(self, *, max_handles: int = 8, reaper_interval: float = 60.0) -> None:
         self._max_handles = max_handles
         self._reaper_interval = reaper_interval
-        self._instances: dict[type[ResourceHandle], ResourceHandle] = {}
-        self._live: dict[type[ResourceHandle], float] = {}
-        self._last_used: dict[type[ResourceHandle], float] = {}
-        self._inflight: dict[type[ResourceHandle], int] = {}
+        self._slots: dict[type[ResourceHandle], _HandleSlot] = {}
         self._reaper_task: asyncio.Task[None] | None = None
 
     def _start_reaper(self) -> None:
@@ -978,8 +1005,8 @@ class HandleManager:
         if cls is None:
             return
         tool._handle_manager = self
-        if cls not in self._instances:
-            self._instances[cls] = cls()
+        if cls not in self._slots:
+            self._slots[cls] = _HandleSlot(instance=cls())
 
     async def start_eager(self) -> None:
         """Acquire every ``eager`` handle now (Agent's first run).
@@ -989,21 +1016,17 @@ class HandleManager:
         handles are skipped. Errors per handle are logged and swallowed
         (an eager handle failing to start must not abort the Agent).
         """
-        for cls, instance in self._instances.items():
-            if not cls.eager or cls in self._live:
+        for cls, slot in self._slots.items():
+            if not cls.eager or slot.is_live:
                 continue
             try:
-                await instance.acquire()
+                await slot.instance.acquire()
             except Exception as exc:  # noqa: BLE001 — eager start is best-effort
                 logger.warning("eager handle %s failed to start: %s", cls.__name__, exc)
                 continue
-            self._live[cls] = time.time()
-            self._last_used[cls] = time.time()
+            slot.live_at = time.time()
+            slot.last_used = time.time()
             self._start_reaper()
-
-    def _evictable(self, cls: type[ResourceHandle]) -> bool:
-        """A handle is evictable when not in-flight and not pinned."""
-        return self._inflight.get(cls, 0) == 0 and not getattr(cls, "pin", False)
 
     async def ensure_acquired(self, tool: Any) -> None:
         """Ensure the tool's handle is live; acquire (or re-acquire) if not.
@@ -1021,18 +1044,21 @@ class HandleManager:
         cls = getattr(tool, "_handle_cls", None)
         if cls is None:
             return
-        instance = self._instances.get(cls)
-        if instance is None:
-            instance = cls()
-            self._instances[cls] = instance
-        if cls not in self._live:
-            if self._unpinned_count() >= self._max_handles:
+        slot = self._slots.get(cls)
+        if slot is None:
+            slot = _HandleSlot(instance=cls())
+            self._slots[cls] = slot
+        if not slot.is_live:
+            unpinned_live = sum(
+                1 for s in self._slots.values() if s.is_live and not s.is_pinned
+            )
+            if unpinned_live >= self._max_handles:
                 await self._evict_coldest()
-            await instance.acquire()
-            self._live[cls] = time.time()
+            await slot.instance.acquire()
+            slot.live_at = time.time()
             self._start_reaper()
-        self._last_used[cls] = time.time()
-        tool.handle = instance
+        slot.last_used = time.time()
+        tool.handle = slot.instance
 
     def adopt(
         self, cls: type[ResourceHandle], instance: ResourceHandle
@@ -1043,11 +1069,16 @@ class HandleManager:
         that connection *is* the handle's first acquire. Rather than drop it
         and reconnect on the first call, the session is adopted: the instance
         is recorded as live with a fresh ``last_used``, and the next
-        ``ensure_acquired`` finds it already in ``_live`` and skips acquire.
+        ``ensure_acquired`` finds it already live and skips acquire.
         """
-        self._instances[cls] = instance
-        self._live[cls] = time.time()
-        self._last_used[cls] = time.time()
+        slot = self._slots.get(cls)
+        if slot is None:
+            slot = _HandleSlot(instance=instance)
+            self._slots[cls] = slot
+        else:
+            slot.instance = instance
+        slot.live_at = time.time()
+        slot.last_used = time.time()
         self._start_reaper()
 
     def mark_inflight(self, tool: Any) -> None:
@@ -1061,10 +1092,9 @@ class HandleManager:
         cls = getattr(tool, "_handle_cls", None)
         if cls is None:
             return
-        self._inflight[cls] = self._inflight.get(cls, 0) + 1
-
-    def _unpinned_count(self) -> int:
-        return sum(1 for cls in self._live if not getattr(cls, "pin", False))
+        slot = self._slots.get(cls)
+        if slot is not None:
+            slot.inflight += 1
 
     def call_done(self, tool: Any) -> None:
         """End the tool's in-flight window and refresh ``last_used``.
@@ -1077,10 +1107,11 @@ class HandleManager:
         cls = getattr(tool, "_handle_cls", None)
         if cls is None:
             return
-        count = self._inflight.get(cls, 0)
-        if count > 0:
-            self._inflight[cls] = count - 1
-        self._last_used[cls] = time.time()
+        slot = self._slots.get(cls)
+        if slot is not None:
+            if slot.inflight > 0:
+                slot.inflight -= 1
+            slot.last_used = time.time()
 
     async def _evict_coldest(self) -> None:
         """Evict the least-recently-used evictable handle to make room.
@@ -1090,21 +1121,24 @@ class HandleManager:
         ``max_handles`` until a call finishes or a pinned handle is the
         only thing live — but pinned handles don't count toward the budget).
         """
-        candidates = [c for c in self._live if self._evictable(c)]
+        candidates = [
+            s for s in self._slots.values() if s.is_evictable
+        ]
         if not candidates:
             return
-        coldest = min(candidates, key=lambda c: self._last_used.get(c, 0.0))
-        await self._release_one(coldest)
+        coldest = min(candidates, key=lambda s: s.last_used)
+        await self._release(coldest)
 
-    async def _release_one(self, cls: type[ResourceHandle]) -> None:
-        instance = self._instances.get(cls)
-        if instance is None or cls not in self._live:
+    async def _release(self, slot: _HandleSlot) -> None:
+        """Release a slot's handle. Sets ``live_at = None`` (re-acquirable)."""
+        if not slot.is_live:
             return
         try:
-            await instance.release()
+            await slot.instance.release()
         except Exception as exc:  # noqa: BLE001 — release must not raise
-            logger.debug("handle %s release error: %s", cls.__name__, exc)
-        self._live.pop(cls, None)
+            logger.debug("handle %s release error: %s",
+                         type(slot.instance).__name__, exc)
+        slot.live_at = None
 
     async def reclaim_idle(self) -> int:
         """Release handles idle past their ``keepalive``. Returns count reclaimed.
@@ -1115,16 +1149,15 @@ class HandleManager:
         """
         now = time.time()
         reclaimed = 0
-        for cls in list(self._live):
-            if getattr(cls, "pin", False):
+        for slot in list(self._slots.values()):
+            if not slot.is_live or slot.is_pinned or slot.inflight > 0:
                 continue
-            if self._inflight.get(cls, 0) > 0:
-                continue
-            idle = now - self._last_used.get(cls, now)
-            if idle >= cls.keepalive:
-                await self._release_one(cls)
+            idle = now - slot.last_used
+            if idle >= type(slot.instance).keepalive:
+                await self._release(slot)
                 reclaimed += 1
-                logger.debug("handle %s reclaimed (idle %.0fs)", cls.__name__, idle)
+                logger.debug("handle %s reclaimed (idle %.0fs)",
+                             type(slot.instance).__name__, idle)
         return reclaimed
 
     async def release_all(self) -> None:
@@ -1136,6 +1169,6 @@ class HandleManager:
             except (Exception, asyncio.CancelledError):  # noqa: BLE001 — either way done
                 pass
             self._reaper_task = None
-        for cls in list(self._live):
-            await self._release_one(cls)
-        self._instances.clear()  # permanent teardown — stale entries can't re-acquire
+        for slot in list(self._slots.values()):
+            await self._release(slot)
+        self._slots.clear()  # permanent teardown — stale entries can't re-acquire
