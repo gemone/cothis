@@ -36,14 +36,13 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
     """
     cwd = WORKDIR.get() or Path.cwd()
     resolved = _resolve_under(path, cwd)
-    text = resolved.read_text(encoding="utf-8")
-    blob = text.encode("utf-8")
-    if len(blob) > _MAX_BYTES:
-        dropped = len(blob) - _MAX_BYTES
-        # Truncate at the byte boundary, then decode whatever survived.
-        # ``blob[:_MAX_BYTES]`` may split a multi-byte char; rstrip the
-        # tail bytes until decode succeeds.
-        truncated = blob[:_MAX_BYTES]
+    # Stat first to bound peak memory at _MAX_BYTES, not file size (#134).
+    size = resolved.stat().st_size
+    if size > _MAX_BYTES:
+        with resolved.open("rb") as fh:
+            truncated = fh.read(_MAX_BYTES)
+        # Multi-byte char may be split at the cap; rstrip tail bytes
+        # until decode succeeds.
         while truncated:
             try:
                 head = truncated.decode("utf-8")
@@ -52,10 +51,11 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
                 truncated = truncated[:-1]
         else:
             head = ""
-        return (
-            head
-            + f"\n… (truncated, {dropped} more bytes)"
-        )
+        # Re-encode head (which may be shorter than the cap after
+        # rstrip) so the dropped count is in bytes, matching ``size``.
+        dropped = size - len(head.encode("utf-8"))
+        return head + f"\n… (truncated, {dropped} more bytes)"
+    text = resolved.read_text(encoding="utf-8")
     lines = text.splitlines()
     total = len(lines)
     start = max(1, start_line or 1)
