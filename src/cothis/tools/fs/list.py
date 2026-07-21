@@ -101,31 +101,53 @@ def _list(
 
     gitignore = None if all else _load_gitignore(root)
 
+    def _qualifies(p: Path) -> tuple[bool, str]:
+        """Filter predicate shared by the materialise + count passes.
+
+        Returns ``(matches, p_type)``. ``p_type`` is ``""`` when the
+        entry fails the type filter (so the caller can short-circuit
+        without re-checking). Used by both the materialise pass (below
+        cap) and the count-only drain (past cap) — the count pass
+        ignores ``p_type`` and only checks ``matches``.
+        """
+        p_type = "dir" if p.is_dir() else "file"
+        if type and p_type != type:
+            return False, ""
+        if pattern and not fnmatch.fnmatch(p.name, pattern):
+            return False, ""
+        rel = p.relative_to(root)
+        if any(part in _IGNORED_DIRS for part in rel.parts):
+            return False, ""
+        if not all:
+            if any(part.startswith(".") for part in rel.parts):
+                return False, ""
+            if gitignore is not None and gitignore.match_file(rel.as_posix()):
+                return False, ""
+        return True, p_type
+
     entries: list[dict[str, str]] = []
-    truncated = False
+    truncated_count = 0
 
     walker = root.rglob("*") if recursive else root.iterdir()
     for p in walker:
         if len(entries) >= _MAX_DIR_ENTRIES:
-            truncated = True
+            # cothis: cap hit — drain walker to count remaining entries
+            # without materialising dicts (#116). ``p`` was yielded but
+            # not appended; count it first.
+            if _qualifies(p)[0]:
+                truncated_count += 1
+            for p_extra in walker:
+                if _qualifies(p_extra)[0]:
+                    truncated_count += 1
             break
-        p_type = "dir" if p.is_dir() else "file"
-        if type and p_type != type:
+        matches, p_type = _qualifies(p)
+        if not matches:
             continue
-        if pattern and not fnmatch.fnmatch(p.name, pattern):
-            continue
-        rel = p.relative_to(root)
-        rel_str = rel.as_posix()
-        if any(part in _IGNORED_DIRS for part in rel.parts):
-            continue
-        if not all:
-            if any(part.startswith(".") for part in rel.parts):
-                continue
-            if gitignore is not None and gitignore.match_file(rel_str):
-                continue
-        entries.append({"name": rel_str, "type": p_type})
+        entries.append({
+            "name": p.relative_to(root).as_posix(), "type": p_type,
+        })
 
     entries.sort(key=lambda e: e["name"])
-    if truncated:
-        return {"entries": entries, "truncated": -1}
+    if truncated_count > 0:
+        return {"entries": entries, "truncated": truncated_count}
     return entries
