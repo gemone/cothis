@@ -373,6 +373,11 @@ def _apply_hunk(content: str, path: str, hunk: Hunk) -> str:
     # difflib's SequenceMatcher fuzzy matching if a real need surfaces.
     norm_lines = [ln.rstrip() for ln in lines]
 
+    # cothis: pick line ending by presence of CRLF + tail-newline state
+    # so replacement lines match the file's convention (#96).
+    nl = "\r\n" if "\r\n" in content else "\n"
+    tail_unterminated = bool(lines) and not lines[-1].endswith(("\r\n", "\n"))
+
     if hunk.context:
         anchor = [c.rstrip() for c in hunk.context]
         start = _find_subseq(norm_lines, anchor)
@@ -395,10 +400,21 @@ def _apply_hunk(content: str, path: str, hunk: Hunk) -> str:
                 file=path,
                 line=search_from + 1,
             )
-        replacement = [a + "\n" for a in hunk.adds]
+        replacement = [a + nl for a in hunk.adds]
         new_lines = lines[:idx] + replacement + lines[idx + len(removes_norm):]
+        # cothis: if the replace block reaches EOF on a tail-unterminated
+        # file, drop the trailing nl from its last line so the file's
+        # no-trailing-newline state is preserved (#96 bug 2).
+        if tail_unterminated and idx + len(removes_norm) == len(lines) and replacement:
+            new_lines[-1] = new_lines[-1].rstrip("\r\n")
     else:
-        replacement = [a + "\n" for a in hunk.adds]
+        replacement = [a + nl for a in hunk.adds]
+        # cothis: pure insertion at EOF on a tail-unterminated file
+        # would concatenate the existing last line with the first
+        # inserted line (no separator). Prepend ``nl`` to the first
+        # replacement line so the splice stays well-formed (#96 bug 3).
+        if tail_unterminated and search_from == len(lines) and replacement:
+            replacement[0] = nl + replacement[0]
         new_lines = lines[:search_from] + replacement + lines[search_from:]
     return "".join(new_lines)
 
