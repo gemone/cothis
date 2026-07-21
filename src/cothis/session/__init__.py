@@ -507,13 +507,13 @@ class Session:
             storage.close()
             lock.release()
             raise KeyError(f"session {session_id!r} not found")
-        graph = _graph.build(storage.list_sessions())
         rows = storage.load_blocks(session_id)
         messages, cut_msg_idx = _rebuild_messages(rows)
         if cut_msg_idx is not None:
             storage.delete_blocks_from_msg_idx(session_id, cut_msg_idx)
             rows = [r for r in rows if r.msg_idx < cut_msg_idx]
         if sr.parent_id is not None:
+            graph = _graph.build(storage.list_sessions())
             ancestor_segments = cls._assemble_ancestors(graph, storage, session_id)
             messages = ancestor_segments + messages
         next_seq = (max(r.seq for r in rows) + 1) if rows else 0
