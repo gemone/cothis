@@ -52,7 +52,13 @@ from typing import Any
 from filelock import FileLock, Timeout
 
 from cothis.session import graph as _graph
-from cothis.session.archive import ArchiveIndex, promote_session, run_archival_pass
+from cothis.session.archive import (
+    ArchiveIndex,
+    cold_session_children,
+    delete_cold_session,
+    promote_session,
+    run_archival_pass,
+)
 from cothis.session.graph import SessionNotFoundError
 from cothis.session.storage import BlockRow, SessionRow, Storage, is_visible
 
@@ -494,12 +500,7 @@ class Session:
         except BaseException:
             lock.release()
             raise
-        run_archival_pass(
-            hot_db_path=db_path,
-            archive_dir=db_path.parent / "archive",
-            threshold_days=90,
-            now_iso=datetime.now(UTC).isoformat(),
-        )
+        cls._run_startup_archival(db_path)
         session = cls(
             db_path=db_path,
             session_id=session_id,
@@ -553,12 +554,7 @@ class Session:
         except BaseException:
             lock.release()
             raise
-        run_archival_pass(
-            hot_db_path=db_path,
-            archive_dir=db_path.parent / "archive",
-            threshold_days=90,
-            now_iso=datetime.now(UTC).isoformat(),
-        )
+        cls._run_startup_archival(db_path)
         sr = storage.load_session(session_id)
         # cothis: cold-read fallback (#86). Hot miss → check the archive
         # index. If the session was archived, read in place via ATTACH
@@ -622,6 +618,22 @@ class Session:
         session._lock = lock
         return session
 
+    @staticmethod
+    def _run_startup_archival(db_path: Path) -> None:
+        """Run the 24h-throttled archival pass once at Session startup.
+
+        ``new`` and ``load`` both call this right after ``Storage``
+        opens. Threshold (90 days idle) lives here, single source of
+        truth; the 24h throttle is in ``run_archival_pass`` via
+        ``archive_state.last_run``.
+        """
+        run_archival_pass(
+            hot_db_path=db_path,
+            archive_dir=db_path.parent / "archive",
+            threshold_days=90,
+            now_iso=datetime.now(UTC).isoformat(),
+        )
+
     @classmethod
     def list_visible(
         cls,
@@ -648,12 +660,15 @@ class Session:
         db_path: Path,
         session_id: str,
     ) -> None:
-        """Leaf-only delete of ``session_id``.
+        """Leaf-only delete of ``session_id`` (across hot + cold).
 
-        Takes the cross-process lock (refuses if held), builds the
-        graph, refuses with :class:`SessionHasChildrenError` if the
-        node is not a leaf, then DELETEs the session's blocks + row.
-        Hot-DB only in this slice (#35); cold-DB delete lands in #36.
+        Hot hit: existing #35 path (load → has_children → delete_session),
+        extended with a cross-DB children check so a hot parent with
+        cold kids is also refused.
+
+        Hot miss: consult the archive index (#87). If the session is
+        archived, ATTACH its cold DB, DELETE the rows + VACUUM, drop
+        the index entry. Leaf-only check applies across both DBs.
         """
         db_path = db_path.expanduser()
         _validate_session_id(session_id)
@@ -663,14 +678,51 @@ class Session:
         except BaseException:
             lock.release()
             raise
+        archive_dir = db_path.parent / "archive"
         try:
             target = storage.load_session(session_id)
-            if target is None:
+            if target is not None:
+                # Hot path. Leaf-only spans both DBs (#87): a hot
+                # parent may still have children that sank to cold.
+                hot_children = (
+                    storage.children_of(session_id)
+                    if storage.has_children(session_id) else []
+                )
+                cold_children = cold_session_children(
+                    archive_dir=archive_dir, session_id=session_id,
+                )
+                if hot_children or cold_children:
+                    raise SessionHasChildrenError(
+                        session_id, hot_children + cold_children,
+                    )
+                storage.delete_session(session_id)
+                return
+
+            # Cold path (#87). Hot miss → archive index → delete in cold.
+            index = ArchiveIndex(archive_dir / "index.json")
+            if index.get(session_id) is None:
                 raise KeyError(f"session {session_id!r} not found")
-            if storage.has_children(session_id):
-                children = storage.children_of(session_id)
-                raise SessionHasChildrenError(session_id, children)
-            storage.delete_session(session_id)
+            hot_children = (
+                storage.children_of(session_id)
+                if storage.has_children(session_id) else []
+            )
+            cold_children = cold_session_children(
+                archive_dir=archive_dir, session_id=session_id,
+            )
+            if hot_children or cold_children:
+                raise SessionHasChildrenError(
+                    session_id, hot_children + cold_children,
+                )
+            deleted = delete_cold_session(
+                hot_db_path=db_path,
+                archive_dir=archive_dir,
+                session_id=session_id,
+                index=index,
+            )
+            if not deleted:
+                # Index drifted between the get() above and the
+                # ATTACH; treat as not-found.
+                raise KeyError(f"session {session_id!r} not found")
         finally:
             storage.close()
             lock.release()
@@ -1019,13 +1071,7 @@ class Session:
         if not rows:
             return
         updated_at = _now_iso()
-        # cothis: cold-session promote-on-first-write (#86). The session
-        # was loaded from the cold DB; hot has no rows for it. Promote
-        # moves the session row + archived blocks cold→hot atomically
-        # with ``updated_at=now`` so the 90-day threshold doesn't
-        # immediately re-archive it. After promote, the lazy-row flag
-        # is already effectively True (hot has the row), and the
-        # index entry is dropped — subsequent writes are hot-only.
+        # cothis: cold-session promote-on-first-write (#86, ADR-0011 §3).
         if self._cold:
             cold_index = ArchiveIndex(
                 self._db_path.parent / "archive" / "index.json"

@@ -92,6 +92,11 @@ blocks via `write_atomic`.
 - `updated_at` jumps from the archived value to `now`. This is the
   contract: a freshly-touched session isn't immediately re-archived
   by the next 90-day pass.
+- **Crash safety.** `_cold` is in-memory only. If the process dies
+  after `promote_session` commits but before `self._cold = False`
+  runs, the next `Session.load` finds the row in the hot DB (so it
+  takes the hot path) and never reads `_cold`. The flag is a hint,
+  not a source of truth — the index + row presence are.
 
 ## 4. Flag plumbing — `cold: bool = False` on `__init__`
 

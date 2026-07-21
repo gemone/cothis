@@ -102,6 +102,12 @@ class ArchiveIndex:
         return self._entries.get(session_id)
 
     def set(self, session_id: str, archive_db: str, archived_at: str) -> None:
+        # Defense-in-depth: validate on write too, not just on load.
+        # ``_read_cold_session`` and ``delete_cold_session`` open the
+        # cold DB by basename; a crafted ``../../etc/passwd`` would
+        # pass ``is_file()`` without this gate.
+        if not _validate_archive_db(archive_db, self._archive_dir):
+            raise ValueError(f"unsafe archive_db: {archive_db!r}")
         self._entries[session_id] = ArchivedEntry(archive_db, archived_at)
 
     def remove(self, session_id: str) -> None:
@@ -145,7 +151,6 @@ def archive_session(
     archive_db_name: str,
     archived_at: str,
     index: ArchiveIndex,
-    vacuum: bool = True,
 ) -> None:
     """Move ``session_id``'s rows from the hot DB to ``archive_dir / archive_db_name``.
 
@@ -194,8 +199,7 @@ def archive_session(
                 )
         finally:
             conn.execute("DETACH DATABASE arch")
-        if vacuum:
-            conn.execute("VACUUM")
+        conn.execute("VACUUM")
     finally:
         conn.close()
 
@@ -254,16 +258,8 @@ def run_archival_pass(
             archive_db_name=f"{_month_bucket(updated_at)}.db",
             archived_at=now_iso,
             index=index,
-            vacuum=False,
         )
         archived += 1
-
-    if archived > 0:
-        vacuum_conn = sqlite3.connect(hot_db_path)
-        try:
-            vacuum_conn.execute("VACUUM")
-        finally:
-            vacuum_conn.close()
 
     conn = sqlite3.connect(hot_db_path)
     try:
@@ -398,3 +394,97 @@ def _ensure_cold_schema(cold_db_path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def delete_cold_session(
+    *,
+    hot_db_path: Path,
+    archive_dir: Path,
+    session_id: str,
+    index: ArchiveIndex,
+    vacuum: bool = True,
+) -> bool:
+    """Delete ``session_id``'s rows from its cold DB; drop the index entry.
+
+    The hot DB is opened only to ATTACH the cold DB (the cross-DB
+    DELETE is one transaction). Parameter-bound ATTACH, same pattern
+    as :func:`archive_session` / :func:`promote_session`.
+
+    Returns ``True`` if a row was actually deleted, ``False`` if the
+    session wasn't in the index or wasn't in the named cold DB. The
+    caller treats ``False`` as "index drifted, drop and report
+    not-found".
+
+    Idempotent: a second call with the same args no-ops because the
+    index entry is gone after the first.
+    """
+    entry = index.get(session_id)
+    if entry is None:
+        return False
+    cold_db_path = archive_dir / entry.archive_db
+    if not cold_db_path.is_file():
+        # Stale index — drop the entry so the next caller doesn't
+        # keep chasing a phantom file.
+        index.remove(session_id)
+        index.save()
+        return False
+
+    conn = sqlite3.connect(hot_db_path, isolation_level="IMMEDIATE")
+    try:
+        conn.execute("ATTACH DATABASE ? AS arch", (str(cold_db_path),))
+        try:
+            with conn:
+                has = conn.execute(
+                    "SELECT 1 FROM arch.sessions WHERE id=?", (session_id,)
+                ).fetchone() is not None
+                if not has:
+                    # Index points at a DB that no longer has the row.
+                    index.remove(session_id)
+                    index.save()
+                    return False
+                conn.execute(
+                    "DELETE FROM arch.blocks WHERE session_id=?", (session_id,)
+                )
+                conn.execute(
+                    "DELETE FROM arch.sessions WHERE id=?", (session_id,)
+                )
+        finally:
+            conn.execute("DETACH DATABASE arch")
+        if vacuum:
+            conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+    index.remove(session_id)
+    index.save()
+    return True
+
+
+def cold_session_children(
+    *,
+    archive_dir: Path,
+    session_id: str,
+) -> list[str]:
+    """Return ids of sessions with ``parent_id=session_id`` across cold DBs.
+
+    The leaf-only check in :meth:`cothis.session.Session.delete` spans
+    both DBs (#87): a cold parent may have children that stayed hot
+    (touched recently) or sank to other monthly cold DBs. Walks every
+    ``YYYY-MM.db`` file under ``archive_dir`` and queries each.
+    """
+    children: list[str] = []
+    if not archive_dir.is_dir():
+        return children
+    for cold_db_path in sorted(archive_dir.glob("*.db")):
+        if not _ARCHIVE_DB_RE.match(cold_db_path.name):
+            continue
+        conn = sqlite3.connect(cold_db_path)
+        try:
+            cur = conn.execute(
+                "SELECT id FROM sessions WHERE parent_id=?", (session_id,)
+            )
+            for row in cur.fetchall():
+                children.append(row[0])
+        finally:
+            conn.close()
+    return children

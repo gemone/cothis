@@ -84,6 +84,23 @@ def _set_updated_at(db_path: Path, sid: str, updated_at: str) -> None:
         conn.close()
 
 
+def _clear_archive_state(db_path: Path) -> None:
+    """Drop ``archive_state.last_run`` so the next pass isn't throttled.
+
+    ``Session.new`` / ``Session.load`` run the startup archival pass
+    (#86), which stamps ``last_run``. Tests that drive archival
+    directly need a clean slate or the 24h throttle trips.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM archive_state WHERE key='last_run'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------
 # Startup trigger (run_archival_pass at Session.new / Session.load)
 # ---------------------------------------------------------------------
@@ -106,14 +123,7 @@ def test_startup_archival_pass_runs_on_session_load(tmp_path: Path) -> None:
 
     # Clear the last_run set by _seed_session's Session.new call so we
     # can observe Session.load setting it.
-    import sqlite3
-
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("DELETE FROM archive_state WHERE key='last_run'")
-        conn.commit()
-    finally:
-        conn.close()
+    _clear_archive_state(db_path)
 
     s = Session.load(db_path, sid, flush_sync=True)
     try:
@@ -132,14 +142,7 @@ def test_startup_archival_pass_actually_archives_idle_session(
 
     # Clear ``last_run`` set by _seed_session's Session.new so the next
     # Session.new actually runs the pass instead of throttling out.
-    import sqlite3
-
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("DELETE FROM archive_state WHERE key='last_run'")
-        conn.commit()
-    finally:
-        conn.close()
+    _clear_archive_state(db_path)
 
     # New Session triggers the pass; the 90-day-idle session moves out.
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
