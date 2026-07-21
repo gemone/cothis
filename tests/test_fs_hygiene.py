@@ -73,50 +73,42 @@ def test_resolve_under_dot_and_dotdot_within_cwd_ok(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------
 
 
-def test_workdir_defaults_to_none() -> None:
-    """Outside any Agent turn, WORKDIR is unset (``None``)."""
-    token = WORKDIR.set(None)
-    try:
-        assert workdir_path() is None
-    finally:
-        WORKDIR.reset(token)
+def test_workdir_context_round_trip_and_defaults(tmp_path: Path) -> None:
+    """WORKDIR set/get/reset + ``workdir_context`` defaults in one test.
 
-
-def test_workdir_set_get_reset_round_trip(tmp_path: Path) -> None:
-    """``set`` stores, ``get`` reads, ``reset(token)`` restores the prior
-    value — the Agent's try/finally contract depends on this. Covers both
-    the single-level case and nested-set restoration."""
-    sentinel_a = Path("/tmp/a")
-    sentinel_b = Path("/tmp/b")
-
-    # Single level.
-    token = WORKDIR.set(tmp_path)
-    try:
-        assert workdir_path() == tmp_path
-    finally:
-        WORKDIR.reset(token)
-
-    # Nested: inner set/reset restores outer's value.
-    token = WORKDIR.set(sentinel_a)
-    try:
-        inner = WORKDIR.set(sentinel_b)
-        try:
-            assert workdir_path() == sentinel_b
-        finally:
-            WORKDIR.reset(inner)
-        assert workdir_path() == sentinel_a
-    finally:
-        WORKDIR.reset(token)
-
-
-def test_workdir_context_defaults_to_path_cwd_when_none() -> None:
-    """``workdir_context(None)`` falls back to ``Path.cwd()`` so Agent
-    construction without cwd still injects a value."""
+    Pins: default is ``None`` outside any turn; ``workdir_context(None)``
+    falls back to ``Path.cwd()``; ``workdir_context(tmp_path)`` yields
+    the supplied value; nested set/reset restores the prior value
+    (Agent's try/finally invariant).
+    """
     from cothis.tools.fs._hygiene import workdir_context
 
-    with workdir_context(None) as wd:
-        assert wd == Path.cwd()
-        assert workdir_path() == Path.cwd()
+    # Default outside any set.
+    token_outer = WORKDIR.set(None)
+    try:
+        assert workdir_path() is None
+
+        # workdir_context(None) → Path.cwd().
+        with workdir_context(None) as wd:
+            assert wd == Path.cwd()
+            assert workdir_path() == Path.cwd()
+
+        # workdir_context(supplied) → that value, restored on exit.
+        with workdir_context(tmp_path) as wd:
+            assert wd == tmp_path
+            assert workdir_path() == tmp_path
+            # Nested set inside the context: reset restores outer value.
+            sentinel = Path("/tmp/sentinel")
+            inner = WORKDIR.set(sentinel)
+            try:
+                assert workdir_path() == sentinel
+            finally:
+                WORKDIR.reset(inner)
+            assert workdir_path() == tmp_path
+        # After the context exits, restored to outer (None).
+        assert workdir_path() is None
+    finally:
+        WORKDIR.reset(token_outer)
 
 
 def test_workdir_context_resets_on_exception(tmp_path: Path) -> None:
