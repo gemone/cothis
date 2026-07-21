@@ -54,6 +54,17 @@ _COTHIS_HOME = Path(
 _USER_TOOLS_DIR = _COTHIS_HOME / "tools"
 
 
+# cothis: defense-in-depth hex-32 validation at the CLI boundary. The
+# storage layer (``Session._validate_session_id``) already enforces
+# this, so the check here never changes behaviour for well-formed
+# input; it gives a friendlier error than a deep FK constraint miss.
+def _validate_session_id_arg(sid: str) -> None:
+    if len(sid) != 32 or not all(c in "0123456789abcdef" for c in sid):
+        raise typer.BadParameter(
+            f"expected a 32-char lowercase hex session id; got {sid!r}"
+        )
+
+
 def _resolve_db_path() -> Path:
     """Resolve the SQLite db path for session persistence.
 
@@ -230,6 +241,7 @@ async def _chat_session(
     # exit 1.
     db_path = _resolve_db_path()
     if resume is not None:
+        _validate_session_id_arg(resume)
         # Resume path: load by id (errors out cleanly if missing). The
         # cwd filter is enforced inside Session.load via the storage
         # row's cwd; the picker in ``history <id>`` already did the
@@ -423,6 +435,7 @@ def history(
     # Inspect one: peek_messages enforces the cwd visibility filter when
     # cwd= is passed, so the picker refuses out-of-scope sessions the same
     # way Session.load(cwd=...) does.
+    _validate_session_id_arg(session_id)
     try:
         messages = Session.peek_messages(db_path, session_id, cwd=Path.cwd())
     except KeyError:
@@ -486,13 +499,14 @@ def history(
 def delete_cmd(
     session_id: str = typer.Argument(..., help="Session id to delete (must be a leaf)."),
 ) -> None:
-    """Delete a session from the local database.
+    """Delete a session from the local or cold database.
 
     Refuses if the session has any forked children — deleting a non-leaf
     node would orphan them. Delete the children first (use
-    ``cothis history`` to find them). Hot-DB only in this slice; cold-DB
-    delete lands in a follow-up.
+    ``cothis history`` to find them). Leaf-only check spans both hot
+    and cold DBs (#87).
     """
+    _validate_session_id_arg(session_id)
     try:
         Session.delete(_resolve_db_path(), session_id)
     except SessionHasChildrenError as exc:
@@ -543,6 +557,7 @@ def archive_cmd(
     elif action == "restore":
         if not target:
             raise typer.BadParameter("restore requires a session id")
+        _validate_session_id_arg(target)
         index = ArchiveIndex(archive_dir / "index.json")
         ok = promote_session(
             hot_db_path=db_path,
@@ -576,6 +591,7 @@ def archive_cmd(
             shutil.copyfileobj(src, dst)
         console.print(f"compressed to [cyan]{out_path.name}[/cyan]")
     else:
+        _validate_session_id_arg(action)
         now_iso = datetime.now(UTC).isoformat()
         index = ArchiveIndex(archive_dir / "index.json")
         archive_session(
