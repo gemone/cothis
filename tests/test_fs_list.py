@@ -113,7 +113,8 @@ def test_list_noise_dirs_always_excluded(tmp_path: Path) -> None:
 
 
 def test_list_truncates_past_cap(tmp_path: Path) -> None:
-    """Past 500 entries, returns ``{"entries": [...], "truncated": N}``."""
+    """Past 500 entries, returns ``{"entries": [...], "truncated": -1}``
+    (sentinel — ``-1`` means "more exist" without exhausting the walker)."""
     for i in range(510):
         (tmp_path / f"f{i:03d}.txt").write_text("x")
 
@@ -122,4 +123,4 @@ def test_list_truncates_past_cap(tmp_path: Path) -> None:
     assert isinstance(result, dict)
     assert "entries" in result
     assert "truncated" in result
-    assert result["truncated"] == 10
+    assert result["truncated"] == -1

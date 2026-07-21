@@ -34,7 +34,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Best-effort, not thread-safe — the Agent runs single-threaded per turn.
 _backend_logged = False
+
+_MAX_PATTERN_LEN = 256
+_VALID_TYPES = {"file", "dir"}
 
 
 def _log_backend_choice() -> None:
@@ -42,23 +46,6 @@ def _log_backend_choice() -> None:
     if not _backend_logged:
         logger.debug("fs tools: fs.list using backend stdlib")
         _backend_logged = True
-
-
-def _is_excluded(
-    rel_parts: tuple[str, ...],
-    gitignore: pathspec.PathSpec | None,
-    rel_str: str,
-    all: bool,
-) -> bool:
-    if any(part in _IGNORED_DIRS for part in rel_parts):
-        return True
-    if all:
-        return False
-    if any(part.startswith(".") for part in rel_parts):
-        return True
-    if gitignore is not None and gitignore.match_file(rel_str):
-        return True
-    return False
 
 
 @tool("fs.list")
@@ -83,6 +70,7 @@ def _list(
     Args:
         path: Directory to list. Relative to cwd.
         pattern: Glob pattern on entry names (e.g. ``"*.py"``).
+            Max 256 chars; NUL rejected.
         type: Filter to ``"file"`` or ``"dir"``.
         recursive: Include nested paths.
         all: Show dotfiles + gitignore-excluded.
@@ -92,6 +80,15 @@ def _list(
         or ``"Error: ..."`` if path doesn't exist.
     """
     _log_backend_choice()
+
+    if pattern is not None:
+        if "\x00" in pattern:
+            return "Error: pattern contains NUL byte"
+        if len(pattern) > _MAX_PATTERN_LEN:
+            return f"Error: pattern exceeds {_MAX_PATTERN_LEN} chars"
+    if type is not None and type not in _VALID_TYPES:
+        return f"Error: type must be 'file' or 'dir', got {type!r}"
+
     cwd = WORKDIR.get() or Path.cwd()
     try:
         root = _resolve_under(path, cwd)
@@ -105,25 +102,30 @@ def _list(
     gitignore = None if all else _load_gitignore(root)
 
     entries: list[dict[str, str]] = []
-    truncated = 0
+    truncated = False
 
     walker = root.rglob("*") if recursive else root.iterdir()
     for p in walker:
         if len(entries) >= _MAX_DIR_ENTRIES:
-            truncated = sum(1 for _ in walker) + 1
+            truncated = True
             break
-        rel = p.relative_to(root)
-        rel_str = rel.as_posix()
-        if _is_excluded(rel.parts, gitignore, rel_str, all):
-            continue
         p_type = "dir" if p.is_dir() else "file"
-        if pattern and not fnmatch.fnmatch(p.name, pattern):
-            continue
         if type and p_type != type:
             continue
+        if pattern and not fnmatch.fnmatch(p.name, pattern):
+            continue
+        rel = p.relative_to(root)
+        rel_str = rel.as_posix()
+        if any(part in _IGNORED_DIRS for part in rel.parts):
+            continue
+        if not all:
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            if gitignore is not None and gitignore.match_file(rel_str):
+                continue
         entries.append({"name": rel_str, "type": p_type})
 
-    if truncated > 0:
-        entries.sort(key=lambda e: e["name"])
-        return {"entries": entries[:_MAX_DIR_ENTRIES], "truncated": truncated}
-    return sorted(entries, key=lambda e: e["name"])
+    entries.sort(key=lambda e: e["name"])
+    if truncated:
+        return {"entries": entries, "truncated": -1}
+    return entries

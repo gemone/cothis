@@ -108,6 +108,9 @@ _IGNORED_DIRS = frozenset(
         "build",
         "target",
         ".DS_Store",
+        ".ssh",
+        ".aws",
+        ".gnupg",
     }
 )
 
