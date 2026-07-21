@@ -268,12 +268,8 @@ def _compile(
             # branch from a POSIX host picks ``cmd``, not the host's ``sh``.
             selected.shell = "cmd" if current == "windows" else "sh"
 
-    # cothis: cmd.exe visibility (#61). ``_shell_quote`` documents a
-    # partial-defence ceiling — non-whitespace cmd metacharacters
-    # (``&``, ``|``, ``%``) pass through unescaped. The ceiling was
-    # invisible to YAML tool authors (lived in a private docstring).
-    # Surface it at load time so authors see the gap and can switch
-    # to ``shell: pwsh`` or argv mode.
+    # cothis: cmd.exe visibility (#61). Surface the ``_shell_quote``
+    # ceiling at load time so tool authors see the gap.
     if selected.shell == "cmd":
         string_args = [
             a["name"] for a in final_args

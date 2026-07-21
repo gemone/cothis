@@ -1151,3 +1151,34 @@ def test_argv_mode_no_cmd_warning(
         if "cmd" in r.message and "metacharacter" in r.message
     ]
     assert cmd_warnings == []
+
+
+def test_default_shell_autoselected_cmd_on_windows_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Author omits ``shell:`` on Windows → auto-selected ``cmd`` still warns (#61).
+
+    The auto-select path at ``yaml.py:266`` is the most dangerous case
+    because the author never typed ``shell: cmd``. The warning is the
+    only signal they get that cmd.exe is in effect.
+    """
+    import logging
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
+    yaml_text = (
+        "name: git-branch\n"
+        "command: git branch {name}\n"
+        "args:\n"
+        "  - name: name\n"
+        "    type: str\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
+        load_yaml_tools(yaml_text)
+    cmd_warnings = [
+        r for r in caplog.records
+        if "cmd" in r.message and "metacharacter" in r.message
+    ]
+    assert len(cmd_warnings) == 1
+    assert "git-branch" in cmd_warnings[0].message
