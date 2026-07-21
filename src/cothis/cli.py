@@ -25,8 +25,8 @@ from cothis.session import (
     SessionHasChildrenError,
     SessionLockedError,
 )
-from cothis.session.storage import Storage, display_cwd, is_visible
 from cothis.session.archive import ArchiveIndex, archive_session, promote_session, run_archival_pass
+from cothis.session.storage import Storage, display_cwd, is_visible
 from cothis.tools import discover_tools
 
 app = typer.Typer()
