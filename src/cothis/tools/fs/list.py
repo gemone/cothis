@@ -131,13 +131,9 @@ def _list(
     walker = root.rglob("*") if recursive else root.iterdir()
     for p in walker:
         if len(entries) >= _MAX_DIR_ENTRIES:
-            # cothis: cap hit — drain the walker to count remaining
-            # qualifying entries without materialising their dicts
-            # (#116). ``p`` was yielded by the outer loop but not yet
-            # appended; count it first, then continue the drain. The
-            # common case (under cap) never enters this branch; the
-            # rare case (over cap) pays an extra pass that reuses the
-            # same filter.
+            # cothis: cap hit — drain walker to count remaining entries
+            # without materialising dicts (#116). ``p`` was yielded but
+            # not appended; count it first.
             if _qualifies(p)[0]:
                 truncated_count += 1
             for p_extra in walker:
