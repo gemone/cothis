@@ -29,28 +29,28 @@ def test_resolve_under_relative_path_inside_cwd_returns_resolved(tmp_path: Path)
 
 
 def test_resolve_under_absolute_path_rejected(tmp_path: Path) -> None:
-    """Absolute paths defeat the cwd boundary; rejected with PatchError."""
-    from cothis.tools.fs.patch import PatchError
+    """Absolute paths defeat the cwd boundary; rejected with PathBoundaryError."""
+    from cothis.tools.fs._hygiene import PathBoundaryError
 
-    with pytest.raises(PatchError, match="absolute"):
+    with pytest.raises(PathBoundaryError, match="absolute"):
         _resolve_under("/etc/passwd", tmp_path)
 
 
 def test_resolve_under_parent_traversal_rejected(tmp_path: Path) -> None:
     """``..`` that escapes cwd is rejected after resolve."""
-    from cothis.tools.fs.patch import PatchError
+    from cothis.tools.fs._hygiene import PathBoundaryError
 
-    with pytest.raises(PatchError, match="cwd|outside"):
+    with pytest.raises(PathBoundaryError, match="cwd|outside"):
         _resolve_under("../../etc/passwd", tmp_path)
 
 
 def test_resolve_under_traversal_into_sibling_subdir_rejected(tmp_path: Path) -> None:
     """``../sibling`` resolves outside cwd; rejected."""
-    from cothis.tools.fs.patch import PatchError
+    from cothis.tools.fs._hygiene import PathBoundaryError
 
     inner = tmp_path / "inner"
     inner.mkdir()
-    with pytest.raises(PatchError):
+    with pytest.raises(PathBoundaryError):
         _resolve_under("../sibling", inner)
 
 
@@ -75,7 +75,6 @@ def test_resolve_under_dot_and_dotdot_within_cwd_ok(tmp_path: Path) -> None:
 
 def test_workdir_defaults_to_none() -> None:
     """Outside any Agent turn, WORKDIR is unset (``None``)."""
-    # Reset to known state for test isolation.
     token = WORKDIR.set(None)
     try:
         assert workdir_path() is None
@@ -83,20 +82,21 @@ def test_workdir_defaults_to_none() -> None:
         WORKDIR.reset(token)
 
 
-def test_workdir_round_trips_a_path(tmp_path: Path) -> None:
-    """Set inside a turn; ``workdir_path()`` returns the same Path."""
+def test_workdir_set_get_reset_round_trip(tmp_path: Path) -> None:
+    """``set`` stores, ``get`` reads, ``reset(token)`` restores the prior
+    value — the Agent's try/finally contract depends on this. Covers both
+    the single-level case and nested-set restoration."""
+    sentinel_a = Path("/tmp/a")
+    sentinel_b = Path("/tmp/b")
+
+    # Single level.
     token = WORKDIR.set(tmp_path)
     try:
         assert workdir_path() == tmp_path
     finally:
         WORKDIR.reset(token)
 
-
-def test_workdir_reset_restores_prior_value(tmp_path: Path) -> None:
-    """``reset(token)`` restores the value active before ``set`` — the
-    Agent's try/finally contract depends on this."""
-    sentinel_a = Path("/tmp/a")
-    sentinel_b = Path("/tmp/b")
+    # Nested: inner set/reset restores outer's value.
     token = WORKDIR.set(sentinel_a)
     try:
         inner = WORKDIR.set(sentinel_b)
@@ -117,8 +117,6 @@ def test_workdir_context_defaults_to_path_cwd_when_none() -> None:
     with workdir_context(None) as wd:
         assert wd == Path.cwd()
         assert workdir_path() == Path.cwd()
-    # Outside the block, restored to prior value.
-    assert workdir_path() != Path.cwd() or workdir_path() == Path.cwd()
 
 
 def test_workdir_context_resets_on_exception(tmp_path: Path) -> None:

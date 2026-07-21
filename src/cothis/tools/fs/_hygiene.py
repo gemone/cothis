@@ -8,6 +8,11 @@ the same cwd; tools resolve user-supplied paths through
 Pure: no disk I/O. The temporary ``fs._cwd_probe`` tool proves the
 wiring end-to-end; slice #3 deletes it once the first real fs tool
 arrives.
+
+cothis: ADR deferred per PRD #46 — current shape is the floor, not
+the ceiling. ``contextvars`` over a schema param / ``injects=``
+mechanism is the load-bearing choice; documenting it formally waits
+until a second consumer validates the shape.
 """
 
 from __future__ import annotations
@@ -18,7 +23,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cothis.tools.core import tool
-from cothis.tools.fs.patch import PatchError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -26,6 +30,15 @@ if TYPE_CHECKING:
 WORKDIR: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "cothis.tools.fs.WORKDIR", default=None,
 )
+
+
+class PathBoundaryError(ValueError):
+    """Raised by :func:`_resolve_under` when a path escapes cwd.
+
+    Sibling modules (e.g. ``patch``) that surface errors to the LLM
+    catch this and translate to their own error type. Owned here so
+    the foundation module doesn't import upward.
+    """
 
 
 def workdir_path() -> Path | None:
@@ -39,6 +52,9 @@ def workdir_context(cwd: Path | None) -> Iterator[Path]:
 
     The Agent wraps each ``run`` / ``run_stream`` body in this so tool
     calls see a consistent cwd. ``None`` falls back to ``Path.cwd()``.
+
+    cothis: cwd is Agent-owned, never tool-schema-supplied — schema
+    input would defeat the boundary (model could fill any path).
     """
     actual = cwd if cwd is not None else Path.cwd()
     token = WORKDIR.set(actual)
@@ -51,37 +67,33 @@ def workdir_context(cwd: Path | None) -> Iterator[Path]:
 def _resolve_under(path: str, cwd: Path) -> Path:
     """Resolve ``path`` against ``cwd``; reject absolute + cwd-escape.
 
-    The Agent owns the cwd (passed in at construction, never schema
-    supplied); tools resolve user input through here so the model can't
-    escape to ``/etc`` or a sibling project. Symlinks are followed
-    (``Path.resolve()``), matching hermes-agent's
-    ``path_security.validate_within_dir``.
+    Coalesces two layers: syntactic (absolute path → reject up front)
+    and post-resolve (``relative_to`` after ``resolve()`` rejects
+    symlink + ``..`` escapes). Path components are the only authority.
     """
     if path.startswith("/"):
-        raise PatchError(
-            "absolute paths not allowed; use paths relative to cwd",
-            file=path,
+        raise PathBoundaryError(
+            f"absolute paths not allowed; use paths relative to cwd: {path!r}"
         )
     cwd_resolved = cwd.resolve()
     resolved = (cwd / path).resolve()
     try:
         resolved.relative_to(cwd_resolved)
     except ValueError as exc:
-        raise PatchError(
-            f"path resolves outside cwd: {path} → {resolved}",
-            file=path,
+        raise PathBoundaryError(
+            f"path resolves outside cwd: {path!r} → {resolved}"
         ) from exc
     return resolved
 
 
+# cothis: slice #3 deletes _cwd_probe — first real fs tool replaces it.
+# Grep this marker when wiring fs.read/fs.write to WORKDIR.
 @tool
 def _cwd_probe() -> str:
     """Return the cwd active for the current turn.
 
-    Temporary: exists only to prove WORKDIR injection end-to-end. Slice
-    #3 deletes this once the first real fs tool reads WORKDIR itself.
+    Temporary: exists only to prove WORKDIR injection end-to-end.
     Returns ``"<unset>"`` when called outside an Agent turn.
     """
     wd = workdir_path()
     return str(wd) if wd is not None else "<unset>"
-
