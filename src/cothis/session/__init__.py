@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import queue
+import sqlite3
 import threading
 import uuid
 from datetime import UTC, datetime
@@ -51,6 +52,7 @@ from typing import Any
 from filelock import FileLock, Timeout
 
 from cothis.session import graph as _graph
+from cothis.session.archive import ArchiveIndex, promote_session, run_archival_pass
 from cothis.session.graph import SessionNotFoundError
 from cothis.session.storage import BlockRow, SessionRow, Storage, is_visible
 
@@ -344,6 +346,47 @@ class SessionHasChildrenError(RuntimeError):
         self.children = children
 
 
+def _read_cold_session(
+    cold_db_path: Path,
+    session_id: str,
+) -> tuple[SessionRow, list[BlockRow]] | None:
+    """Read one archived session in place via ATTACH (#86).
+
+    Opens a *separate* sqlite3 connection to the cold DB and SELECTs the
+    ``sessions`` + ``blocks`` rows. No write — no automatic copy back to
+    hot. The caller (``Session.load``) rebuilds ``messages`` from the
+    rows and stamps the session with ``_cold=True`` so the first new
+    write triggers ``promote_session`` (cold→hot, atomic).
+
+    Returns ``None`` when the index points at the cold DB but the row
+    isn't there (index drifted out of sync — treat as not-found).
+    """
+    if not cold_db_path.is_file():
+        return None
+    conn = sqlite3.connect(cold_db_path, isolation_level="DEFERRED")
+    try:
+        cur = conn.execute(
+            "SELECT id, parent_id, parent_seq, cwd, cli_version, model, "
+            "title, created_at, updated_at, schema_version "
+            "FROM sessions WHERE id=?",
+            (session_id,),
+        )
+        sr_row = cur.fetchone()
+        if sr_row is None:
+            return None
+        cur = conn.execute(
+            "SELECT session_id, seq, msg_idx, block_idx, role, type, ts, "
+            "content, signature, tool_id, tool_name, tool_input, "
+            "tool_use_id, tool_output, image_source, summary, summarized_seq "
+            "FROM blocks WHERE session_id=? ORDER BY msg_idx, block_idx",
+            (session_id,),
+        )
+        blocks = [BlockRow(*row) for row in cur.fetchall()]
+        return SessionRow(*sr_row), blocks
+    finally:
+        conn.close()
+
+
 class Session:
     """In-memory conversation state backed by SQLite.
 
@@ -377,6 +420,7 @@ class Session:
         next_seq: int = 0,
         next_msg_idx: int = 0,
         flush_sync: bool = False,
+        cold: bool = False,
     ) -> None:
         self._db_path = db_path
         self._session_id = session_id
@@ -400,6 +444,11 @@ class Session:
 
         self._closed = False
         self._flush_sync = flush_sync
+        # cothis: cold-session flag (#86). ``True`` when ``load`` rebuilt
+        # ``messages`` from the cold DB (hot miss, archive-index hit). The
+        # first ``_drain_one`` call promotes the rows cold→hot atomically
+        # and clears the flag; subsequent writes are hot-only.
+        self._cold = cold
 
         # Queue + consumer thread. Skipped entirely in flush_sync mode —
         # _drain_one is called inline from append_message instead.
@@ -445,6 +494,12 @@ class Session:
         except BaseException:
             lock.release()
             raise
+        run_archival_pass(
+            hot_db_path=db_path,
+            archive_dir=db_path.parent / "archive",
+            threshold_days=90,
+            now_iso=datetime.now(UTC).isoformat(),
+        )
         session = cls(
             db_path=db_path,
             session_id=session_id,
@@ -498,24 +553,55 @@ class Session:
         except BaseException:
             lock.release()
             raise
+        run_archival_pass(
+            hot_db_path=db_path,
+            archive_dir=db_path.parent / "archive",
+            threshold_days=90,
+            now_iso=datetime.now(UTC).isoformat(),
+        )
         sr = storage.load_session(session_id)
+        # cothis: cold-read fallback (#86). Hot miss → check the archive
+        # index. If the session was archived, read in place via ATTACH
+        # (no copy back to hot); the first new write promotes the rows
+        # cold→hot atomically (see _drain_one). Orphan-truncate and
+        # ancestor-chain assembly are hot-only — both write to / read
+        # from the hot DB, which doesn't have this session's rows yet.
+        cold_loaded = False
         if sr is None:
-            storage.close()
-            lock.release()
-            raise KeyError(f"session {session_id!r} not found")
+            cold_index = ArchiveIndex(db_path.parent / "archive" / "index.json")
+            cold_entry = cold_index.get(session_id)
+            if cold_entry is None:
+                storage.close()
+                lock.release()
+                raise KeyError(f"session {session_id!r} not found")
+            cold_db_path = db_path.parent / "archive" / cold_entry.archive_db
+            cold_read = _read_cold_session(cold_db_path, session_id)
+            if cold_read is None:
+                # Index drifted: stale entry points at a missing row.
+                # Drop it and treat as not-found so the next archival
+                # pass doesn't keep chasing a phantom.
+                cold_index.remove(session_id)
+                cold_index.save()
+                storage.close()
+                lock.release()
+                raise KeyError(f"session {session_id!r} not found")
+            sr, rows = cold_read
+            cold_loaded = True
+            messages, _cut = _rebuild_messages(rows)
+        else:
+            rows = storage.load_blocks(session_id)
+            messages, cut_msg_idx = _rebuild_messages(rows)
+            if cut_msg_idx is not None:
+                storage.delete_blocks_from_msg_idx(session_id, cut_msg_idx)
+                rows = [r for r in rows if r.msg_idx < cut_msg_idx]
+            if sr.parent_id is not None:
+                graph = _graph.build(storage.list_sessions())
+                ancestor_segments = cls._assemble_ancestors(graph, storage, session_id)
+                messages = ancestor_segments + messages
         if cwd is not None and not is_visible(Path(sr.cwd), cwd):
             storage.close()
             lock.release()
             raise KeyError(f"session {session_id!r} not found")
-        rows = storage.load_blocks(session_id)
-        messages, cut_msg_idx = _rebuild_messages(rows)
-        if cut_msg_idx is not None:
-            storage.delete_blocks_from_msg_idx(session_id, cut_msg_idx)
-            rows = [r for r in rows if r.msg_idx < cut_msg_idx]
-        if sr.parent_id is not None:
-            graph = _graph.build(storage.list_sessions())
-            ancestor_segments = cls._assemble_ancestors(graph, storage, session_id)
-            messages = ancestor_segments + messages
         next_seq = (max(r.seq for r in rows) + 1) if rows else 0
         next_msg_idx = (max(r.msg_idx for r in rows) + 1) if rows else 0
         session = cls(
@@ -531,6 +617,7 @@ class Session:
             next_seq=next_seq,
             next_msg_idx=next_msg_idx,
             flush_sync=flush_sync,
+            cold=cold_loaded,
         )
         session._lock = lock
         return session
@@ -932,6 +1019,25 @@ class Session:
         if not rows:
             return
         updated_at = _now_iso()
+        # cothis: cold-session promote-on-first-write (#86). The session
+        # was loaded from the cold DB; hot has no rows for it. Promote
+        # moves the session row + archived blocks cold→hot atomically
+        # with ``updated_at=now`` so the 90-day threshold doesn't
+        # immediately re-archive it. After promote, the lazy-row flag
+        # is already effectively True (hot has the row), and the
+        # index entry is dropped — subsequent writes are hot-only.
+        if self._cold:
+            cold_index = ArchiveIndex(
+                self._db_path.parent / "archive" / "index.json"
+            )
+            promote_session(
+                hot_db_path=self._db_path,
+                archive_dir=self._db_path.parent / "archive",
+                session_id=self._session_id,
+                index=cold_index,
+                now_iso=updated_at,
+            )
+            self._cold = False
         session_row: SessionRow | None = None
         if not self._session_row_written:
             self._maybe_write_gitignore()

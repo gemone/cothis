@@ -72,6 +72,23 @@ def _set_updated_at(db_path: Path, sid: str, updated_at: str) -> None:
         conn.close()
 
 
+def _clear_archive_state(db_path: Path) -> None:
+    """Drop ``archive_state.last_run`` so the next pass isn't throttled.
+
+    ``Session.new`` runs the startup archival pass (#86), which sets
+    ``last_run``. Tests that drive ``run_archival_pass`` directly need
+    a clean slate or the 24h throttle trips.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM archive_state WHERE key='last_run'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------
 # ArchiveIndex
 # ---------------------------------------------------------------------
@@ -211,6 +228,10 @@ def test_run_archival_pass_moves_idle_sessions(tmp_path: Path) -> None:
     # Force the "old" session's updated_at back 100 days.
     _set_updated_at(db_path, old_sid, "2026-04-13T00:00:00+00:00")
     archive_dir = tmp_path / "archive"
+    # cothis: ``_seed_session``'s Session.new call runs the startup
+    # archival pass (#86) and stamps ``archive_state.last_run``. Clear
+    # it so the direct ``run_archival_pass`` call below isn't throttled.
+    _clear_archive_state(db_path)
 
     run_archival_pass(
         hot_db_path=db_path,
@@ -236,6 +257,7 @@ def test_run_archival_pass_throttles_via_archive_state(tmp_path: Path) -> None:
     db_path = tmp_path / "session.db"
     _seed_session(db_path, tmp_path, texts=["old"])
     _set_updated_at(db_path, _first_session_id(db_path), "2026-04-13T00:00:00+00:00")
+    _clear_archive_state(db_path)
     archive_dir = tmp_path / "archive"
 
     # First run: archives.
