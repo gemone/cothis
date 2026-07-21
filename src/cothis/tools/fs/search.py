@@ -13,8 +13,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +31,12 @@ _MAX_PATTERN_LEN = 256
 _MAX_FILE_BYTES = 1_048_576  # 1 MiB — larger files are skipped entirely.
 _MAX_LINE_LEN = 4096  # skip long lines (ReDoS / log noise).
 _MAX_FILES_SCANNED = 5000  # total work cap — bounds traversal even with 0 matches.
-_REGEX_TIMEOUT = 0.5  # seconds per regex.search(line); ReDoS hard stop.
+# cothis: wall-clock cap on the whole call (#111). Per-line
+# ``ThreadPoolExecutor`` timeouts didn't actually bound wall time —
+# Python can't kill a hung worker thread, and ``__exit__`` waits for
+# it. The deadline is checked at the outer (per-file) and inner
+# (per-line) loop boundaries; on hit, the call returns partial results.
+_DEADLINE_SECONDS = 5.0
 
 # Denylist of filename patterns that carry secrets. Checked independently
 # of the dotfile rule — non-dot secrets like ``credentials.json``,
@@ -116,53 +120,62 @@ def _search(
     gitignore = _load_gitignore(root)
     results: list[dict[str, str]] = []
     files_scanned = 0
+    deadline = time.perf_counter() + _DEADLINE_SECONDS
+    deadline_hit = False
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        for p in root.rglob("*"):
-            if len(results) >= max_results or files_scanned >= _MAX_FILES_SCANNED:
-                break
-            if not p.is_file():
+    for p in root.rglob("*"):
+        if len(results) >= max_results or files_scanned >= _MAX_FILES_SCANNED:
+            break
+        if time.perf_counter() > deadline:
+            deadline_hit = True
+            break
+        if not p.is_file():
+            continue
+        if _is_sensitive(p.name):
+            continue
+        if glob and not fnmatch.fnmatchcase(p.name, glob):
+            continue
+        rel = p.relative_to(root)
+        rel_str = rel.as_posix()
+        if any(part in _IGNORED_DIRS for part in rel.parts):
+            continue
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if gitignore is not None and gitignore.match_file(rel_str):
+            continue
+        try:
+            if p.stat().st_size > _MAX_FILE_BYTES:
                 continue
-            if _is_sensitive(p.name):
-                continue
-            if glob and not fnmatch.fnmatchcase(p.name, glob):
-                continue
-            rel = p.relative_to(root)
-            rel_str = rel.as_posix()
-            if any(part in _IGNORED_DIRS for part in rel.parts):
-                continue
-            if any(part.startswith(".") for part in rel.parts):
-                continue
-            if gitignore is not None and gitignore.match_file(rel_str):
-                continue
-            try:
-                if p.stat().st_size > _MAX_FILE_BYTES:
-                    continue
-            except OSError:
-                continue
-            files_scanned += 1
-            try:
-                with p.open("r", encoding="utf-8", errors="ignore") as fh:
-                    for i, line in enumerate(fh, 1):
-                        if len(results) >= max_results:
-                            break
-                        if len(line) > _MAX_LINE_LEN:
-                            continue
-                        try:
-                            future = executor.submit(regex.search, line)
-                            match = future.result(timeout=_REGEX_TIMEOUT)
-                        except FuturesTimeout:
-                            logger.warning(
-                                "fs.search: regex timed out on %s:%d after %.1fs; "
-                                "skipping remaining lines in file (ReDoS).",
-                                rel_str, i, _REGEX_TIMEOUT,
-                            )
-                            break
-                        if match:
-                            results.append(
-                                {"file": rel_str, "line": str(i), "text": line.rstrip("\n")}
-                            )
-            except OSError:
-                continue
+        except OSError:
+            continue
+        files_scanned += 1
+        try:
+            with p.open("r", encoding="utf-8", errors="ignore") as fh:
+                for i, line in enumerate(fh, 1):
+                    if len(results) >= max_results:
+                        break
+                    if time.perf_counter() > deadline:
+                        deadline_hit = True
+                        break
+                    if len(line) > _MAX_LINE_LEN:
+                        continue
+                    # cothis: direct ``regex.search`` — the executor
+                    # round-trip added ~12µs/line of thread overhead
+                    # with no real ReDoS protection (Python can't
+                    # kill the worker). The wall-clock deadline above
+                    # is the actual backstop (#111).
+                    if regex.search(line):
+                        results.append(
+                            {"file": rel_str, "line": str(i), "text": line.rstrip("\n")}
+                        )
+        except OSError:
+            continue
+
+    if deadline_hit:
+        logger.warning(
+            "fs.search: wall-clock cap %.1fs hit; returning %d result(s) "
+            "found before the deadline (ReDoS or huge tree).",
+            _DEADLINE_SECONDS, len(results),
+        )
 
     return results
