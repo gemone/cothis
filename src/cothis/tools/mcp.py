@@ -304,7 +304,19 @@ class MCPServer(_HookableTool):
         # which tools this server contributed (prefix is the server's
         # *self-reported* name, which we can't predict from cothis's YAML
         # ``name:`` field — they may differ).
-        before = set(group.tools)
+        # cothis: shape guard (#63). ``group.tools`` is a private SDK
+        # attribute; an SDK upgrade that reshapes it (list, renamed,
+        # missing) would silently break tool discovery. Fail loud at
+        # first connect with a diagnostic naming the divergence.
+        tools_attr = getattr(group, "tools", None)
+        if not isinstance(tools_attr, dict):
+            raise RuntimeError(
+                f"MCP SDK shape changed: ClientSessionGroup.tools is "
+                f"{type(tools_attr).__name__}, expected dict "
+                f"(prefixed-name → Tool). connect_into's snapshot "
+                f"diff needs updating; see ADR-0005 and issue #63."
+            )
+        before = set(tools_attr)
         try:
             session = await group.connect_to_server(self.params)
         except Exception as exc:  # noqa: BLE001 — any startup failure is non-fatal

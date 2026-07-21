@@ -529,6 +529,37 @@ async def test_connect_into_discovers_tools_with_schema() -> None:
 
 
 @pytest.mark.asyncio
+async def test_connect_into_fails_loud_when_sdk_tools_shape_changes() -> None:
+    """A future SDK that reshapes ``group.tools`` raises a clear RuntimeError (#63).
+
+    ``connect_into`` reads the SDK's private ``group.tools`` dict to
+    discover prefixed tool names. If the SDK switches to a list or
+    renames the attribute, the snapshot diff would silently misbehave
+    (wrong names, lost tools). The shape assertion surfaces it loudly
+    at first connect, naming the expected + actual shape.
+    """
+    from types import SimpleNamespace
+
+    server = MCPServer(name="mcp:test-server", params=None)
+    # Synthetic group whose ``tools`` is a list, not a dict — simulates
+    # an SDK upgrade that drops the prefixed-name keying.
+    fake_group = SimpleNamespace(tools=[])  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="ClientSessionGroup.tools"):
+        await server.connect_into(fake_group)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_connect_into_fails_loud_when_sdk_tools_attr_missing() -> None:
+    """Missing ``tools`` attribute also raises the shape guard (#63)."""
+    from types import SimpleNamespace
+
+    server = MCPServer(name="mcp:test-server", params=None)
+    fake_group = SimpleNamespace()  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="ClientSessionGroup.tools"):
+        await server.connect_into(fake_group)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
 async def test_mcp_tool_call_routes_by_prefixed_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
