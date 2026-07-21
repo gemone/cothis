@@ -373,10 +373,9 @@ def _apply_hunk(content: str, path: str, hunk: Hunk) -> str:
     # difflib's SequenceMatcher fuzzy matching if a real need surfaces.
     norm_lines = [ln.rstrip() for ln in lines]
 
-    # cothis: detect dominant line ending + tail-newline state so
-    # replacement lines match the file's convention (#96).
-    sample = content
-    nl = "\r\n" if "\r\n" in sample else "\n"
+    # cothis: pick line ending by presence of CRLF + tail-newline state
+    # so replacement lines match the file's convention (#96).
+    nl = "\r\n" if "\r\n" in content else "\n"
     tail_unterminated = bool(lines) and not lines[-1].endswith(("\r\n", "\n"))
 
     if hunk.context:
