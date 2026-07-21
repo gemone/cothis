@@ -470,19 +470,46 @@ def cold_session_children(
 
     The leaf-only check in :meth:`cothis.session.Session.delete` spans
     both DBs (#87): a cold parent may have children that stayed hot
-    (touched recently) or sank to other monthly cold DBs. Walks every
-    ``YYYY-MM.db`` file under ``archive_dir`` and queries each.
+    (touched recently) or sank to other monthly cold DBs.
+
+    Opens one connection per batch and ATTACHes the rest under numbered
+    aliases. ``batch_size`` is capped to stay under
+    ``SQLITE_LIMIT_ATTACHED`` (default 10, less the connect-target DB
+    itself). Connection count is bounded regardless of archive count.
     """
     children: list[str] = []
     if not archive_dir.is_dir():
         return children
-    for cold_db_path in sorted(archive_dir.glob("*.db")):
-        if not _ARCHIVE_DB_RE.match(cold_db_path.name):
-            continue
-        conn = sqlite3.connect(cold_db_path)
+    cold_paths = sorted(
+        p for p in archive_dir.glob("*.db") if _ARCHIVE_DB_RE.match(p.name)
+    )
+    if not cold_paths:
+        return children
+
+    # cothis: batch size respects SQLite's ``SQLITE_LIMIT_ATTACHED``.
+    # The connect-target DB itself doesn't count as an ATTACH, so a
+    # batch of 9 uses 1 main + 9 ATTACHed = 10 open DBs (the limit).
+    _BATCH = 9
+    for batch_start in range(0, len(cold_paths), _BATCH):
+        batch = cold_paths[batch_start:batch_start + _BATCH]
+        conn = sqlite3.connect(batch[0])
         try:
+            aliases: list[str] = []
+            for i, p in enumerate(batch[1:], start=1):
+                alias = f"cold_{batch_start + i}"
+                # Parameter-bound ATTACH — alias is integer-derived
+                # (no filename content), no SQL-injection surface.
+                conn.execute(f"ATTACH DATABASE ? AS {alias}", (str(p),))
+                aliases.append(alias)
+            selects = (
+                ["SELECT id FROM main.sessions WHERE parent_id=?"]
+                + [f"SELECT id FROM {a}.sessions WHERE parent_id=?"
+                   for a in aliases]
+            )
+            placeholders = ", ".join(["?"] * len(selects))
             cur = conn.execute(
-                "SELECT id FROM sessions WHERE parent_id=?", (session_id,)
+                " UNION ALL ".join(selects),
+                tuple([session_id] * len(selects)),
             )
             for row in cur.fetchall():
                 children.append(row[0])

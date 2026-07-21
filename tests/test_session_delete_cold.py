@@ -275,3 +275,58 @@ def test_cold_session_children_helper_walks_all_dbs(tmp_path: Path) -> None:
         archive_dir=archive_dir, session_id=parent_sid,
     )
     assert set(found) == {june_child, july_child}
+
+
+def test_cold_session_children_opens_bounded_connections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection count stays bounded regardless of archive count (#127).
+
+    ceil(N / batch_size) connections, where ``batch_size`` respects
+    ``SQLITE_LIMIT_ATTACHED``. The load-bearing invariant is
+    "connections < archives" — the per-batch constant doesn't matter
+    for this test, only that opening 24 archives doesn't open 24
+    connections.
+    """
+    db_path = tmp_path / "session.db"
+    parent_sid = _seed_session(db_path, tmp_path, texts=["parent"])
+    archive_dir = db_path.parent / "archive"
+    archive_dir.mkdir()
+    # 24 monthly DBs (2 years), each empty (no children of parent).
+    # Pre-fix: 24 connections. Post-fix: bounded by batch size.
+    import sqlite3
+
+    from cothis.session import archive as archive_module
+    for year in range(2024, 2026):
+        for month in range(1, 13):
+            cold = archive_dir / f"{year}-{month:02d}.db"
+            conn = sqlite3.connect(cold)
+            try:
+                # Cold schema minimal — no rows needed for the perf path.
+                conn.executescript(
+                    "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_id TEXT);"
+                )
+            finally:
+                conn.close()
+
+    connect_calls = 0
+    real_connect = sqlite3.connect
+
+    def counting_connect(path, *args, **kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(archive_module.sqlite3, "connect", counting_connect)
+
+    found = cold_session_children(
+        archive_dir=archive_dir, session_id=parent_sid,
+    )
+    assert found == []
+    # 24 archives pre-fix → 24 connections. Post-fix (batch=9) →
+    # ceil(24/9) = 3. Allow generous headroom for any batch size
+    # choice; the load-bearing invariant is "connections < archives".
+    assert connect_calls < 24, (
+        f"cold_session_children opened {connect_calls} connections for "
+        f"24 archives; expected bounded < 24 (#127 regression)"
+    )
