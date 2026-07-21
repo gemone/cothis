@@ -472,11 +472,10 @@ def cold_session_children(
     both DBs (#87): a cold parent may have children that stayed hot
     (touched recently) or sank to other monthly cold DBs.
 
-    Opens one connection per batch (default 9 cold DBs) and ATTACHes
-    the rest under numbered aliases. ``SQLITE_LIMIT_ATTACHED`` defaults
-    to 10; the batch size keeps headroom for the connect-target DB
-    itself. Pre-#127 the helper opened one connection per cold DB —
-    36 monthly archives meant 36 connections per ``cothis delete``.
+    Opens one connection per batch and ATTACHes the rest under numbered
+    aliases. ``batch_size`` is capped to stay under
+    ``SQLITE_LIMIT_ATTACHED`` (default 10, less the connect-target DB
+    itself). Connection count is bounded regardless of archive count.
     """
     children: list[str] = []
     if not archive_dir.is_dir():

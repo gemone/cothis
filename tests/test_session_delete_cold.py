@@ -282,10 +282,11 @@ def test_cold_session_children_opens_bounded_connections(
 ) -> None:
     """Connection count stays bounded regardless of archive count (#127).
 
-    Pre-#127 the helper opened one connection per cold DB — N monthly
-    archives meant N sqlite3.connect calls per ``cothis delete``. The
-    batched-ATTACH refactor bounds it to ceil(N / batch) connections,
-    where batch respects SQLite's ``SQLITE_LIMIT_ATTACHED``.
+    ceil(N / batch_size) connections, where ``batch_size`` respects
+    ``SQLITE_LIMIT_ATTACHED``. The load-bearing invariant is
+    "connections < archives" — the per-batch constant doesn't matter
+    for this test, only that opening 24 archives doesn't open 24
+    connections.
     """
     db_path = tmp_path / "session.db"
     parent_sid = _seed_session(db_path, tmp_path, texts=["parent"])
