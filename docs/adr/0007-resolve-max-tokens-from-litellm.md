@@ -52,8 +52,16 @@ process even across multiple `Agent` constructions (relevant for tests).
 4. Fallback `8192`.
 
 Field precedence on a matched entry: `max_output_tokens` first (modern
-field); fall back to legacy `max_tokens` (litellm sets it to the output
-cap for ~140 older entries that predate `max_output_tokens`).
+field); fall back to legacy `max_tokens` **only when `max_input_tokens`
+is also absent**. Per litellm's own `sample_spec.max_tokens` contract,
+when `max_input_tokens` is set the legacy `max_tokens` duplicates it
+(the *input* cap) — returning that as the output cap would inflate the
+`max_tokens` argument and 400 the first `amessages` call. The
+conditional rule lands in #64: pre-#64 the fallback was unconditional
+and 9 entries (`perplexity/sonar*`, `openrouter/auto`, …) were
+misclassified. Today 11 entries hit the legacy path; 9 are skipped
+(input cap), 2 genuinely lack `max_input_tokens` and legitimately use
+`max_tokens` as the output cap.
 
 ### 3. Known ceiling — provider-name divergence
 

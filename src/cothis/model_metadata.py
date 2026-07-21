@@ -50,13 +50,22 @@ def _entry_max_tokens(entry: dict[str, Any]) -> int | None:
     """Pick the output-token cap from one litellm entry.
 
     Field precedence: ``max_output_tokens`` first (the modern field); fall
-    back to the legacy ``max_tokens`` field, which litellm sets to the output
-    cap for ~140 older entries that predate ``max_output_tokens``. Both absent
-    → ``None`` (caller falls back).
+    back to the legacy ``max_tokens`` field ONLY when ``max_input_tokens``
+    is also absent. Per litellm's own ``sample_spec.max_tokens`` contract,
+    when ``max_input_tokens`` is set the legacy ``max_tokens`` duplicates
+    it (the *input* cap) and must not be returned as the output cap (#64).
+    Both absent → ``None`` (caller falls back).
     """
     out = entry.get("max_output_tokens")
     if isinstance(out, (int, float)) and out > 0:
         return int(out)
+    # cothis: skip the legacy fallback when ``max_input_tokens`` is set —
+    # in that case ``max_tokens`` duplicates the input cap, not the
+    # output cap. Without this guard, ``perplexity/sonar`` and 8 other
+    # entries returned 128000 (input) as the output cap and 400'd the
+    # first ``amessages`` call.
+    if "max_input_tokens" in entry:
+        return None
     legacy = entry.get("max_tokens")
     if isinstance(legacy, (int, float)) and legacy > 0:
         return int(legacy)
