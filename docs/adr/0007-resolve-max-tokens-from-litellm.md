@@ -52,8 +52,22 @@ process even across multiple `Agent` constructions (relevant for tests).
 4. Fallback `8192`.
 
 Field precedence on a matched entry: `max_output_tokens` first (modern
-field); fall back to legacy `max_tokens` (litellm sets it to the output
-cap for ~140 older entries that predate `max_output_tokens`).
+field); fall back to legacy `max_tokens` **only when `max_input_tokens`
+is also absent**. Per litellm's own `sample_spec.max_tokens` contract,
+when `max_input_tokens` is set the legacy `max_tokens` duplicates it
+(the *input* cap) — returning that as the output cap would inflate the
+`max_tokens` argument and 400 the first `amessages` call. The
+conditional rule lands in #64. As of the bundled JSON audited at #64's
+fix, **111 chat-reachable entries** (non-embedding, token-costed) hit
+the legacy path; **23 are misclassified** (have `max_input_tokens`, so
+the legacy field is the input cap and is correctly skipped) including
+`perplexity/sonar*`, `openrouter/auto`/`free`/`bodybuilder`,
+`azure/mistral-large-*`, `azure/gpt-3.5*-instruct*`, and many
+`together_ai/Qwen*` / `together_ai/openai/gpt-oss-20b`. The remaining
+**88 genuinely lack `max_input_tokens`** and legitimately use
+`max_tokens` as the output cap (e.g. `replicate/anthropic/*`,
+`openrouter/gryphe/mythomax-l2-13b`, many `together-ai-*` bucket
+proxies).
 
 ### 3. Known ceiling — provider-name divergence
 

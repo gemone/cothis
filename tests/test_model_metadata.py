@@ -88,6 +88,44 @@ def test_resolve_legacy_max_tokens_field_used_when_max_output_absent(
     assert model_metadata.resolve_max_tokens("fake-legacy-model", "openai") == 9999
 
 
+def test_legacy_max_tokens_skipped_when_max_input_tokens_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy ``max_tokens`` is the input cap when ``max_input_tokens`` is set.
+
+    Per litellm's own schema: ``max_tokens`` duplicates ``max_input_tokens``
+    in that case, not ``max_output_tokens``. The resolver must NOT return
+    it as the output cap — falling through to the conservative fallback
+    instead.
+    """
+    from cothis import model_metadata
+
+    fake = {
+        "fake-input-cap-model": {
+            "max_tokens": 128000,        # legacy — duplicates input cap
+            "max_input_tokens": 128000,  # signal: legacy is the input cap
+            # no max_output_tokens
+        }
+    }
+    monkeypatch.setattr(model_metadata, "_metadata", lambda: fake)
+    # Returns fallback, not 128000 — the legacy value is the input cap.
+    assert (
+        model_metadata.resolve_max_tokens("fake-input-cap-model", "openai")
+        == _FALLBACK_MAX_TOKENS
+    )
+
+
+def test_real_sonar_entry_does_not_inflate_output_cap() -> None:
+    """Bundled perplexity/sonar resolves to ``_FALLBACK_MAX_TOKENS``.
+
+    The legacy ``max_tokens`` field carries the input cap, not the
+    output cap; resolving it would 400 the first ``amessages`` call.
+    """
+    assert (
+        resolve_max_tokens("sonar", "perplexity") == _FALLBACK_MAX_TOKENS
+    )
+
+
 # --- Agent wiring -----------------------------------------------------------
 
 
