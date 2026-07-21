@@ -68,7 +68,6 @@ async def dispatch(line: str, *, ctx: SlashContext | None = None) -> str | None:
         return None
     ctx = ctx if ctx is not None else SlashContext()
     name, _, args = line[1:].partition(" ")
-    name = name.strip()
     if not name:
         return None
     if name == "help":
