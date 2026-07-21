@@ -396,47 +396,49 @@ def test_shadowed_tool_load_hooks_never_fire(tmp_path: Any, monkeypatch: Any) ->
 
 
 def test_cothis_home_env_var_overrides_default(monkeypatch: Any) -> None:
-    """``COTHIS_HOME`` overrides the default ``~/.cothis`` for user tools."""
-    import importlib
+    """``COTHIS_HOME`` overrides the default ``~/.cothis`` for user tools.
+
+    No ``importlib.reload`` needed: ``_cothis_home()`` / ``_user_tools_dir()``
+    read the env lazily per call (#66), so monkeypatch's env restore is
+    sufficient.
+    """
     from pathlib import Path
 
-    import cothis.cli
+    from cothis.cli import _cothis_home, _user_tools_dir
 
-    orig = os.environ.get("COTHIS_HOME")
     monkeypatch.setenv("COTHIS_HOME", "/custom/cothis-home")
-    try:
-        importlib.reload(cothis.cli)
-        assert cothis.cli._COTHIS_HOME == Path("/custom/cothis-home")
-        assert cothis.cli._USER_TOOLS_DIR == Path("/custom/cothis-home/tools")
-    finally:
-        # Restore env + reload so module constants match (monkeypatch restores
-        # the env var but NOT the already-reloaded module constants).
-        if orig is not None:
-            monkeypatch.setenv("COTHIS_HOME", orig)
-        else:
-            monkeypatch.delenv("COTHIS_HOME", raising=False)
-        importlib.reload(cothis.cli)
+    assert _cothis_home() == Path("/custom/cothis-home")
+    assert _user_tools_dir() == Path("/custom/cothis-home/tools")
 
 
 def test_cothis_home_defaults_to_home_dotcothis(monkeypatch: Any) -> None:
     """Without ``COTHIS_HOME``, the default is ``~/.cothis``."""
-    import importlib
     from pathlib import Path
 
-    import cothis.cli
+    from cothis.cli import _cothis_home, _user_tools_dir
 
-    orig = os.environ.get("COTHIS_HOME")
     monkeypatch.delenv("COTHIS_HOME", raising=False)
-    try:
-        importlib.reload(cothis.cli)
-        assert cothis.cli._COTHIS_HOME == Path.home() / ".cothis"
-        assert cothis.cli._USER_TOOLS_DIR == Path.home() / ".cothis" / "tools"
-    finally:
-        if orig is not None:
-            monkeypatch.setenv("COTHIS_HOME", orig)
-        else:
-            monkeypatch.delenv("COTHIS_HOME", raising=False)
-        importlib.reload(cothis.cli)
+    assert _cothis_home() == Path.home() / ".cothis"
+    assert _user_tools_dir() == Path.home() / ".cothis" / "tools"
+
+
+def test_cothis_home_picks_up_late_env_change(
+    monkeypatch: Any,
+) -> None:
+    """Changing ``COTHIS_HOME`` after import is reflected without reload (#66).
+
+    ``_cothis_home`` reads ``$COTHIS_HOME`` on every call; a wrapper
+    script that sets the env after import sees the new path without
+    ``importlib.reload``.
+    """
+    from pathlib import Path
+
+    from cothis.cli import _cothis_home
+
+    monkeypatch.setenv("COTHIS_HOME", "/first")
+    assert _cothis_home() == Path("/first")
+    monkeypatch.setenv("COTHIS_HOME", "/second")
+    assert _cothis_home() == Path("/second")
 
 
 def test_main_keyboard_interrupt_exits_130(

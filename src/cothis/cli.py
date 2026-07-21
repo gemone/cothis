@@ -47,11 +47,21 @@ DEFAULT_SYSTEM_PROMPT = (
 _debug = False
 
 _PROJECT_TOOLS_DIR = Path(".agents/tools")
-# Empty/unset ``COTHIS_HOME`` → default ``~/.cothis``.
-_COTHIS_HOME = Path(
-    os.environ.get("COTHIS_HOME") or Path.home() / ".cothis"
-).expanduser()
-_USER_TOOLS_DIR = _COTHIS_HOME / "tools"
+
+
+# cothis: ``_cothis_home`` / ``_user_tools_dir`` read ``$COTHIS_HOME``
+# lazily per call (#66). Mirrors the lazy pattern used by
+# ``_resolve_db_path``.
+def _cothis_home() -> Path:
+    """``$COTHIS_HOME`` or ``~/.cothis``. Read lazily per call."""
+    return Path(
+        os.environ.get("COTHIS_HOME") or Path.home() / ".cothis"
+    ).expanduser()
+
+
+def _user_tools_dir() -> Path:
+    """``$COTHIS_HOME/tools``. Read lazily per call."""
+    return _cothis_home() / "tools"
 
 
 # cothis: defense-in-depth hex-32 validation at the CLI boundary. The
@@ -87,7 +97,7 @@ def _resolve_db_path() -> Path:
         return Path.cwd() / ".agents" / "sessions" / "session.db"
     if dir_env := os.environ.get("COTHIS_SESSIONS_DIR"):
         return Path(dir_env).expanduser() / "session.db"
-    return _COTHIS_HOME / "agents.db"
+    return _cothis_home() / "agents.db"
 
 
 @app.callback()
@@ -148,7 +158,7 @@ def ask(
         agent = Agent(
             model=model,
             provider=provider,
-            tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
+            tools=discover_tools(_PROJECT_TOOLS_DIR, _user_tools_dir()),
             system=DEFAULT_SYSTEM_PROMPT,
             max_iterations=max_iterations,
             max_tokens=max_tokens,
@@ -259,7 +269,7 @@ async def _chat_session(
             agent = Agent(
                 model=model,
                 provider=provider,
-                tools=discover_tools(_PROJECT_TOOLS_DIR, _USER_TOOLS_DIR),
+                tools=discover_tools(_PROJECT_TOOLS_DIR, _user_tools_dir()),
                 system=DEFAULT_SYSTEM_PROMPT,
                 max_iterations=max_iterations,
                 max_tokens=max_tokens,
