@@ -317,3 +317,67 @@ def test_apply_is_pure_does_not_mutate_input() -> None:
 """)
     apply_patch(files, ops)
     assert files == {"x.txt": "alpha\n"}, "input dict must be unchanged"
+
+
+# ---------------------------------------------------------------------
+# Line-ending preservation (#96)
+# ---------------------------------------------------------------------
+
+
+def test_update_preserves_crlf_line_endings() -> None:
+    """CRLF files keep CRLF on patched lines (no mixed endings)."""
+    content = "line1\r\nline2\r\nline3\r\n"
+    ops = parse_patch("""\
+*** Begin Patch
+*** Update File: p.txt
+@@ line1
+-line2
++LINE2
+*** End Patch
+""")
+    result = apply_patch({"p.txt": content}, ops)
+    assert result["p.txt"] == "line1\r\nLINE2\r\nline3\r\n"
+
+
+def test_update_preserves_no_trailing_newline() -> None:
+    """Files with no trailing nl keep that state when their last line is patched."""
+    content = "line1\nline2\nline3"  # no trailing newline
+    ops = parse_patch("""\
+*** Begin Patch
+*** Update File: p.txt
+@@ line2
+-line3
++LINE3
+*** End Patch
+""")
+    result = apply_patch({"p.txt": content}, ops)
+    assert result["p.txt"] == "line1\nline2\nLINE3"
+
+
+def test_insert_at_eof_on_no_trailing_newline() -> None:
+    """Pure insertion at EOF on a no-trailing-nl file doesn't concatenate."""
+    content = "line1\nline2\nline3"  # no trailing newline
+    ops = parse_patch("""\
+*** Begin Patch
+*** Update File: p.txt
+@@ line3
++line4
+*** End Patch
+""")
+    result = apply_patch({"p.txt": content}, ops)
+    assert result["p.txt"] == "line1\nline2\nline3\nline4\n"
+
+
+def test_update_lf_file_still_uses_lf() -> None:
+    """LF-only files are unaffected (regression guard)."""
+    content = "line1\nline2\nline3\n"
+    ops = parse_patch("""\
+*** Begin Patch
+*** Update File: p.txt
+@@ line1
+-line2
++LINE2
+*** End Patch
+""")
+    result = apply_patch({"p.txt": content}, ops)
+    assert result["p.txt"] == "line1\nLINE2\nline3\n"
