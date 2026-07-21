@@ -49,6 +49,23 @@ are formatted; `str` results bypass (text is text). Formats: `json`
 paths; bare-list-of-scalars falls back to json), `yaml` (native nesting).
 _Avoid_: tool response, tool payload.
 
+**Tool runtime context**:
+The Agent-owned state every `Tool` runs against — `cwd` (the directory
+path inputs resolve against), set by the Agent at construction (CLI
+`cwd=Path.cwd()` by default; `ask` uses the caller's). `cwd` is
+**never** tool-schema-supplied: a model-controlled `cwd` would defeat
+the security boundary (the model could escape via `..`). Every `fs.*`
+tool resolves user-supplied paths against `cwd` via `_resolve_under`:
+absolute paths and `../` escapes that leave `cwd` are rejected with
+`"Error: path outside cwd boundary: …"`. In-cwd symlinks are followed
+(so a symlink to elsewhere inside `cwd` works); out-of-cwd symlink
+targets are rejected by the same `relative_to(cwd)` check on the
+resolved path. The context travels via a `ContextVar` (`WORKDIR`),
+not a parameter — tools read `WORKDIR.get()` once at entry.
+_Avoid_: working directory (too OS-flavoured), project root (a `cwd`
+need not be a project), session cwd (that's `Session.cwd`, the
+persisted record of the `cwd` the session was started in).
+
 **Hook chain**:
 An ordered list of callbacks registered on one lifecycle stage of a tool
 (`pre_load` / `after_load` / `pre_execute` / `after_execute` / `on_error`).
