@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
 import os
+import shutil
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Must run before cothis.agent imports any_llm.
@@ -23,6 +26,12 @@ from cothis.session import (
     Session,
     SessionHasChildrenError,
     SessionLockedError,
+)
+from cothis.session.archive import (
+    ArchiveIndex,
+    archive_session,
+    promote_session,
+    run_archival_pass,
 )
 from cothis.session.storage import Storage, display_cwd, is_visible
 from cothis.tools import discover_tools
@@ -491,6 +500,93 @@ def delete_cmd(
     except KeyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"deleted session [cyan]{session_id}[/cyan]")
+
+
+@app.command(name="archive")
+def archive_cmd(
+    action: str = typer.Argument(
+        "all", help="'all' (default), '<session_id>', 'restore <id>', 'compress <file>'"
+    ),
+    target: str = typer.Argument(
+        None, help="Session id (for restore) or file path (for compress)."
+    ),
+) -> None:
+    """Archive, restore, or compress sessions.
+
+    \b
+    Examples:
+        cothis archive              # archive all idle sessions
+        cothis archive <session_id> # archive one session
+        cothis archive restore <id> # promote archived session back
+        cothis archive compress <file>  # gzip a cold DB file
+    """
+    # cothis: hand-rolled dispatch instead of nested typer.Typer() because
+    # the first positional arg is either a subcommand (restore/compress)
+    # or a session id — Typer's subcommand model can't express that
+    # ambiguity. Nested Typer would force `cothis archive session <id>`,
+    # adding a word to the common path.
+    db_path = _resolve_db_path()
+    archive_dir = db_path.parent / "archive"
+
+    if action == "all":
+        now_iso = datetime.now(UTC).isoformat()
+        archived = run_archival_pass(
+            hot_db_path=db_path,
+            archive_dir=archive_dir,
+            threshold_days=90,
+            now_iso=now_iso,
+        )
+        if archived == 0:
+            console.print("no sessions to archive")
+        else:
+            console.print(f"archived {archived} session(s)")
+    elif action == "restore":
+        if not target:
+            raise typer.BadParameter("restore requires a session id")
+        index = ArchiveIndex(archive_dir / "index.json")
+        ok = promote_session(
+            hot_db_path=db_path,
+            archive_dir=archive_dir,
+            session_id=target,
+            index=index,
+        )
+        if ok:
+            console.print(f"restored session [cyan]{target}[/cyan]")
+        else:
+            raise typer.BadParameter(
+                f"session {target!r} not found in archive index"
+            )
+    elif action == "compress":
+        if not target:
+            raise typer.BadParameter("compress requires a file path")
+        if not target.lower().endswith(".db"):
+            raise typer.BadParameter(f"file must end in .db: {target}")
+        file_path = (archive_dir / target).resolve()
+        # cothis: prevent path escape — compress must stay inside archive_dir.
+        # TOCTOU: resolve() → exists() → open() has a symlink-swap window;
+        # acceptable for single-user CLI (no adversary on the same fs).
+        try:
+            file_path.relative_to(archive_dir.resolve())
+        except ValueError:
+            raise typer.BadParameter(f"file must be inside {archive_dir}")
+        if not file_path.exists():
+            raise typer.BadParameter(f"no such file: {target}")
+        out_path = file_path.with_suffix(file_path.suffix + ".gz")
+        with file_path.open("rb") as src, gzip.open(out_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        console.print(f"compressed to [cyan]{out_path.name}[/cyan]")
+    else:
+        now_iso = datetime.now(UTC).isoformat()
+        index = ArchiveIndex(archive_dir / "index.json")
+        archive_session(
+            hot_db_path=db_path,
+            archive_dir=archive_dir,
+            session_id=action,
+            archive_db_name=f"{now_iso[:7]}.db",
+            archived_at=now_iso,
+            index=index,
+        )
+        console.print(f"archived session [cyan]{action}[/cyan]")
 
 
 def main() -> None:
