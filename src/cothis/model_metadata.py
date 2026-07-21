@@ -61,9 +61,7 @@ def _entry_max_tokens(entry: dict[str, Any]) -> int | None:
         return int(out)
     # cothis: skip the legacy fallback when ``max_input_tokens`` is set —
     # in that case ``max_tokens`` duplicates the input cap, not the
-    # output cap. Without this guard, ``perplexity/sonar`` and 8 other
-    # entries returned 128000 (input) as the output cap and 400'd the
-    # first ``amessages`` call.
+    # output cap (#64).
     if "max_input_tokens" in entry:
         return None
     legacy = entry.get("max_tokens")
