@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
 import os
 import sys
@@ -26,7 +27,6 @@ from cothis.session import (
 )
 from cothis.session.storage import Storage, display_cwd, is_visible
 from cothis.session.archive import ArchiveIndex, archive_session, promote_session, run_archival_pass
-import gzip
 from cothis.tools import discover_tools
 
 app = typer.Typer()
