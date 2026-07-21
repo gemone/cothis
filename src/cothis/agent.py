@@ -611,14 +611,9 @@ class Agent(BaseModel):
         second. ``ask`` is unaffected because it discards the Agent after a
         single call.
         """
-        self._ensure_messages(user_input)
+        system_param = self._react_setup(user_input)
         await self._ensure_mcp()
         await self._ensure_handles()
-
-        # cothis: snapshot the assembled system prompt once per run so the
-        # persona/rules can't drift mid-loop (e.g. the agent edits ./AGENTS.md
-        # via a file tool) and we don't re-read disk every iteration.
-        system_param = _system_param(self.system)
 
         for _turn in range(self.max_iterations):
             response = cast(
@@ -633,9 +628,6 @@ class Agent(BaseModel):
             )
             msg = _assistant_msg_from_response(response)
             self._messages.append(msg)
-            # Assistant atomic enqueue (mirror of run_stream; see R3 revised —
-            # both methods persist identically so attaching a Session to a
-            # ``run``-using Agent doesn't silently lose history).
             if self._session is not None:
                 self._session.append_message("assistant", msg["content"])
 
@@ -643,10 +635,7 @@ class Agent(BaseModel):
             if tool_uses:
                 for block in tool_uses:
                     is_error, output = await self._execute_tool(block)
-                    result_block = _tool_result_block(block["id"], output, is_error)
-                    _append_merged(self._messages, "user", result_block)
-                    if self._session is not None:
-                        self._session.append_block("user", result_block)
+                    self._merge_tool_result(block["id"], output, is_error)
                 continue
 
             # Non-tool turn: final answer (text concat; empty → "").
@@ -710,15 +699,11 @@ class Agent(BaseModel):
 
         Side effect: same as ``run`` — mutates ``self._messages``.
         """
-        self._ensure_messages(user_input)
+        system_param = self._react_setup(user_input)
         await self._ensure_mcp()
         await self._ensure_handles()
 
         # Lazy import of the Anthropic stream-event types and ``TextDelta``.
-        # Loaded once per process (Python caches modules); deferred from
-        # module top so ``cothis --help`` and other non-LLM paths skip the
-        # ~2.5s ``anthropic`` + ``any_llm.types.messages`` load. See the
-        # note near the top of this module for the full rationale.
         from anthropic.types import (  # noqa: I001
             RawContentBlockDeltaEvent,
             RawContentBlockStartEvent,
@@ -733,8 +718,6 @@ class Agent(BaseModel):
         model = self.model
         llm = self._llm
         max_iterations = self.max_iterations
-        # cothis: snapshot system prompt once per run — see Agent.run.
-        system_param = _system_param(self.system)
 
         for _turn in range(max_iterations):
             stream = cast(
@@ -836,15 +819,7 @@ class Agent(BaseModel):
                     )
                     yield ToolCallEvent(name=display_name, arguments=block["input"])
                     is_error, output = await self._execute_tool(block)
-                    result_block = _tool_result_block(block["id"], output, is_error)
-                    # Per-execution durability (Q22): each tool_result lands
-                    # in ``_messages`` and the Session immediately on
-                    # completion, not batched at end-of-turn. Same-role
-                    # merge keeps all tool_results from one assistant turn
-                    # in a single user message (Anthropic alternation).
-                    _append_merged(self._messages, "user", result_block)
-                    if self._session is not None:
-                        self._session.append_block("user", result_block)
+                    self._merge_tool_result(block["id"], output, is_error)
                 continue
 
             # Non-tool turn: final answer streamed already; just end the loop.
@@ -855,6 +830,29 @@ class Agent(BaseModel):
         )
 
     # --- internals -----------------------------------------------------
+
+    def _react_setup(self, user_input: str) -> list[dict[str, Any]] | None:
+        """Shared setup for ``_run_inner`` and ``_run_stream_inner``.
+
+        Ensures messages, then returns the snapshot system prompt.
+        Callers await ``_ensure_mcp`` / ``_ensure_handles`` after.
+        """
+        self._ensure_messages(user_input)
+        return _system_param(self.system)
+
+    def _merge_tool_result(
+        self, block_id: str, output: str, is_error: bool
+    ) -> None:
+        """Merge a ``tool_result`` into ``_messages`` + Session.
+
+        Shared by ``_run_inner`` and ``_run_stream_inner`` — the
+        per-execution result enqueue was duplicated verbatim. Single
+        source now; adding per-result logic is a one-site edit.
+        """
+        result_block = _tool_result_block(block_id, output, is_error)
+        _append_merged(self._messages, "user", result_block)
+        if self._session is not None:
+            self._session.append_block("user", result_block)
 
     async def _ensure_handles(self) -> None:
         """Acquire eager/pinned handles once, on first run (ADR-0005).
