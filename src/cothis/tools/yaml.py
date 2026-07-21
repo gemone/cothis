@@ -509,8 +509,7 @@ class _ShellTool(_HookableTool):
     async def __call__(self, **kwargs: Any) -> str:
         rendered = self._block.render(**kwargs)
         # cothis: park the blocking ``subprocess.run`` off the loop
-        # thread (#90). Inline call stalled concurrent async tasks
-        # for the full subprocess lifetime and broke Ctrl-C handling.
+        # thread (#90).
         if isinstance(rendered, list):
             proc = await asyncio.to_thread(
                 subprocess.run, rendered, shell=False,
