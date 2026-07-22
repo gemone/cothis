@@ -212,6 +212,15 @@ def chat(
         "-r",
         help="Resume a session by id (shortcut to the end of main; no picker).",
     ),
+    skill: list[str] = typer.Option(
+        [],
+        "--skill",
+        "-s",
+        help=(
+            "Pre-activate a skill at session start (repeatable). "
+            "Synthesises a load_skill pair after the first user message."
+        ),
+    ),
 ) -> None:
     """Run an interactive multi-turn chat session.
 
@@ -231,6 +240,7 @@ def chat(
             max_iterations=max_iterations,
             max_tokens=max_tokens,
             resume=resume,
+            preactivate_skills=list(skill),
         )
     )
 
@@ -242,6 +252,7 @@ async def _chat_session(
     max_iterations: int,
     max_tokens: int | None,
     resume: str | None = None,
+    preactivate_skills: list[str] | None = None,
 ) -> None:
     # ``chat`` is the only command that persists. ``Session.new`` takes the
     # cross-process lock eagerly; the sessions row + title are written
@@ -274,6 +285,7 @@ async def _chat_session(
                 max_iterations=max_iterations,
                 max_tokens=max_tokens,
                 cwd=Path.cwd(),
+                preactivate_skills=preactivate_skills or [],
             )
             agent.attach_session(session)
 
