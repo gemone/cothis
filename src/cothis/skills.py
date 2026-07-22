@@ -45,6 +45,11 @@ class Skill:
     description: str
     body: str
     source: Path
+    # ``delete`` (default) archives tagged blocks on deactivate; ``summarize``
+    # declares intent to summarise before archiving. The Summarize strategy
+    # is not yet implemented — ``deactivate_skill`` falls back to Delete
+    # with a logged WARNING (#170).
+    deactivation: str = "delete"
 
 
 def discover_skills(
@@ -167,11 +172,20 @@ def _parse_skill_md(path: Path) -> Skill | None:
         )
         return None
 
+    raw_deactivation = str(meta.get("deactivation") or "delete").strip().lower()
+    if raw_deactivation not in ("delete", "summarize"):
+        logger.warning(
+            "skills: %s has unknown deactivation %r; defaulting to 'delete'.",
+            path, raw_deactivation,
+        )
+        raw_deactivation = "delete"
+
     return Skill(
         name=str(name),
         description=str(description).strip(),
         body=body.strip(),
         source=path,
+        deactivation=raw_deactivation,
     )
 
 
@@ -314,9 +328,23 @@ def deactivate_skill(name: str, _session: Any) -> str:
     if not _session.is_skill_active(name):
         return f"Skill {name!r} is not currently active; nothing to deactivate."
 
+    skill = by_name[name]
+    summarize_note = ""
+    if skill.deactivation == "summarize":
+        logger.warning(
+            "skills: %r declares deactivation: summarize, which is not "
+            "yet implemented; falling back to Delete strategy.",
+            name,
+        )
+        summarize_note = (
+            f" (Note: {name!r} declares deactivation: summarize; the "
+            f"Summarize strategy is not yet implemented — used Delete "
+            f"fallback.)"
+        )
+
     _session._deactivate_skill(name)
     return (
         f"Skill {name!r} archived. Future blocks for this skill will be "
         f"marked state='archived'; the model will not see them in "
-        f"subsequent turns."
+        f"subsequent turns.{summarize_note}"
     )
