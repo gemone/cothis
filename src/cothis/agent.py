@@ -274,6 +274,12 @@ def _request_messages(
     in-memory walk), and ``_row_to_block`` on resume. The paired-skip
     invariant holds because both members of a tool_use/tool_result
     pair are tagged for the same archived skill.
+
+    Synthetic pre-activation pairs (#73, #188) are stripped entirely.
+    The pair is persisted for resume rebuild (#71) but never reaches
+    the wire: thinking-mode providers (DeepSeek, OpenAI o-series)
+    reject tool_use blocks that lack ``reasoning_content``. Skill
+    bodies are delivered via the system prompt instead.
     """
     result: list[dict[str, Any]] = []
     for m in messages:
@@ -292,6 +298,8 @@ def _request_messages(
                     k: v for k, v in b.items()
                     if not k.startswith("_cothis_")
                 })
+        if not blocks or all(_is_synthetic_block(b) for b in blocks):
+            continue
         result.append({"role": m["role"], "content": blocks})
 
     if active_skills:
@@ -344,6 +352,28 @@ def _active_skills_footer(active_skills: frozenset[str]) -> dict[str, Any]:
         f"</active_skills>"
     )
     return {"type": "text", "text": text}
+
+
+_SYNTHETIC_ID_PREFIX = "preact_"
+
+
+def _is_synthetic_block(block: Any) -> bool:
+    """True if ``block`` is part of a pre-activation synthetic pair (#188).
+
+    Identifies ``tool_use`` blocks whose ``id`` starts with the
+    ``preact_`` prefix, and ``tool_result`` blocks whose
+    ``tool_use_id`` does. Used by ``_request_messages`` to strip
+    synthetic pairs from the wire payload — thinking-mode providers
+    (DeepSeek, OpenAI o-series) reject tool_use blocks that lack
+    ``reasoning_content``.
+    """
+    if not isinstance(block, dict):
+        return False
+    if block.get("type") == "tool_use":
+        return str(block.get("id", "")).startswith(_SYNTHETIC_ID_PREFIX)
+    if block.get("type") == "tool_result":
+        return str(block.get("tool_use_id", "")).startswith(_SYNTHETIC_ID_PREFIX)
+    return False
 
 
 def _synthetic_skill_pair(name: str, body: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1262,9 +1292,15 @@ class Agent(BaseModel):
         ``Session`` so resume rebuild (#71) treats it as a normal
         model-invoked load — no special case for the synthetic path.
 
+        The synthetic pair is stripped from ``_request_messages`` (#188)
+        — thinking-mode providers (DeepSeek, OpenAI o-series) reject
+        tool_use blocks that lack ``reasoning_content``. Skill bodies
+        are delivered via the system prompt instead: ``self.system``
+        is augmented with one ``<skill_content>`` text block per name.
+
         Unknown skill names fail fast with a ``ValueError`` naming the
         skill + listing what's available; the caller (CLI) surfaces
-        this before the first LLM call.
+        this before the first LM call.
         """
         if self._preactivation_done or not self.preactivate_skills:
             self._preactivation_done = True
@@ -1277,6 +1313,7 @@ class Agent(BaseModel):
 
         catalog = discover_skills(Path.cwd())
         by_name = {s.name: s for s in catalog}
+        system_additions: list[dict[str, Any]] = []
         for name in self.preactivate_skills:
             if name not in by_name:
                 available = ", ".join(sorted(by_name)) or "(none)"
@@ -1284,7 +1321,8 @@ class Agent(BaseModel):
                     f"Unknown skill {name!r} for --skill pre-activation. "
                     f"Available: {available}."
                 )
-            tool_use, tool_result = _synthetic_skill_pair(name, by_name[name].body)
+            skill = by_name[name]
+            tool_use, tool_result = _synthetic_skill_pair(name, skill.body)
             self._messages.append({"role": "assistant", "content": [tool_use]})
             self._messages.append({"role": "user", "content": [tool_result]})
             if self._session is not None:
@@ -1293,6 +1331,24 @@ class Agent(BaseModel):
                 # ``_activate_skill`` is the underscore-prefixed mutation
                 # API — same convention as ``_deactivate_skill`` (#167).
                 self._session._activate_skill(name)
+            system_additions.append({
+                "type": "text",
+                "text": (
+                    f"<skill_content name={name!r}>\n"
+                    f"{skill.body}\n"
+                    f"</skill_content>"
+                ),
+            })
+        # Augment the system prompt so the model sees the skill bodies
+        # without a synthetic tool_use reaching the wire (#188).
+        if system_additions:
+            if isinstance(self.system, str):
+                assembled = _assemble_system(self.system) or []
+                self.system = assembled + system_additions
+            elif isinstance(self.system, list):
+                self.system = list(self.system) + system_additions
+            elif self.system is None:
+                self.system = system_additions
         self._preactivation_done = True
 
     async def _execute_tool(self, tool_use: dict[str, Any]) -> tuple[bool, str]:
