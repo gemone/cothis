@@ -679,7 +679,91 @@ class Session:
             cold=cold_loaded,
         )
         session._lock = lock
+        # cothis: resume rebuild (#71). Derive active_skills from the
+        # load_skill/deactivate_skill tool_use history (state is the
+        # derived product of deactivation, not consulted here). Skills
+        # that vanished from disk since the last session are dropped
+        # from the active set + their tagged blocks archived + warning
+        # logged. Runs after construction so the queue is wired; the
+        # queued UPDATE lands on the consumer thread (single writer).
+        session._rebuild_active_skills_from_rows(rows)
+        session._archive_vanished_skills()
         return session
+
+    def _rebuild_active_skills_from_rows(self, rows: list[BlockRow]) -> None:
+        """Replay load/deactivate tool_use history to set ``_active_skills``.
+
+        Walks every ``tool_use`` block for ``load_skill`` /
+        ``deactivate_skill``, replaying the most-recent state per skill
+        name (``load`` sets active, ``deactivate`` clears). The ``state``
+        column is deliberately not consulted — it's the derived product
+        of deactivation; the load/deactivate sequence is the source of
+        truth. Malformed ``tool_input`` JSON is skipped silently (the
+        rebuild is best-effort; a corrupt row shouldn't break resume).
+        """
+        active: dict[str, bool] = {}
+        for row in rows:
+            if row.tool_name == "load_skill":
+                name = self._skill_name_from_tool_input(row.tool_input)
+                if name is not None:
+                    active[name] = True
+            elif row.tool_name == "deactivate_skill":
+                name = self._skill_name_from_tool_input(row.tool_input)
+                if name is not None:
+                    active[name] = False
+        self._active_skills = {n for n, is_active in active.items() if is_active}
+
+    @staticmethod
+    def _skill_name_from_tool_input(raw: str | None) -> str | None:
+        """Extract ``name`` from a ``{"name": "..."}`` tool_input JSON."""
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        name = parsed.get("name")
+        return str(name) if name else None
+
+    def _archive_vanished_skills(self) -> None:
+        """Archive active skills that no longer exist on disk (#71).
+
+        Discovers skills from the session's cwd and deactivates any
+        active skill missing from the new discovery. The deactivate
+        path composes with Half A + B + the in-memory walk from
+        #167/#168/#169 — future writes for these skills land archived,
+        historical rows are queue-UPDATEd, and the projection skips
+        them on the next request. A WARNING is logged per vanished
+        skill so the REPL user sees what happened.
+        """
+        if not self._active_skills:
+            return
+        try:
+            from cothis.skills import discover_skills
+            discovered = {s.name for s in discover_skills(self._cwd)}
+        except Exception as exc:  # noqa: BLE001 — best-effort; resume continues
+            logger.warning(
+                "Session reload: skill discovery failed (%s); "
+                "skipping vanished-skill archival check.", exc,
+            )
+            return
+        for name in sorted(self._active_skills):
+            if name in discovered:
+                continue
+            logger.warning(
+                "Session reload: skill %r vanished from disk; "
+                "archiving (was active at last session end).",
+                name,
+            )
+            self._deactivate_skill(name)
+            # ``_deactivate_skill`` from #167 leaves the two sets
+            # independent (a skill can be both active + archived, with
+            # the read path picking archival). For vanished-on-disk at
+            # resume, the AC explicitly drops the skill from
+            # ``active_skills`` — the skill is gone, not just hidden.
+            self._active_skills.discard(name)
 
     @staticmethod
     def _run_startup_archival(db_path: Path) -> None:
