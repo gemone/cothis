@@ -253,14 +253,18 @@ def load_skill(name: str, _session: Any) -> str:
 
 
 async def reload_skills_handler(ctx: SlashContext, args: str) -> str:
-    """Slash handler for ``/reload-skills`` (#172).
+    """Slash handler for ``/reload-skills`` (#172, #74 final AC).
 
     Re-runs ``discover_skills`` from the session's cwd (or
     ``Path.cwd()`` when no session is attached) and returns a
     one-line summary naming the count and skill names. The next
     agent run picks up the fresh catalog automatically via
-    ``_assemble_system`` — this handler does not mutate any cached
-    state, it just validates discovery + reports.
+    ``_assemble_system``.
+
+    Active skills no longer present in the new discovery (vanished
+    from disk) are archived via ``Session._deactivate_skill`` and a
+    WARNING is logged per vanished skill. The archival composes with
+    Half A + B + the in-memory walk from #167/#168/#169.
 
     Discovery failures are caught and surfaced to the user as an
     error summary; the handler never raises.
@@ -275,13 +279,36 @@ async def reload_skills_handler(ctx: SlashContext, args: str) -> str:
     except Exception as exc:  # noqa: BLE001 — best-effort; surface to user
         logger.warning("skills: /reload-skills discovery failed: %s", exc)
         return f"Reload failed: {exc}"
-    names = sorted(s.name for s in skills)
+
+    discovered_names = {s.name for s in skills}
+    vanished: list[str] = []
+    if ctx.session is not None:
+        active = frozenset(getattr(ctx.session, "active_skills", frozenset()))
+        for name in sorted(active):
+            if name not in discovered_names:
+                logger.warning(
+                    "skills: /reload-skills: %r vanished from disk; "
+                    "archiving (was active).",
+                    name,
+                )
+                ctx.session._deactivate_skill(name)
+                vanished.append(name)
+
+    names = sorted(discovered_names)
+    parts: list[str] = []
     if not names:
-        return "Reloaded skills catalog: 0 skills discovered."
-    return (
-        f"Reloaded skills catalog: {len(names)} skill(s) discovered: "
-        + ", ".join(names)
-    )
+        parts.append("Reloaded skills catalog: 0 skills discovered.")
+    else:
+        parts.append(
+            f"Reloaded skills catalog: {len(names)} skill(s) discovered: "
+            + ", ".join(names)
+        )
+    if vanished:
+        parts.append(
+            f"Archived {len(vanished)} vanished skill(s): "
+            + ", ".join(vanished)
+        )
+    return " ".join(parts)
 
 
 def register_slash_commands() -> None:
