@@ -23,15 +23,25 @@ if TYPE_CHECKING:
 _FRONTMATTER = "---\nname: x\ndescription: d\n---\n\n"
 
 
+def _force_utf8_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin locale fallback to UTF-8 so invalid-byte tests are deterministic.
+
+    Without this, Windows runners default to CP1252 where ``\\xff`` is
+    a legitimate ``ÿ`` — the locale tier would decode it and the skill
+    would load, breaking the "invalid bytes → skip" assertions.
+    """
+    import locale as _locale
+    monkeypatch.setattr(
+        _locale, "getpreferredencoding", lambda *a, **k: "utf-8",
+    )
+
+
 def test_invalid_utf_8_body_skipped(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bytes invalid in UTF-8 and any locale → skip + warn.
-
-    ``\\xff\\xfe\\xfd`` is not valid UTF-8 and not valid in common
-    locale fallbacks (CP1252 has \\xff but not the sequence as a
-    whole). The skill is skipped with a warning.
-    """
+    """Bytes invalid in UTF-8 (and the pinned UTF-8 locale) → skip + warn."""
+    _force_utf8_locale(monkeypatch)
     skill_dir = tmp_path / "broken"
     skill_dir.mkdir()
     skill_file = skill_dir / "SKILL.md"
@@ -51,8 +61,10 @@ def test_invalid_utf_8_body_skipped(
 
 def test_no_replacement_character_injected(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression: invalid bytes never become U+FFFD in the body."""
+    _force_utf8_locale(monkeypatch)
     skill_dir = tmp_path / "broken"
     skill_dir.mkdir()
     skill_file = skill_dir / "SKILL.md"
@@ -119,8 +131,10 @@ def test_locale_fallback_succeeds(
 
 def test_invalid_utf_8_logs_specific_skip_reason(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Skip log mentions encoding failure so the user can diagnose."""
+    _force_utf8_locale(monkeypatch)
     skill_dir = tmp_path / "broken"
     skill_dir.mkdir()
     skill_file = skill_dir / "SKILL.md"
@@ -137,8 +151,10 @@ def test_invalid_utf_8_logs_specific_skip_reason(
 
 def test_invalid_utf_8_skill_dropped_from_discovery(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end: discover_skills skips the broken skill, loads the good one."""
+    _force_utf8_locale(monkeypatch)
     skills_dir = tmp_path / ".agents" / "skills"
 
     good = skills_dir / "good"
