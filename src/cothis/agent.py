@@ -248,7 +248,11 @@ def _assistant_msg_from_response(response: MessageResponse) -> dict[str, Any]:
     }
 
 
-def _request_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _request_messages(
+    messages: list[dict[str, Any]],
+    *,
+    active_skills: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
     """Project stored messages to ``{role, content}`` for ``amessages``.
 
     Anthropic's native API validates message dicts strictly; the metadata we
@@ -256,19 +260,81 @@ def _request_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     the two request-side fields at send time. Also strips private keys
     (``_cothis_*``) from content blocks — they're internal tags for
     persist-time skill tagging (#164), never sent to the model.
+
+    When ``active_skills`` is non-empty, a ``<active_skills>`` text block
+    is appended to the latest user message (#72). Projection-only: the
+    stored messages and the session store are never modified.
     """
-    result = []
-    for m in messages:
-        blocks = []
-        for b in m["content"]:
-            if isinstance(b, dict):
-                blocks.append({
-                    k: v for k, v in b.items() if not k.startswith("_cothis_")
-                })
-            else:
-                blocks.append(b)
+    result: list[dict[str, Any]] = []
+    latest_user_idx: int | None = None
+    for i, m in enumerate(messages):
+        raw = m["content"]
+        if isinstance(raw, str):
+            blocks: list[Any] = [{"type": "text", "text": raw}]
+        else:
+            blocks = []
+            for b in raw:
+                if isinstance(b, dict):
+                    blocks.append({
+                        k: v for k, v in b.items()
+                        if not k.startswith("_cothis_")
+                    })
+                else:
+                    blocks.append(b)
         result.append({"role": m["role"], "content": blocks})
+        if m["role"] == "user":
+            latest_user_idx = i
+
+    if active_skills:
+        target_idx = _footer_target_idx(result)
+        if target_idx is not None:
+            result[target_idx]["content"].append(
+                _active_skills_footer(active_skills)
+            )
+
     return result
+
+
+def _footer_target_idx(messages: list[dict[str, Any]]) -> int | None:
+    """Pick the message index the ``<active_skills>`` footer attaches to.
+
+    Walks backwards past ``role=user`` messages whose content is all
+    ``tool_result`` blocks (the post-tool-call state) and returns the
+    first user message that has at least one non-``tool_result``
+    block — i.e., the latest user-typed text. Returns ``None`` when no
+    suitable target exists.
+    """
+    for idx in range(len(messages) - 1, -1, -1):
+        m = messages[idx]
+        if m["role"] != "user":
+            continue
+        content = m["content"]
+        if isinstance(content, str):
+            return idx
+        if all(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in content
+        ):
+            continue
+        return idx
+    return None
+
+
+def _active_skills_footer(active_skills: frozenset[str]) -> dict[str, Any]:
+    """Build the ``<active_skills>`` text block appended per turn (#72).
+
+    Lists the currently-active skills and reminds the model that
+    ``deactivate_skill`` retires a skill. Projection-only — never
+    persisted to the session store.
+    """
+    names = ", ".join(sorted(active_skills))
+    text = (
+        f"<active_skills>\n"
+        f"Active skills: {names}\n"
+        f"Use deactivate_skill(name) to retire a skill when no longer needed.\n"
+        f"</active_skills>"
+    )
+    return {"type": "text", "text": text}
 
 
 def _tool_result_block(
@@ -647,7 +713,10 @@ class Agent(BaseModel):
                 "MessageResponse",
                 await self._llm.amessages(
                     model=self.model,
-                    messages=_request_messages(self._messages),
+                    messages=_request_messages(
+                        self._messages,
+                        active_skills=self._active_skills_for_request(),
+                    ),
                     max_tokens=self._effective_max_tokens(),
                     system=system_param,
                     tools=self._tool_schemas(),
@@ -753,7 +822,10 @@ class Agent(BaseModel):
                 "AsyncIterator[MessageStreamEvent]",
                 await llm.amessages(
                     model=model,
-                    messages=_request_messages(self._messages),
+                    messages=_request_messages(
+                        self._messages,
+                        active_skills=self._active_skills_for_request(),
+                    ),
                     max_tokens=self._effective_max_tokens(),
                     system=system_param,
                     tools=tool_schemas,
@@ -921,6 +993,16 @@ class Agent(BaseModel):
             skill_name = self._skill_for_block(block)
             if skill_name is not None:
                 block["_cothis_skill"] = skill_name
+
+    def _active_skills_for_request(self) -> frozenset[str] | None:
+        """Return the session's active skills for request projection (#72).
+
+        Returns ``None`` when no session is attached, so the footer is
+        skipped without a runtime error.
+        """
+        if self._session is None:
+            return None
+        return self._session.active_skills
 
     async def _ensure_handles(self) -> None:
         """Acquire eager/pinned handles once, on first run (ADR-0005).
