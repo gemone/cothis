@@ -107,7 +107,13 @@ def _parse_skill_md(path: Path) -> Skill | None:
     Missing ``name`` defaults to the directory name.
     ``name`` ≠ directory → warn + load.
     """
-    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        logger.warning(
+            "skills: %s has invalid UTF-8; skipped.", path
+        )
+        return None
     match = _FRONTMATTER_RE.match(text)
     if match is None:
         logger.warning(
