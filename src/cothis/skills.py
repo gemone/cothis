@@ -339,38 +339,57 @@ def deactivate_skill(name: str, _session: Any) -> str:
     if _session is None:
         return "Error: deactivate_skill requires a live session to record archival state."
 
+    # Order matters (#180): session state first, catalog last. A skill
+    # activated earlier in the session may have been removed from disk
+    # mid-session (deleted directory, ``git pull`` removed it, symlink
+    # target gone). It's still in ``_active_skills`` — deactivating it
+    # must succeed so the tagged blocks archive. The catalog check is
+    # the fallback for names the session has never seen.
+    if _session.is_skill_archived(name):
+        return f"Skill {name!r} is already archived."
+
+    if _session.is_skill_active(name):
+        skill = _deactivate_active_skill(name, _session)
+        return skill
+
     catalog = discover_skills(Path.cwd())
     by_name = {s.name: s for s in catalog}
-
     if name not in by_name:
         return (
             f"Error: unknown skill {name!r}. "
             f"Available: {', '.join(sorted(by_name)) or '(none)'}."
         )
+    return f"Skill {name!r} is not currently active; nothing to deactivate."
 
-    if _session.is_skill_archived(name):
-        return f"Skill {name!r} is already archived."
 
-    if not _session.is_skill_active(name):
-        return f"Skill {name!r} is not currently active; nothing to deactivate."
+def _deactivate_active_skill(name: str, _session: Any) -> str:
+    """Run the archival + build the result message for an active skill.
 
-    skill = by_name[name]
-    summarize_note = ""
-    if skill.deactivation == "summarize":
-        logger.warning(
-            "skills: %r declares deactivation: summarize, which is not "
-            "yet implemented; falling back to Delete strategy.",
-            name,
-        )
-        summarize_note = (
-            f" (Note: {name!r} declares deactivation: summarize; the "
-            f"Summarize strategy is not yet implemented — used Delete "
-            f"fallback.)"
-        )
-
+    Factored out so the order-of-checks in ``deactivate_skill`` stays
+    flat. Reads the deactivation declaration if the skill is still on
+    disk (Summarize fallback from #170); missing-from-disk skills use
+    the Delete strategy directly (no declaration to read).
+    """
+    deactivation = "delete"
+    summary_note = ""
+    catalog = discover_skills(Path.cwd())
+    by_name = {s.name: s for s in catalog}
+    if name in by_name:
+        deactivation = by_name[name].deactivation
+        if deactivation == "summarize":
+            logger.warning(
+                "skills: %r declares deactivation: summarize, which is not "
+                "yet implemented; falling back to Delete strategy.",
+                name,
+            )
+            summary_note = (
+                f" (Note: {name!r} declares deactivation: summarize; the "
+                f"Summarize strategy is not yet implemented — used Delete "
+                f"fallback.)"
+            )
     _session._deactivate_skill(name)
     return (
         f"Skill {name!r} archived. Future blocks for this skill will be "
         f"marked state='archived'; the model will not see them in "
-        f"subsequent turns.{summarize_note}"
+        f"subsequent turns.{summary_note}"
     )
