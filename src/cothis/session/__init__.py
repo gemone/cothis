@@ -179,6 +179,7 @@ def _block_to_row(
         tool_output=tool_output,
         image_source=image_source,
         skill=block.get("_cothis_skill"),
+        state=block.get("_cothis_state"),
     )
 
 
@@ -484,6 +485,11 @@ class Session:
         # ``load_skill`` adds names here; the catalog + active set drive
         # handler decisions (catalog membership, not text sniffing).
         self._active_skills: set[str] = set()
+        # cothis: archived skills state (#167). Runtime-only; not persisted.
+        # ``deactivate_skill`` adds names here; future block writes for
+        # these skills write ``state='archived'`` directly (Half A of
+        # two-half mark_archived; Half B's queued UPDATE lands in #168).
+        self._archived_skills: set[str] = set()
 
         # Queue + consumer thread. Skipped entirely in flush_sync mode —
         # _drain_one is called inline from append_message instead.
@@ -999,6 +1005,34 @@ class Session:
         self._active_skills.add(name)
         return True
 
+    # cothis: archived skills state (#167). Read-only API for handlers.
+    @property
+    def archived_skills(self) -> frozenset[str]:
+        """Names of skills archived in this session (runtime-only).
+
+        Future block writes for these skills write ``state='archived'``
+        directly (Half A). Historical/in-flight rows are covered by the
+        queued UPDATE (Half B, #168).
+        """
+        return frozenset(self._archived_skills)
+
+    def is_skill_archived(self, name: str) -> bool:
+        """True iff ``name`` has been archived via ``deactivate_skill``."""
+        return name in self._archived_skills
+
+    def _deactivate_skill(self, name: str) -> bool:
+        """Mark a skill as archived. Returns True if newly archived.
+
+        Idempotent: a repeat call returns False and leaves state
+        unchanged. Does not touch ``_active_skills`` — the two sets
+        are independent (a skill can be both active and archived; the
+        row-state read path picks archival).
+        """
+        if name in self._archived_skills:
+            return False
+        self._archived_skills.add(name)
+        return True
+
     def append_message(self, role: str, blocks: list[dict[str, Any]]) -> None:
         """Append a multi-block message atomically (one txn on drain).
 
@@ -1018,6 +1052,17 @@ class Session:
             raise RuntimeError("append_message on a closed Session")
         if not blocks:
             return
+        # cothis: Half A of mark_archived (#167). Stamp archived blocks
+        # before they hit storage. Future writes for a deactivated skill
+        # write ``state='archived'`` directly; Half B's queued UPDATE
+        # (#168) covers in-flight + historical rows.
+        if self._archived_skills:
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                skill = b.get("_cothis_skill")
+                if skill is not None and skill in self._archived_skills:
+                    b["_cothis_state"] = "archived"
         rows = self._alloc_and_map(role, blocks)
         if self.messages and self.messages[-1]["role"] == role:
             self.messages[-1]["content"].extend(blocks)
