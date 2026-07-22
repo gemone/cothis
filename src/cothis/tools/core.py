@@ -164,6 +164,7 @@ def tool(
 def tool(
     *, name: str | None = None, description: str | None = None,
     handle: type[ResourceHandle] | None = None,
+    inject_session: bool = False, skill_marker: bool = False,
 ) -> Callable[[Callable[..., Any]], ToolDef]: ...
 
 
@@ -173,6 +174,8 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     handle: type[ResourceHandle] | None = None,
+    inject_session: bool = False,
+    skill_marker: bool = False,
 ) -> ToolDef | Callable[[Callable[..., Any]], ToolDef]:
     """Decorate a function as a cothis tool with a rich LLM schema.
 
@@ -204,7 +207,10 @@ def tool(
     """
 
     def decorate(fn: Any) -> ToolDef:
-        return ToolDef(fn, name=name, description=description, handle=handle)
+        return ToolDef(
+            fn, name=name, description=description, handle=handle,
+            inject_session=inject_session, skill_marker=skill_marker,
+        )
 
     if isinstance(func, str):
         name = func
@@ -543,6 +549,8 @@ class ToolDef(_HookableTool):
         name: str | None = None,
         description: str | None = None,
         handle: type[ResourceHandle] | None = None,
+        inject_session: bool = False,
+        skill_marker: bool = False,
     ) -> None:
         super().__init__()
         self._fn = fn
@@ -553,9 +561,33 @@ class ToolDef(_HookableTool):
         self.__cothis_schema__ = _build_schema(fn, tool_name, description)
         self._handle_cls: type[ResourceHandle] | None = handle
         self.handle: ResourceHandle | None = None
+        self._inject_session = inject_session
+        self._session_handler: Any = None
+        self._skill_marker = skill_marker
 
     def __call__(self, **kwargs: Any) -> Any:
         return self._fn(**kwargs)
+
+    def session(self, handler: Any) -> Any:
+        """Register a post-execution session handler (#157).
+
+        Implies ``inject_session=True`` — the tool receives ``_session``
+        as a keyword arg (absent from the LLM schema). The handler runs
+        after the tool body returns, before the result is appended to
+        the session. Returns the handler unchanged so it can be used as
+        a decorator::
+
+            @tool("load_skill")
+            def load_skill(name: str, _session: Session) -> str:
+                ...
+
+            @load_skill.session
+            def mark_active(ctx, result):
+                ...
+        """
+        self._inject_session = True
+        self._session_handler = handler
+        return handler
 
 
 def _build_schema(
@@ -595,6 +627,8 @@ def _build_schema(
             inspect.Parameter.VAR_POSITIONAL,
             inspect.Parameter.VAR_KEYWORD,
         ):
+            continue
+        if pname.startswith("_"):
             continue
         annotation = hints.get(pname, param.annotation)
         # Unwrap ``Optional[X]`` (one non-None member) → ``X`` so the type
