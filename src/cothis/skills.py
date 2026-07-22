@@ -282,3 +282,41 @@ def register_slash_commands() -> None:
         "reload-skills", reload_skills_handler,
         summary="Re-run skill discovery; list discovered skills.",
     )
+
+
+@tool(name="deactivate_skill", inject_session=True, skill_marker=True)
+def deactivate_skill(name: str, _session: Any) -> str:
+    """Retire an active skill: its tagged blocks archive (Delete strategy).
+
+    Use this when a skill is no longer needed. Future ``tool_use`` /
+    ``tool_result`` blocks for the named skill write ``state='archived'``
+    at persist time so context assembly can skip them on later turns.
+    Historical rows are covered separately (queued UPDATE).
+
+    Args:
+        name: The skill name (as shown in ``<available_skills>``).
+    """
+    if _session is None:
+        return "Error: deactivate_skill requires a live session to record archival state."
+
+    catalog = discover_skills(Path.cwd())
+    by_name = {s.name: s for s in catalog}
+
+    if name not in by_name:
+        return (
+            f"Error: unknown skill {name!r}. "
+            f"Available: {', '.join(sorted(by_name)) or '(none)'}."
+        )
+
+    if _session.is_skill_archived(name):
+        return f"Skill {name!r} is already archived."
+
+    if not _session.is_skill_active(name):
+        return f"Skill {name!r} is not currently active; nothing to deactivate."
+
+    _session._deactivate_skill(name)
+    return (
+        f"Skill {name!r} archived. Future blocks for this skill will be "
+        f"marked state='archived'; the model will not see them in "
+        f"subsequent turns."
+    )
