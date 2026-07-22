@@ -133,7 +133,12 @@ def test_footer_disappears_when_skill_deactivated() -> None:
 
 
 def test_footer_appended_after_other_blocks_in_latest_user() -> None:
-    """Latest user message with multiple blocks → footer is appended last."""
+    """Latest user message with mixed blocks → footer is appended last.
+
+    A user message with both text and ``tool_result`` blocks is a valid
+    Anthropic message shape; the footer appends to it as a sibling
+    text block.
+    """
     messages = [{
         "role": "user",
         "content": [
@@ -144,4 +149,79 @@ def test_footer_appended_after_other_blocks_in_latest_user() -> None:
     out = _request_messages(messages, active_skills=frozenset({"python"}))
     assert len(out[0]["content"]) == 3
     assert out[0]["content"][-1]["type"] == "text"
+    assert FOOTER_MARKER in out[0]["content"][-1]["text"]
+
+
+def test_footer_skipped_when_latest_user_is_tool_result_only() -> None:
+    """Post-tool-call state: latest user has only ``tool_result`` blocks.
+
+    Appending a text block to a tool-result-only user message would
+    violate Anthropic's tool-flow shape. The footer walks back to the
+    latest user-typed text message instead.
+    """
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "please help"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            ],
+        },
+    ]
+    out = _request_messages(messages, active_skills=frozenset({"python"}))
+    # Latest user (tool_result-only) is untouched.
+    assert len(out[2]["content"]) == 1
+    assert out[2]["content"][0]["type"] == "tool_result"
+    # Footer went on the earlier user-typed text message.
+    assert len(out[0]["content"]) == 2
+    assert out[0]["content"][-1]["type"] == "text"
+    assert FOOTER_MARKER in out[0]["content"][-1]["text"]
+
+
+def test_footer_skipped_when_all_user_messages_are_tool_result_only() -> None:
+    """No user-typed text message to attach to → footer omitted entirely."""
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            ],
+        },
+    ]
+    out = _request_messages(messages, active_skills=frozenset({"python"}))
+    assert len(out[0]["content"]) == 1
+    assert FOOTER_MARKER not in str(out[0]["content"])
+
+
+def test_footer_walks_past_multiple_tool_result_user_messages() -> None:
+    """Multi-tool turn: latest user is tool_result-only, walk past earlier ones too."""
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "a", "name": "x", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "a", "content": "1"}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "b", "name": "y", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "b", "content": "2"}],
+        },
+    ]
+    out = _request_messages(messages, active_skills=frozenset({"python"}))
+    # Both tool_result-only user messages untouched.
+    assert len(out[2]["content"]) == 1
+    assert len(out[4]["content"]) == 1
+    # Footer on the original user-typed text message.
+    assert len(out[0]["content"]) == 2
     assert FOOTER_MARKER in out[0]["content"][-1]["text"]

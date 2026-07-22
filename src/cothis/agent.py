@@ -262,12 +262,14 @@ def _request_messages(
     persist-time skill tagging (#164), never sent to the model.
 
     When ``active_skills`` is non-empty, a ``<active_skills>`` text block
-    is appended to the latest user message (#72). Projection-only: the
-    stored messages and the session store are never modified.
+    is appended to the latest user-typed text message (#72). The footer
+    walks past trailing ``tool_result``-only user messages (the
+    post-tool-call state) — appending a text block there would corrupt
+    Anthropic's tool-flow shape. Projection-only: the stored messages
+    and the session store are never modified.
     """
     result: list[dict[str, Any]] = []
-    latest_user_idx: int | None = None
-    for i, m in enumerate(messages):
+    for m in messages:
         raw = m["content"]
         if isinstance(raw, str):
             blocks: list[Any] = [{"type": "text", "text": raw}]
@@ -282,8 +284,6 @@ def _request_messages(
                 else:
                     blocks.append(b)
         result.append({"role": m["role"], "content": blocks})
-        if m["role"] == "user":
-            latest_user_idx = i
 
     if active_skills:
         target_idx = _footer_target_idx(result)
