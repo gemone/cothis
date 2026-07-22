@@ -1129,6 +1129,9 @@ class Agent(BaseModel):
         try:
             mark_inflight(tool)
 
+            # cothis: inject _session for tools that requested it (#157).
+            if getattr(tool, "_inject_session", False):
+                args["_session"] = self._session
             arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
             logger.debug("→ %s(%s)", name, arg_repr)
             result = tool(**args)
@@ -1159,6 +1162,17 @@ class Agent(BaseModel):
                 "← %s after_execute raised: %s; using original result", name, exc
             )
             logger.debug("tool %r on_error fired (phase=after_execute)", name)
+
+        # cothis: post-execution session handler (#157). Runs after
+        # after_execute, before the result is formatted + appended.
+        # The handler can modify session state (e.g. mark a skill
+        # active). Best-effort — handler errors are logged, not raised.
+        session_handler = getattr(tool, "_session_handler", None)
+        if session_handler is not None and self._session is not None:
+            try:
+                session_handler(self._session, result, args)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("tool %r session handler raised: %s", name, exc)
 
         if isinstance(result, (dict, list)):
             rendered = format_tool_output(result)
