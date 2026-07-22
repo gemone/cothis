@@ -184,7 +184,36 @@ def _commit_atomic(
     return committed
 
 
-@tool("fs.write")
+_WRITE_DESCRIPTION = """Apply a codex ``apply_patch`` document to the working tree.
+
+The patch is bracketed by ``*** Begin Patch`` and ``*** End Patch``.
+Each op names a single file; one op per file per call.
+
+Add a new file::
+
+    *** Begin Patch
+    *** Add File: hello.txt
+    +hello world
+    *** End Patch
+
+Update an existing file (context line, ``-`` removal, ``+`` addition)::
+
+    *** Begin Patch
+    *** Update File: config.py
+    @@ old_value
+    -old_value
+    +new_value
+    *** End Patch
+
+Delete a file::
+
+    *** Begin Patch
+    *** Delete File: obsolete.txt
+    *** End Patch
+"""
+
+
+@tool("fs.write", description=_WRITE_DESCRIPTION)
 def write(content: str) -> str:
     """Apply a codex ``apply_patch`` document to the working tree.
 
@@ -205,7 +234,9 @@ def write(content: str) -> str:
     (``Path.resolve()``), matching the hermes path-security pattern.
 
     Args:
-        content: A codex ``apply_patch`` document.
+        content: A codex ``apply_patch`` document. Bracketed by
+            ``*** Begin Patch`` / ``*** End Patch``; one op per file
+            (Add / Update / Delete).
 
     Returns:
         A summary listing each affected file with its verb, e.g.
