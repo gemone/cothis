@@ -1030,11 +1030,9 @@ def test_non_ascii_accented_name_stripped() -> None:
 async def test_shell_tool_does_not_block_event_loop() -> None:
     """A long subprocess must not freeze concurrent async tasks (#90).
 
-    Pre-#90 ``_ShellTool.__call__`` ran ``subprocess.run`` inline on
-    the loop thread; a 1-second ``sleep`` stalled a concurrent ticker
-    task by exactly the subprocess duration. The fix routes the
-    subprocess through ``asyncio.to_thread`` so the loop stays
-    responsive.
+    ``_ShellTool.__call__`` runs ``subprocess.run`` via
+    ``asyncio.to_thread`` so the event loop stays responsive during
+    the full subprocess lifetime.
     """
     import asyncio
     import time
@@ -1078,9 +1076,8 @@ def test_cmd_shell_with_string_arg_warns_at_load(
     """``shell: cmd`` + string arg emits a load-time WARNING (#61).
 
     cmd.exe quoting is partial defence — ``&`` / ``|`` / ``%`` in arg
-    values are live metacharacters. Pre-#61 the ceiling lived in a
-    docstring the tool author never saw. The warning makes it visible
-    at every load.
+    values are live metacharacters. The load-time warning surfaces
+    the ceiling to the tool author at every load.
     """
     import logging
 
