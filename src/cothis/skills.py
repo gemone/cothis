@@ -283,8 +283,7 @@ async def reload_skills_handler(ctx: SlashContext, args: str) -> str:
     discovered_names = {s.name for s in skills}
     vanished: list[str] = []
     if ctx.session is not None:
-        active = frozenset(getattr(ctx.session, "active_skills", frozenset()))
-        for name in sorted(active):
+        for name in sorted(ctx.session.active_skills):
             if name not in discovered_names:
                 logger.warning(
                     "skills: /reload-skills: %r vanished from disk; "
