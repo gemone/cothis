@@ -175,7 +175,7 @@ def format_catalog(skills: list[Skill]) -> str | None:
 # ---------------------------------------------------------------------
 
 
-@tool("load_skill", inject_session=True, skill_marker=True)
+@tool(name="load_skill", inject_session=True, skill_marker=True)
 def load_skill(name: str, _session: Any) -> str:
     """Activate a skill by name and load its content.
 
