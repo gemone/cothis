@@ -1169,6 +1169,20 @@ class HandleManager:
             return
         try:
             await slot.instance.release()
+        except asyncio.CancelledError:
+            # cothis: MCP session teardown cancels in-flight tasks on the
+            # event loop, which surfaces as CancelledError from
+            # MCPSessionHandle.release. Since 3.8 CancelledError inherits
+            # from BaseException (not Exception), so the broad ``Exception``
+            # clause below doesn't catch it. Without this, the error
+            # escapes _release → reclaim_idle → _reap_loop, kills the
+            # reaper task, and crashes cothis chat after 10 min of idle
+            # MCP keepalive (#185).
+            logger.debug(
+                "handle %s release raised CancelledError (expected for MCP "
+                "teardown); swallowed.",
+                type(slot.instance).__name__,
+            )
         except Exception as exc:  # noqa: BLE001 — release must not raise
             logger.debug("handle %s release error: %s",
                          type(slot.instance).__name__, exc)
