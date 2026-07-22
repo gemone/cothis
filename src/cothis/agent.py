@@ -253,9 +253,22 @@ def _request_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Anthropic's native API validates message dicts strictly; the metadata we
     keep on assistant messages for inspection would be rejected, so strip to
-    the two request-side fields at send time.
+    the two request-side fields at send time. Also strips private keys
+    (``_cothis_*``) from content blocks — they're internal tags for
+    persist-time skill tagging (#70), never sent to the model.
     """
-    return [{"role": m["role"], "content": m["content"]} for m in messages]
+    result = []
+    for m in messages:
+        blocks = []
+        for b in m["content"]:
+            if isinstance(b, dict):
+                blocks.append({
+                    k: v for k, v in b.items() if not k.startswith("_cothis_")
+                })
+            else:
+                blocks.append(b)
+        result.append({"role": m["role"], "content": blocks})
+    return result
 
 
 def _tool_result_block(
@@ -641,6 +654,7 @@ class Agent(BaseModel):
                 ),
             )
             msg = _assistant_msg_from_response(response)
+            self._tag_skill_blocks(msg["content"])
             self._messages.append(msg)
             if self._session is not None:
                 self._session.append_message("assistant", msg["content"])
@@ -648,8 +662,12 @@ class Agent(BaseModel):
             tool_uses = _tool_uses_in(msg["content"])
             if tool_uses:
                 for block in tool_uses:
+                    tool = self._tool_map.get(block.get("name"))
+                    skill = None
+                    if tool is not None and getattr(tool, "_skill_marker", False):
+                        skill = block.get("input", {}).get("name")
                     is_error, output = await self._execute_tool(block)
-                    self._merge_tool_result(block["id"], output, is_error)
+                    self._merge_tool_result(block["id"], output, is_error, skill=skill)
                 continue
 
             # Non-tool turn: final answer (text concat; empty → "").
@@ -798,6 +816,7 @@ class Agent(BaseModel):
             # silently rejects (chat returns to ``>>>`` with no answer).
             content = _coalesce_content(content)
 
+            self._tag_skill_blocks(content)
             self._messages.append(
                 {
                     "role": "assistant",
@@ -832,8 +851,12 @@ class Agent(BaseModel):
                         block["name"],
                     )
                     yield ToolCallEvent(name=display_name, arguments=block["input"])
+                    tool = self._tool_map.get(block.get("name"))
+                    skill = None
+                    if tool is not None and getattr(tool, "_skill_marker", False):
+                        skill = block.get("input", {}).get("name")
                     is_error, output = await self._execute_tool(block)
-                    self._merge_tool_result(block["id"], output, is_error)
+                    self._merge_tool_result(block["id"], output, is_error, skill=skill)
                 continue
 
             # Non-tool turn: final answer streamed already; just end the loop.
@@ -855,18 +878,39 @@ class Agent(BaseModel):
         return _system_param(self.system)
 
     def _merge_tool_result(
-        self, block_id: str, output: str, is_error: bool
+        self, block_id: str, output: str, is_error: bool,
+        *, skill: str | None = None,
     ) -> None:
         """Merge a ``tool_result`` into ``_messages`` + Session.
 
         Shared by ``_run_inner`` and ``_run_stream_inner`` — the
         per-execution result enqueue was duplicated verbatim. Single
         source now; adding per-result logic is a one-site edit.
+        The optional ``skill`` parameter tags the block for
+        persist-time skill tagging (#70).
         """
         result_block = _tool_result_block(block_id, output, is_error)
+        if skill is not None:
+            result_block["_cothis_skill"] = skill
         _append_merged(self._messages, "user", result_block)
         if self._session is not None:
             self._session.append_block("user", result_block)
+
+    def _tag_skill_blocks(self, content: list[dict[str, Any]]) -> None:
+        """Tag ``tool_use`` blocks from ``skill_marker`` tools (#70).
+
+        Sets ``block["_cothis_skill"] = tool_input["name"]`` in-place.
+        ``_block_to_row`` reads it for persist-time tagging;
+        ``_request_messages`` strips it before sending to the model.
+        """
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tool = self._tool_map.get(block.get("name"))
+            if tool is not None and getattr(tool, "_skill_marker", False):
+                skill_name = block.get("input", {}).get("name")
+                if skill_name:
+                    block["_cothis_skill"] = skill_name
 
     async def _ensure_handles(self) -> None:
         """Acquire eager/pinned handles once, on first run (ADR-0005).
