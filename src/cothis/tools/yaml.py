@@ -268,6 +268,23 @@ def _compile(
             # branch from a POSIX host picks ``cmd``, not the host's ``sh``.
             selected.shell = "cmd" if current == "windows" else "sh"
 
+    # cothis: cmd.exe visibility (#61). Surface the ``_shell_quote``
+    # ceiling at load time so tool authors see the gap.
+    if selected.shell == "cmd":
+        string_args = [
+            a["name"] for a in final_args
+            if a.get("type", "str") == "str"
+        ]
+        if string_args:
+            where = f" in {source}" if source else ""
+            logger.warning(
+                "tool %r uses shell: cmd with string arg(s) %s%s; "
+                "cmd.exe metacharacters (&, |, %%) in values are NOT "
+                "escaped — use shell: pwsh or command: [argv] for "
+                "untrusted input.",
+                name, string_args, where,
+            )
+
     return CommandBlock(
         name=name,
         description=description,

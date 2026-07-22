@@ -1030,11 +1030,9 @@ def test_non_ascii_accented_name_stripped() -> None:
 async def test_shell_tool_does_not_block_event_loop() -> None:
     """A long subprocess must not freeze concurrent async tasks (#90).
 
-    Pre-#90 ``_ShellTool.__call__`` ran ``subprocess.run`` inline on
-    the loop thread; a 1-second ``sleep`` stalled a concurrent ticker
-    task by exactly the subprocess duration. The fix routes the
-    subprocess through ``asyncio.to_thread`` so the loop stays
-    responsive.
+    ``_ShellTool.__call__`` runs ``subprocess.run`` via
+    ``asyncio.to_thread`` so the event loop stays responsive during
+    the full subprocess lifetime.
     """
     import asyncio
     import time
@@ -1064,3 +1062,120 @@ async def test_shell_tool_does_not_block_event_loop() -> None:
     assert len(ticks_during_sleep) >= 2, (
         f"loop stalled during subprocess: ticks={ticks}"
     )
+
+
+# ====================================================================
+# cmd shell visibility (#61)
+# ====================================================================
+
+
+def test_cmd_shell_with_string_arg_warns_at_load(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``shell: cmd`` + string arg emits a load-time WARNING (#61).
+
+    cmd.exe quoting is partial defence — ``&`` / ``|`` / ``%`` in arg
+    values are live metacharacters. The load-time warning surfaces
+    the ceiling to the tool author at every load.
+    """
+    import logging
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
+    yaml_text = (
+        "name: git-branch\n"
+        "command: git branch {name}\n"
+        "shell: cmd\n"
+        "args:\n"
+        "  - name: name\n"
+        "    type: str\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
+        load_yaml_tools(yaml_text)
+    warning_text = " ".join(r.message for r in caplog.records)
+    assert "git-branch" in warning_text
+    assert "cmd" in warning_text
+    # Warning names the offending arg so the author can locate it.
+    assert "name" in warning_text
+
+
+def test_pwsh_shell_with_string_arg_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``shell: pwsh`` is the safer Windows choice — no warning."""
+    import logging
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
+    yaml_text = (
+        "name: git-branch\n"
+        "command: git branch {name}\n"
+        "shell: pwsh\n"
+        "args:\n"
+        "  - name: name\n"
+        "    type: str\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
+        load_yaml_tools(yaml_text)
+    cmd_warnings = [
+        r for r in caplog.records
+        if "cmd" in r.message and "metacharacter" in r.message
+    ]
+    assert cmd_warnings == []
+
+
+def test_argv_mode_no_cmd_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Argv mode (``command: [list]``) doesn't need the warning — no shell."""
+    import logging
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    yaml_text = (
+        'name: echo-argv\n'
+        'command: ["echo", "{msg}"]\n'
+        'args:\n'
+        '  - name: msg\n'
+        '    type: str\n'
+    )
+    with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
+        load_yaml_tools(yaml_text)
+    cmd_warnings = [
+        r for r in caplog.records
+        if "cmd" in r.message and "metacharacter" in r.message
+    ]
+    assert cmd_warnings == []
+
+
+def test_default_shell_autoselected_cmd_on_windows_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Author omits ``shell:`` on Windows → auto-selected ``cmd`` still warns (#61).
+
+    The auto-select path at ``yaml.py:266`` is the most dangerous case
+    because the author never typed ``shell: cmd``. The warning is the
+    only signal they get that cmd.exe is in effect.
+    """
+    import logging
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
+    yaml_text = (
+        "name: git-branch\n"
+        "command: git branch {name}\n"
+        "args:\n"
+        "  - name: name\n"
+        "    type: str\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
+        load_yaml_tools(yaml_text)
+    cmd_warnings = [
+        r for r in caplog.records
+        if "cmd" in r.message and "metacharacter" in r.message
+    ]
+    assert len(cmd_warnings) == 1
+    assert "git-branch" in cmd_warnings[0].message
