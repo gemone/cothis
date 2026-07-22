@@ -346,6 +346,35 @@ def _active_skills_footer(active_skills: frozenset[str]) -> dict[str, Any]:
     return {"type": "text", "text": text}
 
 
+def _synthetic_skill_pair(name: str, body: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a synthetic ``load_skill`` tool_use + tool_result pair (#73).
+
+    The pair is tagged ``_cothis_skill=name`` so the persist-time
+    tagging path (#164), archival (#167-#170), and resume rebuild
+    (#71) all treat it as a normal model-invoked ``load_skill``. The
+    ``tool_use.id`` is a fresh UUID so multiple pairs in one
+    pre-activation batch don't collide; ``tool_result.tool_use_id``
+    references it.
+    """
+    import uuid
+
+    tool_use_id = f"preact_{uuid.uuid4().hex[:16]}"
+    tool_use = {
+        "type": "tool_use",
+        "id": tool_use_id,
+        "name": "load_skill",
+        "input": {"name": name},
+        "_cothis_skill": name,
+    }
+    tool_result = {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": body,
+        "_cothis_skill": name,
+    }
+    return tool_use, tool_result
+
+
 def _tool_result_block(
     tool_use_id: str, content: str, is_error: bool
 ) -> dict[str, Any]:
@@ -577,6 +606,11 @@ class Agent(BaseModel):
     api_key: str | None = None
     api_base: str | None = None
     cwd: Path | None = None
+    # cothis: #73 — skills to pre-activate before the first LM call.
+    # Each name is materialised as a synthetic ``load_skill`` pair
+    # appended after the first user message; resume rebuild (#71)
+    # treats the pair as a normal model-invoked load.
+    preactivate_skills: list[str] = Field(default_factory=list)
 
     # Runtime-only state: not validated, not serialised.
     _llm: AnyLLM = PrivateAttr()
@@ -594,6 +628,11 @@ class Agent(BaseModel):
     _mcp_tool_names: set[str] = PrivateAttr(default_factory=set)
     _mcp_started: bool = PrivateAttr(default=False)
     _handles_started: bool = PrivateAttr(default=False)
+    # cothis: #73 — gates ``_run_preactivation`` so it runs exactly once
+    # per Agent instance (the synthetic pairs are durable across resume
+    # via the persisted blocks + #71's rebuild, so re-injecting on a
+    # resumed session would create a duplicate epoch).
+    _preactivation_done: bool = PrivateAttr(default=False)
     # Optional persistence sink. ``ask`` leaves this ``None`` (ephemeral,
     # no Session constructed); ``chat`` calls ``attach_session`` after
     # construction. The three enqueue points (``_ensure_messages`` for the
@@ -950,6 +989,7 @@ class Agent(BaseModel):
         Callers await ``_ensure_mcp`` / ``_ensure_handles`` after.
         """
         self._ensure_messages(user_input)
+        self._run_preactivation()
         return _system_param(self.system)
 
     def _merge_tool_result(
@@ -1211,6 +1251,49 @@ class Agent(BaseModel):
         _append_merged(self._messages, "user", block)
         if self._session is not None:
             self._session.append_block("user", block)
+
+    def _run_preactivation(self) -> None:
+        """Inject synthetic ``load_skill`` pairs for ``preactivate_skills``.
+
+        Runs exactly once per Agent instance (#73). Each pre-activated
+        skill becomes a synthetic ``tool_use`` + ``tool_result`` pair
+        tagged ``_cothis_skill=name``, appended to ``_messages`` after
+        the first user message. The pair is persisted via the attached
+        ``Session`` so resume rebuild (#71) treats it as a normal
+        model-invoked load — no special case for the synthetic path.
+
+        Unknown skill names fail fast with a ``ValueError`` naming the
+        skill + listing what's available; the caller (CLI) surfaces
+        this before the first LLM call.
+        """
+        if self._preactivation_done or not self.preactivate_skills:
+            self._preactivation_done = True
+            return
+        # Function-local import: lets tests patch ``cothis.skills.discover_skills``
+        # and have the call here pick up the patched version (top-level
+        # ``from cothis.skills import discover_skills`` would bind the
+        # original at agent-module load time).
+        from cothis.skills import discover_skills
+
+        catalog = discover_skills(Path.cwd())
+        by_name = {s.name: s for s in catalog}
+        for name in self.preactivate_skills:
+            if name not in by_name:
+                available = ", ".join(sorted(by_name)) or "(none)"
+                raise ValueError(
+                    f"Unknown skill {name!r} for --skill pre-activation. "
+                    f"Available: {available}."
+                )
+            tool_use, tool_result = _synthetic_skill_pair(name, by_name[name].body)
+            self._messages.append({"role": "assistant", "content": [tool_use]})
+            self._messages.append({"role": "user", "content": [tool_result]})
+            if self._session is not None:
+                self._session.append_message("assistant", [tool_use])
+                self._session.append_message("user", [tool_result])
+                # ``_activate_skill`` is the underscore-prefixed mutation
+                # API — same convention as ``_deactivate_skill`` (#167).
+                self._session._activate_skill(name)
+        self._preactivation_done = True
 
     async def _execute_tool(self, tool_use: dict[str, Any]) -> tuple[bool, str]:
         """Dispatch a single ``tool_use`` block; return ``(is_error, output)``.
