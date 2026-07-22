@@ -178,6 +178,7 @@ def _block_to_row(
         tool_use_id=tool_use_id,
         tool_output=tool_output,
         image_source=image_source,
+        skill=block.get("_cothis_skill"),
     )
 
 
