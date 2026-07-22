@@ -255,7 +255,7 @@ def _request_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     keep on assistant messages for inspection would be rejected, so strip to
     the two request-side fields at send time. Also strips private keys
     (``_cothis_*``) from content blocks — they're internal tags for
-    persist-time skill tagging (#70), never sent to the model.
+    persist-time skill tagging (#164), never sent to the model.
     """
     result = []
     for m in messages:
@@ -662,10 +662,7 @@ class Agent(BaseModel):
             tool_uses = _tool_uses_in(msg["content"])
             if tool_uses:
                 for block in tool_uses:
-                    tool = self._tool_map.get(block.get("name"))
-                    skill = None
-                    if tool is not None and getattr(tool, "_skill_marker", False):
-                        skill = block.get("input", {}).get("name")
+                    skill = self._skill_for_block(block)
                     is_error, output = await self._execute_tool(block)
                     self._merge_tool_result(block["id"], output, is_error, skill=skill)
                 continue
@@ -851,10 +848,7 @@ class Agent(BaseModel):
                         block["name"],
                     )
                     yield ToolCallEvent(name=display_name, arguments=block["input"])
-                    tool = self._tool_map.get(block.get("name"))
-                    skill = None
-                    if tool is not None and getattr(tool, "_skill_marker", False):
-                        skill = block.get("input", {}).get("name")
+                    skill = self._skill_for_block(block)
                     is_error, output = await self._execute_tool(block)
                     self._merge_tool_result(block["id"], output, is_error, skill=skill)
                 continue
@@ -887,7 +881,7 @@ class Agent(BaseModel):
         per-execution result enqueue was duplicated verbatim. Single
         source now; adding per-result logic is a one-site edit.
         The optional ``skill`` parameter tags the block for
-        persist-time skill tagging (#70).
+        persist-time skill tagging (#164).
         """
         result_block = _tool_result_block(block_id, output, is_error)
         if skill is not None:
@@ -896,21 +890,37 @@ class Agent(BaseModel):
         if self._session is not None:
             self._session.append_block("user", result_block)
 
+    def _skill_for_block(self, block: dict[str, Any]) -> str | None:
+        """Return the skill name a ``tool_use`` block should be tagged with.
+
+        Shared by ``_run_inner``, ``_run_stream_inner`` (for
+        ``tool_result`` tagging via ``_merge_tool_result``), and
+        ``_tag_skill_blocks`` (for ``tool_use`` tagging). Returns
+        ``input["name"]`` when the dispatched tool has
+        ``_skill_marker=True`` and a ``name`` argument was supplied;
+        otherwise ``None``.
+        """
+        if block.get("type") != "tool_use":
+            return None
+        tool = self._tool_map.get(block.get("name"))
+        if tool is None or not getattr(tool, "_skill_marker", False):
+            return None
+        skill_name = block.get("input", {}).get("name")
+        return skill_name if skill_name else None
+
     def _tag_skill_blocks(self, content: list[dict[str, Any]]) -> None:
-        """Tag ``tool_use`` blocks from ``skill_marker`` tools (#70).
+        """Tag ``tool_use`` blocks from ``skill_marker`` tools (#164).
 
         Sets ``block["_cothis_skill"] = tool_input["name"]`` in-place.
         ``_block_to_row`` reads it for persist-time tagging;
         ``_request_messages`` strips it before sending to the model.
         """
         for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+            if not isinstance(block, dict):
                 continue
-            tool = self._tool_map.get(block.get("name"))
-            if tool is not None and getattr(tool, "_skill_marker", False):
-                skill_name = block.get("input", {}).get("name")
-                if skill_name:
-                    block["_cothis_skill"] = skill_name
+            skill_name = self._skill_for_block(block)
+            if skill_name is not None:
+                block["_cothis_skill"] = skill_name
 
     async def _ensure_handles(self) -> None:
         """Acquire eager/pinned handles once, on first run (ADR-0005).
