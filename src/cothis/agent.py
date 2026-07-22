@@ -1269,6 +1269,10 @@ class Agent(BaseModel):
         if self._preactivation_done or not self.preactivate_skills:
             self._preactivation_done = True
             return
+        # Function-local import: lets tests patch ``cothis.skills.discover_skills``
+        # and have the call here pick up the patched version (top-level
+        # ``from cothis.skills import discover_skills`` would bind the
+        # original at agent-module load time).
         from cothis.skills import discover_skills
 
         catalog = discover_skills(Path.cwd())
@@ -1286,6 +1290,8 @@ class Agent(BaseModel):
             if self._session is not None:
                 self._session.append_message("assistant", [tool_use])
                 self._session.append_message("user", [tool_result])
+                # ``_activate_skill`` is the underscore-prefixed mutation
+                # API — same convention as ``_deactivate_skill`` (#167).
                 self._session._activate_skill(name)
         self._preactivation_done = True
 
