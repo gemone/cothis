@@ -210,8 +210,6 @@ Delete a file::
     *** Begin Patch
     *** Delete File: obsolete.txt
     *** End Patch
-
-One op per file per call — two ops on the same path is rejected.
 """
 
 
