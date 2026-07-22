@@ -414,3 +414,73 @@ exposes the layer: `cothis archive` (run the pass), `cothis archive
 <id>` (archive one), `cothis archive restore <id>` (promote-back),
 `cothis archive compress <file>` (gzip a cold DB for transport).
 _Avoid_: backup (implies offline copies); tier (too generic); freezer.
+
+**Skill**:
+An on-disk capability package the agent can activate on demand (#30,
+ADR-0014). One directory under a skills layer (`.agents/skills/`,
+`$COTHIS_HOME/skills/`, or `~/.agents/skills/`) containing a
+`SKILL.md` with YAML frontmatter (`name`, `description`, optional
+`deactivation`) plus a Markdown body, plus optional resource files
+referenced by the body. Cross-layer name conflicts resolve by
+shadowing (higher-precedence layer wins; a WARNING names both).
+_Avoid_: plugin (implies a runtime extension API); module (collides
+with Python module); package (too generic).
+
+**Progressive disclosure**:
+The two-stage loading model for skills (#30, ADR-0014 §1). The agent
+is told *about* every discovered skill up front via the
+`<available_skills>` catalog block in the system prompt (name +
+one-line description), and loads the full body of a specific skill
+only when `load_skill(name)` is invoked. Keeps the system prompt
+bounded regardless of how many skills are installed.
+_Avoid_: lazy loading (too generic); on-demand fetch.
+
+**Catalog (`<available_skills>`)**:
+The system-prompt block that lists every discovered skill as
+`- name: description` (#68, ADR-0014 §1). Rendered by
+`cothis.skills.format_catalog` as a pure function of the discovered
+list; `None` when the list is empty (the block is omitted entirely).
+Appended to the system prompt with `cache_control: {type: ephemeral}`
+so the catalog is cache-constant per agent run.
+_Avoid_: skill list; directory (collides with the on-disk directory).
+
+**Activation**:
+The runtime state where a skill's body has been injected into the
+tool-result content (via `load_skill`) and its name added to
+`Session.active_skills` (#158, ADR-0014 §1). The active set is
+runtime-only (not persisted); `Session.load` rebuilds it by replaying
+the `load_skill` / `deactivate_skill` tool_use sequence per skill
+(#71, ADR-0014 §4). While any skill is active, every turn's latest
+user-typed message carries an `<active_skills>` footer naming them
+(#72).
+_Avoid_: enabled (too generic); loaded (collides with file loading).
+
+**Deactivation (Delete strategy)**:
+The mechanism that retires an active skill by archiving its tagged
+blocks (#167-#170, ADR-0014 §4). Four-part: Half A marks future
+writes for the skill `state='archived'` at enqueue time; Half B
+queue-updates historical and in-flight rows; an in-memory walk stamps
+the current `messages` mirror; the projection layer
+(`_request_messages`) filters blocks with `_cothis_state='archived'`
+so the model never sees them on later turns. The skill stays on disk
+and in the catalog; only its tagged blocks are hidden. Re-activation
+via a fresh `load_skill` produces a new visible epoch — the archived
+epoch stays archived. A skill declaring `deactivation: summarize`
+falls back to Delete with a logged WARNING (Summarize strategy
+deferred).
+_Avoid_: removal (implies deletion); unloading (collides with file
+unloading); suspension (too generic).
+
+**Session handler (`.session`)**:
+The tool-protocol extension that lets a tool mutate session state on
+execution (#157, ADR-0014 §3). Declared on `ToolDef` via two flags:
+`inject_session=True` causes `Agent._execute_tool` to pass the live
+`Session` as a `_session` kwarg (also stripped from the LLM-facing
+schema); `skill_marker=True` opts the tool into persist-time
+`_cothis_skill` tagging on its `tool_use` / `tool_result` blocks.
+Handlers decide via session state (catalog membership, set
+membership), never by parsing the result text — the latter would
+allow a malicious skill body to forge state mutations.
+`load_skill` and `deactivate_skill` both declare both flags.
+_Avoid_: tool hook (collides with the per-tool lifecycle hooks);
+callback (too generic).
