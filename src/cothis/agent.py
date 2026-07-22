@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
 from cothis.model_metadata import resolve_max_tokens
+from cothis.skills import discover_skills, format_catalog
 from cothis.tools import (
     AfterExecuteError,
     HandleManager,
@@ -105,8 +106,21 @@ def _assemble_system(persona: str) -> list[dict[str, Any]]:
                 "cache_control": {"type": "ephemeral"},
             }
         )
-    # ponytail: catalog block slot reserved for #30 — append a catalog block
-    # here when skills land.
+    # cothis: skills catalog (#68). Discover from 3 layers and append
+    # the ``<available_skills>`` block. Omitted entirely when no skills
+    # or when discovery fails (best-effort; the agent still runs).
+    try:
+        catalog = format_catalog(discover_skills(Path.cwd()))
+        if catalog is not None:
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": catalog,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — catalog is best-effort
+        logger.debug("skills discovery failed: %s", exc)
     return blocks
 
 
