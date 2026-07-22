@@ -324,14 +324,39 @@ def register_slash_commands() -> None:
     )
 
 
-@tool(name="deactivate_skill", inject_session=True, skill_marker=True)
-def deactivate_skill(name: str, _session: Any) -> str:
-    """Retire an active skill: its tagged blocks archive (Delete strategy).
+_DEACTIVATE_DESCRIPTION = """Remove a previously-activated skill from future context.
 
-    Use this when a skill is no longer needed. Future ``tool_use`` /
-    ``tool_result`` blocks for the named skill write ``state='archived'``
-    at persist time so context assembly can skip them on later turns.
-    Historical rows are covered separately (queued UPDATE).
+After this call, the skill's instructions are excluded from
+subsequent turns — the model will no longer see them. Use this
+when a loaded skill is no longer relevant and context space matters.
+
+Example::
+
+    deactivate_skill(name='git-commit')
+    → "Skill 'git-commit' archived."
+
+Returns a confirmation on success, a notice if the skill was
+already archived or was never activated.
+"""
+
+
+@tool(
+    name="deactivate_skill",
+    inject_session=True,
+    skill_marker=True,
+    description=_DEACTIVATE_DESCRIPTION,
+)
+def deactivate_skill(name: str, _session: Any) -> str:
+    """Retire an active skill so context assembly excludes its blocks.
+
+    Effect: ``_cothis_state='archived'`` propagates to the skill's
+    tagged blocks (Half A at enqueue time, Half B via queued UPDATE on
+    historical rows, in-memory walk on the current mirror). The
+    projection layer (``_request_messages``) filters blocks with
+    ``_cothis_state='archived'`` so the model never sees them on later
+    turns. The skill stays on disk and in the catalog; only its blocks
+    are hidden. Re-activation via ``load_skill`` produces a new visible
+    epoch.
 
     Args:
         name: The skill name (as shown in ``<available_skills>``).
