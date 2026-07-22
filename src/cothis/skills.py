@@ -104,12 +104,30 @@ def _parse_skill_md(path: Path) -> Skill | None:
     """Parse a ``SKILL.md`` file leniently.
 
     Returns ``None`` (with a log line) on:
+    - Decode failure (neither UTF-8 nor locale-decodable; skip + log).
+      Never uses ``errors='replace'`` — silent U+FFFD injection into
+      the system prompt violates the same floor ``agent._read_text``
+      enforces for AGENTS.md content.
     - Broken YAML frontmatter (skip + log)
     - Empty ``description`` (skip + log)
     Missing ``name`` defaults to the directory name.
     ``name`` ≠ directory → warn + load.
     """
-    text = path.read_text(encoding="utf-8", errors="replace")
+    import locale
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = path.read_text(
+                encoding=locale.getpreferredencoding(False),
+            )
+        except (UnicodeDecodeError, LookupError):
+            logger.warning(
+                "skills: %s is neither valid UTF-8 nor %s-decodable; skipped.",
+                path, locale.getpreferredencoding(False),
+            )
+            return None
     match = _FRONTMATTER_RE.match(text)
     if match is None:
         logger.warning(
