@@ -47,7 +47,7 @@ import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from filelock import FileLock, Timeout
 
@@ -77,6 +77,20 @@ _CLOSE_GRACE_PERIOD: float = 1.0
 def _now_iso() -> str:
     """UTC now as ISO-8601. SQLite stores as TEXT; lexicographic == chronological."""
     return datetime.now(UTC).isoformat()
+
+
+class _ArchiveOp(NamedTuple):
+    """Queued UPDATE marker for Half B of ``mark_archived`` (#168).
+
+    Carries the session id + skill name; the consumer calls
+    ``Storage.archive_skill_blocks`` to set ``state='archived'`` on all
+    matching rows. Routed through the same queue as block writes so the
+    single-writer invariant holds and the UPDATE lands after any
+    in-flight block INSERTs.
+    """
+
+    session_id: str
+    skill: str
 
 
 def _cli_version() -> str:
@@ -1027,10 +1041,17 @@ class Session:
         unchanged. Does not touch ``_active_skills`` — the two sets
         are independent (a skill can be both active and archived; the
         row-state read path picks archival).
+
+        Posts a queued UPDATE (Half B, #168) so historical + in-flight
+        rows for this skill land ``state='archived'`` regardless of
+        drain timing. The UPDATE runs on the consumer thread (single
+        writer, no SQLite concurrency). Half A (#167) covers rows
+        enqueued *after* this call.
         """
         if name in self._archived_skills:
             return False
         self._archived_skills.add(name)
+        self._enqueue_archive(name)
         return True
 
     def append_message(self, role: str, blocks: list[dict[str, Any]]) -> None:
@@ -1126,6 +1147,21 @@ class Session:
         else:
             self._queue.put(rows)
 
+    def _enqueue_archive(self, skill: str) -> None:
+        """Queue an archive UPDATE for ``skill`` (#168 Half B).
+
+        Routes the ``_ArchiveOp`` through the same queue as block
+        writes (FIFO), so any in-flight INSERT for this skill lands
+        before the UPDATE runs. flush_sync mode runs inline. The op
+        carries the session id so the consumer can dispatch the
+        UPDATE without capturing session state.
+        """
+        op = _ArchiveOp(session_id=self._session_id, skill=skill)
+        if self._flush_sync or self._queue is None:
+            self._drain_one(op)
+        else:
+            self._queue.put(op)
+
     # --- consumer -------------------------------------------------------
 
     def _consumer_loop(self) -> None:
@@ -1145,18 +1181,27 @@ class Session:
                 break
             self._drain_one(rows)
 
-    def _drain_one(self, rows: list[BlockRow]) -> None:
-        """Persist one atomic write. Idempotent on the session-row init.
+    def _drain_one(self, op: list[BlockRow] | _ArchiveOp) -> None:
+        """Persist one atomic write or run a queued archive UPDATE.
 
-        First call (for a ``new`` session): compute the title from the
-        first user-text block in ``self.messages``, write the ``.gitignore``
-        if applicable, then ``write_atomic`` with a fresh ``SessionRow``.
-        Subsequent calls / all ``load`` calls: pass ``session_row=None``.
+        Block writes: first call (for a ``new`` session) computes the
+        title from the first user-text block in ``self.messages``,
+        writes the ``.gitignore`` if applicable, then ``write_atomic``
+        with a fresh ``SessionRow``. Subsequent calls / all ``load``
+        calls pass ``session_row=None``.
+
+        Archive ops: dispatch to ``Storage.archive_skill_blocks`` so
+        all rows tagged with the named skill land ``state='archived'``
+        (Half B of mark_archived, #168).
 
         Transient ``write_atomic`` failures retried per
         ``_WRITE_RETRY_BACKOFFS``; poison rows dropped after exhaustion
         (see module-top comment).
         """
+        if isinstance(op, _ArchiveOp):
+            self._storage.archive_skill_blocks(op.session_id, op.skill)
+            return
+        rows = op
         if not rows:
             return
         updated_at = _now_iso()

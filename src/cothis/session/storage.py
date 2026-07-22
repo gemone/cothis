@@ -394,6 +394,22 @@ class Storage:
         )
         return [BlockRow(*row) for row in cur.fetchall()]
 
+    def archive_skill_blocks(self, session_id: str, skill: str) -> int:
+        """Set ``state='archived'`` on all blocks tagged with ``skill``.
+
+        Returns the count of rows matched. Idempotent on the row set —
+        a second call matches the same rows (the ``state`` column is
+        rewritten to the same value). The caller (Session) drives this
+        from the consumer thread so the single-writer invariant holds.
+        """
+        cur = self._conn.execute(
+            "UPDATE blocks SET state='archived' "
+            "WHERE session_id=? AND skill=?",
+            (session_id, skill),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def load_blocks_through_seq(
         self, session_id: str, max_seq: int
     ) -> list[BlockRow]:

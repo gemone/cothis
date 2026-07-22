@@ -173,13 +173,15 @@ def test_append_message_no_skill_marker_unaffected(tmp_path: Path) -> None:
     s.close()
 
 
-def test_append_message_block_enqueued_before_archival_stays_visible(
+def test_append_message_block_enqueued_before_archival_is_caught_by_half_b(
     tmp_path: Path,
 ) -> None:
-    """A block enqueued before archival is NOT retroactively marked.
+    """A block enqueued before archival is caught by Half B's queued UPDATE.
 
-    Half A only covers future writes; the queued UPDATE (Half B, #168)
-    will cover in-flight + historical rows.
+    Half A (#167) only marks blocks directly at enqueue time, so the
+    pre-archival enqueue leaves ``state=None``. The queued UPDATE posted
+    by ``_deactivate_skill`` (#168) catches historical + in-flight rows
+    regardless of when they were written.
     """
     s = Session.new(
         tmp_path / "db.db", cwd=tmp_path, model="m", flush_sync=True,
@@ -193,10 +195,14 @@ def test_append_message_block_enqueued_before_archival_stays_visible(
     }
     s.append_message("assistant", [block])
 
-    # Now deactivate. Already-flushed row should still have state=None.
+    # Before deactivate: Half A didn't mark (enqueue was before archival).
+    pre = s._storage.load_blocks(s._session_id)
+    assert pre[0].state is None
+
+    # After deactivate: Half B catches the historical row.
     s._deactivate_skill("python")
     rows = s._storage.load_blocks(s._session_id)
-    assert rows[0].state is None
+    assert rows[0].state == "archived"
     s.close()
 
 
