@@ -204,41 +204,55 @@ def _row_to_block(row: BlockRow) -> dict[str, Any]:
     An unknown ``type`` (one that round-tripped through the ``content =
     json.dumps(block)`` fallback) is restored by ``json.loads``-ing the
     content verbatim.
+
+    ``_cothis_skill`` and ``_cothis_state`` are rehydrated from the
+    row's ``skill`` / ``state`` columns when present (#169). The
+    projection layer (``_request_messages``) filters on
+    ``_cothis_state='archived'`` so resumed sessions with archived
+    blocks skip them on the next request.
     """
     if row.type == "text":
-        return {"type": "text", "text": row.content or ""}
-    if row.type == "thinking":
-        out: dict[str, Any] = {"type": "thinking", "thinking": row.content or ""}
+        block: dict[str, Any] = {"type": "text", "text": row.content or ""}
+    elif row.type == "thinking":
+        block = {"type": "thinking", "thinking": row.content or ""}
         if row.signature is not None:
-            out["signature"] = row.signature
-        return out
-    if row.type == "tool_use":
-        return {
+            block["signature"] = row.signature
+    elif row.type == "tool_use":
+        block = {
             "type": "tool_use",
             "id": row.tool_id or "",
             "name": row.tool_name or "",
             "input": json.loads(row.tool_input) if row.tool_input else {},
         }
-    if row.type == "tool_result":
-        return {
+    elif row.type == "tool_result":
+        block = {
             "type": "tool_result",
             "tool_use_id": row.tool_use_id or "",
             "content": row.tool_output if row.tool_output is not None else "",
         }
-    if row.type == "image":
-        return {
+    elif row.type == "image":
+        block = {
             "type": "image",
             "source": json.loads(row.image_source) if row.image_source else {},
         }
-    # Unknown type — restore the verbatim block we json.dumps'd at write time.
-    if row.content is not None:
+    elif row.content is not None:
+        # Unknown type — restore the verbatim block we json.dumps'd at write time.
         try:
             loaded = json.loads(row.content)
             if isinstance(loaded, dict):
-                return loaded
+                block = loaded
+            else:
+                block = {"type": row.type, "text": row.content or ""}
         except json.JSONDecodeError:
-            pass
-    return {"type": row.type, "text": row.content or ""}
+            block = {"type": row.type, "text": row.content or ""}
+    else:
+        block = {"type": row.type, "text": row.content or ""}
+
+    if row.skill is not None:
+        block["_cothis_skill"] = row.skill
+    if row.state is not None:
+        block["_cothis_state"] = row.state
+    return block
 
 
 def _rebuild_messages(
@@ -1047,11 +1061,22 @@ class Session:
         drain timing. The UPDATE runs on the consumer thread (single
         writer, no SQLite concurrency). Half A (#167) covers rows
         enqueued *after* this call.
+
+        Walks the in-memory ``messages`` mirror and stamps
+        ``_cothis_state='archived'`` on matching blocks (#169) so the
+        next request's projection filters them without waiting for a
+        resume.
         """
         if name in self._archived_skills:
             return False
         self._archived_skills.add(name)
         self._enqueue_archive(name)
+        for m in self.messages:
+            for b in m["content"]:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("_cothis_skill") == name:
+                    b["_cothis_state"] = "archived"
         return True
 
     def append_message(self, role: str, blocks: list[dict[str, Any]]) -> None:
