@@ -88,7 +88,7 @@ def discover_skills(
                 continue
             if skill.name in by_name:
                 logger.warning(
-                    "skills: %r from layer %r shadows %r from layer %r",
+                    "skills: %r in layer %r is shadowed by %r in layer %r",
                     skill.name, layer_name, skill.name, seen_in[skill.name],
                 )
                 continue

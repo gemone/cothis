@@ -3,7 +3,7 @@
 A complete coding agent built on top of
 [`any-llm`](https://github.com/mozilla-ai/any-llm) — talk to any LLM
 provider through a single interface, with a small ReAct-style loop that
-call tools. Built-in tools are `fs.read`, `fs.write`, and `fs.dir`; you
+call tools. Built-in tools are `fs.read`, `fs.write`, `fs.list`, and `fs.search`; you
 can add more as YAML shell tools, Python `@tool` functions, or MCP servers
 under `.agents/tools/` (see [Custom tools](#custom-tools)).
 
@@ -94,7 +94,7 @@ uv run cothis chat
 
 `chat` reuses one agent across turns, so conversation history
 accumulates. Each turn's final answer is streamed token-by-token and
-rendered as Markdown; tool calls (`fs.read`, `fs.dir`, `fs.write`, and
+rendered as Markdown; tool calls (`fs.read`, `fs.list`, `fs.write`, and
 any custom tools you've added) are printed inline as `calling <name>(<args>)`. Exit
 with `Ctrl-D` or `Ctrl-C`.
 
@@ -159,7 +159,7 @@ are silently not registered — the LLM never sees a tool it can't run here.
 
 ### Python tools (built-in `@tool`)
 
-Built-in tools (`fs.read`, `fs.dir`, `fs.write`) are defined with the
+Built-in tools (`fs.read`, `fs.list`, `fs.write`) are defined with the
 `@tool` decorator. It reads a Google-style docstring (summary → tool
 description, `Args:` → per-arg descriptions) and `inspect.signature`
 (types + defaults), then pre-builds an OpenAI schema so descriptions
