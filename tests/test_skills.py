@@ -48,7 +48,7 @@ def test_project_shadows_user_cothis(
         )
     by_name = {s.name: s for s in skills}
     assert by_name["deploy"].description == "proj"
-    assert "shadows" in " ".join(r.message for r in caplog.records)
+    assert "shadow" in " ".join(r.message for r in caplog.records)
 
 
 def test_three_layer_shadow_order(
