@@ -267,6 +267,13 @@ def _request_messages(
     post-tool-call state) — appending a text block there would corrupt
     Anthropic's tool-flow shape. Projection-only: the stored messages
     and the session store are never modified.
+
+    Blocks carrying ``_cothis_state='archived'`` are filtered out of
+    the projection (#169). The marker is set by Half A (#167, at
+    enqueue time), Half B (#168, queued UPDATE on SQLite rows +
+    in-memory walk), and ``_row_to_block`` on resume. The paired-skip
+    invariant holds because both members of a tool_use/tool_result
+    pair are tagged for the same archived skill.
     """
     result: list[dict[str, Any]] = []
     for m in messages:
@@ -276,13 +283,15 @@ def _request_messages(
         else:
             blocks = []
             for b in raw:
-                if isinstance(b, dict):
-                    blocks.append({
-                        k: v for k, v in b.items()
-                        if not k.startswith("_cothis_")
-                    })
-                else:
+                if not isinstance(b, dict):
                     blocks.append(b)
+                    continue
+                if b.get("_cothis_state") == "archived":
+                    continue
+                blocks.append({
+                    k: v for k, v in b.items()
+                    if not k.startswith("_cothis_")
+                })
         result.append({"role": m["role"], "content": blocks})
 
     if active_skills:
