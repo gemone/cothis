@@ -87,6 +87,7 @@ def _patched_agent(preactivate: list[str]) -> Any:
     return SimpleNamespace(
         _messages=[],
         _session=None,
+        system="persona",
         preactivate_skills=list(preactivate),
         _preactivation_done=False,
     )

@@ -295,7 +295,13 @@ def test_re_activate_does_not_retroactively_un_archive(tmp_path: Path) -> None:
 
 
 def test_request_messages_composes_with_active_skills_footer() -> None:
-    """Skipped archived block + footer rendering don't interfere (#72)."""
+    """Skipped archived block + footer rendering don't interfere (#72).
+
+    The assistant message had only one block (the archived ``tool_use``).
+    Once that block is filtered, the message is empty — Anthropic's API
+    rejects empty assistant messages, so the projection drops it (#188).
+    The footer still attaches to the surviving user text message.
+    """
     messages = [
         {"role": "user", "content": [{"type": "text", "text": "hi"}]},
         {
@@ -312,16 +318,18 @@ def test_request_messages_composes_with_active_skills_footer() -> None:
     out = _request_messages(
         messages, active_skills=frozenset({"python"}),
     )
-    # Footer appended (latest user text message).
+    # The empty assistant message was dropped; only the user text remains.
+    assert len(out) == 1
+    # Footer appended to the surviving user text message.
     footer_blocks = [
         b for b in out[0]["content"]
         if isinstance(b, dict) and b.get("type") == "text"
         and "<active_skills>" in b.get("text", "")
     ]
     assert len(footer_blocks) == 1
-    # Archived tool_use skipped.
+    # No tool_use reaches the model.
     types = [
-        b.get("type") for b in out[1]["content"]
+        b.get("type") for b in out[0]["content"]
         if isinstance(b, dict)
     ]
     assert "tool_use" not in types
