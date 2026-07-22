@@ -479,6 +479,10 @@ class Session:
         # first ``_drain_one`` call promotes the rows cold→hot atomically
         # and clears the flag; subsequent writes are hot-only.
         self._cold = cold
+        # cothis: active skills state (#158). Runtime-only; not persisted.
+        # ``load_skill`` adds names here; the catalog + active set drive
+        # handler decisions (catalog membership, not text sniffing).
+        self._active_skills: set[str] = set()
 
         # Queue + consumer thread. Skipped entirely in flush_sync mode —
         # _drain_one is called inline from append_message instead.
@@ -971,6 +975,23 @@ class Session:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    # cothis: skills state (#158). Read-only API for handlers + tools.
+    @property
+    def active_skills(self) -> frozenset[str]:
+        """Names of skills activated in this session (runtime-only)."""
+        return frozenset(self._active_skills)
+
+    def is_skill_active(self, name: str) -> bool:
+        """True iff ``name`` has been activated via ``load_skill``."""
+        return name in self._active_skills
+
+    def _activate_skill(self, name: str) -> bool:
+        """Mark a skill as active. Returns True if newly activated."""
+        if name in self._active_skills:
+            return False
+        self._active_skills.add(name)
+        return True
 
     def append_message(self, role: str, blocks: list[dict[str, Any]]) -> None:
         """Append a multi-block message atomically (one txn on drain).

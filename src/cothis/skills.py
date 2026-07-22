@@ -2,7 +2,8 @@
 
 Discovers Agent Skills from three layers (project > user-cothis >
 user-agents), parses each ``SKILL.md`` leniently, and renders the
-``<available_skills>`` catalog block for the system prompt.
+``<available_skills>`` catalog block for the system prompt. Also
+provides the ``load_skill`` tool for skill activation (#158).
 
 Layers (highest precedence first):
 - **Project**: ``.agents/skills/`` (relative to cwd)
@@ -19,9 +20,14 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
+
+from cothis.tools.core import tool
+
+if TYPE_CHECKING:
+    from cothis.session import Session
 
 logger = logging.getLogger(__name__)
 
@@ -162,3 +168,51 @@ def format_catalog(skills: list[Skill]) -> str | None:
         lines.append(f"  - {skill.name}: {skill.description}")
     lines.append("</available_skills>")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------
+# load_skill tool (#158)
+# ---------------------------------------------------------------------
+
+
+@tool(name="load_skill", inject_session=True, skill_marker=True)
+def load_skill(name: str, _session: Any) -> str:
+    """Activate a skill by name and load its content.
+
+    Use this when you need the detailed instructions from a skill
+    listed in ``<available_skills>``. The skill body is returned
+    wrapped in ``<skill_content>`` tags. Repeated calls for an
+    already-active skill return a notice instead of reloading.
+
+    Args:
+        name: The skill name (as shown in the catalog).
+    """
+    catalog = discover_skills(Path.cwd())
+    by_name = {s.name: s for s in catalog}
+
+    if name not in by_name:
+        return f"Error: unknown skill {name!r}. Available: {', '.join(sorted(by_name)) or '(none)'}."
+
+    if _session is not None and _session.is_skill_active(name):
+        return f"Skill {name!r} is already active."
+
+    skill = by_name[name]
+    if _session is not None:
+        _session._activate_skill(name)
+
+    parts = [f"<skill_content name={name!r}>\n{skill.body}\n</skill_content>"]
+
+    resources_dir = skill.source.parent
+    resource_files = sorted(
+        f.relative_to(resources_dir).as_posix()
+        for f in resources_dir.rglob("*")
+        if f.is_file() and f.name != _SKILL_FILE
+    )
+    if resource_files:
+        parts.append(
+            "<skill_resources>\n"
+            + "\n".join(f"  - {r}" for r in resource_files)
+            + "\n</skill_resources>"
+        )
+
+    return "\n\n".join(parts)
