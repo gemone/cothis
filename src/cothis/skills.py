@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from cothis.slash import SlashContext
+from cothis.slash import register as slash_register
 from cothis.tools.core import tool
 
 if TYPE_CHECKING:
@@ -216,3 +218,49 @@ def load_skill(name: str, _session: Any) -> str:
         )
 
     return "\n\n".join(parts)
+
+
+async def reload_skills_handler(ctx: SlashContext, args: str) -> str:
+    """Slash handler for ``/reload-skills`` (#172).
+
+    Re-runs ``discover_skills`` from the session's cwd (or
+    ``Path.cwd()`` when no session is attached) and returns a
+    one-line summary naming the count and skill names. The next
+    agent run picks up the fresh catalog automatically via
+    ``_assemble_system`` — this handler does not mutate any cached
+    state, it just validates discovery + reports.
+
+    Discovery failures are caught and surfaced to the user as an
+    error summary; the handler never raises.
+    """
+    cwd = Path.cwd()
+    if ctx.session is not None:
+        cwd = getattr(ctx.session, "cwd", cwd)
+        if not isinstance(cwd, Path):
+            cwd = Path.cwd()
+    try:
+        skills = discover_skills(cwd)
+    except Exception as exc:  # noqa: BLE001 — best-effort; surface to user
+        logger.warning("skills: /reload-skills discovery failed: %s", exc)
+        return f"Reload failed: {exc}"
+    names = sorted(s.name for s in skills)
+    if not names:
+        return "Reloaded skills catalog: 0 skills discovered."
+    return (
+        f"Reloaded skills catalog: {len(names)} skill(s) discovered: "
+        + ", ".join(names)
+    )
+
+
+def register_slash_commands() -> None:
+    """Register skills-related slash commands (currently ``/reload-skills``).
+
+    Idempotent: safe to call multiple times (the registry overwrites on
+    re-registration). Not auto-called at module import — the REPL (or
+    whoever wires slash dispatch) calls this explicitly so importing
+    ``cothis.skills`` stays side-effect-free.
+    """
+    slash_register(
+        "reload-skills", reload_skills_handler,
+        summary="Re-run skill discovery; list discovered skills.",
+    )

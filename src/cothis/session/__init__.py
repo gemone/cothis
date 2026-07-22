@@ -976,6 +976,11 @@ class Session:
     def session_id(self) -> str:
         return self._session_id
 
+    @property
+    def cwd(self) -> Path:
+        """Cwd captured at session creation time (read-only)."""
+        return self._cwd
+
     # cothis: skills state (#158). Read-only API for handlers + tools.
     @property
     def active_skills(self) -> frozenset[str]:
