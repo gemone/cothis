@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # the first real migration (#30 adds blocks.skill/blocks.state, or later).
 # Bump this constant when a migration actually ships; the writer below pins
 # it on every sessions row so future per-row dispatch has the data.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _DDL = (
     """
@@ -81,6 +81,8 @@ _DDL = (
         image_source  TEXT,
         summary       TEXT,
         summarized_seq TEXT,
+        skill         TEXT,
+        state         TEXT,
         PRIMARY KEY (session_id, seq))
     """,
     "CREATE INDEX IF NOT EXISTS idx_blocks_msg  ON blocks(session_id, msg_idx, block_idx)",
@@ -134,6 +136,8 @@ class BlockRow(NamedTuple):
     image_source: str | None = None
     summary: str | None = None
     summarized_seq: str | None = None
+    skill: str | None = None
+    state: str | None = None
 
 
 def _restrict_to_owner(path: str) -> None:
@@ -258,10 +262,22 @@ class Storage:
         # value is a no-op.
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.execute("PRAGMA foreign_keys=ON")
         for stmt in _DDL:
             self._conn.execute(stmt)
+        # cothis: v1→v2 migration (#69). Add ``skill`` and ``state`` columns
+        # to existing v1 databases. New DBs already have them from DDL.
+        # Safe: PRAGMA table_info + set-membership guard means re-open is
+        # a no-op even if user_version wasn't bumped yet.
+        row = self._conn.execute("PRAGMA user_version").fetchone()
+        current_version = row[0] if row else 0
+        if current_version < 2:
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(blocks)")}
+            if "skill" not in cols:
+                self._conn.execute("ALTER TABLE blocks ADD COLUMN skill TEXT")
+            if "state" not in cols:
+                self._conn.execute("ALTER TABLE blocks ADD COLUMN state TEXT")
+        self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
         # Tighten db + WAL/SHM sidecars to owner-only. SQLite creates all
         # three via open() under the umask; sidecars do NOT inherit the
@@ -319,8 +335,8 @@ class Storage:
                         (session_id, seq, msg_idx, block_idx, role, type, ts,
                          content, signature, tool_id, tool_name, tool_input,
                          tool_use_id, tool_output, image_source, summary,
-                         summarized_seq)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         summarized_seq, skill, state)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [tuple(b) for b in block_rows],
                 )
@@ -370,7 +386,7 @@ class Storage:
             SELECT session_id, seq, msg_idx, block_idx, role, type, ts,
                    content, signature, tool_id, tool_name, tool_input,
                    tool_use_id, tool_output, image_source, summary,
-                   summarized_seq
+                   summarized_seq, skill, state
             FROM blocks WHERE session_id=?
             ORDER BY msg_idx, block_idx
             """,
@@ -395,7 +411,7 @@ class Storage:
             SELECT session_id, seq, msg_idx, block_idx, role, type, ts,
                    content, signature, tool_id, tool_name, tool_input,
                    tool_use_id, tool_output, image_source, summary,
-                   summarized_seq
+                   summarized_seq, skill, state
             FROM blocks WHERE session_id=? AND seq <= ?
             ORDER BY msg_idx, block_idx
             """,

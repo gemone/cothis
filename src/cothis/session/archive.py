@@ -386,6 +386,8 @@ def _ensure_cold_schema(cold_db_path: Path) -> None:
                 image_source  TEXT,
                 summary       TEXT,
                 summarized_seq TEXT,
+                skill         TEXT,
+                state         TEXT,
                 PRIMARY KEY (session_id, seq));
             CREATE INDEX IF NOT EXISTS idx_blocks_msg  ON blocks(session_id, msg_idx, block_idx);
             CREATE INDEX IF NOT EXISTS idx_blocks_tool ON blocks(session_id, tool_name);
