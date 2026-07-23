@@ -302,6 +302,19 @@ def _request_messages(
             continue
         result.append({"role": m["role"], "content": blocks})
 
+    # Merge consecutive same-role messages (#205). When the archived-
+    # block filter drops an entire message (all blocks archived), the
+    # surrounding messages of the same role become consecutive.
+    # Anthropic's Messages API rejects this with HTTP 400. The merge
+    # concatenates their content blocks into a single message.
+    merged: list[dict[str, Any]] = []
+    for msg in result:
+        if merged and merged[-1]["role"] == msg["role"]:
+            merged[-1]["content"].extend(msg["content"])
+        else:
+            merged.append({"role": msg["role"], "content": list(msg["content"])})
+    result = merged
+
     if active_skills:
         target_idx = _footer_target_idx(result)
         if target_idx is not None:
