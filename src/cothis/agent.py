@@ -18,7 +18,9 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -43,6 +45,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
 from cothis.model_metadata import resolve_max_tokens
+from cothis.notify import NotifyBus
 from cothis.skills import discover_skills, format_catalog
 from cothis.tools import (
     AfterExecuteError,
@@ -682,6 +685,12 @@ class Agent(BaseModel):
     # user turn, post-MessageStop for the assistant content, per-execution
     # inside the tool loop for ``tool_result``) all guard on this.
     _session: Session | None = PrivateAttr(default=None)
+    # Durable notify bus (#224). ``None`` unless ``COTHIS_NOTIFY_BUS`` is
+    # set at attach time AND a session is bound — gating is coalesced so
+    # the common ephemeral path pays zero bus overhead. When present,
+    # ``_execute_tool`` emits ``started`` + (``completed`` | ``failed``)
+    # rows into ``notify_events`` via the session storage connection.
+    _bus: NotifyBus | None = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
         from any_llm import AnyLLM
@@ -737,6 +746,12 @@ class Agent(BaseModel):
         (``Session.new``) has empty ``messages`` and the seed is a no-op.
         """
         self._session = session
+        # cothis: #224 — bind the durable notify bus when the feature flag
+        # is set. ``None`` otherwise; all ``_execute_tool`` emission sites
+        # guard on ``self._bus`` so the flag-off path is byte-for-byte
+        # identical to pre-bus behavior.
+        if os.environ.get("COTHIS_NOTIFY_BUS"):
+            self._bus = NotifyBus(session._storage._conn)
         if session.messages:
             # Replace, not extend: a fresh Agent has no history of its own,
             # and the Session's messages are the ground truth. Rebuild is
@@ -1416,6 +1431,44 @@ class Agent(BaseModel):
             run_hooks_safe(tool, "_run_on_error", exc, "handle", args)
             return True, f"Error calling {name}: {exc}"
 
+        # cothis: #224 — emit ``started`` after pre_execute + handle acquire
+        # succeed and before the body runs. Single dispatch point covers
+        # every tool source (ToolDef, _ShellTool, MCPClientTool). The
+        # terminal emit (``completed`` / ``failed``) is centralised in
+        # ``_emit_terminal`` so duration math + pointer format live once.
+        if self._bus is not None:
+            call_id = tool_use.get("id")
+            self._bus.append(
+                topic="tool_call",
+                event_type="started",
+                session_id=self._session.session_id if self._session is not None else None,
+                meta={"tool": name, "call_id": call_id},
+            )
+        started_at = time.monotonic()
+
+        def _emit_terminal(event_type: str, ok: bool) -> None:
+            """#224 — write the terminal tool_call event for this dispatch."""
+            if self._bus is None:
+                return
+            sid = self._session.session_id if self._session is not None else None
+            call_id = tool_use.get("id")
+            self._bus.append(
+                topic="tool_call",
+                event_type=event_type,
+                session_id=sid,
+                meta={
+                    "tool": name,
+                    "call_id": call_id,
+                    "duration_ms": int((time.monotonic() - started_at) * 1000),
+                    "ok": ok,
+                },
+                payload_pointer=(
+                    f"session:{sid}:tool:{call_id}"
+                    if sid is not None and call_id is not None
+                    else None
+                ),
+            )
+
         # Bracket the body in an in-flight window so the background reaper
         # can't reclaim this handle mid-call. Pairs with handle_call_done
         # in the finally below. No-op for tools without a bound handle.
@@ -1438,6 +1491,7 @@ class Agent(BaseModel):
             logger.debug("← %s raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=tool)", name)
             run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
+            _emit_terminal("failed", ok=False)
             return True, f"Error calling {name}: {exc}"
         finally:
             # End the in-flight window so the reaper can reclaim this
@@ -1476,4 +1530,5 @@ class Agent(BaseModel):
         else:
             rendered = str(result)
         logger.debug("← %s: %s", name, rendered)
+        _emit_terminal("completed", ok=True)
         return False, rendered
