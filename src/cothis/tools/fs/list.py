@@ -48,7 +48,26 @@ def _log_backend_choice() -> None:
         _backend_logged = True
 
 
-@tool("fs.list")
+_LIST_DESCRIPTION = """List directory entries with optional filtering.
+
+Returns ``[{name, type}]`` dicts — ``name`` is relative to ``path``,
+``type`` is ``"file"`` or ``"dir"``. Past 500 entries the shape
+changes to ``{"entries": [...], "truncated": true}`` so check for
+the ``truncated`` key when listing large directories.
+
+Dotfiles and gitignore-excluded entries are hidden by default; pass
+``all=True`` to show them (noise dirs like ``.git`` / ``__pycache__``
+are always excluded regardless). Use ``recursive=True`` for nested
+paths and ``type="file"`` / ``type="dir"`` to filter.
+
+Example::
+
+    fs.list(path='.', pattern='*.py')
+    → [{"name": "app.py", "type": "file"}, {"name": "utils.py", "type": "file"}]
+"""
+
+
+@tool("fs.list", description=_LIST_DESCRIPTION)
 def _list(
     path: str = ".",
     pattern: str | None = None,
