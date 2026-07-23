@@ -37,8 +37,8 @@ base class, issue #1 stories 1–10). Three forms: `@tool`, `@tool("name")`,
 (summary → tool description, `Args:` → per-arg descriptions) and
 `inspect.signature` (types + required/optional), pre-builds an
 Anthropic-shape tool schema (`{name, description, input_schema}`) that
-`Agent` passes straight to `any_llm.amessages`. `fs.read`, `fs.write`,
-`fs.list`, `fs.search` all use it.
+`Agent` passes straight to `any_llm.amessages`. `fs.read`, `fs.create`,
+`fs.modify`, `fs.delete`, `fs.list`, `fs.search` all use it.
 _Avoid_: tool factory, tool wrapper, tool class.
 
 **Tool output format**:
