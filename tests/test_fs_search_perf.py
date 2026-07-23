@@ -38,9 +38,9 @@ def test_fast_path_scans_2000_lines_quickly(tmp_path: Path) -> None:
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
     assert len(result) == 2000
-    # 100ms is 4× the pre-fix executor cost — leaves headroom for CI
-    # variance while still failing if the executor comes back.
-    assert elapsed_ms < 100, f"scan too slow: {elapsed_ms:.1f}ms"
+    # 250ms is ~10× the pre-fix executor cost — leaves generous headroom
+    # for CI runner variance (Ubuntu shared runners spike to 200ms+).
+    assert elapsed_ms < 250, f"scan too slow: {elapsed_ms:.1f}ms"
 
 
 def test_wall_clock_cap_returns_partial_results_across_many_files(
