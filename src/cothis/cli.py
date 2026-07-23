@@ -14,12 +14,19 @@ from pathlib import Path
 # Must run before cothis.agent imports any_llm.
 os.environ.setdefault("ANY_LLM_UNIFIED_EXCEPTIONS", "1")
 
-import click
-import typer
-from prompt_toolkit.shortcuts import PromptSession
-from rich.console import Console
-from rich.live import Live
-from rich.markdown import Markdown
+# If COTHIS_PROFILE_STARTUP is set, re-exec under -X importtime and exit
+# before any third-party import runs. Imports only stdlib so the
+# measurement cost is negligible when the flag is unset.
+from cothis._profile_startup import maybe_profile
+
+maybe_profile()
+
+import click  # cost: ~5ms
+import typer  # cost: ~30ms (loads click + shell completion)
+from prompt_toolkit.shortcuts import PromptSession  # cost: ~40ms
+from rich.console import Console  # cost: ~15ms
+from rich.live import Live  # cost: ~5ms
+from rich.markdown import Markdown  # cost: ~5ms
 
 from cothis.agent import Agent, MaxIterationsError, ToolCallEvent
 from cothis.session import (

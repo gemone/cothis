@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, cast
 # is how ty narrows the ``MessageStreamEvent`` union (it can't narrow by
 # string ``event.type`` comparison). The union is itself just these
 # anthropic SDK classes (any-llm re-exports them).
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr  # cost: ~5ms
 
 # cothis: ``Tool`` must be runtime-imported (not TYPE_CHECKING-only) because
 # pydantic resolves the ``list[Tool]`` field annotation at model-build time

@@ -79,6 +79,48 @@ The PRs that established the standard (issue → PR):
 - #201 → #202 (`fs.list`)
 - #203 → #204 (`code.lines`)
 
+## Startup latency budget
+
+`cothis --help` is the first thing every user runs. It must feel instant. This section pins the budget and the import rule that keeps it honest.
+
+### Baselines + ceilings (2026-07-24)
+
+Measured per the methodology in `tests/test_startup_latency.py` — 3-run median wall time of `python -c "import cothis.cli; cothis.cli.app(['--help'])"` minus `python -c "pass"` on the same host:
+
+| Platform | Baseline | Ceiling | Rationale |
+|----------|---------:|--------:|-----------|
+| Linux    | ~390 ms  | 600 ms  | 1.5× baseline — headroom for CI variance |
+| macOS    | ~500 ms  | 750 ms  | estimate; tighten after first stable CI run |
+| Windows  | ~840 ms  | 1300 ms | #45 post-deferral data point × 1.5 |
+
+**Target:** the issue asks for `baseline + 50 ms` per platform. Ceilings here are conservative (1.5× baseline) because CI runners vary by ~50–100 ms run-to-run; tighten toward the 50 ms target once we accumulate stable data. A gross regression (a new top-level `import tensorflow`) gets caught today; a subtle one (a new 30 ms import) may not.
+
+### Lazy-import rule
+
+Every third-party top-level import in the startup path (`cothis/__init__.py`, `cothis/cli.py`, `cothis/agent.py`) must **either**:
+
+1. **Carry an inline `# cost: ~Nms` comment** naming its measured cost — so a reviewer sees the hit in the diff. Example: `from pydantic import BaseModel  # cost: ~5ms`.
+2. **Be deferred** under `if TYPE_CHECKING:` or inside the function that first uses it. The patterns from #45 (anthropic SDK), #81 (griffe), #118 (follow-ups) are the template.
+
+Stdlib imports (`pathlib`, `typing`, `os`, `sys`, `asyncio`, …) are exempt — they're cheap and the audit ignores them. The third-party set is `any_llm`, `anthropic`, `click`, `filelock`, `griffe`, `mcp`, `pathspec`, `prompt_toolkit`, `pydantic`, `rich`, `typer`, `yaml` — derived from `pyproject.toml`'s `[project.dependencies]` plus transitive module names.
+
+Enforced by `tests/test_startup_latency.py::test_no_unjustified_third_party_imports` (AST-based, not string match — handles `if TYPE_CHECKING` blocks correctly).
+
+### Profile a new import
+
+To measure a new third-party import's cost before adding it to the startup path:
+
+```
+python -X importtime -c "import <package>" 2>&1 | tail -1
+```
+
+The `importtime` flag prints `self_us | cumulative_us | module` to stderr. Use the `self_us` value (first column) — that's the cost of the module itself, excluding transitive deps already loaded.
+
+### Out of scope
+
+- Runtime latency (turn time, tool dispatch) — separate concern.
+- Cothis SDK import time for embedders — focus is the CLI.
+
 ## Agent skills
 
 ### Issue tracker
