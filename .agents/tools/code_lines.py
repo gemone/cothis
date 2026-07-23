@@ -14,8 +14,20 @@ from pathlib import Path
 
 from cothis import tool
 
+_CODE_LINES_DESCRIPTION = """Count lines of code in a file.
 
-@tool("code.lines")
+Returns a ``{total, blank, comment, code}`` dict — ``total`` is the
+file's line count, ``blank`` is empty lines, ``comment`` is lines
+starting with ``#`` or ``\"\"\"``, ``code`` is the rest.
+
+Example::
+
+    code.lines(path='src/app.py')
+    → {"total": 100, "blank": 10, "comment": 20, "code": 70}
+"""
+
+
+@tool("code.lines", description=_CODE_LINES_DESCRIPTION)
 def count_lines(path: str) -> dict[str, int]:
     """Count lines of code in a file.
 
