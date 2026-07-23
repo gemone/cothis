@@ -71,7 +71,25 @@ def _is_sensitive(name: str) -> bool:
     return any(fnmatch.fnmatchcase(name, pat) for pat in _SENSITIVE_PATTERNS)
 
 
-@tool("fs.search")
+_SEARCH_DESCRIPTION = """Search file contents for a regex pattern.
+
+Returns a list of ``{file, line, text}`` dicts — ``file`` is the path
+relative to ``path``, ``line`` is the 1-based line number (matches
+``fs.read`` numbering so follow-up reads land on the right line),
+``text`` is the full matched line (trailing newline stripped).
+
+Sensitive files (credentials, private keys, ``.env``, tokens) are
+always excluded regardless of ``glob`` — searching for them silently
+returns zero results.
+
+Example::
+
+    fs.search(pattern='TODO', glob='*.py')
+    → [{"file": "src/app.py", "line": 42, "text": "# TODO: refactor"}]
+"""
+
+
+@tool("fs.search", description=_SEARCH_DESCRIPTION)
 def _search(
     pattern: str,
     path: str = ".",
