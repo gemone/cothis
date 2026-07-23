@@ -28,14 +28,14 @@ def test_format_string_argument_quoted() -> None:
 
 def test_format_multiple_arguments() -> None:
     event = ToolCallEvent(
-        name="fs.write",
+        name="fs.create",
         arguments={"path": "/tmp/out.txt", "content": "hello"},
     )
     out = _format_tool_call(event)
     # dict iteration order is insertion order; assert both pieces present.
     assert "path='/tmp/out.txt'" in out
     assert "content='hello'" in out
-    assert out.startswith("calling fs.write(")
+    assert out.startswith("calling fs.create(")
     assert out.endswith(")")
 
 
@@ -70,7 +70,7 @@ def test_discover_tools_emits_per_tool_debug_log(tmp_path: Any, caplog: Any) -> 
     debug_names = [r.getMessage() for r in debug_loaded]
     assert any("proj.deploy" in m and "deploy.yaml" in m for m in debug_names)
     assert any("fs.read" in m and "builtins" in m for m in debug_names)
-    assert any("fs.write" in m and "builtins" in m for m in debug_names)
+    assert any("fs.create" in m and "builtins" in m for m in debug_names)
 
 
 def test_format_integer_argument_not_quoted() -> None:
@@ -90,7 +90,7 @@ def test_format_no_arguments() -> None:
 def test_format_string_with_special_chars_repr_escaped() -> None:
     # repr keeps newlines / quotes visible, preventing garbled display.
     event = ToolCallEvent(
-        name="fs.write",
+        name="fs.create",
         arguments={"content": 'line1\nline2 "quoted"'},
     )
     out = _format_tool_call(event)
@@ -109,10 +109,10 @@ def test_discover_tools_user_global_absent_no_error(tmp_path: Any) -> None:
     user = tmp_path / "nonexistent"
 
     tools = discover_tools(project, user)
-    # Only builtins load (fs.read, fs.dir, fs.write).
+    # Only builtins load (fs.read, fs.list, fs.create).
     names = {t.__name__ for t in tools}
     assert "fs.read" in names
-    assert "fs.write" in names
+    assert "fs.create" in names
 
 
 def test_discover_tools_user_global_loads_tools(tmp_path: Any) -> None:

@@ -24,7 +24,7 @@ it's a layer input, not a public API.
 
 from __future__ import annotations
 
-from cothis.tools.builtins import read, write
+from cothis.tools.builtins import read
 from cothis.tools.core import (
     AfterExecuteError,
     HandleManager,
@@ -66,5 +66,4 @@ __all__ = [
     "run_hooks_safe",
     "schema_for",
     "tool",
-    "write",
 ]
