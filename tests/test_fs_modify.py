@@ -159,6 +159,47 @@ async def test_fs_modify_path_escape(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------
+# Trailing newline invariant (#215)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_content_without_trailing_newline(tmp_path: Path) -> None:
+    """Content missing a trailing newline must not merge with the next preserved line."""
+    from cothis.tools.fs.modify import _modify
+
+    _make_file(tmp_path, "f.py", 3)
+    with workdir_context(tmp_path):
+        await _modify(path="f.py", start_line=2, end_line=2, content="NEW")
+    text = (tmp_path / "f.py").read_text()
+    assert text == "line1\nNEW\nline3\n"
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_multiline_content_without_trailing_newline(tmp_path: Path) -> None:
+    """Multi-line content whose final line lacks a newline must not merge."""
+    from cothis.tools.fs.modify import _modify
+
+    _make_file(tmp_path, "f.py", 5)
+    with workdir_context(tmp_path):
+        await _modify(path="f.py", start_line=2, end_line=3, content="a\nb\nc")
+    text = (tmp_path / "f.py").read_text()
+    assert text == "line1\na\nb\nc\nline4\nline5\n"
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_content_with_trailing_newline_unchanged(tmp_path: Path) -> None:
+    """Content already ending with a newline must not gain an extra one."""
+    from cothis.tools.fs.modify import _modify
+
+    _make_file(tmp_path, "f.py", 3)
+    with workdir_context(tmp_path):
+        await _modify(path="f.py", start_line=2, end_line=2, content="NEW\n")
+    text = (tmp_path / "f.py").read_text()
+    assert text == "line1\nNEW\nline3\n"
+
+
+# ---------------------------------------------------------------------
 # Schema description
 # ---------------------------------------------------------------------
 

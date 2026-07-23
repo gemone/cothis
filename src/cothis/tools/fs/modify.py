@@ -71,6 +71,9 @@ async def _modify(
     actual_end = min(end_line, total)
 
     content_lines = content.splitlines(keepends=True) if content else []
+    if content_lines and not content_lines[-1].endswith(("\n", "\r")):
+        ending = "\r\n" if lines and lines[0].endswith("\r\n") else "\n"
+        content_lines[-1] += ending
     new_lines = lines[: start_line - 1] + content_lines + lines[actual_end:]
     new_text = "".join(new_lines)
     resolved.write_text(new_text, encoding="utf-8")
