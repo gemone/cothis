@@ -68,7 +68,33 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
     )
 
 
-@tool("fs.read")
+_READ_DESCRIPTION = """Read UTF-8 text files with 1-based line numbers (tab-separated).
+
+Pass a single path or a list. Each line in the output is prefixed
+with its line number and a tab so you can reference exact lines in
+``start_line`` / ``end_line`` on follow-up calls.
+
+Single path — returns one numbered block::
+
+    fs.read(path='config.py')
+    → 1\tdebug = True
+      2\tport = 8080
+
+Multiple paths — one block per file under a ``=== <path> ===`` header::
+
+    fs.read(path=['a.py', 'b.py'])
+    → === a.py ===
+        1\tprint('a')
+      === b.py ===
+        1\tprint('b')
+
+In a multi-path call, one missing file produces an
+``Error: file not found: <path>`` block for that file; the others
+return normally (the call does not abort).
+"""
+
+
+@tool("fs.read", description=_READ_DESCRIPTION)
 def read(
     path: str | list[str],
     start_line: int | None = None,
