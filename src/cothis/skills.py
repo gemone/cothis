@@ -209,14 +209,35 @@ def format_catalog(skills: list[Skill]) -> str | None:
 # ---------------------------------------------------------------------
 
 
-@tool(name="load_skill", inject_session=True, skill_marker=True)
-def load_skill(name: str, _session: Any) -> str:
-    """Activate a skill by name and load its content.
+_LOAD_DESCRIPTION = """Activate a skill by name; the skill body is returned for use.
 
-    Use this when you need the detailed instructions from a skill
-    listed in ``<available_skills>``. The skill body is returned
-    wrapped in ``<skill_content>`` tags. Repeated calls for an
-    already-active skill return a notice instead of reloading.
+Call this when you need the detailed instructions of a skill listed
+in ``<available_skills>``. The skill body comes back wrapped in a
+``<skill_content>`` XML block; resource files (if any) are listed in
+a sibling ``<skill_resources>`` block. Repeated calls for an
+already-active skill return a short notice instead of reloading.
+
+Example::
+
+    load_skill(name='git-commit')
+    → "<skill_content name='git-commit'>\\n...body...\\n</skill_content>"
+"""
+
+
+@tool(
+    name="load_skill",
+    inject_session=True,
+    skill_marker=True,
+    description=_LOAD_DESCRIPTION,
+)
+def load_skill(name: str, _session: Any) -> str:
+    """Activate a skill, returning its body wrapped in ``<skill_content>``.
+
+    Effect: ``_session._active_skills.add(name)`` (idempotent — repeat
+    calls return a notice rather than re-injecting the body). The
+    catalog is discovered fresh on each call via ``discover_skills``
+    (3-layer: project > user-cothis > user-agents), so newly installed
+    skills are pickable without restarting the session.
 
     Args:
         name: The skill name (as shown in the catalog).
