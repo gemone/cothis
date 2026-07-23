@@ -57,7 +57,13 @@ def test_request_messages_strips_synthetic_tool_use() -> None:
 
 
 def test_request_messages_strips_synthetic_tool_result() -> None:
-    """User message with only a ``preact_``-referenced tool_result → skipped."""
+    """User message with only a ``preact_``-referenced tool_result → skipped.
+
+    The two surviving user messages are consecutive (the synthetic
+    assistant + user pair between them was stripped). The merge pass
+    (#205) combines them into one message — Anthropic's alternation
+    invariant is preserved.
+    """
     tu, tr = _synthetic_skill_pair("python", "body")
     messages = [
         {"role": "user", "content": [{"type": "text", "text": "hi"}]},
@@ -66,10 +72,11 @@ def test_request_messages_strips_synthetic_tool_result() -> None:
         {"role": "user", "content": [{"type": "text", "text": "follow-up"}]},
     ]
     out = _request_messages(messages)
-    # First user + follow-up survive; synthetic pair stripped.
-    assert len(out) == 2
-    assert out[0]["content"][0]["text"] == "hi"
-    assert out[1]["content"][0]["text"] == "follow-up"
+    # Consecutive user messages merged into one.
+    assert len(out) == 1
+    texts = [b["text"] for b in out[0]["content"] if isinstance(b, dict) and b.get("type") == "text"]
+    assert "hi" in texts
+    assert "follow-up" in texts
 
 
 def test_request_messages_keeps_real_tool_use() -> None:
