@@ -492,8 +492,10 @@ class _ShellTool(_HookableTool):
 
     Dispatch (type-driven, ADR-0001):
     - ``command`` is a list → argv mode: ``subprocess.run(list, shell=False)``.
-    - ``command`` is a str → shell mode: ``subprocess.run(str, shell=True,
-      executable=self._shell_path)``.
+    - ``command`` is a str → shell mode: ``_shell_argv`` selects the dispatch
+      path per interpreter — argv mode (``shell=False``) for POSIX and
+      PowerShell, the ``shell=True`` path for ``cmd.exe``. See ``_shell_argv``
+      for the Windows ``CreateProcess`` failure mode that motivates argv mode.
 
     Rendering delegates to ``CommandBlock.render`` — the list-vs-string
     render fork lives there, not here. This class carries only the dispatch
@@ -528,17 +530,73 @@ class _ShellTool(_HookableTool):
         # cothis: park the blocking ``subprocess.run`` off the loop
         # thread (#90).
         if isinstance(rendered, list):
+            # argv mode — never reaches _shell_quote; safe on all platforms.
             proc = await asyncio.to_thread(
                 subprocess.run, rendered, shell=False,
                 capture_output=True, text=True,
             )
         else:
-            proc = await asyncio.to_thread(
-                subprocess.run, rendered, shell=True,
-                capture_output=True, text=True,
-                executable=self._shell_path,
-            )
+            argv = _shell_argv(self._shell_path, self._block.shell, rendered)
+            if argv is None:
+                # cmd.exe: keep shell=True — see _shell_argv.
+                proc = await asyncio.to_thread(
+                    subprocess.run, rendered, shell=True,
+                    capture_output=True, text=True,
+                    executable=self._shell_path,
+                )
+            else:
+                proc = await asyncio.to_thread(
+                    subprocess.run, argv, shell=False,
+                    capture_output=True, text=True,
+                )
         return _format_proc_result(proc)
+
+
+def _shell_argv(
+    shell_path: str | None, shell_name: str | None, command: str
+) -> list[str] | None:
+    r"""Build an explicit argv for shell-mode dispatch, or return ``None``
+    to keep the ``shell=True`` path.
+
+    Shell mode dispatches via argv (``shell=False``) for POSIX and PowerShell
+    interpreters, and via the ``shell=True`` path for ``cmd.exe``.
+
+    The argv path exists because ``subprocess.run(str, shell=True,
+    executable=...)`` is unreliable for non-cmd interpreters on Windows:
+
+    - Python's ``shell=True`` wraps the command as ``<exe> /c "<command>"``.
+      That ``/c`` is cmd.exe syntax — pwsh/powershell want ``-Command``;
+      POSIX shells want ``-c``.
+    - On Windows, ``CreateProcess`` embeds the executable path in
+      ``lpCommandLine`` (the child re-tokenises it). A path containing
+      spaces — the common case for ``C:\Program Files\PowerShell\7\pwsh.EXE``
+      — is split by the child's parser, producing the spurious argv entry
+      ``Files\PowerShell\7\pwsh.EXE`` and exit code 64.
+
+    Passing an explicit argv sidesteps both: each interpreter gets the flag
+    it understands (``-Command`` / ``-c``), and Windows does not re-tokenise
+    an argv list.
+
+    ``cmd.exe`` returns ``None`` (the ``shell=True`` path) because
+    ``_shell_quote`` cmd-quotes values with ``list2cmdline``; ``shell=True``
+    passes that rendered string to cmd.exe verbatim so the quoting
+    round-trips, whereas argv-mode dispatch would re-apply ``list2cmdline``
+    to the whole argv and double-escape the inner double-quotes (which
+    cmd.exe does not honour). cmd.exe also lives in a spaces-free path
+    (``C:\Windows\System32\cmd.exe``), so the path-split bug above does
+    not apply.
+
+    ``shell_path`` is the resolved exe path (``shutil.which`` output, may
+    contain spaces). ``shell_name`` is the declared ``shell:`` value used
+    to pick the flag; ``None`` falls back to POSIX ``-c``. ``command`` is
+    the rendered command string from ``CommandBlock.render``.
+    """
+    name = (shell_name or "").lower()
+    if name in {"cmd", "cmd.exe"} or name.endswith(r"\cmd.exe"):
+        return None
+    if name in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
+        return [shell_path or "pwsh", "-Command", command]
+    return [shell_path or "sh", "-c", command]
 
 
 def _format_proc_result(proc: Any) -> str:
