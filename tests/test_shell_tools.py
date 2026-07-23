@@ -34,6 +34,7 @@ from cothis.tools.yaml import (
     _current_platform,
     _extract_field_names,
     _merge_arg_specs,
+    _shell_argv,
     _ShellTool,
     load_yaml_tools,
     preview,
@@ -1179,3 +1180,165 @@ def test_default_shell_autoselected_cmd_on_windows_warns(
     ]
     assert len(cmd_warnings) == 1
     assert "git-branch" in cmd_warnings[0].message
+
+
+# ====================================================================
+# _shell_argv: shell-mode argv construction (Windows path-with-spaces fix)
+# ====================================================================
+
+
+def test_shell_argv_cmd_returns_none() -> None:
+    """cmd.exe returns ``None`` so dispatch keeps the ``shell=True`` path.
+
+    cmd.exe is the one interpreter dispatched via ``shell=True`` rather than
+    argv mode: ``_shell_quote`` cmd-quotes values with ``list2cmdline``, and
+    ``shell=True`` passes that rendered string to cmd.exe verbatim so the
+    quoting round-trips. argv-mode dispatch would re-apply ``list2cmdline``
+    and double-escape the inner double-quotes. cmd.exe also lives in a
+    spaces-free path, so the path-split bug argv mode exists to fix does
+    not apply.
+    """
+    assert _shell_argv(r"C:\Windows\System32\cmd.exe", "cmd", "echo hi") is None
+
+
+def test_shell_argv_cmd_absolute_path_returns_none() -> None:
+    r"""An absolute ``cmd.exe`` path passed as ``shell_name`` still matches,
+    via the ``\cmd.exe`` suffix (defensive — ``shell:`` is usually a bare
+    name, but a full path is accepted)."""
+    assert _shell_argv(
+        r"C:\Windows\System32\cmd.exe", r"C:\Windows\System32\cmd.exe", "echo hi"
+    ) is None
+
+
+def test_shell_argv_pwsh_uses_dash_command() -> None:
+    r"""pwsh mode builds ``[exe, "-Command", command]``.
+
+    PowerShell's script-string flag is ``-Command`` (not cmd's ``/c``). No
+    ``-NoProfile`` is injected: that would silently drop the user's
+    ``$PROFILE`` (aliases, env, loaded modules). ``-NoProfile`` is the
+    author's call, not cothis's.
+    """
+    argv = _shell_argv(r"C:\Program Files\PowerShell\pwsh.EXE", "pwsh", "Get-Date")
+    assert argv == [r"C:\Program Files\PowerShell\pwsh.EXE", "-Command", "Get-Date"]
+
+
+def test_shell_argv_powershell_alias_matches_pwsh() -> None:
+    r"""Windows PowerShell 5.1 (``powershell``) uses the same ``-Command`` flag."""
+    argv = _shell_argv(
+        r"C:\WINDOWS\System32\WindowsPowerShell1.0\powershell.EXE",
+        "powershell",
+        "Get-Date",
+    )
+    assert argv is not None
+    assert argv[1:] == ["-Command", "Get-Date"]
+
+
+def test_shell_argv_pwsh_does_not_substring_match() -> None:
+    """A name merely containing ``pwsh`` (e.g. ``mypwshwrapper``) does NOT
+    route to the PowerShell ``-Command`` branch — it falls through to the
+    POSIX ``-c`` default. Substring matching would silently hand the wrong
+    flag to an unrelated interpreter."""
+    argv = _shell_argv("/usr/bin/mypwshwrapper", "mypwshwrapper", "echo hi")
+    assert argv == ["/usr/bin/mypwshwrapper", "-c", "echo hi"]
+
+
+def test_shell_argv_posix_uses_dash_c() -> None:
+    """POSIX shells (sh / bash / zsh / dash) get ``-c`` per POSIX."""
+    for name in ("sh", "bash", "zsh", "dash"):
+        argv = _shell_argv(f"/usr/bin/{name}", name, "echo hi")
+        assert argv == [f"/usr/bin/{name}", "-c", "echo hi"], name
+
+
+def test_shell_argv_unknown_falls_back_to_posix_dash_c() -> None:
+    """An unrecognised shell name falls back to the POSIX ``-c`` form.
+
+    Fallback is safe-by-construction: ``-c`` is the POSIX script-string
+    flag, and the path is whatever ``shutil.which`` resolved. Unknown
+    shells are rare (every common interpreter is enumerated above).
+    """
+    argv = _shell_argv("/usr/bin/fictional-shell", "fictional-shell", "echo hi")
+    assert argv == ["/usr/bin/fictional-shell", "-c", "echo hi"]
+
+
+def test_shell_argv_none_shell_name_falls_back_to_posix() -> None:
+    """``shell_name=None`` falls back to the POSIX ``-c`` form.
+
+    Defensive: ``_ShellTool`` is only constructed for shell mode (where
+    ``block.shell`` is always set), but the helper tolerates None so
+    unit tests and future callers don't need to fabricate a name.
+    """
+    argv = _shell_argv("/usr/bin/sh", None, "echo hi")
+    assert argv == ["/usr/bin/sh", "-c", "echo hi"]
+
+
+def test_shell_argv_path_with_spaces_survives() -> None:
+    r"""A shell_path containing spaces reaches the child intact.
+
+    The common Windows case is ``C:\Program Files\PowerShell\pwsh.EXE``.
+    argv mode (``shell=False``) does not embed the exe path in
+    ``lpCommandLine``, so Windows does not re-tokenise it. This test pins
+    the argv shape that makes that true: the path is one element.
+    """
+    path = r"C:\Program Files\PowerShell\pwsh.EXE"
+    argv = _shell_argv(path, "pwsh", "Get-Date -Format 'yyyy-MM-dd'")
+    assert argv is not None
+    assert argv[0] == path
+    assert len(argv) == 3  # [exe, -Command, script]
+
+
+def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cmd.exe dispatch keeps ``shell=True`` and preserves inner double-quotes.
+
+    In cmd shell mode, ``_shell_quote`` cmd-quotes each value with
+    ``list2cmdline`` (``foo & bar`` → ``"foo & bar"``). ``__call__`` must
+    dispatch this on the ``shell=True`` path, not argv mode: argv-mode
+    ``subprocess.run(list, shell=False)`` would re-apply ``list2cmdline``
+    to the whole argv and escape the inner double-quotes as backslash-quote,
+    which cmd.exe does not honour (the ``&`` would become a live
+    metacharacter).
+
+    Captures the exact ``subprocess.run`` call (``__call__`` is async, so
+    the blocking call runs via ``asyncio.to_thread``) and pins
+    ``shell=True``, the resolved executable, and the rendered string's
+    inner quotes.
+    """
+    import asyncio
+
+    import cothis.tools.yaml as yaml_mod
+
+    yaml_text = """
+name: echo_cmd
+shell: cmd
+command: "echo {pattern}"
+args:
+  - name: pattern
+    type: str
+"""
+    block = yaml_mod._compile(yaml_text)
+    tool = yaml_mod._ShellTool(block, shell_path=r"C:\Windows\System32\cmd.exe")
+
+    captured: dict[str, Any] = {}
+
+    class _FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _spy_run(*args: Any, **kwargs: Any) -> Any:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _FakeProc()
+
+    monkeypatch.setattr(yaml_mod.subprocess, "run", _spy_run)
+    asyncio.run(tool(pattern="foo & bar"))
+
+    # Dispatch keeps shell=True (the cmd.exe path), not shell=False with a
+    # re-tokenised argv.
+    assert captured["kwargs"].get("shell") is True
+    assert captured["kwargs"].get("executable") == r"C:\Windows\System32\cmd.exe"
+    # The rendered command preserves the cmd-quoted inner double-quotes
+    # (``"foo & bar"``), not backslash-escaped ones.
+    assert captured["args"] == ('echo "foo & bar"',)
+    assert '\\"' not in captured["args"][0]
