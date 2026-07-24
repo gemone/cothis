@@ -1165,7 +1165,7 @@ class Agent(BaseModel):
             # ``server.pin`` — MCP sessions are framework-managed (created at
             # startup, released at ``aclose``) and must not be reclaimed
             # mid-chat. The reaper's anyio cancel scopes during MCP teardown
-            # crash prompt_toolkit's background tasks (#231).
+            # crash prompt_toolkit's background tasks.
             handle_cls = type(
                 f"MCPSessionHandle_{server._label}",
                 (MCPSessionHandle,),
@@ -1176,7 +1176,7 @@ class Agent(BaseModel):
                     "_fallback_label": server._label,
                     "keepalive": server.keepalive,
                     "pin": True,
-                    "eager": server.pin,
+                    "eager": True,
                 },
             )
             instance = handle_cls()

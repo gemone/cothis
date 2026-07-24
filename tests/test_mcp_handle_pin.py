@@ -1,4 +1,4 @@
-"""Tests that MCPSessionHandle is always pinned (#231).
+"""Tests that MCPSessionHandle is always pinned.
 
 The HandleManager's background reaper uses anyio cancel scopes in
 ``disconnect_from_server`` during MCP teardown, which propagates
@@ -94,7 +94,7 @@ async def test_mcp_handle_is_pinned_regardless_of_server_pin(
         cls = getattr(tool, "_handle_cls")
         slot = agent._handle_manager._slots[cls]
         assert cls.pin is True, (
-            "MCPSessionHandle must be pinned regardless of server.pin (#231)"
+            "MCPSessionHandle must be pinned regardless of server.pin"
         )
         assert slot.is_pinned, (
             "adopted slot must report is_pinned=True so the reaper skips it"
@@ -129,7 +129,7 @@ async def test_mcp_handle_not_reclaimed_by_reaper(
         slot.last_used = time.time() - 9999
         await agent._handle_manager.reclaim_idle()
         assert slot.is_live, (
-            "reaper reclaimed a pinned MCP handle — would crash prompt_toolkit (#231)"
+            "reaper reclaimed a pinned MCP handle — would crash prompt_toolkit"
         )
     finally:
         await agent.aclose()
