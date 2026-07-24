@@ -121,7 +121,7 @@ def test_restart_counter_keeps_recent_entries() -> None:
 def _make_supervisor_db(tmp_path: Path) -> tuple[Any, Any]:
     """Build a Supervisor backed by an in-memory SQLite DB."""
     from cothis.notify import NotifyBus
-    from cothis.supervisor import Supervisor
+    from cothis.supervisor import _DEFAULT_THRESHOLD, _DEFAULT_WINDOW_S, Supervisor
 
     conn = sqlite3.connect(":memory:")
     bus = NotifyBus(conn)
@@ -129,6 +129,8 @@ def _make_supervisor_db(tmp_path: Path) -> tuple[Any, Any]:
     sup._bus = bus
     sup._workers = {}
     sup._counters = {}
+    sup._threshold = _DEFAULT_THRESHOLD
+    sup._window_s = _DEFAULT_WINDOW_S
     return sup, bus
 
 

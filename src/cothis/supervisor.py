@@ -82,10 +82,10 @@ class WorkerHandle:
     session_id: str
     pid: int
     ws_url: str
-    token: str
-    cwd: str
-    status: str  # "running" | "restarting" | "errored"
-    restart_count: int
+    token: str = field(repr=False)  # bearer token; don't leak via repr/log
+    cwd: str = ""
+    status: str = "running"  # "running" | "restarting" | "errored"
+    restart_count: int = 0
 
 
 class Supervisor:
@@ -111,8 +111,15 @@ class Supervisor:
         if db_path is None:
             db_path = Path.home() / ".cothis" / "supervisor.db"
         db_path = Path(db_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Owner-only: the DB carries session IDs + worker bearer tokens.
+        # ``exist_ok=True`` doesn't chmod an existing dir, so the explicit
+        # ``os.chmod`` covers the upgrade-from-older-cothis case.
+        db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(db_path.parent, 0o700)
         self._conn = sqlite3.connect(str(db_path))
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._bus = NotifyBus(self._conn)
         self._workers: dict[str, WorkerHandle] = {}
         self._counters: dict[str, RestartCounter] = {}
@@ -121,10 +128,8 @@ class Supervisor:
 
     def _counter_for(self, session_id: str) -> RestartCounter:
         if session_id not in self._counters:
-            threshold = getattr(self, "_threshold", _DEFAULT_THRESHOLD)
-            window_s = getattr(self, "_window_s", _DEFAULT_WINDOW_S)
             self._counters[session_id] = RestartCounter(
-                threshold=threshold, window_s=window_s
+                threshold=self._threshold, window_s=self._window_s,
             )
         return self._counters[session_id]
 

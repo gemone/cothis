@@ -85,13 +85,14 @@ rate × window, which is small).
 List of timestamps + filter at query time. ``is_over_threshold``
 returns True once count ≥ threshold within the window.
 
-## 4. Subprocess-per-session, not thread-per-session
+## 4. Subprocess-per-session, not thread-per-session (design; spawn deferred to #250)
 
-Each session runs in its own OS process. The Supervisor spawns via
-``subprocess.Popen`` (real subprocess path deferred — this MVP ships
-the pure lifecycle logic + the spawn / WS-handshake contract; the
-real subprocess integration lands when the worker CLI entrypoint
-from #225 is finalised).
+Each session runs in its own OS process. The Supervisor will spawn
+via ``subprocess.Popen`` once the worker CLI entrypoint lands (follow-up #250);
+this MVP ships only the pure lifecycle logic (backoff, counter,
+status snapshot, lifecycle events). ``supervisor.py`` contains no
+``Popen`` call yet — a reader expecting the spawn path there should
+follow #250 instead.
 
 ### Considered
 
