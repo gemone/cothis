@@ -147,29 +147,48 @@ Worker calls ``Agent.run_stream`` + forwards each yielded event as
 one WS message. The translation is mechanical: ``str`` →
 ``assistant_delta``, ``ToolCallEvent`` → ``tool_call_started``.
 
-## 6. anyio — deferred (#248)
+## 6. anyio — implemented (#248)
 
-The issue mentions anyio as a "runtime-agnostic insurance" for the WS
-wrappers. The MVP uses ``websockets`` directly (which is asyncio-only
-in v16's ``asyncio.server`` module). The deferred anyio wrapper is
-tracked as follow-up #248; it stays open until a concrete non-asyncio
-use case surfaces or the criterion is dropped.
+The worker's WS surface sits behind a ``WSTransport`` seam
+(``cothis.ws``), and the worker itself uses anyio's backend-neutral
+primitives (``anyio.fail_after`` for the turn timeout). The criterion
+deferred from #225 — *"anyio WS wrappers are isolated and unit-testable
+(mock the transport)"* — is satisfied by the seam: production wires the
+``websockets`` adapter; ``tests/test_ws_transport.py`` injects a
+``FakeTransport`` / ``FakeConnection`` so dispatch, auth, and the timeout
+cancel scope run with **no socket bound**.
+
+anyio is the runtime abstraction, not the WS implementation — anyio ships
+no websocket primitive. The honest reading of "anyio WS wrappers" is
+therefore two things, both delivered:
+
+- a transport **seam** (``WSTransport`` protocol + ``Connection`` protocol)
+  that isolates the I/O surface so it can be mocked, and
+- **anyio primitives** in the worker (``fail_after`` cancel scope instead of
+  ``asyncio.timeout``) so the worker names no ``asyncio`` symbol — if a
+  second backend appears, only the adapter in ``cothis.ws`` changes.
+
+The ``websockets`` library is asyncio-only, but it runs unchanged under
+anyio's asyncio backend (the loop is the same). anyio is declared as a
+direct dependency (it was already present transitively via httpx/mcp).
 
 ### Considered
 
-- **anyio-based WS wrappers from day one.** Rejected: the project
-  runs on asyncio today (``Agent.run_stream``, ``Session``, all
-  async-io). Adding an anyio layer now is speculative abstraction
-  with no consumer.
-- **anyio on trio backend.** Rejected: trio would require rewriting
-  ``Agent.run_stream``'s internals; the cost is large + the benefit
-  is zero until a second backend appears.
+- **anyio-based WS wrappers from day one.** Rejected (originally): the
+  project runs on asyncio today, so it read as speculative. Re-evaluated
+  in #248: the *seam* earns its keep independently of anyio — it makes the
+  worker's dispatch logic hermetically testable — and the maintainer
+  (decision 2026-07-24) authorised the introduction as a deliberate,
+  subjective call.
+- **anyio on trio backend.** Still not done: trio would require rewriting
+  ``Agent.run_stream``'s internals. The current change is structured so
+  that work, if it ever appears, is local to ``cothis.ws``.
 
 ### Decision
 
-Direct ``websockets`` use for the MVP. If a real trio use case
-surfaces, wrap the worker's WS layer in anyio at that point — the
-Agent's stream API is the abstraction boundary, not the WS layer.
+``WSTransport`` seam + anyio primitives in the worker (#248). The Agent's
+stream API remains the other abstraction boundary; the WS layer is
+mechanical translation, now mockable through the seam.
 
 ## 7. Out of scope for #225
 
