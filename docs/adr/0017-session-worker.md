@@ -147,11 +147,13 @@ Worker calls ``Agent.run_stream`` + forwards each yielded event as
 one WS message. The translation is mechanical: ``str`` →
 ``assistant_delta``, ``ToolCallEvent`` → ``tool_call_started``.
 
-## 6. anyio — deferred
+## 6. anyio — deferred (#248)
 
 The issue mentions anyio as a "runtime-agnostic insurance" for the WS
 wrappers. The MVP uses ``websockets`` directly (which is asyncio-only
-in v16's ``asyncio.server`` module).
+in v16's ``asyncio.server`` module). The deferred anyio wrapper is
+tracked as follow-up #248; it stays open until a concrete non-asyncio
+use case surfaces or the criterion is dropped.
 
 ### Considered
 
