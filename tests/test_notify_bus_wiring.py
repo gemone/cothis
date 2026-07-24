@@ -1,4 +1,4 @@
-"""Tests for ``Agent._execute_tool`` notify-bus emission (#224).
+"""Tests for ``Agent._execute_tool`` notify-bus emission.
 
 The bus is gated by ``COTHIS_NOTIFY_BUS``. When unset, ``Agent._bus``
 is ``None`` and tool behavior is byte-for-byte identical to today.

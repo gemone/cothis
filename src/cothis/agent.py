@@ -685,7 +685,7 @@ class Agent(BaseModel):
     # user turn, post-MessageStop for the assistant content, per-execution
     # inside the tool loop for ``tool_result``) all guard on this.
     _session: Session | None = PrivateAttr(default=None)
-    # Durable notify bus (#224). ``None`` unless ``COTHIS_NOTIFY_BUS`` is
+    # Durable notify bus. ``None`` unless ``COTHIS_NOTIFY_BUS`` is
     # set at attach time AND a session is bound — gating is coalesced so
     # the common ephemeral path pays zero bus overhead. When present,
     # ``_execute_tool`` emits ``started`` + (``completed`` | ``failed``)
@@ -746,8 +746,8 @@ class Agent(BaseModel):
         (``Session.new``) has empty ``messages`` and the seed is a no-op.
         """
         self._session = session
-        # cothis: #224 — bind the durable notify bus when the feature flag
-        # is set. ``None`` otherwise; all ``_execute_tool`` emission sites
+        # Bind the durable notify bus when the feature flag is set.
+        # ``None`` otherwise; all ``_execute_tool`` emission sites
         # guard on ``self._bus`` so the flag-off path is byte-for-byte
         # identical to pre-bus behavior.
         if os.environ.get("COTHIS_NOTIFY_BUS"):
@@ -1431,11 +1431,13 @@ class Agent(BaseModel):
             run_hooks_safe(tool, "_run_on_error", exc, "handle", args)
             return True, f"Error calling {name}: {exc}"
 
-        # cothis: #224 — emit ``started`` after pre_execute + handle acquire
-        # succeed and before the body runs. Single dispatch point covers
-        # every tool source (ToolDef, _ShellTool, MCPClientTool). The
-        # terminal emit (``completed`` / ``failed``) is centralised in
-        # ``_emit_terminal`` so duration math + pointer format live once.
+        # Emit ``started`` after pre_execute + handle acquire succeed and
+        # before the body runs. Single dispatch point covers every tool
+        # source (ToolDef, _ShellTool, MCPClientTool). The terminal emit
+        # (``completed`` / ``failed``) is centralised in ``_emit_terminal``
+        # so duration math + pointer format live once. Both are gated on
+        # ``self._bus`` so the flag-off path pays zero overhead — no
+        # monotonic read, no closure allocation.
         if self._bus is not None:
             call_id = tool_use.get("id")
             self._bus.append(
@@ -1444,30 +1446,33 @@ class Agent(BaseModel):
                 session_id=self._session.session_id if self._session is not None else None,
                 meta={"tool": name, "call_id": call_id},
             )
-        started_at = time.monotonic()
+            started_at = time.monotonic()
 
-        def _emit_terminal(event_type: str, ok: bool) -> None:
-            """#224 — write the terminal tool_call event for this dispatch."""
-            if self._bus is None:
+            def _emit_terminal(event_type: str, ok: bool) -> None:
+                """Write the terminal tool_call event for this dispatch."""
+                assert self._bus is not None  # narrowed by the outer guard
+                sid = self._session.session_id if self._session is not None else None
+                call_id = tool_use.get("id")
+                self._bus.append(
+                    topic="tool_call",
+                    event_type=event_type,
+                    session_id=sid,
+                    meta={
+                        "tool": name,
+                        "call_id": call_id,
+                        "duration_ms": int((time.monotonic() - started_at) * 1000),
+                        "ok": ok,
+                    },
+                    payload_pointer=(
+                        f"session:{sid}:tool:{call_id}"
+                        if sid is not None and call_id is not None
+                        else None
+                    ),
+                )
+        else:
+            def _emit_terminal(event_type: str, ok: bool) -> None:
+                """No-op when the bus is disabled (flag-off path)."""
                 return
-            sid = self._session.session_id if self._session is not None else None
-            call_id = tool_use.get("id")
-            self._bus.append(
-                topic="tool_call",
-                event_type=event_type,
-                session_id=sid,
-                meta={
-                    "tool": name,
-                    "call_id": call_id,
-                    "duration_ms": int((time.monotonic() - started_at) * 1000),
-                    "ok": ok,
-                },
-                payload_pointer=(
-                    f"session:{sid}:tool:{call_id}"
-                    if sid is not None and call_id is not None
-                    else None
-                ),
-            )
 
         # Bracket the body in an in-flight window so the background reaper
         # can't reclaim this handle mid-call. Pairs with handle_call_done
