@@ -126,13 +126,22 @@ driven by the type of `command:`:
   ```
 - **shell mode** — `command:` is a string. A `shell:` field naming the
   interpreter (`bash`, `pwsh`, …) is supported; if omitted, cothis
-  auto-selects the OS default (`sh` on POSIX, `cmd` on Windows). The
-  string is passed to that shell, supporting pipes / `&&` / redirection.
-  The shell must be on PATH or the tool is not registered.
+  auto-selects the OS default (`sh` on POSIX). The string is passed to
+  that shell, supporting pipes / `&&` / redirection. The shell must be
+  on PATH or the tool is not registered.
   ```yaml
   shell: bash
   command: grep foo file | wc -l
   ```
+
+  **`shell: cmd` is rejected.** cmd.exe cannot safely quote argument
+  values — `&`, `|`, and `%VAR%` are live metacharacters that
+  `subprocess.list2cmdline` does not neutralise, so a value like
+  `foo&echo PWNED` would inject. Declare `shell: pwsh` (PowerShell —
+  single-quote quoting is sound) or switch to argv mode (`command:
+  [list]`, inherently safe). On Windows, authors who omit `shell:`
+  must declare `shell: pwsh` or use argv mode; the compile error names
+  both migration paths.
 
 Arguments are declared under `args:` and substituted into the command at
 `{arg_name}` placeholders. Only args actually referenced by the selected
