@@ -171,6 +171,108 @@ class Supervisor:
         """Read recent ``session_lifecycle`` events for the TUI's status stream."""
         return self._bus.fetch_since(last_seq=last_seq)
 
+    # -----------------------------------------------------------------
+    # Subprocess spawn / stop / restart (integration slice)
+    # -----------------------------------------------------------------
+
+    def spawn_worker(
+        self,
+        session_id: str,
+        *,
+        model: str,
+        provider: str,
+        cwd: str | None = None,
+        max_iterations: int = 30,
+        env: dict[str, str] | None = None,
+    ) -> WorkerHandle:
+        """Spawn ``python -m cothis.worker`` for ``session_id``.
+
+        Blocks until the worker prints its ready line (``{"uri", "token"}``),
+        then records a ``spawned`` lifecycle event and returns a handle.
+        The caller (TUI) gets the WS URL + bearer token from the handle.
+
+        ``cwd`` defaults to the current working directory; ``env`` is merged
+        over ``os.environ`` (the worker inherits provider API keys this way).
+        Raises ``RuntimeError`` if the worker exits before printing the
+        ready line or the line is unparseable.
+        """
+        import json as _json
+        import subprocess
+        import sys
+
+        argv = [
+            sys.executable, "-m", "cothis.worker",
+            "--session", session_id,
+            "--model", model,
+            "--provider", provider,
+            "--max-iterations", str(max_iterations),
+        ]
+        run_env = {**os.environ, **(env or {})}
+        proc = subprocess.Popen(  # noqa: S603 — argv is constructed, not shell-expanded
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd or os.getcwd(),
+            env=run_env,
+            text=True,
+        )
+        # ``readline`` returns "" at EOF; None is impossible on a pipe.
+        ready_raw = proc.stdout.readline() if proc.stdout else ""
+        if not ready_raw:
+            stderr_tail = ""
+            if proc.stderr:
+                # Drain stderr so the error message reaches the caller.
+                stderr_tail = proc.stderr.read()[-2000:]
+            proc.wait(timeout=5)
+            raise RuntimeError(
+                f"worker for session {session_id!r} exited (code={proc.returncode}) "
+                f"before ready line; stderr tail:\n{stderr_tail}"
+            )
+        try:
+            ready = _json.loads(ready_raw)
+        except _json.JSONDecodeError as exc:
+            proc.kill()
+            raise RuntimeError(
+                f"worker ready line not JSON: {ready_raw!r}"
+            ) from exc
+        handle = WorkerHandle(
+            session_id=session_id,
+            pid=proc.pid,
+            ws_url=ready["uri"],
+            token=ready["token"],
+            cwd=cwd or os.getcwd(),
+            status="running",
+            restart_count=self._counter_for(session_id).count(),
+        )
+        # Stash the Popen so ``stop_worker`` / ``restart_worker`` can reach it.
+        # ``object`` avoids a dataclass field for a process object.
+        setattr(handle, "_proc", proc)
+        self._workers[session_id] = handle
+        self.record_lifecycle("spawned", session_id, extra_meta={"pid": proc.pid})
+        return handle
+
+    def stop_worker(self, session_id: str, *, timeout: float = 10.0) -> None:
+        """Terminate one worker (SIGTERM → wait → SIGKILL if needed).
+
+        Records a ``stopped`` lifecycle event. Idempotent: a no-op if the
+        session isn't tracked or the process already exited.
+        """
+        import subprocess
+
+        handle = self._workers.get(session_id)
+        if handle is None:
+            return
+        proc: subprocess.Popen[Any] | None = getattr(handle, "_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()  # SIGTERM
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()  # SIGKILL
+                proc.wait(timeout=timeout)
+        handle.status = "stopped"
+        self.record_lifecycle("stopped", session_id)
+
     def close(self) -> None:
         """Close the supervisor DB connection."""
         self._conn.close()

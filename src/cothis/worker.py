@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from websockets.asyncio.server import ServerConnection, serve
@@ -212,3 +214,128 @@ class SessionWorker:
         aclose = getattr(self._agent, "aclose", None)
         if aclose is not None:
             await aclose()
+
+
+# ---------------------------------------------------------------------
+# CLI entrypoint: ``python -m cothis.worker --session <id> ...``
+# ---------------------------------------------------------------------
+#
+# Spawned by ``Supervisor.spawn_worker`` (#227 follow-up) and directly
+# runnable by a user. On bind it prints exactly one JSON line —
+# ``{"uri": ..., "token": ...}`` — to stdout; the Supervisor reads that
+# line to learn where the worker is listening + the bearer token to
+# pass to the TUI. Everything else goes to stderr so the JSON line is
+# unambiguous even when the worker logs.
+#
+# cothis: ``argparse``, not ``typer``. This process is spawned by the
+# Supervisor, never typed by a human; typer's 30ms startup cost buys
+# nothing here and counts against the worker-bind latency budget.
+# ``run_turn`` itself needs an Agent; this entrypoint is the minimum
+# glue to get one listening on a WS.
+
+def _build_arg_parser() -> Any:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="cothis.worker",
+        description="Run one cothis session worker (WS server on loopback).",
+    )
+    parser.add_argument(
+        "--session",
+        required=True,
+        help="32-char hex session id to attach this worker to.",
+    )
+    parser.add_argument(
+        "--provider",
+        required=True,
+        help="any-llm provider key (e.g. openrouter, openai, anthropic).",
+    )
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Model identifier for the chosen provider.",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=30,
+        help="LLM round-trip cap per turn (default: 30).",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Output-token cap. Default: resolved from litellm metadata.",
+    )
+    return parser
+
+
+def _emit_ready(uri: str, token: str) -> None:
+    """Print exactly one ``{"uri", "token"}`` JSON line to stdout.
+
+    ``ensure_ascii=False`` per the project's text-boundary default; the
+    token is ASCII regardless, but the URI host could be non-ASCII in
+    exotic setups and the line is the Supervisor's parse target.
+    """
+    import sys
+
+    line = json.dumps({"uri": uri, "token": token}, ensure_ascii=False)
+    # ``flush=True`` — the Supervisor blocks on readline() and the pipe
+    # is block-buffered by default under subprocess.Popen.
+    print(line, flush=True, file=sys.stdout)
+
+
+async def _serve(argv: list[str] | None = None) -> None:
+    """Parse argv, build Agent+Session, bind worker, serve until shutdown."""
+    args = _build_arg_parser().parse_args(argv)
+
+    # Must run before cothis.agent imports any_llm — mirrors cli.py.
+    os.environ.setdefault("ANY_LLM_UNIFIED_EXCEPTIONS", "1")
+
+    from cothis.agent import Agent
+    from cothis.cli import (
+        _PROJECT_TOOLS_DIR,
+        DEFAULT_SYSTEM_PROMPT,
+        _resolve_db_path,
+        _user_tools_dir,
+        _validate_session_id_arg,
+    )
+    from cothis.session import Session
+    from cothis.tools import discover_tools
+
+    _validate_session_id_arg(args.session)
+    db_path = _resolve_db_path()
+    session = Session.load(db_path, args.session, cwd=Path.cwd())
+    try:
+        agent = Agent(
+            model=args.model,
+            provider=args.provider,
+            tools=discover_tools(_PROJECT_TOOLS_DIR, _user_tools_dir()),
+            system=DEFAULT_SYSTEM_PROMPT,
+            max_iterations=args.max_iterations,
+            max_tokens=args.max_tokens,
+            cwd=Path.cwd(),
+        )
+        agent.attach_session(session)
+        worker = SessionWorker(agent)
+        uri = await worker.start()
+        _emit_ready(uri, worker.token)
+        try:
+            await worker.serve_forever()
+        finally:
+            await worker.stop()
+    finally:
+        session.close()
+
+
+def run(argv: list[str] | None = None) -> None:
+    """Entry point: ``python -m cothis.worker``.
+
+    ``argv`` defaults to ``sys.argv[1:]``. Exits non-zero on bind failure
+    or if the session id is malformed/missing.
+    """
+    asyncio.run(_serve(argv))
+
+
+if __name__ == "__main__":
+    run()
