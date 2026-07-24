@@ -1160,8 +1160,12 @@ class Agent(BaseModel):
             # Build a per-server ResourceHandle subclass so each server is one
             # pool entry. The startup connection is adopted as the handle's
             # first acquire (no wasted reconnect): the session is seeded onto
-            # the instance, and ``adopt`` marks it live. keepalive/pin come
-            # from the YAML declaration (ADR-0005).
+            # the instance, and ``adopt`` marks it live. ``keepalive`` comes
+            # from the YAML declaration; ``pin`` is forced True regardless of
+            # ``server.pin`` — MCP sessions are framework-managed (created at
+            # startup, released at ``aclose``) and must not be reclaimed
+            # mid-chat. The reaper's anyio cancel scopes during MCP teardown
+            # crash prompt_toolkit's background tasks.
             handle_cls = type(
                 f"MCPSessionHandle_{server._label}",
                 (MCPSessionHandle,),
@@ -1171,8 +1175,8 @@ class Agent(BaseModel):
                     "_fallback": fallback,
                     "_fallback_label": server._label,
                     "keepalive": server.keepalive,
-                    "pin": server.pin,
-                    "eager": server.pin,
+                    "pin": True,
+                    "eager": True,
                 },
             )
             instance = handle_cls()
