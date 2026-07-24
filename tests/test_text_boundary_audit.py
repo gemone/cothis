@@ -50,15 +50,17 @@ def _line_has_allow_marker(line: str) -> bool:
 # ---------------------------------------------------------------------
 
 
-def _string_literals(path: Path) -> list[tuple[int, str, str]]:
-    """Return (line_no, literal_value, full_source_line) for each string literal.
+def _string_literals(path: Path) -> list[tuple[int, str]]:
+    """Return (line_no, full_source_line) for each single-line string literal.
 
     Skips multi-line string tokens (module/class/function docstrings)
     so documentation that *mentions* a forbidden pattern as a warning
-    isn't flagged.
+    isn't flagged. The per-rule regex matchers are specific enough
+    that running them against ``line`` directly is equivalent to
+    matching against the literal token value.
     """
     src = path.read_text(encoding="utf-8")
-    out: list[tuple[int, str, str]] = []
+    out: list[tuple[int, str]] = []
     try:
         tokens = list(tokenize.generate_tokens(iter(src.splitlines(keepends=True)).__next__))
     except tokenize.TokenError:
@@ -73,18 +75,16 @@ def _string_literals(path: Path) -> list[tuple[int, str, str]]:
         lineno = tok.start[0]
         if lineno == 0 or lineno > len(lines):
             continue
-        out.append((lineno, tok.string, lines[lineno - 1]))
+        out.append((lineno, lines[lineno - 1]))
     return out
 
 
 def _errors_replace_sites(path: Path) -> list[str]:
     """Rule 1: ``errors='replace'`` / ``errors="replace"`` on a string-literal token."""
     bad: list[str] = []
-    for lineno, literal, line in _string_literals(path):
-        if "replace" not in literal:
-            continue
-        # match errors='replace' or errors="replace" (with optional spaces)
-        if not re.search(r"errors\s*=\s*(['\"]\s*replace\s*['\"])", literal):
+    pat = re.compile(r"errors\s*=\s*(['\"]\s*replace\s*['\"])")
+    for lineno, line in _string_literals(path):
+        if not pat.search(line):
             continue
         if _line_has_allow_marker(line):
             continue
@@ -95,10 +95,9 @@ def _errors_replace_sites(path: Path) -> list[str]:
 def _ensure_ascii_true_sites(path: Path) -> list[str]:
     """Rule 2: ``ensure_ascii=True`` without inline justification."""
     bad: list[str] = []
-    for lineno, literal, line in _string_literals(path):
-        if "ensure_ascii" not in literal:
-            continue
-        if not re.search(r"ensure_ascii\s*=\s*True", literal):
+    pat = re.compile(r"ensure_ascii\s*=\s*True")
+    for lineno, line in _string_literals(path):
+        if not pat.search(line):
             continue
         if _line_has_allow_marker(line):
             continue
@@ -118,7 +117,7 @@ def _hardcoded_newline_append_sites(path: Path) -> list[str]:
     bad: list[str] = []
     # Contiguous append pattern: identifier-or-close-paren, spaces, +, spaces, "\n"
     append_pat = re.compile(r"\+\s*(['\"]\\\\n['\"]|['\"]\\n['\"])")
-    for lineno, _literal, line in _string_literals(path):
+    for lineno, line in _string_literals(path):
         if _line_has_allow_marker(line):
             continue
         if append_pat.search(line):
@@ -133,6 +132,9 @@ def _hardcoded_newline_append_sites(path: Path) -> list[str]:
 
 
 _PYFILES = _python_files()
+_RULE3_FILES = [
+    p for p in _PYFILES if any(seg in str(p) for seg in _RULE3_SCOPED_MODULES)
+]
 
 
 @pytest.mark.parametrize(
@@ -168,12 +170,8 @@ def test_no_ensure_ascii_true(path: Path) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [p for p in _PYFILES if any(seg in str(p) for seg in _RULE3_SCOPED_MODULES)],
-    ids=[
-        str(p.relative_to(_SRC_ROOT.parent))
-        for p in _PYFILES
-        if any(seg in str(p) for seg in _RULE3_SCOPED_MODULES)
-    ],
+    _RULE3_FILES,
+    ids=[str(p.relative_to(_SRC_ROOT.parent)) for p in _RULE3_FILES],
 )
 def test_no_hardcoded_newline_in_fs_tools(path: Path) -> None:
     """Rule 3 — no ``+ '\\n'`` literal in ``tools/fs/*`` (file mutation paths)."""
