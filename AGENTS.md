@@ -165,6 +165,58 @@ If the PR renames anything in scope, the description includes a one-line confirm
 - **#153** — same rename left README.md referring to `fs.dir`; caught separately, fixed in #162 alongside unrelated work.
 
 Each was a separate fix PR; neither was caught by the rename PR itself. The checklist makes the rename PR responsible for the scan.
+## External boundary fail-loud
+
+Two classes of bug share a shape: code depends on something **external** — a third-party SDK's private attribute, or a prior registration it's about to overwrite — without a diagnostic when the assumption breaks. The user sees missing tools or shadowed commands with no log line. This rule makes the dependency loud.
+
+Scoped to **boundary sites only** (init, registration, first-call setup) — not hot paths. Runtime cost matters inside loops; at boundaries it doesn't.
+
+### Rule 1 — Third-party non-public attribute read
+
+Every read of an attribute the upstream package hasn't documented as public must be preceded by a shape check (`isinstance` / `hasattr` / type assertion) that raises `RuntimeError` or logs `WARNING` naming: the expected shape, the actual shape, the upstream package, the ADR/issue reference.
+
+**Signals that an attribute is non-public:** leading underscore (`_private`), absent from upstream's `__all__`, documented as "internal" in upstream docs.
+
+**In-scope examples:**
+
+- `group.tools` on `mcp.ClientSessionGroup` — guarded in `cothis.tools.mcp.connect_into` (#63, ADR-0005). The SDK may reshape its tool store or re-key entries; the guard fails loud at first connect.
+- `client._raw` on a third-party client.
+
+**Out of scope:**
+
+- Python introspection builtins (`obj.__class__`, `obj.__dict__`, `type(obj)`, `hasattr(obj, "x")` itself).
+- stdlib attributes.
+- Attributes on our own internal classes (`session._lock`, `tool._handle_cls` — first-party).
+- namedtuple `_replace` / `_fields` — "private" by convention but part of the public API.
+
+### Rule 2 — Silent overwrite / shadow
+
+Every code path that overwrites a prior registration (dict key, command name, tool name, env-derived path) at a boundary site must emit a `logger.warning` naming the key, the prior source, and the new source — unless the overwrite is the explicit documented contract.
+
+**Overwrite is the contract (no warning needed):**
+
+- `os.environ[...] = ...` — env vars are write-often by design.
+- `self._cache[key] = ...` — internal cache, no prior source to name.
+
+**Overwrite is NOT the contract (warning required):**
+
+- `self._tool_map[key] = tool` — two different tools sanitising to the same wire name shadow silently (#112 pattern). Guarded in `Agent.model_post_init`.
+- `_entries[name] = Entry(...)` in `slash.register` — a plugin registering `/skills` after the framework has registered `/skills` silently shadows (#112). Guarded in `cothis.slash.register`.
+
+### Enforcement
+
+`tests/test_boundary_fail_loud_audit.py` is a **regression guard**, not a new-bug finder. Each known boundary site is parametrised; the test verifies the guard is still present in the source. If a refactor moves or renames a site, the test turns red and the registry gets updated with the new location. New boundary sites are added to the registry when they're introduced — the rule is this section; the test is the backstop.
+
+A general static scan for `obj._foo` attribute reads was considered and rejected: distinguishing third-party objects from first-party ones requires cross-module type inference that's noisy in practice. The registry approach is explicit + cheap + catches the actual regression mode (guard removed in a refactor).
+
+### Motivating bugs
+
+- **#63** — `MCPServer.connect_into` read `group.tools` without a shape guard. An SDK upgrade would silently break tool discovery. Fixed by the `isinstance` + `RuntimeError` guard that names the divergence + the ADR.
+- **#112** — `slash.register` silently overwrote on duplicate name. A plugin registering `/skills` after the framework shadowed the framework command with no signal. Fixed by the collision `logger.warning`.
+
+### Related
+
+- **#80** — silent-except in `_build_schema` — same shape, different mechanism (exception swallow vs. attribute read). Out of scope here; the pattern is covered by the project's "no silent failure" stance in the Project rules section.
 
 ## Agent skills
 
