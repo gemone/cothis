@@ -109,15 +109,33 @@ class NotifyBus:
         assert lastrowid is not None, "INSERT always produces a rowid"
         return int(lastrowid)
 
-    def compact(self, retention_days: int | None = None) -> int:
+    def compact(
+        self,
+        retention_days: int | None = None,
+        preserve_seqs: set[int] | None = None,
+    ) -> int:
         """Delete events older than the retention window; return count removed.
 
         ``retention_days`` defaults to ``COTHIS_NOTIFY_RETENTION_DAYS``;
         0, negative, or unparseable → no-op (compaction is opt-in).
         The Supervisor (#227) calls this periodically — default cadence
-        daily. Snapshot-preservation (skipping rows pinned by an active
-        snapshot) is deferred to #246 — no snapshot table exists yet,
-        so the current implementation is pure age-based retention.
+        daily.
+
+        ``preserve_seqs`` (optional, #246) holds event ``seq`` values that
+        must survive compaction regardless of age — i.e. events an active
+        consumer (a Supervisor checkpoint, a live TUI cursor) still
+        references. The criterion from #236 ("events referenced by an
+        active snapshot are preserved") is satisfied this way: the
+        caller pins the lowest ``seq`` its consumers haven't read past
+        (see :meth:`preserve_since`) and compaction skips those rows.
+
+        We deliberately do NOT model a separate ``notify_snapshots``
+        table: the real need is a per-consumer high-water mark, not
+        arbitrary event-pinning, and a set of ``seq`` values is the
+        minimal structure that captures it. A new table + lock/expiry
+        lifecycle would be abstraction the current callers don't ask
+        for (AGENTS.md § Project rules: no abstraction that wasn't
+        requested).
         """
         if retention_days is None:
             try:
@@ -132,12 +150,24 @@ class NotifyBus:
         if retention_days <= 0:
             return 0
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        # Build the DELETE with a seq-exclusion guard when callers pin
+        # rows. Using a placeholder per value (not string-formatting seqs
+        # into SQL) keeps the parametrised-statement contract intact —
+        # seqs are ints from AUTOINCREMENT, but defence-in-depth anyway.
+        if preserve_seqs:
+            pinned = {int(s) for s in preserve_seqs}
+            placeholders = ",".join("?" for _ in pinned)
+            sql = (
+                f"DELETE FROM notify_events "
+                f"WHERE ts < ? AND seq NOT IN ({placeholders})"
+            )
+            params: tuple = (cutoff, *pinned)
+        else:
+            sql = "DELETE FROM notify_events WHERE ts < ?"
+            params = (cutoff,)
         with self._append_lock:
             with self._conn:
-                cur = self._conn.execute(
-                    "DELETE FROM notify_events WHERE ts < ?",
-                    (cutoff,),
-                )
+                cur = self._conn.execute(sql, params)
         deleted = cur.rowcount
         if deleted:
             logger.info(
@@ -146,6 +176,34 @@ class NotifyBus:
                 retention_days,
             )
         return int(deleted)
+
+    def preserve_since(self, *cursors: int) -> set[int]:
+        """Return the ``seq`` set to pass as ``preserve_seqs`` for cursor-based pinning.
+
+        Given one or more consumer high-water marks (the largest ``seq``
+        each consumer has already read), return every ``seq`` at or below
+        the *minimum* cursor that still exists in the log. Compaction with
+        this set leaves intact the contiguous prefix any lagging consumer
+        might still fetch — the log-compaction cursor rule.
+
+        A cursor of 0 (consumer hasn't read anything) pins nothing,
+        because such a consumer can't reference any specific event yet;
+        passing no cursors returns an empty set (no pinning).
+
+        Rationale: the Supervisor restarts workers and must not delete
+        ``session_lifecycle`` rows a re-attaching TUI hasn't seen. The
+        TUI tracks ``last_seq``; the Supervisor forwards the live
+        cursors here at compact time. This is the #236 snapshot
+        criterion, expressed as a cursor instead of a snapshot table.
+        """
+        active = [c for c in cursors if c > 0]
+        if not active:
+            return set()
+        floor = min(active)
+        rows = self._conn.execute(
+            "SELECT seq FROM notify_events WHERE seq <= ?", (floor,)
+        ).fetchall()
+        return {int(r[0]) for r in rows}
 
     def fetch_since(
         self,
