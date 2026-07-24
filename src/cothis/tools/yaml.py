@@ -268,22 +268,34 @@ def _compile(
             # branch from a POSIX host picks ``cmd``, not the host's ``sh``.
             selected.shell = "cmd" if current == "windows" else "sh"
 
-    # cothis: cmd.exe visibility (#61). Surface the ``_shell_quote``
-    # ceiling at load time so tool authors see the gap.
+    # cothis: cmd.exe injection ceiling — Option B (#61, GH#139).
+    # ``shell: cmd`` is REJECTED at compile time. ``_shell_quote``'s
+    # cmd.exe escaping is partial — ``&`` / ``|`` / ``%VAR%`` in arg
+    # values are live metacharacters that ``list2cmdline`` does not
+    # neutralise (see the ceiling note on ``_shell_quote``) — so the
+    # only way to close the injection ceiling permanently is to forbid
+    # the interpreter. Option A (the load-time WARNING, PR #137) gave
+    # authors a release cycle of visibility; this is the hard error
+    # that follows. Authors migrate to ``shell: pwsh`` (PowerShell
+    # single-quote quoting is sound) or argv mode (``command: [list]``,
+    # inherently safe — ``execve`` does its own tokenisation). This
+    # also fires for the auto-selected ``cmd`` on Windows when
+    # ``shell:`` is omitted (story 16 auto-select still picks ``cmd``),
+    # so a Windows author who omits ``shell:`` MUST declare ``pwsh`` or
+    # switch to argv mode — the error message is the migration signal.
+    # The cmd branches in ``_shell_quote`` / ``_shell_argv`` /
+    # ``_ShellTool.__call__`` are retained as defensive code + ceiling
+    # documentation but are unreachable from the YAML pipeline now.
     if selected.shell == "cmd":
-        string_args = [
-            a["name"] for a in final_args
-            if a.get("type", "str") == "str"
-        ]
-        if string_args:
-            where = f" in {source}" if source else ""
-            logger.warning(
-                "tool %r uses shell: cmd with string arg(s) %s%s; "
-                "cmd.exe metacharacters (&, |, %%) in values are NOT "
-                "escaped — use shell: pwsh or command: [argv] for "
-                "untrusted input.",
-                name, string_args, where,
-            )
+        where = f" in {source}" if source else ""
+        msg = (
+            f"tool {name!r}: 'shell: cmd' is not supported{where}; "
+            "cmd.exe cannot safely quote arg values (&, |, %VAR% are "
+            "live metacharacters that list2cmdline does not escape). "
+            "Use 'shell: pwsh' (PowerShell) or 'command: [argv]' "
+            "(argv mode, no shell) instead."
+        )
+        raise ValueError(msg)
 
     return CommandBlock(
         name=name,

@@ -884,36 +884,39 @@ def test_nonzero_exit_returns_error_with_stderr() -> None:
 
 
 def test_preview_platform_override_propagates_to_shell_auto_select() -> None:
-    """Copilot A: ``preview(_platform="windows")`` on a POSIX host picks
-    ``cmd``, not ``sh``. The platform override must reach shell auto-selection,
-    not just command-branch selection."""
+    """Copilot A: ``preview(_platform="windows")`` on a POSIX host
+    auto-selects ``cmd`` (which is then rejected — #61 Option B), not
+    ``sh``. The platform override reaches shell auto-selection, not just
+    command-branch selection. Since ``cmd`` is now banned, the
+    observable behaviour is that the windows branch raises at compile
+    time; the linux branch still picks ``sh`` cleanly."""
     yaml_text = 'name: t\ncommand: "echo hi"\n'  # no shell: → auto-select
-    cmd, shell_name = preview(yaml_text, _platform="windows")
-    assert shell_name == "cmd"
+    # Windows auto-select now picks cmd, which Option B rejects.
+    with pytest.raises(ValueError, match="'shell: cmd'"):
+        preview(yaml_text, _platform="windows")
     cmd, shell_name = preview(yaml_text, _platform="linux")
     assert shell_name == "sh"
+    assert cmd == "echo hi"
 
 
 def test_cmd_shell_quoting_uses_list2cmdline_not_shlex() -> None:
-    """Copilot B: ``shell: cmd`` mode quotes values with
+    """Copilot B: ``_shell_quote`` for the ``cmd`` interpreter uses
     ``subprocess.list2cmdline`` (double-quoted), not ``shlex.quote``
     (single-quoted). ``shlex.quote`` would silently fail on ``cmd.exe``
-    because cmd doesn't treat single quotes as quoting — story 22 would
-    not hold on Windows."""
-    yaml_text = """
-name: echo_cmd
-shell: cmd
-command: "echo {pattern}"
-args:
-  - name: pattern
-    type: str
-"""
-    cmd, shell_name = preview(yaml_text, pattern="foo & bar")
-    assert shell_name == "cmd"
-    # ``list2cmdline(["foo & bar"])`` → ``'"foo & bar"'`` (double-quoted).
-    # ``shlex.quote("foo & bar")`` → ``"'foo & bar'"`` (single-quoted).
-    # The assertion pins the cmd.exe-safe form.
-    assert cmd == 'echo "foo & bar"'
+    because cmd doesn't treat single quotes as quoting.
+
+    The YAML pipeline rejects ``shell: cmd`` before render (#61 Option
+    B), so ``_shell_quote``'s cmd branch is now unreachable from
+    ``preview`` / ``load_yaml_tools``. This test exercises it directly
+    to pin the quoting shape the retained defensive code produces — the
+    branch stays as ceiling documentation + a defence-in-depth path for
+    any future caller that builds a ``CommandBlock`` with ``shell=cmd``
+    without going through ``_compile``.
+    """
+    from cothis.tools.yaml import _shell_quote
+    assert _shell_quote("foo & bar", "cmd") == '"foo & bar"'
+    # Sanity: a no-metachar value round-trips unchanged.
+    assert _shell_quote("plain", "cmd") == "plain"
 
 
 def test_shell_tool_name_with_spaces_normalised_to_dashes() -> None:
@@ -1066,22 +1069,22 @@ async def test_shell_tool_does_not_block_event_loop() -> None:
 
 
 # ====================================================================
-# cmd shell visibility (#61)
+# cmd shell rejection — Option B (#61, GH#139)
 # ====================================================================
 
 
-def test_cmd_shell_with_string_arg_warns_at_load(
+def test_cmd_shell_with_string_arg_rejected_at_compile(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """``shell: cmd`` + string arg emits a load-time WARNING (#61).
+    """``shell: cmd`` raises ``ValueError`` at compile time (#61, GH#139).
 
     cmd.exe quoting is partial defence — ``&`` / ``|`` / ``%`` in arg
-    values are live metacharacters. The load-time warning surfaces
-    the ceiling to the tool author at every load.
+    values are live metacharacters ``list2cmdline`` does not neutralise,
+    and a load-time WARNING (PR #137, Option A) cannot prevent the
+    injection. Option B closes the ceiling permanently: ``_compile``
+    rejects ``shell: cmd`` outright, naming the tool, the source, and
+    both safe alternatives (``shell: pwsh`` / argv mode).
     """
-    import logging
-
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
     yaml_text = (
@@ -1092,20 +1095,93 @@ def test_cmd_shell_with_string_arg_warns_at_load(
         "  - name: name\n"
         "    type: str\n"
     )
-    with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
+    with pytest.raises(ValueError) as excinfo:
         load_yaml_tools(yaml_text)
-    warning_text = " ".join(r.message for r in caplog.records)
-    assert "git-branch" in warning_text
-    assert "cmd" in warning_text
-    # Warning names the offending arg so the author can locate it.
-    assert "name" in warning_text
+    msg = str(excinfo.value)
+    # Error names the tool + source + both safe alternatives.
+    assert "git-branch" in msg
+    assert "'shell: cmd'" in msg
+    assert "pwsh" in msg
+    assert "argv" in msg
 
 
-def test_pwsh_shell_with_string_arg_no_warning(
+def test_cmd_shell_rejection_names_source(tmp_path: Path) -> None:
+    """The reject error includes the source file when loaded from disk."""
+    bad = tmp_path / "evil.yaml"
+    bad.write_text(
+        "name: t\ncommand: echo {x}\nshell: cmd\n"
+        "args:\n  - name: x\n    type: str\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="shell: cmd") as excinfo:
+        load_tools_from_layer(tmp_path)
+    assert "evil.yaml" in str(excinfo.value)
+
+
+def test_cmd_shell_rejected_without_string_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``shell: cmd`` is rejected even with NO string args.
+
+    Option A only warned when string args were present; Option B rejects
+    unconditionally — a cmd tool with only int/bool args today is a
+    string-arg injection tomorrow, and the cmd.exe quoting ceiling is
+    a property of the interpreter, not the current arg set.
+    """
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
+    yaml_text = (
+        "name: t\n"
+        "command: echo {n}\n"
+        "shell: cmd\n"
+        "args:\n"
+        "  - name: n\n"
+        "    type: int\n"
+    )
+    with pytest.raises(ValueError, match="'shell: cmd'"):
+        load_yaml_tools(yaml_text)
+
+
+def test_cmd_shell_rejected_with_no_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``shell: cmd`` is rejected even for a no-arg command.
+
+    A no-arg cmd tool can't inject today, but rejecting only the
+    arg-bearing case would let a cmd tool slip through and gain an arg
+    later without re-triggering the check. The interpreter is unsafe;
+    reject it uniformly.
+    """
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
+    with pytest.raises(ValueError, match="'shell: cmd'"):
+        load_yaml_tools("name: t\ncommand: ver\nshell: cmd\n")
+
+
+def test_preview_rejects_cmd_shell() -> None:
+    """``preview`` shares ``_compile`` and rejects ``shell: cmd`` too.
+
+    The two paths cannot drift on what a valid YAMLTool is — both go
+    through ``_compile``, so the cmd ban holds for preview as well.
+    """
+    yaml_text = (
+        "name: t\ncommand: echo {x}\nshell: cmd\n"
+        "args:\n  - name: x\n    type: str\n"
+    )
+    with pytest.raises(ValueError, match="'shell: cmd'"):
+        preview(yaml_text)
+
+
+def test_pwsh_shell_accepted_on_windows(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """``shell: pwsh`` is the safer Windows choice — no warning."""
+    """``shell: pwsh`` is unaffected — the recommended Windows interpreter.
+
+    PowerShell single-quote quoting (via ``shlex.quote``) is sound, so
+    pwsh loads cleanly with no cmd warning and no rejection. This pins
+    the unaffected pwsh path required by the acceptance criteria.
+    """
     import logging
 
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
@@ -1119,7 +1195,8 @@ def test_pwsh_shell_with_string_arg_no_warning(
         "    type: str\n"
     )
     with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
-        load_yaml_tools(yaml_text)
+        tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "git-branch"
     cmd_warnings = [
         r for r in caplog.records
         if "cmd" in r.message and "metacharacter" in r.message
@@ -1127,11 +1204,16 @@ def test_pwsh_shell_with_string_arg_no_warning(
     assert cmd_warnings == []
 
 
-def test_argv_mode_no_cmd_warning(
+def test_argv_mode_unaffected_no_cmd_warning(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Argv mode (``command: [list]``) doesn't need the warning — no shell."""
+    """Argv mode (``command: [list]``) is unaffected — inherently safe.
+
+    ``shell=False`` / ``execve`` does its own tokenisation, so no shell
+    quoting is involved and the cmd ban never applies. Pins the
+    unaffected argv path required by the acceptance criteria.
+    """
     import logging
 
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
@@ -1143,7 +1225,8 @@ def test_argv_mode_no_cmd_warning(
         '    type: str\n'
     )
     with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
-        load_yaml_tools(yaml_text)
+        tool = load_yaml_tools(yaml_text)[0]
+    assert tool.__name__ == "echo-argv"
     cmd_warnings = [
         r for r in caplog.records
         if "cmd" in r.message and "metacharacter" in r.message
@@ -1151,18 +1234,26 @@ def test_argv_mode_no_cmd_warning(
     assert cmd_warnings == []
 
 
-def test_default_shell_autoselected_cmd_on_windows_warns(
+def test_posix_sh_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``shell: sh`` (POSIX default) is unaffected — ``shlex.quote`` is sound."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "linux")
+    yaml_text = 'name: t\ncommand: "echo {x}"\nargs:\n  - name: x\n    type: str\n'
+    tool = _shell_tool(yaml_text)  # auto-selects sh on POSIX, no raise
+    assert tool._block.shell == "sh"
+
+
+def test_default_shell_autoselected_cmd_on_windows_rejected(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Author omits ``shell:`` on Windows → auto-selected ``cmd`` still warns (#61).
+    """Author omits ``shell:`` on Windows → auto-selected ``cmd`` is rejected (#61).
 
-    The auto-select path at ``yaml.py:266`` is the most dangerous case
-    because the author never typed ``shell: cmd``. The warning is the
-    only signal they get that cmd.exe is in effect.
+    The auto-select path (story 16) still picks ``cmd`` on Windows when
+    ``shell:`` is omitted. With Option B that auto-selected cmd is
+    rejected too — a Windows author who omits ``shell:`` MUST declare
+    ``pwsh`` or switch to argv mode. The error message is the only
+    migration signal, so it must fire here.
     """
-    import logging
-
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
     yaml_text = (
@@ -1172,14 +1263,24 @@ def test_default_shell_autoselected_cmd_on_windows_warns(
         "  - name: name\n"
         "    type: str\n"
     )
-    with caplog.at_level(logging.WARNING, logger="cothis.tools.yaml"):
+    with pytest.raises(ValueError, match="'shell: cmd'"):
         load_yaml_tools(yaml_text)
-    cmd_warnings = [
-        r for r in caplog.records
-        if "cmd" in r.message and "metacharacter" in r.message
-    ]
-    assert len(cmd_warnings) == 1
-    assert "git-branch" in cmd_warnings[0].message
+
+
+def test_windows_argv_command_without_shell_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows + argv mode (no ``shell:``) is accepted — argv needs no shell.
+
+    The cmd ban only applies to shell mode. A Windows author who omits
+    ``shell:`` and uses a list ``command:`` is on the safe argv path
+    regardless of platform, so the tool loads. This is the argv-mode
+    migration target the error message points Windows authors to.
+    """
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("cothis.tools.yaml._current_platform", lambda: "windows")
+    tool = _shell_tool('name: t\ncommand: ["echo", "hi"]\n')
+    assert tool._block.shell is None  # argv mode, never reached cmd auto-select
 
 
 # ====================================================================
@@ -1292,12 +1393,19 @@ def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
     """cmd.exe dispatch keeps ``shell=True`` and preserves inner double-quotes.
 
     In cmd shell mode, ``_shell_quote`` cmd-quotes each value with
-    ``list2cmdline`` (``foo & bar`` → ``"foo & bar"``). ``__call__`` must
+    ``list2cmdline`` (``foo & bar`` → ``\"foo & bar\"``). ``__call__`` must
     dispatch this on the ``shell=True`` path, not argv mode: argv-mode
     ``subprocess.run(list, shell=False)`` would re-apply ``list2cmdline``
     to the whole argv and escape the inner double-quotes as backslash-quote,
     which cmd.exe does not honour (the ``&`` would become a live
     metacharacter).
+
+    The YAML pipeline rejects ``shell: cmd`` at compile time (#61 Option
+    B), so this dispatch path is now unreachable from ``load_yaml_tools``
+    — the cmd branch in ``_ShellTool.__call__`` is retained as defensive
+    code (see the ceiling note on ``_shell_quote``). To exercise it
+    without going through ``_compile``, we build a ``CommandBlock`` with
+    ``shell=\"cmd\"`` directly and drive ``_ShellTool`` from there.
 
     Captures the exact ``subprocess.run`` call (``__call__`` is async, so
     the blocking call runs via ``asyncio.to_thread``) and pins
@@ -1308,15 +1416,16 @@ def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
 
     import cothis.tools.yaml as yaml_mod
 
-    yaml_text = """
-name: echo_cmd
-shell: cmd
-command: "echo {pattern}"
-args:
-  - name: pattern
-    type: str
-"""
-    block = yaml_mod._compile(yaml_text)
+    # Build a cmd-shell CommandBlock directly — ``_compile`` now rejects
+    # ``shell: cmd`` (Option B), but the dispatch branch is retained as
+    # defensive code, so we bypass compile to exercise it.
+    block = yaml_mod.CommandBlock(
+        name="echo_cmd",
+        description="Shell tool: echo_cmd",
+        command="echo {pattern}",
+        shell="cmd",
+        arg_specs=[{"name": "pattern", "type": "str"}],
+    )
     tool = yaml_mod._ShellTool(block, shell_path=r"C:\Windows\System32\cmd.exe")
 
     captured: dict[str, Any] = {}
