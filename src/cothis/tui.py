@@ -15,14 +15,9 @@ follow-ups (see ADR-0019 §6).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, VerticalScroll
 from textual.widgets import Header, Label, ListItem, ListView, Markdown, TextArea
-
-if TYPE_CHECKING:
-    from typing import Any
 
 
 class SessionList(ListView):
