@@ -13,7 +13,7 @@ Before writing any code, stop at the first rung that holds:
 
 Rules:
 
-- No abstraction that wasn't requested. The package layout (`agent.py`, `cli.py`, `tools/`, `__init__.py`) is the intended shape. `tools/` is a package because the original `tools.py` outgrew one file (it was doing five+ jobs); its submodules are the result of that split, each owning one concern: `core.py` (Tool protocol, `_HookableTool`, `@tool`/`ToolDef`, schema helpers, shared validators, `discover_tools` — layer merge + shadow + load hooks), `yaml.py` (YAML shell-tool pipeline: `load_yaml_tools` → `CommandBlock` → `_compile` → `_ShellTool` → `preview`), `builtins.py` (re-export shim — `TOOLS` registry + `from cothis.tools.fs.{read,list,search,write} import …`), `tools/fs/` (`_hygiene.py` for WORKDIR + boundary, `patch.py` for codex apply_patch, `read.py`/`write.py`/`list.py`/`search.py` — `fs.read`/`fs.write`/`fs.list`/`fs.search`), `mcp.py` (`MCPServer`, `MCPClientTool`, built on the SDK's `ClientSessionGroup`), `format.py` (`format_tool_output` — json/csv/tsv/yaml). A new submodule is justified when a concern is clearly distinct AND its extraction leaves the source file more focused — not to mirror an external taxonomy. The test for adding one is the same as the test that justified the original split: does the file it came from become easier to reason about?
+- No abstraction that wasn't requested. The package layout (`agent.py`, `cli.py`, `tools/`, `__init__.py`) is the intended shape. `tools/` is a package because the original `tools.py` outgrew one file (it was doing five+ jobs); its submodules are the result of that split, each owning one concern: `core.py` (Tool protocol, `_HookableTool`, `@tool`/`ToolDef`, schema helpers, shared validators, `discover_tools` — layer merge + shadow + load hooks), `yaml.py` (YAML shell-tool pipeline: `load_yaml_tools` → `CommandBlock` → `_compile` → `_ShellTool` → `preview`), `builtins.py` (re-export shim — `TOOLS` registry + `from cothis.tools.fs.{read,list,search,create,modify,delete} import …`), `tools/fs/` (`_hygiene.py` for WORKDIR + boundary, `read.py`/`list.py`/`search.py`/`create.py`/`modify.py`/`delete.py` — `fs.read`/`fs.list`/`fs.search`/`fs.create`/`fs.modify`/`fs.delete`), `mcp.py` (`MCPServer`, `MCPClientTool`, built on the SDK's `ClientSessionGroup`), `format.py` (`format_tool_output` — json/csv/tsv/yaml). A new submodule is justified when a concern is clearly distinct AND its extraction leaves the source file more focused — not to mirror an external taxonomy. The test for adding one is the same as the test that justified the original split: does the file it came from become easier to reason about?
 - No new dependency if it can be avoided. `pyproject.toml` is lean on purpose.
 - No boilerplate nobody asked for. No config layers, no plugin systems, no settings pydantic-model wrapping what env vars already do.
 - Deletion over addition. Boring over clever. Fewest files possible.
@@ -21,7 +21,7 @@ Rules:
 - When two stdlib approaches are the same size, pick the edge-case-correct one. Lean means less code, not the flimsier algorithm.
 - Mark intentional simplifications with a `cothis:` comment. If the shortcut has a known ceiling (single-turn tool call, no streaming, no tool-parallelism, hardcoded prompt), the comment names the ceiling and the upgrade path.
 
-Never compromise on: prompt correctness (the LLM only sees what you send — drift here is silent breakage), tool I/O safety (the agent writes files via `fs.write` — confirm paths are scoped as intended), error messages that the LLM can act on (vague errors break the loop), API key handling (read once, never log), CLI ergonomics (flags and env vars behave as documented in the README), external API signatures and intent (verify by inspecting the real signature — `inspect.signature`, `help()`, source — and a one-liner repro, not from memory; passing `.status(transient=True)` when `rich.Status.__init__` already hardcodes `Live(transient=True)` is a `TypeError`, and relying on a default you assumed rather than confirmed is silent breakage when the assumption is wrong). Code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks. cothis uses **pytest** (configured in `pyproject.toml`, tests under `tests/`) — reach for it for anything beyond a one-liner; for trivial checks a `python -c "assert ..."` is fine. Fixtures like `tmp_path` / `monkeypatch` / `caplog` are welcome when they make the test honest; what's not welcome is a test so buried in mocks that it tests the mock, not the logic.
+Never compromise on: prompt correctness (the LLM only sees what you send — drift here is silent breakage), tool I/O safety (the agent writes files via `fs.create` / `fs.modify` / `fs.delete` — confirm paths are scoped as intended), error messages that the LLM can act on (vague errors break the loop), API key handling (read once, never log), CLI ergonomics (flags and env vars behave as documented in the README), external API signatures and intent (verify by inspecting the real signature — `inspect.signature`, `help()`, source — and a one-liner repro, not from memory; passing `.status(transient=True)` when `rich.Status.__init__` already hardcodes `Live(transient=True)` is a `TypeError`, and relying on a default you assumed rather than confirmed is silent breakage when the assumption is wrong). Code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks. cothis uses **pytest** (configured in `pyproject.toml`, tests under `tests/`) — reach for it for anything beyond a one-liner; for trivial checks a `python -c "assert ..."` is fine. Fixtures like `tmp_path` / `monkeypatch` / `caplog` are welcome when they make the test honest; what's not welcome is a test so buried in mocks that it tests the mock, not the logic.
 
 ## Tool description standard
 
@@ -120,6 +120,51 @@ The `importtime` flag prints `self_us | cumulative_us | module` to stderr. Use t
 
 - Runtime latency (turn time, tool dispatch) — separate concern.
 - Cothis SDK import time for embedders — focus is the CLI.
+
+## Renaming
+
+When a PR renames a tool, concept, CLI flag, or public class/function/module, the docs drift silently until someone reads them — by which point multiple files carry the old name. This has shipped two bugs already (#150 AGENTS.md/CONTEXT.md drift on `fs.dir` → `fs.list`, #153 README drift on the same rename).
+
+### When the checklist applies
+
+A rename is any of these in a PR:
+
+- Tool rename (`fs.dir` → `fs.list`).
+- Concept rename (`active_skills` → `active set`).
+- CLI flag rename (`--skill` → `--activate`).
+- Public class / function / module rename (`ToolDef` → `Tool`).
+
+Internal-only renames (a private `_helper` function, a local variable) are exempt — the surface area is bounded by the file.
+
+### Post-rename scan
+
+Run this grep from the repo root before opening the PR:
+
+```
+grep -rn '<old-name>' README.md AGENTS.md CONTEXT.md docs/ tests/
+```
+
+If `CONTEXT-MAP.md` exists (multi-context repo), include the sub-context `CONTEXT.md` files in the scan. The scan must return nothing (or only legitimate historical references — e.g. an ADR explaining why the rename happened).
+
+### Scope (6 locations)
+
+1. **`README.md`** — user-facing docs; first place drift is read.
+2. **`AGENTS.md`** — project rules + conventions; drift here teaches contributors the wrong name.
+3. **`CONTEXT.md`** (+ any sub-context per `CONTEXT-MAP.md`) — domain glossary; drift here breaks the ubiquitous-language invariant.
+4. **`docs/adr/*.md`** — ADRs reference tool/concept names in their decision context. Historical references inside an ADR explaining the rename are legitimate; references that describe the *current* state as the old name are drift.
+5. **`tests/*.py`** — tests reference names in assertions (`assert tool.name == "fs.write"`) and fixtures. These break loudly (test failure) on rename, which is the desired signal — but the test file itself should be updated as part of the rename PR, not as a follow-up.
+6. **The PR's own description** — so the squash-merge commit message uses the new name. A rename PR titled `feat(tools): add fs.dir` (when the new name is `fs.list`) leaves a permanent misnamed commit.
+
+### PR-description convention
+
+If the PR renames anything in scope, the description includes a one-line confirmation: *"Post-rename docs scan ran (AGENTS.md § Renaming); returned no drift outside legitimate historical references."* No template file is added — the project enforces conventions via review, not via a PR-template scaffold.
+
+### Motivating bugs
+
+- **#150** — `fs.dir` → `fs.list` rename (PR #101) left AGENTS.md + CONTEXT.md referring to `fs.dir`; caught by reading docs, fixed in #152.
+- **#153** — same rename left README.md referring to `fs.dir`; caught separately, fixed in #162 alongside unrelated work.
+
+Each was a separate fix PR; neither was caught by the rename PR itself. The checklist makes the rename PR responsible for the scan.
 
 ## Agent skills
 
