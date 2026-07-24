@@ -25,7 +25,7 @@ from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
-from cothis.agent import Agent, ToolCallEvent
+from cothis.agent import Agent, ContentDelta, ToolCallEvent
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -179,9 +179,13 @@ class SessionWorker:
         try:
             async with asyncio.timeout(_TURN_TIMEOUT_S):
                 async for event in self._agent.run_stream(prompt):
-                    if isinstance(event, str):
+                    if isinstance(event, ContentDelta):
                         await conn.send(
-                            json.dumps({"type": "assistant_delta", "text": event})
+                            json.dumps({
+                                "type": "assistant_delta",
+                                "kind": event.kind,
+                                "text": event.text,
+                            })
                         )
                     elif isinstance(event, ToolCallEvent):
                         await conn.send(
