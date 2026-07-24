@@ -42,23 +42,33 @@ if TYPE_CHECKING:
 
 
 def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
-    """Compile a YAML tool declaration into a callable.
+    """Compile a YAML tool declaration (or a ``tools:`` list) into callables.
 
-    Routes on ``type:``. A declaration with ``type: mcp.stdio`` (or
-    ``type: mcp.http``) is an MCP server (an ``MCPServer`` handle producing
-    many tools at Agent startup, not one shell tool) — see
-    ``_build_mcp_stdio_server`` / ``_build_mcp_http_server`` and ADR-0005. An
-    unknown ``type:`` value raises ``ValueError`` naming the file + value +
-    valid options (story 30). A declaration with ``type:`` absent is a
-    shell-template tool: compile, gate the executable via ``shutil.which``,
-    wrap in ``_ShellTool``. If the executable is not on PATH the tool is not
-    registered — the model never sees a tool it cannot dispatch on this host.
-    The skip is logged at ``WARNING`` (every startup decision is observable
+    Three top-level shapes route on the parsed mapping:
+
+    - **MCP server** (``type: mcp.stdio`` / ``type: mcp.http``): an
+      ``MCPServer`` handle producing many tools at Agent startup — see
+      ``_build_mcp_stdio_server`` / ``_build_mcp_http_server`` and ADR-0005.
+      An unknown ``type:`` raises ``ValueError`` naming the file + value +
+      valid options (story 30).
+    - **Multi-tool** (top-level ``tools:`` list): each entry is compiled,
+      gated, and wrapped independently — one file exposing N related tools
+      (story 21). See ``_compile_tools``. A ``tools:`` list is the only
+      legal key in a multi-tool file (``_MULTI_TOOL_KEYS``); mixing
+      ``tools:`` with single-tool fields (``name:``, ``command:``, …) is an
+      author error, not a partial load.
+    - **Single-tool** (``name:`` / ``command:`` at top level): the original
+      form, unchanged for backward compat. Compile, gate the executable via
+      ``shutil.which``, wrap in ``_ShellTool``.
+
+    Gating: if a tool's executable is not on PATH the tool is not registered
+    — the model never sees a tool it cannot dispatch on this host. The skip
+    is logged at ``WARNING`` per tool (every startup decision is observable
     by default — see CONTEXT.md "Tool lifecycle").
 
-    See ``_compile`` for the shell-YAML shape and ``CommandBlock`` for the
-    contract. ``preview`` shares the same compile path, so the two cannot
-    drift on what a valid YAMLTool is.
+    See ``_compile_spec`` for the shell-YAML shape and ``CommandBlock`` for
+    the contract. ``preview`` shares the same compile path, so the two
+    cannot drift on what a valid YAMLTool is.
     """
     from cothis.tools.mcp import _build_mcp_http_server, _build_mcp_stdio_server
 
@@ -75,7 +85,22 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
             f"valid: 'mcp.stdio', 'mcp.http', or omit 'type:' for a shell tool"
         )
         raise ValueError(msg)
+    if isinstance(spec, dict) and "tools" in spec:
+        return _compile_tools(spec, source=source)
+
     block = _compile(yaml_text, source=source)
+    return _gate_and_wrap(block, source=source)
+
+
+def _gate_and_wrap(block: CommandBlock, *, source: str | None) -> list[Tool]:
+    """Gate ``block``'s executable on PATH and wrap the survivors in ``_ShellTool``.
+
+    Shared between the single-tool path (one ``CommandBlock``) and the
+    multi-tool path (one per ``tools:`` entry) so the gate → wrap → warn
+    sequence is identical — no silent divergence between the two file
+    shapes. Returns ``[]`` (not an error) when the executable is missing;
+    the gated tool is logged at ``WARNING`` so the author sees the skip.
+    """
     exe = shutil.which(block.gate_target)
     if exe is None:
         logger.warning(
@@ -83,6 +108,60 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
         )
         return []
     return [_ShellTool(block, shell_path=exe if block.shell else None)]
+
+
+def _compile_tools(spec: Any, *, source: str | None) -> list[Tool]:
+    """Compile a multi-tool file (top-level ``tools: [...]``) → N tools.
+
+    The container accepts only ``tools:`` (``_MULTI_TOOL_KEYS``) — a
+    single-tool field (``name:``, ``command:``, ``args:``, …) alongside a
+    ``tools:`` list is ambiguous (which is authoritative?) and is rejected
+    by ``_check_unknown_keys`` rather than partially honoured. This keeps
+    the ``extra=\"forbid\"`` discipline the single-tool form already enforces:
+    a typo or a shape mix-up surfaces immediately.
+
+    Each entry is validated by ``_compile_spec`` against the SAME
+    ``_TOOL_KEYS`` contract as a single-tool file (so a nested ``tools:``
+    inside an entry is rejected, and all the command/arg/placeholder
+    invariants apply uniformly). Entries are gated and wrapped independently
+    via ``_gate_and_wrap``: an entry whose executable is off PATH is skipped
+    without aborting the others.
+
+    ``name:`` uniqueness applies ACROSS entries within one file (story 21):
+    duplicates raise ``ValueError`` naming both 1-based indices and the name.
+    Cross-file uniqueness is ``load_tools_from_layer``'s concern
+    (``_check_same_layer_duplicate``); here is the within-file check.
+    """
+    _check_unknown_keys(spec, _MULTI_TOOL_KEYS, source, what="YAML tool file")
+    raw_tools = spec["tools"]
+    where = f" in {source}" if source else ""
+    if not isinstance(raw_tools, list):
+        msg = (
+            f"YAML tool file: 'tools' must be a list{where}; "
+            f"got {type(raw_tools).__name__}"
+        )
+        raise ValueError(msg)
+
+    tools: list[Tool] = []
+    seen: dict[str, int] = {}
+    for idx, entry in enumerate(raw_tools, start=1):
+        if not isinstance(entry, dict):
+            msg = (
+                f"tools[{idx}]: must be a YAML mapping{where}; "
+                f"got {type(entry).__name__}"
+            )
+            raise ValueError(msg)
+        block = _compile_spec(entry, source=source, what=f"tools[{idx}]")
+        if block.name in seen:
+            prior = seen[block.name]
+            msg = (
+                f"YAML tool file: duplicate name {block.name!r}{where}; "
+                f"tools[{prior}] and tools[{idx}] both declare it"
+            )
+            raise ValueError(msg)
+        seen[block.name] = idx
+        tools.extend(_gate_and_wrap(block, source=source))
+    return tools
 
 
 class CommandBlock:
@@ -180,7 +259,26 @@ def _compile(
     source: str | None = None,
     platform: str | None = None,
 ) -> CommandBlock:
-    """Validate a YAML tool declaration and select a branch.
+    """Parse ``yaml_text`` and compile the single-tool spec within.
+
+    Thin wrapper over ``_compile_spec``: the YAML parse lives here so the
+    single-tool text entry points (``load_yaml_tools``'s fallback branch,
+    and direct callers / tests) keep their existing signature. Multi-tool
+    files (``tools: [...]``) route to ``_compile_tools`` per entry and never
+    reach here.
+    """
+    spec = yaml.safe_load(yaml_text)
+    return _compile_spec(spec, source=source, platform=platform)
+
+
+def _compile_spec(
+    spec: Any,
+    *,
+    source: str | None = None,
+    platform: str | None = None,
+    what: str = "YAML tool",
+) -> CommandBlock:
+    """Validate a single YAML tool spec (a parsed mapping) and select a branch.
 
     Runs ALL validation that determines whether the spec is a well-formed
     YAMLTool — the contract both ``load_yaml_tools`` and ``preview`` share:
@@ -188,6 +286,13 @@ def _compile(
     discipline, execution-mode pairing rules. Then selects the platform
     branch (``platform`` overrides ``sys.platform`` detection; used by
     ``preview`` to render any branch from any host) and merges args.
+
+    Operates on a parsed mapping rather than YAML text so the multi-tool
+    path (``_compile_tools``) can re-use it per ``tools:`` entry without
+    re-parsing — one validation contract for both the single-tool top-level
+    and each entry in a ``tools:`` list. ``what`` names the scope in error
+    messages (``"YAML tool"`` for a single-tool file, ``"tools[i]"`` for an
+    entry in a multi-tool file) so a malformed entry points at its index.
 
     Does NOT gate: ``shutil.which`` is ``load_yaml_tools``'s concern, so
     ``preview`` can compile any branch regardless of host executables.
@@ -197,12 +302,11 @@ def _compile(
     the field, and ``source``). Emits ``UserWarning`` for declared-but-
     unreferenced args (``preview`` suppresses; ``load_yaml_tools`` surfaces).
     """
-    spec = yaml.safe_load(yaml_text)
-    _check_unknown_keys(spec, _TOOL_KEYS, source, what="YAML tool")
-    name = _normalise_tool_name(str(_require(spec, "name", source)), source)
+    _check_unknown_keys(spec, _TOOL_KEYS, source, what=what)
+    name = _normalise_tool_name(str(_require(spec, "name", source, what=what)), source)
     description = _stringify(spec.get("description")) or f"Shell tool: {name}"
 
-    top = _parse_command_block(spec, name, source, what="YAML tool")
+    top = _parse_command_block(spec, name, source, what=what)
     platforms_raw = spec.get("platforms") or {}
     _check_unknown_keys(
         platforms_raw, _PLATFORM_KEYS, source, what=f"tool {name!r}: platforms"
@@ -626,6 +730,7 @@ def preview(
     yaml_text: str,
     *,
     _platform: str | None = None,
+    _index: int = 0,
     source: str | None = None,
     **kwargs: Any,
 ) -> tuple[list[str] | str, str | None]:
@@ -642,19 +747,61 @@ def preview(
     windows branch) so any branch can be previewed from any host.
     Underscore-prefixed so it cannot collide with a tool's own arg names.
 
-    Validation is shared with ``load_yaml_tools`` via ``_compile`` — the
+    ``_index`` selects which tool to preview in a multi-tool file
+    (``tools: [...]``): 0-based, default 0 (the first entry). An out-of-range
+    index raises ``ValueError`` naming the count. A single-tool file ignores
+    ``_index``. Underscore-prefixed for the same collision-free reason.
+
+    Validation is shared with ``load_yaml_tools`` via ``_compile_spec`` — the
     two paths cannot drift. Raises ``ValueError`` on malformed YAML.
     """
+    spec = yaml.safe_load(yaml_text)
+    if isinstance(spec, dict) and "tools" in spec:
+        # Multi-tool file: pick the requested entry and compile it alone.
+        # Reuses ``_compile_spec`` against ``_TOOL_KEYS`` exactly as
+        # ``_compile_tools`` does, so preview and load see one contract.
+        _check_unknown_keys(spec, _MULTI_TOOL_KEYS, source, what="YAML tool file")
+        raw_tools = spec["tools"]
+        where = f" in {source}" if source else ""
+        if not isinstance(raw_tools, list):
+            msg = (
+                f"YAML tool file: 'tools' must be a list{where}; "
+                f"got {type(raw_tools).__name__}"
+            )
+            raise ValueError(msg)
+        if not 0 <= _index < len(raw_tools):
+            msg = (
+                f"preview _index {_index} out of range for file with "
+                f"{len(raw_tools)} tool(s){where}"
+            )
+            raise ValueError(msg)
+        entry = raw_tools[_index]
+        what = f"tools[{_index + 1}]"
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            block = _compile_spec(entry, source=source, platform=_platform, what=what)
+        return block.render(**kwargs), block.shell
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning)
-        block = _compile(yaml_text, source=source, platform=_platform)
+        block = _compile_spec(spec, source=source, platform=_platform)
     return block.render(**kwargs), block.shell
 
 
 # Known top-level keys on a tool declaration. Unknown keys are rejected at
 # parse time (``extra="forbid"`` discipline) so a typo like ``shel:`` or a
 # renamed field surfaces immediately, not as a silently-ignored directive.
+#
+# NOTE: ``tools`` is deliberately NOT here. A ``tools:`` list is a
+# container-level shape (handled by ``_compile_tools`` against
+# ``_MULTI_TOOL_KEYS``), NOT a field of a single tool. Adding it here would
+# let a nested ``tools:`` inside a ``tools:`` entry (or a stray ``tools:``
+# typo on a single-tool file) pass silently — exactly the drift the forbid
+# rule exists to catch. See ``_compile_tools`` and story 21.
 _TOOL_KEYS = {"name", "description", "command", "shell", "args", "platforms"}
+# The multi-tool container (a file whose top level is ``tools: [...]``)
+# accepts only ``tools`` — no single-tool field may coexist (ambiguous).
+_MULTI_TOOL_KEYS = {"tools"}
 _ARG_KEYS = {"name", "type", "description", "required", "to"}
 _PLATFORM_KEYS = {"linux", "macos", "unix", "windows"}
 
