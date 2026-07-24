@@ -144,3 +144,37 @@ async def test_append_tool_call_via_app() -> None:
         card = app.append_tool_call("fs.modify")
         await pilot.pause()
         assert isinstance(card, ToolCallCard)
+
+
+@pytest.mark.asyncio
+async def test_ctrl_enter_keypress_sends_prompt() -> None:
+    """Ctrl+Enter binding triggers send_prompt via the actual keypress."""
+    from cothis.tui import ConversationView, CothisApp, InputBar
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        bar = app.query_one(InputBar)
+        bar.set_text("via keypress")
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        assert "via keypress" in view.renderable_str
+        assert bar.get_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_user_message_brackets_are_escaped() -> None:
+    """Brackets in user text are escaped so Markdown injection is blocked."""
+    from cothis.tui import ConversationView, CothisApp, InputBar
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        bar = app.query_one(InputBar)
+        bar.set_text("[click](javascript:alert(1))")
+        app.action_send_prompt()
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        assert "\\[click\\]" in view.renderable_str
+        assert "[click]" not in view.renderable_str.replace("\\[click\\]", "")

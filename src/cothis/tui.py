@@ -64,7 +64,12 @@ class SessionList(ListView):
 
 
 class ToolCallCard(Static):
-    """Inline card for one tool dispatch — name + status badge."""
+    """Inline card for one tool dispatch — name + status badge.
+
+    Status reflects only the start event today; wiring to
+    ``tool_call_completed``/``tool_call_failed`` (notify bus
+    events from #224) lands when the WS client attaches (#250).
+    """
 
     DEFAULT_CSS = """
     ToolCallCard {
@@ -128,8 +133,13 @@ class ConversationView(VerticalScroll):
             logger.debug("dropping thinking delta (%d chars)", len(text))
 
     def append_user_message(self, text: str) -> None:
-        """Render a user prompt with a distinct prefix."""
-        self._text_buf += f"\n> **you**: {text}\n\n"
+        """Render a user prompt with a distinct prefix.
+
+        User text is Markdown-escaped (brackets) so injected links
+        or markup can't activate inside the Markdown widget.
+        """
+        safe = text.replace("[", "\\[").replace("]", "\\]")
+        self._text_buf += f"\n> **you**: {safe}\n\n"
         self._refresh_markdown()
 
     def append_tool_call(self, name: str, status: str = "running") -> ToolCallCard:
@@ -235,8 +245,12 @@ class CothisApp(App):
         view.append_user_message(text)
         bar.clear()
 
-    def append_assistant_delta(self, kind: str, text: str) -> None:
-        """Forward a WS ``assistant_delta`` to the conversation view."""
+    def append_assistant_delta(self, kind: str = "text", text: str = "") -> None:
+        """Forward a WS ``assistant_delta`` to the conversation view.
+
+        ``kind`` defaults to ``"text"`` for mixed-version compatibility
+        (old servers without the ``kind`` field in the WS message).
+        """
         self.query_one(ConversationView).append_delta(kind, text)
 
     def append_tool_call(self, name: str, status: str = "running") -> Any:
