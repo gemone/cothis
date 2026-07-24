@@ -116,8 +116,8 @@ class NotifyBus:
         0, negative, or unparseable → no-op (compaction is opt-in).
         The Supervisor (#227) calls this periodically — default cadence
         daily. Snapshot-preservation (skipping rows pinned by an active
-        snapshot) is a documented follow-up; no snapshot table exists
-        yet, so the current implementation is pure age-based retention.
+        snapshot) is deferred to #246 — no snapshot table exists yet,
+        so the current implementation is pure age-based retention.
         """
         if retention_days is None:
             try:

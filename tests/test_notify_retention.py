@@ -6,8 +6,8 @@ configured retention window. Retention is read from
 disabled, no rows deleted). Returns the count of deleted rows.
 
 Snapshot-preservation (skipping rows pinned by an active snapshot) is
-out of scope for this slice — no snapshot table exists yet. When the
-snapshot mechanism lands, the ``compact`` signature gains a
+deferred to follow-up #246 — no snapshot table exists yet. When that
+mechanism lands, the ``compact`` signature gains a
 ``preserve_seqs: set[int] | None`` parameter; tests in this file will
 extend to cover it.
 """
@@ -25,8 +25,8 @@ if TYPE_CHECKING:
     import pytest
 
 
-def _make_bus(tmp_path: Path) -> tuple[NotifyBus, Any]:
-    """Build a NotifyBus backed by a temp SQLite DB."""
+def _make_bus() -> tuple[NotifyBus, Any]:
+    """Build a NotifyBus backed by an in-memory SQLite DB."""
     import sqlite3
 
     conn = sqlite3.connect(":memory:")
@@ -57,7 +57,7 @@ def _count_rows(conn: Any) -> int:
 
 def test_compact_deletes_rows_older_than_retention_window(tmp_path: Path) -> None:
     """Rows older than the cutoff are deleted; younger ones stay."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
 
     _seed_old_event(bus, conn, days_old=45)  # older than 30d
     _seed_old_event(bus, conn, days_old=60)  # older than 30d
@@ -73,7 +73,7 @@ def test_compact_deletes_rows_older_than_retention_window(tmp_path: Path) -> Non
 
 def test_compact_preserves_rows_within_window(tmp_path: Path) -> None:
     """Rows inside the retention window are kept."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
 
     _seed_old_event(bus, conn, days_old=10)  # within 30d
     _seed_old_event(bus, conn, days_old=20)  # within 30d
@@ -84,19 +84,13 @@ def test_compact_preserves_rows_within_window(tmp_path: Path) -> None:
     assert _count_rows(conn) == 3
 
 
-def test_compact_boundary_inclusive(tmp_path: Path) -> None:
-    """A row exactly retention_days old is preserved (cutoff is exclusive)."""
-    bus, conn = _make_bus(tmp_path)
-    _seed_old_event(bus, conn, days_old=30)  # exactly 30 days
+def test_compact_just_past_boundary_is_deleted(tmp_path: Path) -> None:
+    """A row 31 days old is deleted under retention_days=30 (deterministic)."""
+    bus, conn = _make_bus()
+    _seed_old_event(bus, conn, days_old=31)
 
     deleted = bus.compact(retention_days=30)
-    # ts is 30 days ago; cutoff is (now - 30 days). Boundary row ts is
-    # a hair before cutoff (the seed ran microseconds after the cutoff
-    # computation), so it's deleted. Re-running compact after a
-    # hair more time would flip it. Pin the actual behavior: with
-    # retention_days=30, a 30-day-old row is on the knife's edge.
-    # The contract: cutoff is exclusive — rows with ts < cutoff deleted.
-    assert deleted in (0, 1)
+    assert deleted == 1
 
 
 # ---------------------------------------------------------------------
@@ -106,7 +100,7 @@ def test_compact_boundary_inclusive(tmp_path: Path) -> None:
 
 def test_compact_zero_retention_is_noop(tmp_path: Path) -> None:
     """retention_days=0 → no rows deleted."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
     _seed_old_event(bus, conn, days_old=365)
 
     deleted = bus.compact(retention_days=0)
@@ -116,7 +110,7 @@ def test_compact_zero_retention_is_noop(tmp_path: Path) -> None:
 
 def test_compact_negative_retention_is_noop(tmp_path: Path) -> None:
     """Negative retention_days → no rows deleted (defensive)."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
     _seed_old_event(bus, conn, days_old=365)
 
     deleted = bus.compact(retention_days=-1)
@@ -126,7 +120,7 @@ def test_compact_negative_retention_is_noop(tmp_path: Path) -> None:
 
 def test_compact_empty_table(tmp_path: Path) -> None:
     """Empty table → deleted=0, no error."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
     deleted = bus.compact(retention_days=30)
     assert deleted == 0
 
@@ -140,7 +134,7 @@ def test_compact_reads_env_var(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """compact() with no arg reads COTHIS_NOTIFY_RETENTION_DAYS."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
     _seed_old_event(bus, conn, days_old=45)
 
     monkeypatch.setenv("COTHIS_NOTIFY_RETENTION_DAYS", "30")
@@ -150,7 +144,7 @@ def test_compact_reads_env_var(
 
 def test_compact_env_var_zero_disables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """COTHIS_NOTIFY_RETENTION_DAYS=0 → disabled."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
     _seed_old_event(bus, conn, days_old=365)
 
     monkeypatch.setenv("COTHIS_NOTIFY_RETENTION_DAYS", "0")
@@ -160,7 +154,7 @@ def test_compact_env_var_zero_disables(tmp_path: Path, monkeypatch: pytest.Monke
 
 def test_compact_env_var_unset_disables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Env var unset → no compaction (opt-in feature)."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
     _seed_old_event(bus, conn, days_old=365)
 
     monkeypatch.delenv("COTHIS_NOTIFY_RETENTION_DAYS", raising=False)
@@ -172,7 +166,7 @@ def test_compact_env_var_garbage_disables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Non-integer env var → no compaction, no crash."""
-    bus, conn = _make_bus(tmp_path)
+    bus, conn = _make_bus()
     _seed_old_event(bus, conn, days_old=365)
 
     monkeypatch.setenv("COTHIS_NOTIFY_RETENTION_DAYS", "garbage")
