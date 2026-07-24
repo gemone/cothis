@@ -217,6 +217,21 @@ A general static scan for `obj._foo` attribute reads was considered and rejected
 ### Related
 
 - **#80** — silent-except in `_build_schema` — same shape, different mechanism (exception swallow vs. attribute read). Out of scope here; the pattern is covered by the project's "no silent failure" stance in the Project rules section.
+## Text boundary guard
+
+Three rules for every line that decodes bytes, emits text, or mutates file content. Each covers a distinct boundary; each was paid for by a shipped bug.
+
+1. **Decode bytes strict by default.** `open(..., encoding='utf-8', errors='strict')` — or just `encoding='utf-8'`, since strict is the default — for every path whose output reaches the model or the user. Locale fallback (UTF-8 → cp1252 → latin-1) is opt-in and must be a visible two-tier helper (#166), not a silent `errors='replace'` that injects U+FFFD into the prompt.
+2. **Emit Unicode-native by default.** `json.dumps(..., ensure_ascii=False)` and `yaml.dump(..., allow_unicode=True)` are the project defaults. `ensure_ascii=True` is opt-in: it escapes every non-Latin codepoint to `\uXXXX`, inflating token cost ~1.5× under BPE (#108). If a downstream consumer genuinely requires ASCII (e.g. SMTP headers), add an inline `# text-boundary: allow` marker naming the consumer.
+3. **Don't hardcode `\n` on replacement lines.** Code that mutates file content reads via `splitlines(keepends=True)` and joins via `"".join(...)`; the original terminators survive. Appending `+ "\n"` to a replacement line (the #96 / #215 pattern) produces mixed endings on CRLF files and spurious trailing newlines on no-trailing-newline files. Forbidden in `tools/fs/*`; outside that directory, prefer the same pattern but a literal `\n` is not flagged.
+
+Each rule is enforced by `tests/test_text_boundary_audit.py` as a source-level scan over `src/cothis/**/*.py`. Violations can be suppressed with a same-line `# text-boundary: allow` comment when the call is genuinely justified (binary-safe regex search, ASCII-only wire format, etc.) — the marker keeps the rationale next to the call site, not in a separate allowlist file.
+
+### Motivating bugs
+
+- **#108** — `format_tool_output`'s JSON path defaulted to `ensure_ascii=True`, escaping CJK/emoji to `\uXXXX` (1.5× token cost).
+- **#166** — `_parse_skill_md` used `errors='replace'`, silently substituting U+FFFD for undecodable bytes → garbled bytes flowed into `Skill.body` → `<skill_content>` → the system prompt (silent prompt-injection vector).
+- **#96** — `_apply_hunk` hardcoded `\n` on replacement lines; CRLF files got mixed endings, no-trailing-newline files gained spurious trailing newlines. Anti-pattern now forbidden; motivating code deleted in #213.
 
 ## Agent skills
 
