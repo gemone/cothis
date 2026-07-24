@@ -24,6 +24,7 @@ Tests spawn short-lived subprocesses (``echo``) but never touch the network.
 from __future__ import annotations
 
 import logging
+import shutil
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -1342,3 +1343,310 @@ args:
     # (``"foo & bar"``), not backslash-escaped ones.
     assert captured["args"] == ('echo "foo & bar"',)
     assert '\\"' not in captured["args"][0]
+
+
+# ====================================================================
+# Multiple tools per file (tools: list) — story 21
+# ====================================================================
+
+
+def test_tools_list_compiles_each_entry() -> None:
+    """A ``tools:`` list compiles to N tools, each independently callable.
+
+    The acceptance criterion: related commands (e.g. all ``uv`` subcommands)
+    live in one file but expose as separate tools in the registry.
+    """
+    import asyncio
+
+    yaml_text = """
+tools:
+  - name: greet
+    description: Say hello.
+    command: ["echo", "hello"]
+  - name: bye
+    description: Say bye.
+    command: ["echo", "bye"]
+"""
+    tools = load_yaml_tools(yaml_text)
+    assert len(tools) == 2
+    by_name = {t.__name__: t for t in tools}
+    assert set(by_name) == {"greet", "bye"}
+    assert by_name["greet"].__doc__ == "Say hello."
+    assert asyncio.run(by_name["greet"]()) == "hello\n"
+    assert asyncio.run(by_name["bye"]()) == "bye\n"
+
+
+def test_tools_list_entry_full_spec_supported() -> None:
+    """Each entry carries the full single-tool shape: args, platforms, shell.
+
+    An entry is validated by the same contract as a standalone tool file,
+    so an arg placeholder substitutes and a per-platform branch selects.
+    """
+    import asyncio
+
+    yaml_text = """
+tools:
+  - name: echo_n
+    command: ["echo", "{n}"]
+    args:
+      - name: n
+        type: int
+"""
+    tools = load_yaml_tools(yaml_text)
+    assert asyncio.run(tools[0](n=5)) == "5\n"
+
+
+def test_single_tool_form_unchanged_after_tools_support() -> None:
+    """Backward compat: the original single-tool top-level form still loads.
+
+    A file with ``name:`` / ``command:`` at the top level (no ``tools:``)
+    compiles to exactly one tool — no regression from the multi-tool
+    routing added alongside it.
+    """
+    import asyncio
+
+    tool = load_yaml_tools('name: hi\ncommand: ["echo", "hello"]\n')
+    assert len(tool) == 1
+    assert tool[0].__name__ == "hi"
+    assert asyncio.run(tool[0]()) == "hello\n"
+
+
+def test_tools_list_with_args_substitutes_per_entry() -> None:
+    """Args declared per entry substitute into that entry's command only."""
+    import asyncio
+
+    yaml_text = """
+tools:
+  - name: a
+    command: ["echo", "{x}"]
+    args:
+      - name: x
+        type: str
+  - name: b
+    command: ["echo", "{y}"]
+    args:
+      - name: y
+        type: str
+"""
+    tools = {t.__name__: t for t in load_yaml_tools(yaml_text)}
+    assert asyncio.run(tools["a"](x="ax")) == "ax\n"
+    assert asyncio.run(tools["b"](y="by")) == "by\n"
+
+
+def test_tools_duplicate_name_names_both_indices() -> None:
+    """Duplicate ``name:`` across entries raises naming both 1-based indices.
+
+    Acceptance criterion: uniqueness applies across tools within one file.
+    The error points the author at both offending entries.
+    """
+    yaml_text = """
+tools:
+  - name: dup
+    command: ["echo", "one"]
+  - name: other
+    command: ["echo", "two"]
+  - name: dup
+    command: ["echo", "three"]
+"""
+    with pytest.raises(ValueError, match=r"dup.*tools\[1\].*tools\[3\]"):
+        load_yaml_tools(yaml_text)
+
+
+def test_tools_list_rejects_sibling_single_tool_fields() -> None:
+    """A ``tools:`` list mixed with single-tool fields is rejected.
+
+    ``tools:`` is the only legal key in a multi-tool file (``_MULTI_TOOL_KEYS``).
+    A sibling ``name:`` / ``command:`` is ambiguous (which is authoritative?)
+    and is rejected by ``_check_unknown_keys`` rather than partially honoured —
+    keeping the ``extra=\"forbid\"`` discipline the single-tool form enforces.
+    """
+    yaml_text = """
+name: top
+command: ["echo", "hi"]
+tools:
+  - name: inner
+    command: ["echo", "inner"]
+"""
+    with pytest.raises(ValueError, match="unknown field.*name"):
+        load_yaml_tools(yaml_text)
+
+
+def test_tools_nested_list_rejected() -> None:
+    """A ``tools:`` key inside a ``tools:`` entry is rejected.
+
+    Each entry is validated against ``_TOOL_KEYS`` (no ``tools``), so a
+    nested multi-tool container surfaces as an unknown field rather than
+    being silently ignored.
+    """
+    yaml_text = """
+tools:
+  - name: outer
+    command: ["echo", "hi"]
+    tools:
+      - name: inner
+        command: ["echo", "inner"]
+"""
+    with pytest.raises(ValueError, match=r"tools\[1\].*unknown field.*tools"):
+        load_yaml_tools(yaml_text)
+
+
+def test_tools_must_be_a_list() -> None:
+    """A non-list ``tools:`` value is rejected with a type-naming error."""
+    yaml_text = "tools: not-a-list\n"
+    with pytest.raises(ValueError, match="'tools' must be a list"):
+        load_yaml_tools(yaml_text)
+
+
+def test_tools_empty_list_compiles_to_no_tools() -> None:
+    """An empty ``tools:`` list yields no tools, not an error.
+
+    Symmetric with ``load_tools_from_layer`` on an empty directory: a
+    file that declares nothing registers nothing.
+    """
+    assert load_yaml_tools("tools: []\n") == []
+
+
+def test_tools_entry_must_be_a_mapping() -> None:
+    """A non-mapping entry (e.g. a bare string) is rejected, naming the index."""
+    yaml_text = """
+tools:
+  - name: ok
+    command: ["echo", "hi"]
+  - "not a mapping"
+"""
+    with pytest.raises(ValueError, match=r"tools\[2\].*must be a YAML mapping"):
+        load_yaml_tools(yaml_text)
+
+
+def test_tools_entry_missing_name_names_index() -> None:
+    """A malformed entry's error message points at its 1-based index."""
+    yaml_text = """
+tools:
+  - name: ok
+    command: ["echo", "hi"]
+  - command: ["echo", "noname"]
+"""
+    with pytest.raises(ValueError, match=r"tools\[2\].*must define 'name'"):
+        load_yaml_tools(yaml_text)
+
+
+def test_tools_entry_gates_independently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One entry's executable off PATH is skipped; the others still register.
+
+    Gating applies per entry: a missing executable never aborts the whole
+    file. ``echo`` is on PATH (registered), ``no-such-bin-xyz`` is not
+    (skipped), and the order of registered tools is preserved.
+    """
+
+    real_which = shutil.which
+
+    def _fake_which(name: str) -> str | None:
+        if name == "no-such-bin-xyz":
+            return None
+        return real_which(name)
+
+    monkeypatch.setattr("shutil.which", _fake_which)
+    yaml_text = """
+tools:
+  - name: first
+    command: ["echo", "one"]
+  - name: missing
+    command: ["no-such-bin-xyz", "arg"]
+  - name: third
+    command: ["echo", "three"]
+"""
+    tools = load_yaml_tools(yaml_text)
+    assert [t.__name__ for t in tools] == ["first", "third"]
+
+
+def test_preview_multi_tool_default_index_zero() -> None:
+    """``preview`` of a multi-tool file defaults to the first entry."""
+    yaml_text = """
+tools:
+  - name: a
+    command: ["echo", "from-a"]
+  - name: b
+    command: ["echo", "from-b"]
+"""
+    cmd, shell = preview(yaml_text)
+    assert cmd == ["echo", "from-a"]
+    assert shell is None
+
+
+def test_preview_multi_tool_selects_index() -> None:
+    """``_index=`` selects which entry ``preview`` renders."""
+    yaml_text = """
+tools:
+  - name: a
+    command: ["echo", "from-a"]
+  - name: b
+    shell: bash
+    command: "echo from-b"
+"""
+    cmd0, shell0 = preview(yaml_text, _index=0)
+    assert cmd0 == ["echo", "from-a"]
+    assert shell0 is None
+    cmd1, shell1 = preview(yaml_text, _index=1)
+    assert cmd1 == "echo from-b"
+    assert shell1 == "bash"
+
+
+def test_preview_multi_tool_out_of_range_raises() -> None:
+    """An out-of-range ``_index`` raises naming the tool count."""
+    yaml_text = """
+tools:
+  - name: a
+    command: ["echo", "hi"]
+"""
+    with pytest.raises(ValueError, match="_index 5 out of range"):
+        preview(yaml_text, _index=5)
+
+
+def test_preview_multi_tool_validates_entry() -> None:
+    """``preview`` of a multi-tool file runs the same per-entry validation.
+
+    A malformed entry (missing ``command:``) is rejected via the shared
+    ``_compile_spec`` path, so preview and load cannot drift on what a
+    valid entry is.
+    """
+    yaml_text = """
+tools:
+  - name: a
+    command: ["echo", "hi"]
+  - name: bad
+"""
+    with pytest.raises(ValueError, match=r"tools\[2\].*must define 'command'"):
+        preview(yaml_text, _index=1)
+
+
+def test_load_tools_from_layer_finds_tools_list(tmp_path: Path) -> None:
+    """A multi-tool YAML file in a tools dir registers all its entries.
+
+    Discovery (``load_tools_from_layer``) consumes ``load_yaml_tools``'s
+    list output directly, so a ``tools:`` file contributes N tools to the
+    layer registry with no discovery change.
+    """
+    import asyncio
+
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "uv.yaml").write_text(
+        """
+tools:
+  - name: uv.add
+    command: ["echo", "added"]
+  - name: uv.run
+    command: ["echo", "ran"]
+""",
+        encoding="utf-8",
+    )
+    (tools_dir / "single.yaml").write_text(
+        'name: solo\ncommand: ["echo", "solo"]\n', encoding="utf-8"
+    )
+
+    tools = load_tools_from_layer(tools_dir)
+    by_name = {t.__name__: t for t in tools}
+    assert set(by_name) == {"uv.add", "uv.run", "solo"}
+    assert asyncio.run(by_name["uv.add"]()) == "added\n"
+    assert asyncio.run(by_name["uv.run"]()) == "ran\n"
+
