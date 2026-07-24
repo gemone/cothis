@@ -18,6 +18,7 @@ entrypoint (#250) is finalised; for now, ``send_prompt`` emits a
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from textual.app import App, ComposeResult
@@ -35,6 +36,10 @@ from textual.widgets import (
 
 if TYPE_CHECKING:
     from typing import Any
+
+logger = logging.getLogger(__name__)
+
+_TOOL_STATUS_ICONS = {"running": ">>", "done": "OK", "failed": "XX"}
 
 
 # ---------------------------------------------------------------------
@@ -80,7 +85,7 @@ class ToolCallCard(Static):
         self.update(self._render_str())
 
     def _render_str(self) -> str:
-        icon = {"running": ">>", "done": "OK", "failed": "XX"}.get(self._status, "?")
+        icon = _TOOL_STATUS_ICONS.get(self._status, "?")
         return f"[{icon}] {self._name}"
 
 
@@ -113,20 +118,14 @@ class ConversationView(VerticalScroll):
         """Route a ContentDelta to the right rendering path.
 
         ``kind="text"`` → accumulate + re-render Markdown.
-        ``kind="thinking"`` → accumulate in a separate dim block.
+        ``kind="thinking"`` → logged but not rendered (collapsible block
+        lands when the toggle UX is designed).
         """
         if kind == "text":
             self._text_buf += text
             self._refresh_markdown()
         elif kind == "thinking":
-            # Thinking deltas render dimmed; for now, skip visual but
-            # could mount a collapsible block when the toggle lands.
-            pass
-
-    def append_markdown(self, markdown: str) -> None:
-        """Backward-compatible API for direct text injection."""
-        self._text_buf += markdown + "\n"
-        self._refresh_markdown()
+            logger.debug("dropping thinking delta (%d chars)", len(text))
 
     def append_user_message(self, text: str) -> None:
         """Render a user prompt with a distinct prefix."""
@@ -142,10 +141,11 @@ class ConversationView(VerticalScroll):
 
     def _refresh_markdown(self) -> None:
         """Re-render the accumulated Markdown widget."""
+        from textual.css.query import NoMatches
+
         try:
-            md = self.query_one(Markdown)
-            md.update(self._text_buf)
-        except Exception:
+            self.query_one(Markdown).update(self._text_buf)
+        except NoMatches:
             self.mount(Markdown(self._text_buf))
 
 
@@ -191,7 +191,7 @@ class CothisApp(App):
 
     | Ctrl+Enter | send prompt |
     | Esc        | interrupt / clear / dismiss overlay |
-    | Ctrl+C ×2  | quit |
+    | Ctrl+C     | quit |
     """
 
     TITLE = "cothis"
