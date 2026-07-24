@@ -19,6 +19,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
+    "textual>=0.47.0",
     "typer>=0.25.1",
     "websockets>=13.0",
 ]
