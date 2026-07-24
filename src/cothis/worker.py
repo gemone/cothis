@@ -25,6 +25,8 @@ from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
+from cothis.agent import Agent, ToolCallEvent
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
@@ -32,10 +34,18 @@ logger = logging.getLogger(__name__)
 
 
 _WS_PATH = "/agent"
-_HTTP_401 = Response(401, "Unauthorized", Headers())
+_TURN_TIMEOUT_S = 300
+_MAX_CONCURRENT_CONNS = 4
 
 
+def _http_401() -> Response:
+    """Fresh 401 Response per handshake (``Headers`` is mutable)."""
+    return Response(401, "Unauthorized", Headers())
 
+
+def _http_503() -> Response:
+    """Fresh 503 Response for over-capacity handshakes."""
+    return Response(503, "Service Unavailable", Headers())
 
 
 class SessionWorker:
@@ -53,7 +63,7 @@ class SessionWorker:
 
     def __init__(
         self,
-        agent: Any,
+        agent: Agent,
         *,
         host: str = "127.0.0.1",
     ) -> None:
@@ -62,6 +72,7 @@ class SessionWorker:
         self._token = secrets.token_urlsafe(32)
         self._server: Any = None
         self._stop_event = asyncio.Event()
+        self._active_conns: int = 0
 
     @property
     def token(self) -> str:
@@ -103,17 +114,20 @@ class SessionWorker:
         ``Headers`` mapping.
         """
         if request.path != _WS_PATH:
-            return _HTTP_401
+            return _http_401()
+        if self._active_conns >= _MAX_CONCURRENT_CONNS:
+            return _http_503()
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
-            return _HTTP_401
+            return _http_401()
         # Constant-time compare; token length is bounded (32+ chars).
         if not secrets.compare_digest(auth[len("Bearer "):], self._token):
-            return _HTTP_401
+            return _http_401()
         return None
 
     async def _handle_conn(self, conn: ServerConnection) -> None:
         """Dispatch control messages until the connection closes."""
+        self._active_conns += 1
         try:
             async for raw in conn:
                 try:
@@ -133,6 +147,8 @@ class SessionWorker:
                     return
         except Exception as exc:  # noqa: BLE001
             logger.warning("SessionWorker connection error: %s", exc)
+        finally:
+            self._active_conns -= 1
 
     async def _dispatch(self, conn: ServerConnection, msg: dict[str, Any]) -> None:
         """One control message → one or more WS responses."""
@@ -153,25 +169,34 @@ class SessionWorker:
             )
 
     async def _stream_turn(self, conn: ServerConnection, prompt: str) -> None:
-        """Drive ``Agent.run_stream`` and forward each event to the client."""
-        from cothis.agent import ToolCallEvent
+        """Drive ``Agent.run_stream`` and forward each event to the client.
 
+        Bounded by ``_TURN_TIMEOUT_S`` so a stuck tool or model stream
+        can't hold the connection indefinitely. Errors are logged
+        server-side + a generic ``"internal error"`` goes to the client
+        (loopback-only is not a license to leak exception details).
+        """
         try:
-            async for event in self._agent.run_stream(prompt):
-                if isinstance(event, str):
-                    await conn.send(
-                        json.dumps({"type": "assistant_delta", "text": event})
-                    )
-                elif isinstance(event, ToolCallEvent):
-                    await conn.send(
-                        json.dumps({
-                            "type": "tool_call_started",
-                            "tool": event.name,
-                            "arguments": event.arguments,
-                        })
-                    )
-        except Exception as exc:  # noqa: BLE001
-            await conn.send(json.dumps({"type": "error", "message": str(exc)}))
+            async with asyncio.timeout(_TURN_TIMEOUT_S):
+                async for event in self._agent.run_stream(prompt):
+                    if isinstance(event, str):
+                        await conn.send(
+                            json.dumps({"type": "assistant_delta", "text": event})
+                        )
+                    elif isinstance(event, ToolCallEvent):
+                        await conn.send(
+                            json.dumps({
+                                "type": "tool_call_started",
+                                "tool": event.name,
+                                "arguments": event.arguments,
+                            })
+                        )
+        except TimeoutError:
+            logger.warning("SessionWorker turn timed out after %ds", _TURN_TIMEOUT_S)
+            await conn.send(json.dumps({"type": "error", "message": "turn timeout"}))
+        except Exception:  # noqa: BLE001
+            logger.exception("Agent.run_stream failed")
+            await conn.send(json.dumps({"type": "error", "message": "internal error"}))
 
     async def serve_forever(self) -> None:
         """Block until ``shutdown`` arrives or ``stop()`` is called."""
