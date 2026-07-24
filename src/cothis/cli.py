@@ -364,13 +364,13 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
             # Content delta — first one spins up Live, subsequent ones update it.
             if live is None:
                 status.stop()
-                accumulated = event
+                accumulated = event.text
                 live = Live(
                     Markdown(accumulated), console=console, refresh_per_second=10
                 )
                 live.start()
             else:
-                accumulated += event
+                accumulated += event.text
                 live.update(Markdown(accumulated))
     except MaxIterationsError as exc:
         has_max_iterations_error = True

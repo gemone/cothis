@@ -52,6 +52,7 @@ from pydantic import ValidationError
 
 from cothis.agent import (
     Agent,
+    ContentDelta,
     MaxIterationsError,
     ToolCallEvent,
     _apply_stream_delta,
@@ -746,7 +747,9 @@ async def test_run_stream_yields_text_deltas_and_stores_final(
 
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
-    assert out == ["He", "llo"]
+    assert len(out) == 2
+    assert out[0].kind == "text" and out[0].text == "He"
+    assert out[1].kind == "text" and out[1].text == "llo"
     stored = agent._messages[-1]
     assert stored["role"] == "assistant"
     assert stored["content"][0]["text"] == "Hello"
@@ -797,7 +800,7 @@ async def test_run_stream_tool_turn_yields_event_then_final(
     assert isinstance(out[0], ToolCallEvent)
     assert out[0].name == "add"
     assert out[0].arguments == {"a": 2, "b": 3}
-    assert out[1] == "5"
+    assert out[1].kind == "text" and out[1].text == "5"
 
 
 @pytest.mark.asyncio
@@ -891,7 +894,7 @@ async def test_run_stream_max_tokens_mid_tool_call_still_executes(
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
     assert isinstance(out[0], ToolCallEvent)
-    assert out[1] == "recovered"
+    assert out[1].kind == "text" and out[1].text == "recovered"
     # tool_use paired with tool_result — session valid.
     tool_result_msgs = [
         m
@@ -921,7 +924,7 @@ async def test_run_stream_latches_on_first_message_stop(
 
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
-    assert out == ["x"]  # duplicate stop did not error or re-process
+    assert len(out) == 1 and out[0].kind == "text" and out[0].text == "x"
 
 
 @pytest.mark.asyncio
@@ -1018,8 +1021,9 @@ async def test_run_stream_coalesces_fragmented_assistant_message(
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
     # Stream yielded the text delta from turn 1 + tool event + turn 2 text.
-    assert "hello" in out
-    assert "done" in out
+    texts = [e.text for e in out if isinstance(e, ContentDelta)]
+    assert any("hello" in t for t in texts)
+    assert any("done" in t for t in texts)
     assert any(isinstance(e, ToolCallEvent) for e in out)
 
     # Stored turn-1 assistant message is coalesced: 3 blocks, not 7.

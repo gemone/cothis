@@ -538,6 +538,20 @@ def _finalize_stream_block(block: dict[str, Any]) -> None:
 
 
 @dataclass(frozen=True)
+class ContentDelta:
+    """Streamed delta from the model — either text content or thinking.
+
+    ``kind="text"`` deltas render as normal assistant content (Markdown).
+    ``kind="thinking"`` deltas render dimmed/collapsed (toggle to expand).
+    The TUI routes on ``kind``; the WS ``assistant_delta`` message carries
+    the same field.
+    """
+
+    kind: str  # "text" | "thinking"
+    text: str
+
+
+@dataclass(frozen=True)
 class ToolCallEvent:
     """Streamed event: the agent is about to invoke a tool.
 
@@ -863,7 +877,7 @@ class Agent(BaseModel):
             f"Agent did not finish within {self.max_iterations} iterations."
         )
 
-    async def run_stream(self, user_input: str) -> AsyncIterator[str | ToolCallEvent]:
+    async def run_stream(self, user_input: str) -> AsyncIterator[ContentDelta | ToolCallEvent]:
         """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
 
         Wraps the body in ``workdir_context(self.cwd)`` so every tool call
@@ -873,7 +887,7 @@ class Agent(BaseModel):
             async for event in self._run_stream_inner(user_input):
                 yield event
 
-    async def _run_stream_inner(self, user_input: str) -> AsyncIterator[str | ToolCallEvent]:
+    async def _run_stream_inner(self, user_input: str) -> AsyncIterator[ContentDelta | ToolCallEvent]:
         """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
 
         Yields:
@@ -954,7 +968,7 @@ class Agent(BaseModel):
                 elif isinstance(event, RawContentBlockDeltaEvent):
                     _apply_stream_delta(blocks[event.index], event.delta)
                     if isinstance(event.delta, TextDelta):
-                        yield event.delta.text
+                        yield ContentDelta(kind="text", text=event.delta.text)
                         _yielded_text_indexes.add(event.index)
                 elif isinstance(event, RawContentBlockStopEvent):
                     block = blocks.get(event.index)
@@ -981,7 +995,7 @@ class Agent(BaseModel):
                 ):
                     text = block.get("text", "")
                     if text:
-                        yield text
+                        yield ContentDelta(kind="text", text=text)
 
             # Coalesce adjacent same-type blocks before storing. The
             # OpenAI→Messages stream converter fragments blocks on every
