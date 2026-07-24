@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
@@ -107,6 +108,44 @@ class NotifyBus:
         lastrowid = cur.lastrowid
         assert lastrowid is not None, "INSERT always produces a rowid"
         return int(lastrowid)
+
+    def compact(self, retention_days: int | None = None) -> int:
+        """Delete events older than the retention window; return count removed.
+
+        ``retention_days`` defaults to ``COTHIS_NOTIFY_RETENTION_DAYS``;
+        0, negative, or unparseable → no-op (compaction is opt-in).
+        The Supervisor (#227) calls this periodically — default cadence
+        daily. Snapshot-preservation (skipping rows pinned by an active
+        snapshot) is deferred to #246 — no snapshot table exists yet,
+        so the current implementation is pure age-based retention.
+        """
+        if retention_days is None:
+            try:
+                retention_days = int(os.environ.get("COTHIS_NOTIFY_RETENTION_DAYS", "0"))
+            except ValueError:
+                logger.warning(
+                    "COTHIS_NOTIFY_RETENTION_DAYS=%r is not an integer; "
+                    "skipping compaction.",
+                    os.environ.get("COTHIS_NOTIFY_RETENTION_DAYS"),
+                )
+                return 0
+        if retention_days <= 0:
+            return 0
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        with self._append_lock:
+            with self._conn:
+                cur = self._conn.execute(
+                    "DELETE FROM notify_events WHERE ts < ?",
+                    (cutoff,),
+                )
+        deleted = cur.rowcount
+        if deleted:
+            logger.info(
+                "notify_events compaction: deleted %d rows older than %d days",
+                deleted,
+                retention_days,
+            )
+        return int(deleted)
 
     def fetch_since(
         self,
