@@ -47,7 +47,7 @@ import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from filelock import FileLock, Timeout
 
@@ -61,6 +61,13 @@ from cothis.session.archive import (
 )
 from cothis.session.graph import SessionNotFoundError
 from cothis.session.storage import BlockRow, SessionRow, Storage, is_visible
+
+if TYPE_CHECKING:
+    # cothis: ``Skill`` is imported only for typing to avoid a circular
+    # import (``cothis.skills`` imports from ``cothis.session`` indirectly
+    # via ``cothis.tools.core`` at runtime). The runtime reference stored in
+    # ``_active_skill_meta`` is a ``cothis.skills.Skill`` instance.
+    from cothis.skills import Skill
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +520,15 @@ class Session:
         # ``load_skill`` adds names here; the catalog + active set drive
         # handler decisions (catalog membership, not text sniffing).
         self._active_skills: set[str] = set()
+        # cothis: side cache of the ``Skill`` objects for active skills
+        # (#256). Populated by ``load_skill`` at activation so
+        # ``_deactivate_active_skill`` can read the ``deactivation`` field
+        # without re-scanning the 3-layer catalog (O(K) → O(1) per
+        # deactivate). Runtime-only; not persisted. The cold-replay path
+        # (``_rebuild_active_skills_from_rows``) does NOT populate this — a
+        # miss there makes ``_deactivate_active_skill`` fall back to
+        # ``discover_skills`` (the pre-#256 behaviour).
+        self._active_skill_meta: dict[str, Skill] = {}
         # cothis: archived skills state (#167). Runtime-only; not persisted.
         # ``deactivate_skill`` adds names here; future block writes for
         # these skills write ``state='archived'`` directly (Half A of

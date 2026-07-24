@@ -18,6 +18,9 @@ class _FakeSession:
 
     def __init__(self) -> None:
         self._active: set[str] = set()
+        # cothis: mirrors Session._active_skill_meta (#256). load_skill
+        # stashes the Skill here so deactivate can skip the catalog scan.
+        self._active_skill_meta: dict[str, Any] = {}
 
     def is_skill_active(self, name: str) -> bool:
         return name in self._active

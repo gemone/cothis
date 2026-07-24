@@ -217,6 +217,10 @@ class _FakeSession:
     def __init__(self) -> None:
         self._active: set[str] = set()
         self._archived: set[str] = set()
+        # cothis: mirrors Session._active_skill_meta (#256). Tests that
+        # activate via ``load_skill`` get this populated; tests that call
+        # ``_activate_skill`` directly leave it empty (cache-miss fallback).
+        self._active_skill_meta: dict[str, Any] = {}
 
     def is_skill_active(self, name: str) -> bool:
         return name in self._active
@@ -278,6 +282,49 @@ def test_deactivate_skill_happy_path() -> None:
     assert "deactivat" in result.lower() or "archiv" in result.lower()
 
 
+def test_deactivate_warm_cache_does_not_scan_catalog() -> None:
+    """Warm ``_active_skill_meta`` → deactivate reads the cached Skill and
+    does NOT call ``discover_skills`` (#256).
+
+    This is the core regression guard for the perf fix: the deactivation
+    field is read from the Skill stashed at activation time, so the O(K)
+    3-layer catalog scan is skipped entirely on the warm path.
+    """
+    from unittest.mock import MagicMock
+
+    session = _FakeSession()
+    session._activate_skill("python")
+    # Simulate load_skill having stashed the Skill at activation.
+    session._active_skill_meta["python"] = _make_skill("python")
+
+    with patch("cothis.skills.discover_skills", new=MagicMock()) as mock_discover:
+        result = deactivate_skill(name="python", _session=session)
+    assert mock_discover.call_count == 0
+    assert session.is_skill_archived("python")
+    assert "python" in result
+
+
+def test_deactivate_warm_cache_preserves_summarize_declaration() -> None:
+    """The cached Skill's ``deactivation: summarize`` is honoured on the
+    warm path — the WARNING + Delete fallback fire without a catalog scan."""
+    import logging as _logging
+    from unittest.mock import MagicMock
+
+    session = _FakeSession()
+    session._activate_skill("python")
+    session._active_skill_meta["python"] = _make_skill(
+        "python", deactivation="summarize",
+    )
+
+    with patch("cothis.skills.discover_skills", new=MagicMock()) as mock_discover:
+        with patch.object(_logging.getLogger("cothis.skills"), "warning") as mock_warn:
+            result = deactivate_skill(name="python", _session=session)
+    assert mock_discover.call_count == 0
+    assert session.is_skill_archived("python")
+    assert any("summarize" in str(c) for c in mock_warn.call_args_list)
+    assert "summarize" in result.lower() or "fallback" in result.lower()
+
+
 def test_deactivate_skill_no_session_returns_error() -> None:
     """No session attached → error (cannot record archival state)."""
     with patch("cothis.skills.discover_skills", return_value=[_make_skill("python")]):
@@ -297,7 +344,7 @@ def test_deactivate_skill_handler_registered_as_tool() -> None:
 # ---------------------------------------------------------------------
 
 
-def _make_skill(name: str) -> Any:
+def _make_skill(name: str, *, deactivation: str = "delete") -> Any:
     """Build a minimal Skill instance for tests."""
     from pathlib import Path as _Path
 
@@ -307,4 +354,5 @@ def _make_skill(name: str) -> Any:
         description=f"{name} description",
         body=f"{name} body",
         source=_Path(f"/tmp/{name}/SKILL.md"),
+        deactivation=deactivation,
     )

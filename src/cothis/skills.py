@@ -254,6 +254,9 @@ def load_skill(name: str, _session: Any) -> str:
     skill = by_name[name]
     if _session is not None:
         _session._activate_skill(name)
+        # cothis: stash the Skill object so deactivate can read its
+        # ``deactivation`` field without re-scanning the catalog (#256).
+        _session._active_skill_meta[name] = skill
 
     parts = [f"<skill_content name={name!r}>\n{skill.body}\n</skill_content>"]
 
@@ -415,13 +418,26 @@ def _deactivate_active_skill(name: str, _session: Any) -> str:
     flat. Reads the deactivation declaration if the skill is still on
     disk (Summarize fallback from #170); missing-from-disk skills use
     the Delete strategy directly (no declaration to read).
+
+    The ``Skill`` is read from ``_session._active_skill_meta`` first
+    (populated at activation by ``load_skill``), avoiding a 3-layer
+    catalog scan per deactivate (#256). A cache miss — which happens
+    only when the skill was cold-replayed from rows at resume
+    (``_rebuild_active_skills_from_rows`` doesn't populate the cache) —
+    falls back to ``discover_skills`` so the pre-#256 path still
+    governs the cold case.
     """
     deactivation = "delete"
     summary_note = ""
-    catalog = discover_skills(Path.cwd())
-    by_name = {s.name: s for s in catalog}
-    if name in by_name:
-        deactivation = by_name[name].deactivation
+    cached = getattr(_session, "_active_skill_meta", {}).get(name)
+    if cached is not None:
+        skill = cached
+    else:
+        catalog = discover_skills(Path.cwd())
+        by_name = {s.name: s for s in catalog}
+        skill = by_name.get(name)
+    if skill is not None:
+        deactivation = skill.deactivation
         if deactivation == "summarize":
             logger.warning(
                 "skills: %r declares deactivation: summarize, which is not "
