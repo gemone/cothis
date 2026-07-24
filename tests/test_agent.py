@@ -54,6 +54,7 @@ from cothis.agent import (
     Agent,
     MaxIterationsError,
     ToolCallEvent,
+    ToolResultEvent,
     _apply_stream_delta,
     _assemble_system,
     _assistant_msg_from_response,
@@ -794,10 +795,83 @@ async def test_run_stream_tool_turn_yields_event_then_final(
 
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
+    # Sequence is now: ToolCallEvent → ToolResultEvent → text delta.
+    # The result event closes the tool lifecycle (no session bound here,
+    # so result_pointer is None).
     assert isinstance(out[0], ToolCallEvent)
     assert out[0].name == "add"
     assert out[0].arguments == {"a": 2, "b": 3}
-    assert out[1] == "5"
+    assert isinstance(out[1], ToolResultEvent)
+    assert out[1].name == "add"
+    assert out[1].is_error is False
+    assert out[1].result_pointer is None  # no Session attached
+    assert out[1].duration_ms >= 0
+    assert out[2] == "5"
+
+
+@pytest.mark.asyncio
+async def test_run_stream_tool_result_event_error_and_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ToolResultEvent`` carries ``is_error`` + a session pointer.
+
+    A failing tool sets ``is_error=True``; when a Session is bound the
+    ``result_pointer`` follows the notify-bus format
+    (``session:<sid>:tool:<call_id>``).
+    """
+
+    class _Boom:
+        __name__ = "boom"
+
+        def __call__(self, **kw: Any) -> str:
+            raise ValueError("nope")
+
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["boom"] = _Boom()
+
+    # Fake a bound session so the pointer is populated. Only ``session_id``
+    # is read by the stream path.
+    fake_session = MagicMock()
+    fake_session.session_id = "sess-42"
+    agent._session = fake_session
+
+    def turn1() -> list[Any]:
+        return [
+            _message_start("m1"),
+            _block_start(
+                0, ToolUseBlock(type="tool_use", id="call-7", name="boom", input={})
+            ),
+            _block_stop(0),
+            _msg_delta("tool_use"),
+            _msg_stop(),
+        ]
+
+    def turn2() -> list[Any]:
+        return [
+            _message_start("m2"),
+            _block_start(0, TextBlock(type="text", text="")),
+            _block_delta(0, TextDelta(type="text_delta", text="recovered")),
+            _block_stop(0),
+            _msg_delta("end_turn"),
+            _msg_stop(),
+        ]
+
+    turn = {"i": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        turn["i"] += 1
+        return _stream_from(turn1() if turn["i"] == 1 else turn2())
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    out = await _drain(agent.run_stream("hi"))
+    # Locate the result event (between the call event and the final delta).
+    results = [e for e in out if isinstance(e, ToolResultEvent)]
+    assert len(results) == 1
+    assert results[0].name == "boom"
+    assert results[0].is_error is True
+    assert results[0].duration_ms >= 0
+    assert results[0].result_pointer == "session:sess-42:tool:call-7"
+    assert out[-1] == "recovered"
 
 
 @pytest.mark.asyncio
@@ -891,7 +965,10 @@ async def test_run_stream_max_tokens_mid_tool_call_still_executes(
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
     assert isinstance(out[0], ToolCallEvent)
-    assert out[1] == "recovered"
+    # out[1] is the ToolResultEvent closing the tool lifecycle (added when
+    # run_stream started yielding tool-completion events).
+    assert isinstance(out[1], ToolResultEvent)
+    assert out[2] == "recovered"
     # tool_use paired with tool_result — session valid.
     tool_result_msgs = [
         m

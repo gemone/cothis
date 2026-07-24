@@ -551,6 +551,29 @@ class ToolCallEvent:
     arguments: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ToolResultEvent:
+    """Streamed event: a tool call has finished (success or error).
+
+    Yielded by ``Agent.run_stream`` immediately after each individual tool
+    dispatch completes, paired with the preceding ``ToolCallEvent``. Closes
+    the tool lifecycle so structured consumers (the TUI, the SessionWorker's
+    WS stream) can render "fs.read completed" / "fs.read failed", show
+    duration, and clear loading state — the text REPL infers completion
+    implicitly from the next ``assistant_delta`` and ignores this event.
+
+    ``result_pointer`` mirrors the notify-bus pointer format
+    (``session:<sid>:tool:<call_id>``) so a consumer that already reads the
+    bus can use the same key against session storage; ``None`` when no
+    Session is bound (ephemeral ``ask`` path).
+    """
+
+    name: str
+    is_error: bool
+    duration_ms: int
+    result_pointer: str | None
+
+
 class MaxIterationsError(RuntimeError):
     """Raised when the agent exhausts its iteration budget before finishing."""
 
@@ -863,7 +886,9 @@ class Agent(BaseModel):
             f"Agent did not finish within {self.max_iterations} iterations."
         )
 
-    async def run_stream(self, user_input: str) -> AsyncIterator[str | ToolCallEvent]:
+    async def run_stream(
+        self, user_input: str
+    ) -> AsyncIterator[str | ToolCallEvent | ToolResultEvent]:
         """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
 
         Wraps the body in ``workdir_context(self.cwd)`` so every tool call
@@ -873,7 +898,9 @@ class Agent(BaseModel):
             async for event in self._run_stream_inner(user_input):
                 yield event
 
-    async def _run_stream_inner(self, user_input: str) -> AsyncIterator[str | ToolCallEvent]:
+    async def _run_stream_inner(
+        self, user_input: str
+    ) -> AsyncIterator[str | ToolCallEvent | ToolResultEvent]:
         """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
 
         Yields:
@@ -883,6 +910,11 @@ class Agent(BaseModel):
             ``ToolCallEvent``: emitted immediately before each individual
                 tool dispatch (not batched), so multi-tool turns surface
                 "calling X" → X runs → "calling Y" → Y runs in order.
+            ``ToolResultEvent``: emitted immediately after each individual
+                tool dispatch completes, paired with the preceding
+                ``ToolCallEvent``. Closes the lifecycle so structured
+                consumers (TUI, SessionWorker WS) can render completion /
+                failure + duration; the text REPL ignores it.
 
         The accumulator consumes the Anthropic stream-event union directly
         (any-llm synthesises these events from OpenAI chunks for non-Anthropic
@@ -1027,8 +1059,36 @@ class Agent(BaseModel):
                     )
                     yield ToolCallEvent(name=display_name, arguments=block["input"])
                     skill = self._skill_for_block(block)
-                    is_error, output = await self._execute_tool(block)
-                    self._merge_tool_result(block["id"], output, is_error, skill=skill)
+                    _tool_started = time.monotonic()
+                    is_error, _output = await self._execute_tool(block)
+                    _tool_duration_ms = int(
+                        (time.monotonic() - _tool_started) * 1000
+                    )
+                    self._merge_tool_result(
+                        block["id"], _output, is_error, skill=skill
+                    )
+                    # cothis: close the tool lifecycle for structured
+                    # consumers. Pointer format matches the notify bus
+                    # (``session:<sid>:tool:<call_id>``); ``None`` on the
+                    # ephemeral ``ask`` path. Duration is measured around
+                    # ``_execute_tool`` only — same window the notify bus
+                    # uses, so the two stay comparable.
+                    _sid = (
+                        self._session.session_id
+                        if self._session is not None
+                        else None
+                    )
+                    _call_id = block.get("id")
+                    yield ToolResultEvent(
+                        name=display_name,
+                        is_error=is_error,
+                        duration_ms=_tool_duration_ms,
+                        result_pointer=(
+                            f"session:{_sid}:tool:{_call_id}"
+                            if _sid is not None and _call_id is not None
+                            else None
+                        ),
+                    )
                 continue
 
             # Non-tool turn: final answer streamed already; just end the loop.

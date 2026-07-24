@@ -21,13 +21,25 @@ if TYPE_CHECKING:
 
 
 def _mock_agent() -> Any:
-    """Agent stub whose ``run_stream`` yields one delta + closes."""
-    from cothis.agent import ToolCallEvent
+    """Agent stub whose ``run_stream`` yields one delta + closes.
+
+    The stub emits the full event lifecycle for one tool call:
+    ``assistant_delta`` → ``ToolCallEvent`` → ``ToolResultEvent``. This
+    mirrors what a real ``Agent.run_stream`` yields after the
+    tool-completion event was added (GH#254).
+    """
+    from cothis.agent import ToolCallEvent, ToolResultEvent
 
     async def _run_stream(prompt: str):
         yield "hello "
         yield "world"
         yield ToolCallEvent(name="fs.read", arguments={"path": "a.py"})
+        yield ToolResultEvent(
+            name="fs.read",
+            is_error=False,
+            duration_ms=12,
+            result_pointer="session:s1:tool:c1",
+        )
 
     agent = MagicMock()
     agent.run_stream = _run_stream
@@ -177,8 +189,9 @@ async def test_worker_run_turn_emits_assistant_delta_and_tool_call() -> None:
         ) as ws:
             await ws.send(json.dumps({"type": "run_turn", "prompt": "hi"}))
             received: list[dict[str, Any]] = []
-            # Loop until the turn ends (mock_agent yields exactly 3 events).
-            while len(received) < 3:
+            # Loop until the turn ends (mock_agent yields exactly 4 events:
+            # two assistant_delta + tool_call_started + tool_call_result_pointer).
+            while len(received) < 4:
                 raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 received.append(json.loads(raw))
             assert received[0] == {"type": "assistant_delta", "text": "hello "}
@@ -187,6 +200,13 @@ async def test_worker_run_turn_emits_assistant_delta_and_tool_call() -> None:
                 "type": "tool_call_started",
                 "tool": "fs.read",
                 "arguments": {"path": "a.py"},
+            }
+            assert received[3] == {
+                "type": "tool_call_result_pointer",
+                "tool": "fs.read",
+                "is_error": False,
+                "duration_ms": 12,
+                "pointer": "session:s1:tool:c1",
             }
     finally:
         await worker.stop()

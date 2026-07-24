@@ -28,7 +28,7 @@ from rich.console import Console  # cost: ~15ms
 from rich.live import Live  # cost: ~5ms
 from rich.markdown import Markdown  # cost: ~5ms
 
-from cothis.agent import Agent, MaxIterationsError, ToolCallEvent
+from cothis.agent import Agent, MaxIterationsError, ToolCallEvent, ToolResultEvent
 from cothis.session import (
     Session,
     SessionHasChildrenError,
@@ -332,6 +332,10 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
       * ``ToolCallEvent``  — printed inline (``calling fs.read(...)``) so the
         user can see why a multi-step turn is taking time. Printed *above*
         the spinner's animation row, which rich's Status handles cleanly.
+      * ``ToolResultEvent`` — ignored here. The text REPL infers tool
+        completion from the next ``assistant_delta``; this event exists for
+        structured consumers (TUI, SessionWorker WS) that need an explicit
+        lifecycle signal.
       * ``str``            — a content delta of the final answer.
 
     The ReAct loop is multi-turn: tool-call turns and content turns alternate.
@@ -360,6 +364,10 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
                     accumulated = ""
                     status.start()
                 console.print(_format_tool_call(event), style="dim")
+                continue
+            if isinstance(event, ToolResultEvent):
+                # Text REPL ignores tool-completion events; the next
+                # ``assistant_delta`` implicitly signals "tools are done".
                 continue
             # Content delta — first one spins up Live, subsequent ones update it.
             if live is None:
