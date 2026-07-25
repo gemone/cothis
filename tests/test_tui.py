@@ -1032,6 +1032,71 @@ async def test_action_new_session_passes_empty_list_when_not_in_git_repo(
     assert app.captured == []
 
 
+@pytest.mark.asyncio
+async def test_on_new_session_default_mounts_worktree_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 slice C: default ``on_new_session`` pushes ``WorktreePickerModal``.
+
+    Replaces the slice-A no-op stub. Now Ctrl-N → ``action_new_session``
+    → ``on_new_session`` mounts the picker (added in slice B) so the
+    user sees the worktree list. Slice D will wire session creation on
+    dismiss; this slice closes the "modal mounts" wiring contract.
+    """
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.on_new_session([Worktree(Path("/repo/main"), "main")])
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal), (
+            f"expected WorktreePickerModal on top; "
+            f"got {type(app.screen).__name__}"
+        )
+
+        modal.action_dismiss_modal()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_action_new_session_keypress_pushes_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 slice C: ``n`` keypress → ``action_new_session`` → picker mounts.
+
+    End-to-end via the actual keypress binding (``n``, not ``ctrl+n`` —
+    the binding was added in slice A). The default ``on_new_session``
+    mounts ``WorktreePickerModal``; the test verifies the modal is on
+    top of the screen stack after the keypress.
+    """
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    monkeypatch.setattr(
+        "cothis.git.list_worktrees",
+        lambda _cwd: [
+            Worktree(Path("/repo/main"), "main"),
+            Worktree(Path("/repo/feat"), "feature/x"),
+        ],
+    )
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal)
+
+        modal.action_dismiss_modal()
+        await pilot.pause()
+
+
 # ---------------------------------------------------------------------
 # ask_user_request dispatch (#229 slice C) — TUI side. Worker-side
 # Future blocking is Slice D; modal UI is Slice E.

@@ -521,14 +521,33 @@ class CothisApp(App):
         self.on_new_session(worktrees)
 
     def on_new_session(self, worktrees: list) -> None:
-        """Hook called by ``action_new_session`` (the ``n`` keypress) with the
-        visible worktrees. Default: pushes ``WorktreePickerModal`` (#234 slice
-        C) and routes the chosen path to ``on_worktree_pick`` (slice D).
+        """Mount ``WorktreePickerModal``; route the chosen path to ``on_worktree_pick`` (#234 slice C/D).
+
+        Hook fired by ``action_new_session`` (the ``n`` keypress). The
+        picker shows one ``Button`` per worktree; on dismiss the chosen
+        path (or ``None`` for Esc / Cancel) is forwarded to
+        ``on_worktree_pick`` — the single entry point for "create a
+        session bound to this cwd".
+
+        Subclasses can override to capture the worktree list without
+        mounting the modal (existing tests do this).
         """
         logger.info(
             "tui: new-session action fired; %d worktree(s) visible",
             len(worktrees),
         )
+
+        def _on_dismiss(value: str | None) -> None:
+            if value is None:
+                logger.info("tui: new-session cancelled (no worktree picked)")
+                return
+            logger.info(
+                "tui: worktree picked for new session: %s "
+                "(session creation lands in slice D)",
+                value,
+            )
+
+        self.push_screen(WorktreePickerModal(worktrees), _on_dismiss)
 
     # -----------------------------------------------------------------
     # Menu binding (#235 slice A) — Ctrl-M opens the config menu.
