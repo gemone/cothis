@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -47,6 +48,45 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _TOOL_STATUS_ICONS = {"running": ">>", "done": "OK", "failed": "XX"}
+
+
+# ---------------------------------------------------------------------
+# Skill selection persistence (#235 slice D)
+# ---------------------------------------------------------------------
+
+
+def _skill_selection_path() -> Path:
+    """Path to the persisted skill selection JSON."""
+    home = os.environ.get("COTHIS_HOME") or str(Path.home() / ".cothis")
+    return Path(home) / "skill_selection.json"
+
+
+def save_skill_selection(skills: set[str]) -> None:
+    """Persist the selected skill names to ``$COTHIS_HOME/skill_selection.json``.
+
+    Overwrites the file atomically (single ``write_text`` call).
+    Sorted output for deterministic diffs.
+    """
+    path = _skill_selection_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(skills)), encoding="utf-8")
+
+
+def load_skill_selection() -> set[str]:
+    """Load the persisted skill selection; empty set if missing or corrupt.
+
+    Missing file → ``set()`` (first run). Corrupt JSON → ``set()`` +
+    a WARNING log (don't crash the TUI on a bad config file).
+    """
+    path = _skill_selection_path()
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("tui: cannot read skill selection from %s", path)
+        return set()
+    return {str(s) for s in data} if isinstance(data, list) else set()
 
 
 # ---------------------------------------------------------------------
