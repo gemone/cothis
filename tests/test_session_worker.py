@@ -27,7 +27,9 @@ def _mock_agent() -> Any:
     async def _run_stream(prompt: str):
         yield ContentDelta(kind="text", text="hello ")
         yield ContentDelta(kind="text", text="world")
-        yield ToolCallEvent(name="fs.read", arguments={"path": "a.py"})
+        yield ToolCallEvent(
+            name="fs.read", arguments={"path": "a.py"}, call_id="tu_test",
+        )
 
     agent = MagicMock()
     agent.run_stream = _run_stream
@@ -247,6 +249,7 @@ async def test_worker_run_turn_emits_assistant_delta_and_tool_call() -> None:
                 "type": "tool_call_started",
                 "tool": "fs.read",
                 "arguments": {"path": "a.py"},
+                "call_id": "tu_test",
             }
     finally:
         await worker.stop()

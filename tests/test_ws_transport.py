@@ -182,7 +182,9 @@ async def test_run_turn_streams_deltas_via_fake_transport() -> None:
     events = [
         ContentDelta(kind="text", text="hello "),
         ContentDelta(kind="text", text="world"),
-        ToolCallEvent(name="fs.read", arguments={"path": "a.py"}),
+        ToolCallEvent(
+            name="fs.read", arguments={"path": "a.py"}, call_id="tu_test1",
+        ),
     ]
     transport = FakeTransport()
     worker = SessionWorker(_scripted_agent(events), transport=transport)
@@ -206,6 +208,7 @@ async def test_run_turn_streams_deltas_via_fake_transport() -> None:
             "type": "tool_call_started",
             "tool": "fs.read",
             "arguments": {"path": "a.py"},
+            "call_id": "tu_test1",
         }
     finally:
         await conn.feed(None)
@@ -221,12 +224,15 @@ async def test_run_turn_forwards_tool_result_pointer_via_fake_transport() -> Non
     ``duration_ms`` / ``pointer`` fields so the TUI can render completion.
     """
     events = [
-        ToolCallEvent(name="fs.read", arguments={"path": "a.py"}),
+        ToolCallEvent(
+            name="fs.read", arguments={"path": "a.py"}, call_id="tu_result1",
+        ),
         ToolResultEvent(
             tool="fs.read",
             is_error=False,
             duration_ms=12,
-            result_pointer="session:s1:tool:tu1",
+            result_pointer="session:s1:tool:tu_result1",
+            call_id="tu_result1",
         ),
     ]
     transport = FakeTransport()
@@ -241,13 +247,15 @@ async def test_run_turn_forwards_tool_result_pointer_via_fake_transport() -> Non
             "type": "tool_call_started",
             "tool": "fs.read",
             "arguments": {"path": "a.py"},
+            "call_id": "tu_result1",
         }
         assert got[1] == {
             "type": "tool_call_result_pointer",
             "tool": "fs.read",
             "is_error": False,
             "duration_ms": 12,
-            "pointer": "session:s1:tool:tu1",
+            "pointer": "session:s1:tool:tu_result1",
+            "call_id": "tu_result1",
         }
     finally:
         await conn.feed(None)
