@@ -1054,3 +1054,30 @@ async def test_ask_user_request_auto_reject_sends_resolve_ask(
     assert resolve_frames[0] == {
         "type": "resolve_ask", "ask_id": "ask_99", "value": None,
     }
+
+
+# ---------------------------------------------------------------------
+# Menu binding (#235 slice A) — Ctrl-M fires ``on_menu_open`` hook.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_action_menu_fires_on_menu_open_hook() -> None:
+    """AC #235 slice A: ``action_menu`` calls ``on_menu_open``."""
+    from cothis.tui import CothisApp
+
+    class _CapturingApp(CothisApp):
+        def __init__(self) -> None:
+            super().__init__()
+            self.menu_fired = False
+
+        def on_menu_open(self) -> None:  # type: ignore[override]
+            self.menu_fired = True
+
+    app = _CapturingApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_menu()
+        await pilot.pause()
+
+    assert app.menu_fired is True
