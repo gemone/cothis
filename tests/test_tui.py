@@ -1141,3 +1141,81 @@ async def test_set_active_session_highlights_matching_list_item(
         classes = {item.id: item.classes for item in items}
         assert "active-session" not in classes[f"s_{sid1}"]
         assert "active-session" in classes[f"s_{sid2}"]
+
+
+# ---------------------------------------------------------------------
+# Multi-session WS (#230 slice B)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attach_session_ws_stores_in_dict_and_sets_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #230 slice B: ``attach_session_ws`` stores WS in ``_ws_by_session``."""
+    from cothis.tui import CothisApp
+
+    fake = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("session-a", "ws://fake/agent", "tok")
+        await pilot.pause()
+
+        assert "session-a" in app._ws_by_session
+        assert app._ws_by_session["session-a"] is fake
+        assert app._active_session_id == "session-a"
+        assert "session-a" in app._ws_pump_tasks_by_session
+
+        await app.detach_session_ws("session-a")
+        await pilot.pause()
+
+        assert "session-a" not in app._ws_by_session
+        assert "session-a" not in app._ws_pump_tasks_by_session
+
+
+@pytest.mark.asyncio
+async def test_attach_session_ws_multiple_sessions_coexist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #230 slice B: two sessions attached simultaneously, both alive."""
+    from cothis.tui import CothisApp
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    async def fake_connect_async(uri: str, **kw: object) -> _FakeWS:
+        return fake_connect(uri, **kw)
+
+    monkeypatch.setattr("websockets.connect", fake_connect_async)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("session-a", "ws://fake/agent-a", "tok")
+        await pilot.pause()
+        await app.attach_session_ws("session-b", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+
+        assert len(app._ws_by_session) == 2
+        assert "session-a" in app._ws_by_session
+        assert "session-b" in app._ws_by_session
+        # Active session is the last-attached.
+        assert app._active_session_id == "session-b"
+
+        await app.detach_session_ws("session-a")
+        await pilot.pause()
+        assert "session-a" not in app._ws_by_session
+        assert "session-b" in app._ws_by_session
+
+        await app.detach_session_ws("session-b")
+        await pilot.pause()
