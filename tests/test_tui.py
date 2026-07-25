@@ -1083,6 +1083,46 @@ async def test_action_menu_fires_on_menu_open_hook() -> None:
     assert app.menu_fired is True
 
 
+@pytest.mark.asyncio
+async def test_list_configurable_skills_returns_discovered_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #235: ``list_configurable_skills`` returns names from discover_skills."""
+    from pathlib import Path as _Path
+
+    from cothis.skills import Skill
+    from cothis.tui import CothisApp
+
+    fake_skills = [
+        Skill(name="git-commit", description="d1", body="b1", source=_Path("/x")),
+        Skill(name="fs-read", description="d2", body="b2", source=_Path("/y")),
+    ]
+    monkeypatch.setattr(
+        "cothis.skills.discover_skills", lambda _cwd: fake_skills,
+    )
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        names = app.list_configurable_skills()
+    assert names == ["git-commit", "fs-read"]
+
+
+@pytest.mark.asyncio
+async def test_list_configurable_skills_empty_when_none_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #235: empty list when no skills are installed."""
+    from cothis.tui import CothisApp
+
+    monkeypatch.setattr("cothis.skills.discover_skills", lambda _cwd: [])
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.list_configurable_skills() == []
+
+
 # ---------------------------------------------------------------------
 # Active-session highlight (#230 slice D) — SessionList items gain
 # ``active-session`` CSS class when their session becomes active.
