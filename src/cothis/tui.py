@@ -286,7 +286,39 @@ class CothisApp(App):
     BINDINGS = [
         Binding("ctrl+enter", "send_prompt", "Send", show=False),
         Binding("ctrl+c", "quit", "Quit", show=False),
+        Binding("n", "new_session", "New session", show=True),
     ]
+
+    def action_new_session(self) -> None:
+        """Trigger the new-session flow (#234).
+
+        Lists git worktrees visible from ``Path.cwd()`` and forwards them
+        to ``on_new_session`` — an overridable hook the subclass / caller
+        wires to a picker UI. Default hook logs + returns; subclasses
+        override to mount a modal that lets the user choose where to
+        create the session (then call ``Session.new`` + ``attach_ws``).
+
+        Subprocess bound: ``list_worktrees`` runs ``git worktree list``
+        synchronously with a 5s timeout (the helper's safety net).
+        Acceptable here because the action is user-triggered (Ctrl-N)
+        and the bound timeout prevents indefinite blocking.
+        """
+        from cothis.git import list_worktrees
+
+        worktrees = list_worktrees(Path.cwd())
+        self.on_new_session(worktrees)
+
+    def on_new_session(self, worktrees: list) -> None:
+        """Hook called by ``action_new_session`` with the visible worktrees.
+
+        Default: log + return. Subclasses override to mount a picker
+        modal (``ModalScreen``) that lets the user choose a worktree
+        for the new session. The picker UI lands in a follow-up.
+        """
+        logger.info(
+            "tui: new-session action fired; %d worktree(s) visible",
+            len(worktrees),
+        )
 
     # WS attach state (#252 item 1). ``None`` until ``attach_ws`` runs;
     # ``attach_ws`` re-uses these slots idempotently. Typed as ``Any``
