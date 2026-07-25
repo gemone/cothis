@@ -184,14 +184,15 @@ async def test_resolve_ask_calls_agent_resolve_ask() -> None:
     the answer flows back through the agent's tool return + subsequent
     ``assistant_delta`` / ``tool_call_*`` events.
     """
+    agent_mock = _scripted_agent([])
     transport = FakeTransport()
-    worker = SessionWorker(_scripted_agent([]), transport=transport)
+    worker = SessionWorker(agent_mock, transport=transport)
     await worker.start()
     # Replace the MagicMock's resolve_ask with a fresh tracker so the
     # assertion below is unambiguous (scripted_agent returns one shared
     # MagicMock; without reassignment, any other test that touched
     # ``resolve_ask`` would pollute the call list).
-    worker._agent.resolve_ask = MagicMock()
+    agent_mock.resolve_ask = MagicMock()
     conn = await transport.accept()
     try:
         await conn.feed(
@@ -206,7 +207,7 @@ async def test_resolve_ask_calls_agent_resolve_ask() -> None:
         # resolve_ask dispatch is awaited inline (no background task);
         # a 0-schedule-tick sleep lets the coroutine run.
         await asyncio.sleep(0.05)
-        worker._agent.resolve_ask.assert_called_once_with("ask_1", "yes")
+        agent_mock.resolve_ask.assert_called_once_with("ask_1", "yes")
         assert conn.sent == [], (
             f"resolve_ask should not emit a frame; got {conn.sent!r}"
         )
@@ -225,8 +226,9 @@ async def test_on_ask_user_callback_sends_ask_user_request_frame() -> None:
     an async ``conn.send`` so the frame reaches the client before the
     tool blocks on the Future.
     """
+    agent_mock = _scripted_agent([])
     transport = FakeTransport()
-    worker = SessionWorker(_scripted_agent([]), transport=transport)
+    worker = SessionWorker(agent_mock, transport=transport)
     # Callback is installed at __init__ — before start() / accept().
     assert getattr(worker._agent, "_on_ask_user", None) is not None, (
         "worker must install _on_ask_user on the agent in __init__"
@@ -239,8 +241,9 @@ async def test_on_ask_user_callback_sends_ask_user_request_frame() -> None:
             prompt="Continue?",
             choices=["yes", "no"],
         )
-        # Sync call from inside the agent's tool execution.
-        worker._agent._on_ask_user(event)
+        # Sync call from inside the agent's tool execution. Access via the
+        # mock reference so ty doesn't see a typed-Agent attribute access.
+        agent_mock._on_ask_user(event)
         await conn.wait_for_send(1)
         msg = json.loads(conn.sent[0])
         assert msg == {
@@ -263,8 +266,9 @@ async def test_on_ask_user_callback_without_active_conn_is_safe() -> None:
     ``_TURN_TIMEOUT_S``). The callback itself must NOT raise — that
     would crash the agent's tool execution mid-turn.
     """
+    agent_mock = _scripted_agent([])
     transport = FakeTransport()
-    worker = SessionWorker(_scripted_agent([]), transport=transport)
+    worker = SessionWorker(agent_mock, transport=transport)
     # Note: no start() / accept() — _active_conn stays None.
     callback = getattr(worker._agent, "_on_ask_user", None)
     assert callback is not None
