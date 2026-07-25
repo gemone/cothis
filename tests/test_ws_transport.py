@@ -256,6 +256,35 @@ async def test_run_turn_streams_deltas_via_fake_transport() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_turn_dispatched_concurrently_allows_ping_during_turn() -> None:
+    """AC #229 B+D-1: ``ping`` is dispatched while ``run_turn`` runs in background."""
+    from cothis.agent import ContentDelta
+
+    async def _slow_agent_events():
+        yield ContentDelta(kind="text", text="thinking...")
+        await asyncio.sleep(0.2)
+        yield ContentDelta(kind="text", text="done")
+
+    transport = FakeTransport()
+    worker = SessionWorker(_scripted_agent([]), transport=transport)
+    setattr(worker._agent, "run_stream", _slow_agent_events)
+
+    await worker.start()
+    conn = await transport.accept()
+    try:
+        await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
+        await conn.feed(json.dumps({"type": "ping"}))
+        await conn.wait_for_send(1, timeout=1.0)
+        first = json.loads(conn.sent[0])
+        assert first == {"type": "pong"}, (
+            f"expected pong as first frame (concurrent dispatch); got {first}"
+        )
+    finally:
+        await conn.feed(None)
+        await worker.stop()
+
+
+@pytest.mark.asyncio
 async def test_run_turn_forwards_tool_result_pointer_via_fake_transport() -> None:
     """AC #254: ``ToolResultEvent`` from the agent → ``tool_call_result_pointer`` WS message.
 
