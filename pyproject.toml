@@ -11,6 +11,7 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "any-llm-sdk[all]>=1.17.0",
+    "anyio>=4.0",  # direct dep: cothis.ws + cothis.worker use fail_after/Event (#248)
     "filelock>=3.13",
     "griffe>=2.1.0",
     "mcp>=1.28.1",
