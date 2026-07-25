@@ -651,6 +651,29 @@ def archive_cmd(
 
 
 # ---------------------------------------------------------------------
+# TUI entrypoint (#237) — opt-in launch of the Textual app.
+# ``chat`` stays as the legacy REPL until the TUI reaches feature
+# parity (spawn-and-attach wiring, picker modal #234); then ``chat``
+# will default to TUI + ``--legacy`` keeps the old REPL.
+# ---------------------------------------------------------------------
+
+
+@app.command()
+def tui() -> None:
+    """Launch the Textual TUI (3-pane layout + WS attach hooks).
+
+    Opt-in today (``chat`` still launches the legacy REPL). The TUI
+    exposes ``attach_ws`` / ``on_session_selected`` / ``on_new_session``
+    hooks (#275, #281, #284) that a caller wires to a Supervisor
+    (#274 spawn_worker) for end-to-end session driving. The picker
+    modal (#234) + interactive notify (#229) land in follow-ups.
+    """
+    from cothis.tui import run as run_tui
+
+    run_tui()
+
+
+# ---------------------------------------------------------------------
 # Worker subprocess entrypoint (#250, deferred from #225)
 #
 # Spawns one ``SessionWorker`` that owns a single session + binds a WS
