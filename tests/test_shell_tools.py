@@ -133,18 +133,25 @@ command: "echo from-bash"
 
 
 def test_shell_auto_selected_when_omitted(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A string command without ``shell:`` auto-selects the OS default (story 16).
+    """A string command without ``shell:`` auto-selects per platform (story 16).
 
-    POSIX → ``sh``, Windows → ``cmd``. Explicit ``shell:`` still overrides.
+    POSIX → ``sh`` and loads cleanly. Windows → ``cmd`` is auto-selected then
+    immediately rejected at compile time (Option B, #139: ``shell: cmd`` is
+    forbidden because cmd.exe cannot safely quote ``&``/``|``/``%VAR%``);
+    authors must declare ``shell: pwsh`` explicitly. Explicit ``shell:``
+    still overrides on both platforms.
     """
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     yaml_text = """
 name: t
 command: echo hi
 """
-    tool = _shell_tool(yaml_text)
-    expected = "cmd" if _current_platform() == "windows" else "sh"
-    assert tool._block.shell == expected
+    if _current_platform() == "windows":
+        with pytest.raises(ValueError, match=r"'shell: cmd' is not supported"):
+            _shell_tool(yaml_text)
+    else:
+        tool = _shell_tool(yaml_text)
+        assert tool._block.shell == "sh"
 
 
 def test_shell_pipe_supported_in_string_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -742,8 +749,10 @@ args:
     with pytest.raises(ValueError, match="undeclared placeholder"):
         preview(undeclared)
 
-    # String without shell — auto-selects OS default (story 16), no error.
-    cmd, _ = preview('name: t\ncommand: "echo hi"\n')
+    # String with explicit shell — avoids auto-select, no error on any
+    # platform (auto-select picks ``cmd`` on Windows which is now
+    # rejected at compile time, #139).
+    cmd, _ = preview('name: t\nshell: sh\ncommand: "echo hi"\n')
     assert cmd == "echo hi"
 
     # List WITH shell — both still reject.
