@@ -39,7 +39,11 @@ _DDL = (
         meta   TEXT,
         payload_pointer TEXT)
     """,
-    "CREATE INDEX IF NOT EXISTS idx_notify_seq ON notify_events(seq)",
+    # idx_notify_seq was redundant: ``seq`` is INTEGER PRIMARY KEY, so it
+    # already aliases rowid (SQLite B-tree indexed by rowid). The explicit
+    # index doubled write amplification on every INSERT for no query-plan
+    # benefit — DROP IF EXISTS also cleans up legacy DBs created pre-#263.
+    "DROP INDEX IF EXISTS idx_notify_seq",
     "CREATE INDEX IF NOT EXISTS idx_notify_session ON notify_events(session_id)",
 )
 
