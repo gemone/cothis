@@ -641,15 +641,14 @@ class CothisApp(App):
     async def send_run_turn(self, prompt: str) -> None:
         """Forward a prompt as a ``run_turn`` control message over WS.
 
-        No-op when not attached (caller falls back to local echo). The
-        ``tool_call_result_pointer`` (#254) frame on the return path
-        will update the matching ``ToolCallCard`` once status wiring
-        lands; for now ``run_turn`` confirms with ``assistant_delta``
-        + ``tool_call_started`` frames per #255/#254.
+        Routes to the active session's WS when multi-session is in use
+        (``_ws_by_session``); falls back to the single-session ``_ws``
+        for backward compat. No-op when neither is attached.
         """
-        if self._ws is None:
+        ws = self._ws_by_session.get(self._active_session_id or "") or self._ws
+        if ws is None:
             return
-        await self._ws.send(json.dumps({"type": "run_turn", "prompt": prompt}))
+        await ws.send(json.dumps({"type": "run_turn", "prompt": prompt}))
 
     async def _pump_ws(self) -> None:
         """Read inbound WS frames from ``self._ws`` (single-session path)."""

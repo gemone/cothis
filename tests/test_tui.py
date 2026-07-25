@@ -1259,3 +1259,48 @@ async def test_attach_session_ws_multiple_sessions_coexist(
 
         await app.detach_session_ws("session-b")
         await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_send_run_turn_routes_to_active_session_ws(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #230 slice C: ``send_run_turn`` routes to the active session's WS."""
+    import json as _json
+
+    from cothis.tui import CothisApp
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("session-a", "ws://fake/agent-a", "tok")
+        await pilot.pause()
+        await app.attach_session_ws("session-b", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+
+        await app.send_run_turn("hello from b")
+        assert len(fake_b.sent) == 1
+        assert _json.loads(fake_b.sent[0]) == {
+            "type": "run_turn", "prompt": "hello from b",
+        }
+        assert fake_a.sent == []
+
+        app.set_active_session("session-a")
+        await pilot.pause()
+        await app.send_run_turn("hello from a")
+        assert len(fake_a.sent) == 1
+        assert _json.loads(fake_a.sent[0]) == {
+            "type": "run_turn", "prompt": "hello from a",
+        }
+
+        await app.detach_session_ws("session-a")
+        await app.detach_session_ws("session-b")
+        await pilot.pause()
