@@ -950,3 +950,107 @@ async def test_action_new_session_passes_empty_list_when_not_in_git_repo(
         await pilot.pause()
 
     assert app.captured == []
+
+
+# ---------------------------------------------------------------------
+# ask_user_request dispatch (#229 slice C) — TUI side. Worker-side
+# Future blocking is Slice D; modal UI is Slice E.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ask_user_request_dispatches_to_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #229 slice C: inbound ``ask_user_request`` fires the hook with args.
+
+    Subclass captures the call; verifies the hook receives ``ask_id``,
+    ``prompt``, + ``choices``.
+    """
+    import json as _json
+
+    from cothis.tui import CothisApp
+
+    class _CapturingApp(CothisApp):
+        def __init__(self) -> None:
+            super().__init__()
+            self.captured: dict = {}
+
+        def on_ask_user_request(
+            self, *, ask_id: str, prompt: str, choices: list,
+        ) -> None:  # type: ignore[override]
+            self.captured = {
+                "ask_id": ask_id, "prompt": prompt, "choices": choices,
+            }
+
+    fake = _FakeWS([
+        _json.dumps({
+            "type": "ask_user_request",
+            "ask_id": "ask_42",
+            "prompt": "Deploy to prod?",
+            "choices": ["yes", "no"],
+        }),
+    ])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = _CapturingApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        for _ in range(3):
+            await pilot.pause()
+
+    assert app.captured == {
+        "ask_id": "ask_42", "prompt": "Deploy to prod?", "choices": ["yes", "no"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_ask_user_request_auto_reject_sends_resolve_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #229 slice C: default hook auto-sends ``resolve_ask`` with ``value=None``.
+
+    The auto-reject prevents the worker from blocking forever on a Future
+    that has no modal to resolve it (tests, headless runs, pre-Slice-E
+    TUI usage). The outbound frame lands on the fake WS's ``sent`` list.
+    """
+    import json as _json
+
+    from cothis.tui import CothisApp
+
+    fake = _FakeWS([
+        _json.dumps({
+            "type": "ask_user_request",
+            "ask_id": "ask_99",
+            "prompt": "Continue?",
+            "choices": ["y", "n"],
+        }),
+    ])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        for _ in range(3):
+            await pilot.pause()
+
+    resolve_frames = [
+        _json.loads(f) for f in fake.sent
+        if _json.loads(f).get("type") == "resolve_ask"
+    ]
+    assert len(resolve_frames) == 1, (
+        f"expected 1 resolve_ask frame; got {resolve_frames}"
+    )
+    assert resolve_frames[0] == {
+        "type": "resolve_ask", "ask_id": "ask_99", "value": None,
+    }
