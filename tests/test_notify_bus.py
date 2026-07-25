@@ -170,3 +170,78 @@ def test_notify_event_is_namedtuple_for_call_site_clarity() -> None:
     )
     assert e.seq == 1
     assert e.topic == "t"
+
+
+# ---------------------------------------------------------------------
+# Redundant index guard (#263)
+#
+# ``seq`` is INTEGER PRIMARY KEY → aliases rowid → already has a
+# covering B-tree. An explicit ``idx_notify_seq`` doubles INSERT write
+# amplification for zero query-plan benefit. These tests guard the
+# removal + the lazy migration (DROP IF EXISTS on reopen).
+# ---------------------------------------------------------------------
+
+
+def _has_index(conn: sqlite3.Connection, name: str) -> bool:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+        (name,),
+    ).fetchall()
+    return bool(rows)
+
+
+def test_notify_bus_does_not_create_redundant_seq_index(bus: NotifyBus) -> None:
+    """AC #263: ``idx_notify_seq`` must not be created — rowid PK covers it."""
+    assert not _has_index(bus._conn, "idx_notify_seq"), (
+        "idx_notify_seq is redundant with the rowid PK and must not exist"
+    )
+    # Sanity: the genuine session-filter index is still there.
+    assert _has_index(bus._conn, "idx_notify_session")
+
+
+def test_notify_bus_drops_legacy_redundant_seq_index_on_reopen(
+    tmp_path: Path,
+) -> None:
+    """AC #263 migration: legacy DBs with ``idx_notify_seq`` get it dropped."""
+    db = tmp_path / "legacy.db"
+    # Simulate a pre-#263 database: notify_events exists with the redundant index.
+    s1 = Storage(db)
+    try:
+        NotifyBus(s1._conn)  # creates the table the modern way
+        s1._conn.execute("CREATE INDEX idx_notify_seq ON notify_events(seq)")
+        s1._conn.commit()
+        assert _has_index(s1._conn, "idx_notify_seq"), "pre-seed: index should exist"
+    finally:
+        s1.close()
+
+    # Reopen — DROP INDEX IF EXISTS in _DDL must remove it.
+    s2 = Storage(db)
+    try:
+        NotifyBus(s2._conn)
+        assert not _has_index(s2._conn, "idx_notify_seq"), (
+            "legacy idx_notify_seq must be dropped on reopen"
+        )
+    finally:
+        s2.close()
+
+
+def test_notify_bus_fetch_since_uses_primary_key_not_seq_index(
+    bus: NotifyBus,
+) -> None:
+    """AC #263 regression: planner uses the rowid PK, never ``idx_notify_seq``."""
+    bus.append(topic="t", event_type="a")
+    bus.append(topic="t", event_type="b")
+
+    plan_rows = bus._conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT seq, ts, topic, event_type, session_id, meta, payload_pointer "
+        "FROM notify_events WHERE seq > ? ORDER BY seq",
+        (0,),
+    ).fetchall()
+    plan_text = " ".join(str(r[-1]) for r in plan_rows)
+    assert "PRIMARY KEY" in plan_text, (
+        f"expected rowid PK in plan, got: {plan_text!r}"
+    )
+    assert "idx_notify_seq" not in plan_text, (
+        f"planner must not reference dropped index, got: {plan_text!r}"
+    )
