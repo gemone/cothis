@@ -22,7 +22,9 @@ from cothis.tools import discover_tools
 
 
 def test_format_string_argument_quoted() -> None:
-    event = ToolCallEvent(name="fs.read", arguments={"path": "/tmp/x"})
+    event = ToolCallEvent(
+        name="fs.read", arguments={"path": "/tmp/x"}, call_id="tu_test",
+    )
     assert _format_tool_call(event) == "calling fs.read(path='/tmp/x')"
 
 
@@ -30,6 +32,7 @@ def test_format_multiple_arguments() -> None:
     event = ToolCallEvent(
         name="fs.create",
         arguments={"path": "/tmp/out.txt", "content": "hello"},
+        call_id="tu_test",
     )
     out = _format_tool_call(event)
     # dict iteration order is insertion order; assert both pieces present.
@@ -74,7 +77,9 @@ def test_discover_tools_emits_per_tool_debug_log(tmp_path: Any, caplog: Any) -> 
 
 
 def test_format_integer_argument_not_quoted() -> None:
-    event = ToolCallEvent(name="add", arguments={"a": 2, "b": 3})
+    event = ToolCallEvent(
+        name="add", arguments={"a": 2, "b": 3}, call_id="tu_test",
+    )
     out = _format_tool_call(event)
     assert "a=2" in out
     assert "b=3" in out
@@ -83,7 +88,7 @@ def test_format_integer_argument_not_quoted() -> None:
 
 
 def test_format_no_arguments() -> None:
-    event = ToolCallEvent(name="noop", arguments={})
+    event = ToolCallEvent(name="noop", arguments={}, call_id="tu_test")
     assert _format_tool_call(event) == "calling noop()"
 
 
@@ -92,6 +97,7 @@ def test_format_string_with_special_chars_repr_escaped() -> None:
     event = ToolCallEvent(
         name="fs.create",
         arguments={"content": 'line1\nline2 "quoted"'},
+        call_id="tu_test",
     )
     out = _format_tool_call(event)
     assert "content='line1\\nline2 \"quoted\"'" in out
