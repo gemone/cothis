@@ -253,6 +253,17 @@ Each rule is enforced by `tests/test_text_boundary_audit.py` as a source-level s
 
 `CothisApp` opens a WS client via `attach_ws(uri, token)` (#275) — caller decides how the worker was spawned (`Supervisor.spawn_worker` or direct `cothis worker` subprocess). Inbound frames are pumped by a background task that dispatches by `type`: `assistant_delta` → `ConversationView.append_delta`, `tool_call_started` → `append_tool_call` (mounts a `ToolCallCard`), `tool_call_result_pointer` → `update_tool_call_status` (badge flip by `call_id`). `action_send_prompt` (#276) forwards a `run_turn` control message when attached; local echo always runs. `on_session_selected(session_id)` (#281) is the overridable hook fired when the user picks a session in `SessionList`; `on_new_session(worktrees)` (#284) is fired by `Ctrl-N` with the result of `list_worktrees`. Both default to log + return; subclasses wire the real spawn-and-attach flow.
 
+## Interactive ask_user flow (#229)
+
+A tool that needs user input mid-turn (e.g., "Deploy to prod? [yes/no]") blocks on an `asyncio.Future` until the user replies. The full chain across four layers:
+
+1. **Agent** (`agent.py`): `Agent._ask_user(prompt, choices)` creates a Future keyed by `ask_id`, emits an `AskUserRequestEvent` via the `_on_ask_user` callback (installed by the worker), and awaits the Future. `Agent.resolve_ask(ask_id, value)` resolves it.
+2. **Worker** (`worker.py`): `SessionWorker.__init__` installs `_on_ask_user` on the Agent via `setattr`. The callback (`_emit_ask_user_request`) schedules an `ask_user_request` WS frame (`{type, ask_id, prompt, choices}`) to the active connection. The `_dispatch` handler for `resolve_ask` calls `agent.resolve_ask(ask_id, value)` — which resolves the Future and unblocks the tool. `run_turn` is dispatched as a background task (#316) so `resolve_ask` can be read while the turn runs (no deadlock).
+3. **TUI** (`tui.py`): `_dispatch_ws_message` routes `ask_user_request` to `on_ask_user_request`, which pushes `AskUserModal(prompt, choices)` with a dismiss callback. The callback sends `resolve_ask` with the chosen value (or `None` for Esc / Cancel) over the active session's WS.
+4. **Agent** (continued): the Future resolves, `_ask_user` returns the chosen value, the tool continues.
+
+Persistence across TUI restart is filed as #307 (unanswered requests should survive). The mechanism is ask_user-specific today; generalising it (any tool can emit + block) is a design follow-up, not a separate code path — the pattern is `_on_<event>` callback + Future keyed by an id, replicated per event type.
+
 ## Git introspection (read-only)
 
 `cothis.git` exposes `list_worktrees(cwd) -> list[Worktree]` and `find_worktree_for_path(path, worktrees) -> Worktree | None` for the session picker (#234). `list_worktrees` shells out to `git worktree list --porcelain` with a 5s timeout; failure modes (missing binary, not-a-repo, timeout) degrade to an empty list so the picker UI falls back to "current directory only" without distinguishing cause. `Worktree` is a NamedTuple `(path, branch)` with the short branch name (`refs/heads/main` → `main`); detached HEAD → `branch=None`. `refresh_session_list` uses `find_worktree_for_path` to enrich each session's label with `· branch:<name>` when the session's cwd belongs to a known worktree.
