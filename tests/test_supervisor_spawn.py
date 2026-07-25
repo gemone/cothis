@@ -215,3 +215,64 @@ async def test_check_worker_health_running_then_exited(tmp_path: Path) -> None:
         assert sup.check_worker_health(sid) == "stopped"
     finally:
         sup.close()
+
+
+# ---------------------------------------------------------------------
+# monitor_once — crash detection (#250 slice B)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_monitor_once_detects_crash_and_records_lifecycle(
+    tmp_path: Path,
+) -> None:
+    """AC #250 slice B: ``monitor_once`` detects a crashed worker + records lifecycle.
+
+    Spawns a real worker, SIGKILLs it to simulate a crash, calls
+    ``monitor_once`` — verifies the crash was detected, the lifecycle
+    ``crashed`` event was recorded, + the handle is marked ``errored``.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    db_path = sessions_dir / "session.db"
+
+    session = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    session.append_message("user", [{"type": "text", "text": "hi"}])
+    sid = session.session_id
+    session.close()
+
+    sup = Supervisor(tmp_path / "supervisor.db")
+    try:
+        sup.spawn_worker(
+            sid,
+            model="openai/gpt-oss-120b",
+            provider="openrouter",
+            cwd=tmp_path,
+            sessions_dir=sessions_dir,
+            extra_env={"OPENROUTER_API_KEY": "test-dummy-not-used"},
+        )
+        assert sup.check_worker_health(sid) == "running"
+
+        # Simulate a crash: SIGKILL the subprocess (not graceful SIGINT).
+        proc = sup._procs[sid]
+        proc.kill()
+        proc.wait(timeout=5)
+
+        # monitor_once should detect the crash.
+        crashed = sup.monitor_once()
+        assert sid in crashed
+
+        # Lifecycle event recorded.
+        events = sup.lifecycle_since(0)
+        crash_events = [e for e in events if e.event_type == "crashed"]
+        assert len(crash_events) == 1
+        assert crash_events[0].session_id == sid
+
+        # Handle marked errored.
+        assert sup._workers[sid].status == "errored"
+
+        # Second call: no re-flag (proc popped by monitor_once).
+        crashed_again = sup.monitor_once()
+        assert crashed_again == []
+    finally:
+        sup.close()
