@@ -262,3 +262,171 @@ async def test_append_delta_segmented_streaming_is_linear_not_quadratic() -> Non
         f"got {ratio:.2f}× (small={t_small*1000:.1f}ms, large={t_large*1000:.1f}ms) — "
         f"buffer is accumulating O(N²) work somewhere"
     )
+
+
+# ---------------------------------------------------------------------
+# WS attach (#252 item 1) — caller supplies URI + bearer token; the
+# app opens a client, pumps inbound frames to ConversationView, and
+# exposes ``send_run_turn`` for outbound prompts. Tests drive the
+# pump via a fake ``websockets.connect`` that yields scripted frames.
+# ---------------------------------------------------------------------
+
+
+class _FakeWS:
+    """In-memory stand-in for a ``websockets.WebSocketClientProtocol``.
+
+    Exposes ``send`` (records outbound) + async iteration (yields
+    scripted inbound frames) + ``close``. No socket, no I/O.
+    """
+
+    def __init__(self, inbound: list[str]) -> None:
+        self._inbound = list(inbound)
+        self.sent: list[str] = []
+        self.closed = False
+
+    async def __aenter__(self) -> _FakeWS:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def __aiter__(self) -> _FakeWS:
+        return self
+
+    async def __anext__(self):
+        if not self._inbound:
+            raise StopAsyncIteration
+        return self._inbound.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_attach_ws_dispatches_assistant_delta_to_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 1: inbound ``assistant_delta`` lands in ConversationView."""
+    import json as _json
+
+    from cothis.tui import ConversationView, CothisApp
+
+    frames = [
+        _json.dumps({"type": "assistant_delta", "kind": "text", "text": "hello "}),
+        _json.dumps({"type": "assistant_delta", "kind": "text", "text": "world"}),
+    ]
+    fake = _FakeWS(frames)
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        assert uri == "ws://fake/agent"
+        assert kw.get("additional_headers") == {"Authorization": "Bearer tok"}
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        # Drain the pump task: it yields one frame per ``pilot.pause`` tick.
+        for _ in range(len(frames) + 1):
+            await pilot.pause()
+        view = app.query_one(ConversationView)
+        assert "hello" in view.renderable_str
+        assert "world" in view.renderable_str
+        await app.detach_ws()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_attach_ws_dispatches_tool_call_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 1: inbound ``tool_call_started`` mounts a ToolCallCard."""
+    import json as _json
+
+    from cothis.tui import CothisApp, ToolCallCard
+
+    frames = [
+        _json.dumps({"type": "tool_call_started", "tool": "fs.read"}),
+    ]
+    fake = _FakeWS(frames)
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        for _ in range(len(frames) + 1):
+            await pilot.pause()
+        cards = list(app.query(ToolCallCard))
+        assert len(cards) == 1
+        await app.detach_ws()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_send_run_turn_forwards_prompt_when_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 1: ``send_run_turn`` writes a JSON control message over WS."""
+    import json as _json
+
+    from cothis.tui import CothisApp
+
+    fake = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        await pilot.pause()
+        await app.send_run_turn("what is 2+2?")
+        # ``send`` is async on the WS; the bytes are already on the fake's
+        # ``sent`` list before the pump task drains.
+        assert len(fake.sent) == 1
+        assert _json.loads(fake.sent[0]) == {
+            "type": "run_turn",
+            "prompt": "what is 2+2?",
+        }
+        await app.detach_ws()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_detach_ws_closes_connection_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 1: detach closes the WS; double-detach is a safe no-op."""
+    from cothis.tui import CothisApp
+
+    fake = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        await pilot.pause()
+        await app.detach_ws()
+        assert fake.closed
+        assert app._ws is None
+        # Double-detach must not raise.
+        await app.detach_ws()
+        await pilot.pause()

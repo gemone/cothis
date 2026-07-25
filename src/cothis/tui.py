@@ -18,6 +18,8 @@ entrypoint (#250) is finalised; for now, ``send_prompt`` emits a
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -36,6 +38,8 @@ from textual.widgets import (
 
 if TYPE_CHECKING:
     from typing import Any
+
+    import websockets
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +255,14 @@ class CothisApp(App):
         Binding("ctrl+c", "quit", "Quit", show=False),
     ]
 
+    # WS attach state (#252 item 1). ``None`` until ``attach_ws`` runs;
+    # ``attach_ws`` re-uses these slots idempotently. Typed as ``Any``
+    # because websockets' client connection class moved across versions
+    # (``ClientConnection`` in v13+, ``WebSocketClientProtocol`` pre-v13)
+    # and we don't need to call any methods on it outside this file.
+    _ws: Any = None
+    _ws_pump_task: asyncio.Task[None] | None = None
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main"):
@@ -288,6 +300,107 @@ class CothisApp(App):
     def append_tool_call(self, name: str, status: str = "running") -> Any:
         """Forward a WS ``tool_call_started`` to the conversation view."""
         return self.query_one(ConversationView).append_tool_call(name, status)
+
+    # -----------------------------------------------------------------
+    # WS attach (#252 item 1) — caller supplies URI + bearer token
+    # from a worker spawn (via Supervisor.spawn_worker or a direct
+    # ``cothis worker`` subprocess). The app opens a client, pumps
+    # inbound frames to ``ConversationView`` / ``ToolCallCard``, and
+    # exposes ``send_run_turn`` for ``action_send_prompt`` to use.
+    # -----------------------------------------------------------------
+
+    async def attach_ws(self, uri: str, token: str) -> None:
+        """Open a WS client to a worker; pump inbound frames to the view.
+
+        Caller decides how the worker got spawned (Supervisor, direct
+        subprocess, etc.) — this method only needs the bind-handshake
+        output (URI + bearer token). Inbound frames dispatch by
+        ``type`` to ``append_assistant_delta`` / ``append_tool_call``.
+
+        Idempotent: calling again replaces the previous attachment.
+        """
+        import websockets
+
+        await self.detach_ws()
+        self._ws = await websockets.connect(
+            uri, additional_headers={"Authorization": f"Bearer {token}"},
+        )
+        self._ws_pump_task = asyncio.create_task(self._pump_ws())
+
+    async def detach_ws(self) -> None:
+        """Close the WS client + cancel the pump task (if attached)."""
+        task = self._ws_pump_task
+        self._ws_pump_task = None
+        ws = self._ws
+        self._ws = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if ws is not None:
+            await ws.close()
+
+    async def send_run_turn(self, prompt: str) -> None:
+        """Forward a prompt as a ``run_turn`` control message over WS.
+
+        No-op when not attached (caller falls back to local echo). The
+        ``tool_call_result_pointer`` (#254) frame on the return path
+        will update the matching ``ToolCallCard`` once status wiring
+        lands; for now ``run_turn`` confirms with ``assistant_delta``
+        + ``tool_call_started`` frames per #255/#254.
+        """
+        if self._ws is None:
+            return
+        await self._ws.send(json.dumps({"type": "run_turn", "prompt": prompt}))
+
+    async def _pump_ws(self) -> None:
+        """Read inbound WS frames + dispatch to ConversationView.
+
+        The websockets library surfaces a closed connection as
+        ``ConnectionClosed`` raised from ``recv``; we log + let the
+        task end. The connection will be re-established by the caller
+        (the supervisor will restart the worker per #227).
+        """
+        if self._ws is None:
+            return
+        import websockets
+
+        try:
+            async for raw in self._ws:
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("tui: dropping non-JSON WS frame: %r", raw)
+                    continue
+                self._dispatch_ws_message(msg)
+        except websockets.exceptions.ConnectionClosed as exc:
+            logger.info("tui: WS connection closed (code=%s)", exc.code)
+
+    def _dispatch_ws_message(self, msg: dict) -> None:
+        """Route one decoded WS message to the appropriate view method."""
+        typ = msg.get("type")
+        if typ == "assistant_delta":
+            self.append_assistant_delta(
+                msg.get("kind", "text"), msg.get("text", ""),
+            )
+        elif typ == "tool_call_started":
+            self.append_tool_call(msg.get("tool", "?"))
+        elif typ == "tool_call_result_pointer":
+            # #254 result frame — update the matching ToolCallCard's
+            # status. Card identity isn't stable yet (cards are mounted
+            # by name without a call_id); landing the card-id wiring
+            # is a follow-up under #252 item 4.
+            logger.debug(
+                "tui: tool_call_result_pointer for %s (is_error=%s) — "
+                "card status update not yet wired",
+                msg.get("tool"), msg.get("is_error"),
+            )
+        elif typ == "error":
+            logger.warning("tui: worker error: %s", msg.get("message", ""))
+        else:
+            logger.debug("tui: ignoring unknown WS message type: %r", typ)
 
 
 def run() -> None:
