@@ -175,6 +175,46 @@ async def test_ping_pong_via_fake_transport() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolve_ask_accepted_without_error_frame(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC #229 slice A: ``resolve_ask`` is accepted — no ``unknown type`` error.
+
+    The handler logs the receipt at DEBUG + returns. No error frame is
+    sent back. The Future-based unblocking lands in Slice D; this test
+    only verifies the protocol surface (the message type is recognised,
+    doesn't fall through to the error path).
+    """
+    import logging
+
+    transport = FakeTransport()
+    worker = SessionWorker(_scripted_agent([]), transport=transport)
+    await worker.start()
+    conn = await transport.accept()
+    try:
+        with caplog.at_level(logging.DEBUG, logger="cothis.worker"):
+            await conn.feed(json.dumps({
+                "type": "resolve_ask", "ask_id": "ask_1", "value": "yes",
+            }))
+            await conn.wait_for_send(1, timeout=1.0)
+
+        # No error frame — the empty ``sent`` proves the message was
+        # accepted silently (resolve_ask doesn't send a reply today;
+        # the Future resolution is Slice D).
+        assert conn.sent == [], (
+            f"resolve_ask should produce no outbound frame; got {conn.sent!r}"
+        )
+        # DEBUG log captured: the handler ran + logged the receipt.
+        assert any(
+            "resolve_ask" in r.getMessage() and "ask_1" in r.getMessage()
+            for r in caplog.records
+        ), f"expected DEBUG log for resolve_ask; got: {[r.getMessage() for r in caplog.records]}"
+    finally:
+        await conn.feed(None)
+        await worker.stop()
+
+
+@pytest.mark.asyncio
 async def test_run_turn_streams_deltas_via_fake_transport() -> None:
     """``run_turn`` forwards each agent event — driven through the seam."""
     from cothis.agent import ContentDelta

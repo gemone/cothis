@@ -143,6 +143,17 @@ class SessionWorker:
         elif typ in ("attach_input", "detach_input"):
             # Real terminal attach lands with #230; accept + ignore for now.
             logger.debug("SessionWorker got %r (terminal attach deferred)", typ)
+        elif typ == "resolve_ask":
+            # #229 slice A: receive + log. Future-based unblocking
+            # (Slice D) will resolve the asyncio.Future keyed by ask_id;
+            # this branch just accepts the message so it doesn't fall
+            # through to the ``unknown type`` error path.
+            ask_id = msg.get("ask_id")
+            value = msg.get("value")
+            logger.debug(
+                "SessionWorker resolve_ask received (ask_id=%s, value=%r)",
+                ask_id, value,
+            )
         else:
             await conn.send(
                 json.dumps({"type": "error", "message": f"unknown type: {typ!r}"})
