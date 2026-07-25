@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from cothis.agent import ToolCallEvent, ToolResultEvent
+from cothis.agent import AskUserRequestEvent, ToolCallEvent, ToolResultEvent
 from cothis.worker import SessionWorker
 
 # ---------------------------------------------------------------------
@@ -175,43 +175,110 @@ async def test_ping_pong_via_fake_transport() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_ask_accepted_without_error_frame(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """AC #229 slice A: ``resolve_ask`` is accepted — no ``unknown type`` error.
+async def test_resolve_ask_calls_agent_resolve_ask() -> None:
+    """AC #229 B+D-3: ``resolve_ask`` WS handler routes to ``agent.resolve_ask``.
 
-    The handler logs the receipt at DEBUG + returns. No error frame is
-    sent back. The Future-based unblocking lands in Slice D; this test
-    only verifies the protocol surface (the message type is recognised,
-    doesn't fall through to the error path).
+    Replaces the slice A stub (which only logged receipt of the message).
+    Now the handler resolves the agent's pending Future, unblocking the
+    tool that called ``_ask_user``. Still emits no WS frame of its own —
+    the answer flows back through the agent's tool return + subsequent
+    ``assistant_delta`` / ``tool_call_*`` events.
     """
-    import logging
-
+    agent_mock = _scripted_agent([])
     transport = FakeTransport()
-    worker = SessionWorker(_scripted_agent([]), transport=transport)
+    worker = SessionWorker(agent_mock, transport=transport)
     await worker.start()
+    # Replace the MagicMock's resolve_ask with a fresh tracker so the
+    # assertion below is unambiguous (scripted_agent returns one shared
+    # MagicMock; without reassignment, any other test that touched
+    # ``resolve_ask`` would pollute the call list).
+    agent_mock.resolve_ask = MagicMock()
     conn = await transport.accept()
     try:
-        with caplog.at_level(logging.DEBUG, logger="cothis.worker"):
-            await conn.feed(json.dumps({
-                "type": "resolve_ask", "ask_id": "ask_1", "value": "yes",
-            }))
-            await conn.wait_for_send(1, timeout=1.0)
-
-        # No error frame — the empty ``sent`` proves the message was
-        # accepted silently (resolve_ask doesn't send a reply today;
-        # the Future resolution is Slice D).
-        assert conn.sent == [], (
-            f"resolve_ask should produce no outbound frame; got {conn.sent!r}"
+        await conn.feed(
+            json.dumps(
+                {
+                    "type": "resolve_ask",
+                    "ask_id": "ask_1",
+                    "value": "yes",
+                }
+            )
         )
-        # DEBUG log captured: the handler ran + logged the receipt.
-        assert any(
-            "resolve_ask" in r.getMessage() and "ask_1" in r.getMessage()
-            for r in caplog.records
-        ), f"expected DEBUG log for resolve_ask; got: {[r.getMessage() for r in caplog.records]}"
+        # resolve_ask dispatch is awaited inline (no background task);
+        # a 0-schedule-tick sleep lets the coroutine run.
+        await asyncio.sleep(0.05)
+        agent_mock.resolve_ask.assert_called_once_with("ask_1", "yes")
+        assert conn.sent == [], (
+            f"resolve_ask should not emit a frame; got {conn.sent!r}"
+        )
     finally:
         await conn.feed(None)
         await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_ask_user_callback_sends_ask_user_request_frame() -> None:
+    """AC #229 B+D-3: ``Agent._ask_user`` → worker emits ``ask_user_request`` WS frame.
+
+    The worker installs ``_on_ask_user`` on the agent at ``__init__``
+    time. When the agent's ``_ask_user`` runs (inside a tool, inside a
+    turn), it fires the callback synchronously; the callback schedules
+    an async ``conn.send`` so the frame reaches the client before the
+    tool blocks on the Future.
+    """
+    agent_mock = _scripted_agent([])
+    transport = FakeTransport()
+    worker = SessionWorker(agent_mock, transport=transport)
+    # Callback is installed at __init__ — before start() / accept().
+    assert getattr(worker._agent, "_on_ask_user", None) is not None, (
+        "worker must install _on_ask_user on the agent in __init__"
+    )
+    await worker.start()
+    conn = await transport.accept()
+    try:
+        event = AskUserRequestEvent(
+            ask_id="ask_1",
+            prompt="Continue?",
+            choices=["yes", "no"],
+        )
+        # Sync call from inside the agent's tool execution. Access via the
+        # mock reference so ty doesn't see a typed-Agent attribute access.
+        agent_mock._on_ask_user(event)
+        await conn.wait_for_send(1)
+        msg = json.loads(conn.sent[0])
+        assert msg == {
+            "type": "ask_user_request",
+            "ask_id": "ask_1",
+            "prompt": "Continue?",
+            "choices": ["yes", "no"],
+        }
+    finally:
+        await conn.feed(None)
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_ask_user_callback_without_active_conn_is_safe() -> None:
+    """If ``_on_ask_user`` fires before any conn is accepted, warn + drop.
+
+    Correct behaviour when there's no client: the agent's Future simply
+    never resolves (the turn will eventually time out via
+    ``_TURN_TIMEOUT_S``). The callback itself must NOT raise — that
+    would crash the agent's tool execution mid-turn.
+    """
+    agent_mock = _scripted_agent([])
+    transport = FakeTransport()
+    worker = SessionWorker(agent_mock, transport=transport)
+    # Note: no start() / accept() — _active_conn stays None.
+    callback = getattr(worker._agent, "_on_ask_user", None)
+    assert callback is not None
+    event = AskUserRequestEvent(
+        ask_id="ask_orphan",
+        prompt="?",
+        choices=["a", "b"],
+    )
+    # Must not raise.
+    callback(event)
 
 
 @pytest.mark.asyncio
@@ -223,7 +290,9 @@ async def test_run_turn_streams_deltas_via_fake_transport() -> None:
         ContentDelta(kind="text", text="hello "),
         ContentDelta(kind="text", text="world"),
         ToolCallEvent(
-            name="fs.read", arguments={"path": "a.py"}, call_id="tu_test1",
+            name="fs.read",
+            arguments={"path": "a.py"},
+            call_id="tu_test1",
         ),
     ]
     transport = FakeTransport()
@@ -294,7 +363,9 @@ async def test_run_turn_forwards_tool_result_pointer_via_fake_transport() -> Non
     """
     events = [
         ToolCallEvent(
-            name="fs.read", arguments={"path": "a.py"}, call_id="tu_result1",
+            name="fs.read",
+            arguments={"path": "a.py"},
+            call_id="tu_result1",
         ),
         ToolResultEvent(
             tool="fs.read",
