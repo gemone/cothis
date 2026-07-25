@@ -1127,8 +1127,10 @@ async def test_list_configurable_skills_empty_when_none_installed(
 async def test_config_menu_modal_renders_skill_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #235 slice B: ``action_menu`` pushes ConfigMenuModal with skill names."""
+    """AC #235 slice B/C: ``action_menu`` pushes ConfigMenuModal with toggleable skill buttons."""
     from pathlib import Path as _Path
+
+    from textual.widgets import Button
 
     from cothis.skills import Skill
     from cothis.tui import ConfigMenuModal, CothisApp
@@ -1149,13 +1151,65 @@ async def test_config_menu_modal_renders_skill_names(
 
         modal = app.screen
         assert isinstance(modal, ConfigMenuModal)
-        labels = [str(getattr(l, "_Static__content", "")) for l in modal.query("Label")]
-        label_text = " ".join(labels)
-        assert "git-commit" in label_text
-        assert "fs-read" in label_text
+        buttons = list(modal.query(Button))
+        button_ids = [b.id for b in buttons]
+        assert "skill-git-commit" in button_ids
+        assert "skill-fs-read" in button_ids
+        assert "menu-done" in button_ids
 
         modal.action_dismiss_modal()
         await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_config_menu_modal_toggle_selects_and_dismisses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #235 slice C: clicking a skill button toggles selection; Done returns the set."""
+    from pathlib import Path as _Path
+
+    from textual.widgets import Button
+
+    from cothis.skills import Skill
+    from cothis.tui import ConfigMenuModal, CothisApp
+
+    fake_skills = [
+        Skill(name="git-commit", description="d1", body="b1", source=_Path("/x")),
+        Skill(name="fs-read", description="d2", body="b2", source=_Path("/y")),
+    ]
+    monkeypatch.setattr(
+        "cothis.skills.discover_skills", lambda _cwd: fake_skills,
+    )
+
+    captured: list = []
+
+    def on_dismiss(value: object) -> None:
+        captured.append(value)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(ConfigMenuModal(["git-commit", "fs-read"]), on_dismiss)
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, ConfigMenuModal)
+        assert modal._selected == set()
+
+        git_button = next(
+            b for b in modal.query(Button) if b.id == "skill-git-commit"
+        )
+        await pilot.click(git_button)
+        await pilot.pause()
+        assert "git-commit" in modal._selected
+
+        done_button = next(
+            b for b in modal.query(Button) if b.id == "menu-done"
+        )
+        await pilot.click(done_button)
+        await pilot.pause()
+
+    assert captured == [{"git-commit"}]
 
 
 # ---------------------------------------------------------------------

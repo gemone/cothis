@@ -260,13 +260,12 @@ class InputBar(Container):
         self.query_one(TextArea).text = ""
 
 
-class ConfigMenuModal(ModalScreen[str | None]):
-    """Config menu modal — lists configurable skills (#235 slice B).
+class ConfigMenuModal(ModalScreen[set[str] | None]):
+    """Config menu modal — toggleable skill entries (#235 slice B+C).
 
-    Displays the skill names from ``list_configurable_skills`` as a
-    read-only list. Slice C will add toggleable entries; Slice D will
-    persist selections. For now the modal is informational: the user
-    sees what's available + closes with Esc or the Close button.
+    Each skill is a ``Button`` that toggles selected/unselected on click.
+    ``Done`` dismisses with the selected set; ``Esc`` dismisses with
+    ``None`` (cancel). Slice D will persist the selection across sessions.
     """
 
     DEFAULT_CSS = """
@@ -276,12 +275,16 @@ class ConfigMenuModal(ModalScreen[str | None]):
     ConfigMenuModal > Label {
         padding: 0 2;
     }
+    ConfigMenuModal > Button.skill-toggle.-active {
+        background: $accent;
+    }
     """
 
-    BINDINGS = [("escape", "dismiss_modal", "Close")]
+    BINDINGS = [("escape", "dismiss_modal", "Cancel")]
 
     def __init__(self, skills: list[str]) -> None:
         self._skills = skills
+        self._selected: set[str] = set()
         super().__init__()
 
     def compose(self) -> ComposeResult:
@@ -289,15 +292,24 @@ class ConfigMenuModal(ModalScreen[str | None]):
         if not self._skills:
             yield Label("(no skills configured)", id="menu-empty")
         for name in self._skills:
-            yield Label(f"  • {name}")
-        yield Button("Close", id="menu-close")
+            yield Button(name, id=f"skill-{name}", classes="skill-toggle")
+        yield Button("Done", id="menu-done")
 
     def action_dismiss_modal(self) -> None:
         self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "menu-close":
-            self.dismiss(None)
+        bid = event.button.id or ""
+        if bid == "menu-done":
+            self.dismiss(self._selected)
+        elif bid.startswith("skill-"):
+            skill = bid[len("skill-"):]
+            if skill in self._selected:
+                self._selected.discard(skill)
+                event.button.remove_class("-active")
+            else:
+                self._selected.add(skill)
+                event.button.add_class("-active")
 
 
 class AskUserModal(ModalScreen[str | None]):
