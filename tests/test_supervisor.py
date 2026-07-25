@@ -232,3 +232,52 @@ def test_status_stream_surfaces_session_state(tmp_path: Path) -> None:
     s2 = next(s for s in status if s["session_id"] == "s2")
     assert s2["status"] == "errored"
     assert s2["restart_count"] == 5
+
+
+# ---------------------------------------------------------------------
+# _should_restart (#250 slice D — threshold guard)
+# ---------------------------------------------------------------------
+
+
+def test_should_restart_true_when_under_threshold() -> None:
+    """AC #250 slice D: ``_should_restart`` returns True when under threshold."""
+    from cothis.supervisor import Supervisor
+
+    sup = Supervisor.__new__(Supervisor)
+    sup._counters = {}
+    sup._threshold = 3
+    sup._window_s = 600
+    assert sup._should_restart("s1") is True
+
+
+def test_should_restart_false_when_over_threshold() -> None:
+    """AC #250 slice D: returns False when restart count exceeds threshold."""
+    from cothis.supervisor import Supervisor
+
+    sup = Supervisor.__new__(Supervisor)
+    sup._counters = {}
+    sup._threshold = 2
+    sup._window_s = 600
+    counter = sup._counter_for("s1")
+    counter.record()
+    counter.record()
+    assert sup._should_restart("s1") is False
+
+
+def test_should_restart_resets_after_window_expires() -> None:
+    """AC #250 slice D: old restarts prune from the window → should_restart True again."""
+    from datetime import UTC, datetime, timedelta
+
+    from cothis.supervisor import Supervisor
+
+    sup = Supervisor.__new__(Supervisor)
+    sup._counters = {}
+    sup._threshold = 2
+    sup._window_s = 1.0
+    counter = sup._counter_for("s1")
+    counter.record()
+    counter.record()
+    assert sup._should_restart("s1") is False
+    old = datetime.now(UTC) - timedelta(seconds=5)
+    counter._restarts = [old, old]
+    assert sup._should_restart("s1") is True
