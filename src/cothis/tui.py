@@ -369,6 +369,11 @@ class CothisApp(App):
     # and we don't need to call any methods on it outside this file.
     _ws: Any = None
     _ws_pump_task: asyncio.Task[None] | None = None
+    # Multi-session WS connections (#230 slice B). Keyed by session_id;
+    # each entry has its own pump task. The single-session ``_ws`` /
+    # ``_ws_pump_task`` above stay for backward compat (``attach_ws``).
+    _ws_by_session: dict[str, Any] = {}
+    _ws_pump_tasks_by_session: dict[str, asyncio.Task[None]] = {}
     # Active session id (#230 slice A) — the session the user is currently
     # interacting with. Future slices route ``send_run_turn`` to the active
     # session's WS + highlight the entry in ``SessionList``.
@@ -594,6 +599,45 @@ class CothisApp(App):
         if ws is not None:
             await ws.close()
 
+    # -----------------------------------------------------------------
+    # Multi-session WS attach (#230 slice B)
+    # -----------------------------------------------------------------
+
+    async def attach_session_ws(
+        self, session_id: str, uri: str, token: str,
+    ) -> None:
+        """Open a WS client for a specific session (multi-session #230).
+
+        Stores the connection in ``_ws_by_session`` keyed by
+        ``session_id`` + starts a dedicated pump task. Marks the
+        session as active via ``set_active_session``. Idempotent:
+        re-attaching replaces the previous connection for that session.
+        """
+        import websockets
+
+        await self.detach_session_ws(session_id)
+        ws = await websockets.connect(
+            uri, additional_headers={"Authorization": f"Bearer {token}"},
+        )
+        self._ws_by_session[session_id] = ws
+        self._ws_pump_tasks_by_session[session_id] = asyncio.create_task(
+            self._pump_ws_connection(ws)
+        )
+        self.set_active_session(session_id)
+
+    async def detach_session_ws(self, session_id: str) -> None:
+        """Close + remove one session's WS connection (multi-session #230)."""
+        task = self._ws_pump_tasks_by_session.pop(session_id, None)
+        ws = self._ws_by_session.pop(session_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if ws is not None:
+            await ws.close()
+
     async def send_run_turn(self, prompt: str) -> None:
         """Forward a prompt as a ``run_turn`` control message over WS.
 
@@ -608,19 +652,22 @@ class CothisApp(App):
         await self._ws.send(json.dumps({"type": "run_turn", "prompt": prompt}))
 
     async def _pump_ws(self) -> None:
-        """Read inbound WS frames + dispatch to ConversationView.
-
-        The websockets library surfaces a closed connection as
-        ``ConnectionClosed`` raised from ``recv``; we log + let the
-        task end. The connection will be re-established by the caller
-        (the supervisor will restart the worker per #227).
-        """
+        """Read inbound WS frames from ``self._ws`` (single-session path)."""
         if self._ws is None:
             return
+        await self._pump_ws_connection(self._ws)
+
+    async def _pump_ws_connection(self, ws: Any) -> None:
+        """Read inbound WS frames from a specific connection + dispatch.
+
+        Shared between single-session (``_pump_ws``) and multi-session
+        (``attach_session_ws``) paths. Parameterized on ``ws`` so
+        concurrent pump tasks don't race on ``self._ws`` (#230).
+        """
         import websockets
 
         try:
-            async for raw in self._ws:
+            async for raw in ws:
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
