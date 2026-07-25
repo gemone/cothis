@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from textual.app import App, ComposeResult
@@ -344,6 +345,46 @@ class CothisApp(App):
         return self.query_one(ConversationView).append_tool_call(
             name, status, call_id=call_id,
         )
+
+    def refresh_session_list(self, db_path: Path) -> None:
+        """Repopulate ``SessionList`` from the session storage DB.
+
+        Opens ``Storage`` transiently for the read; no fcntl lock is
+        acquired on read-only access (the worker's lock is on its own
+        write connection). Closes the connection immediately so the
+        TUI doesn't hold a long-running reader on the worker's DB.
+
+        Sessions visible from ``Path.cwd()`` (the user's current
+        directory tree) are listed; others are filtered out by
+        ``list_sessions_in_cwd_tree``.
+
+        Failures (missing DB, corrupt schema) log a warning + leave
+        the existing list intact — the TUI stays usable without a
+        session picker if the storage layer is unavailable.
+        """
+        from cothis.session.storage import Storage
+
+        try:
+            storage = Storage(db_path)
+        except Exception as exc:  # noqa: BLE001 — best-effort UI populate
+            logger.warning("tui: cannot open session DB %s: %s", db_path, exc)
+            return
+        try:
+            rows = storage.list_sessions_in_cwd_tree(Path.cwd())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tui: cannot list sessions in %s: %s", db_path, exc)
+            return
+        finally:
+            storage.close()
+
+        session_list = self.query_one(SessionList)
+        session_list.clear()
+        for row in rows:
+            label = row.title or f"session {row.id[:8]}"
+            cwd_hint = str(row.cwd) if row.cwd else "(no cwd)"
+            # Parens (not square brackets) — Textual parses ``[...]`` as
+            # markup tags, so a bracketed cwd path raises MarkupError.
+            session_list.append(ListItem(Label(f"{label}  ({cwd_hint})")))
 
     # -----------------------------------------------------------------
     # WS attach (#252 item 1) — caller supplies URI + bearer token

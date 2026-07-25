@@ -12,7 +12,12 @@ Covers the 3-pane layout + interactivity API:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.mark.asyncio
@@ -660,3 +665,74 @@ async def test_tool_call_result_pointer_without_call_id_is_no_op(
         assert cards[0]._status == "running"
         await app.detach_ws()
         await pilot.pause()
+
+
+# ---------------------------------------------------------------------
+# Session list populate (#252 item 5 — list pane half; selection
+# handling is a separate slice).
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_session_list_populates_from_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 5 (list): ``refresh_session_list`` shows sessions visible from cwd.
+
+    Seeds a Storage DB with two sessions (one matching the test cwd,
+    one in an unrelated directory), then calls refresh_session_list.
+    Only the cwd-visible session appears in SessionList.
+    """
+    from textual.widgets import ListItem
+
+    from cothis.session import Session
+    from cothis.tui import CothisApp, SessionList
+
+    db_path = tmp_path / "session.db"
+
+    # Visible session: cwd matches test's tmp_path.
+    visible = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    visible.append_message("user", [{"type": "text", "text": "in scope"}])
+    visible.close()
+
+    # Hidden session: cwd is an unrelated directory.
+    hidden = Session.new(
+        db_path, cwd=tmp_path / "elsewhere", model="m", flush_sync=True,
+    )
+    hidden.append_message("user", [{"type": "text", "text": "out of scope"}])
+    hidden.close()
+
+    monkeypatch.chdir(tmp_path)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+
+        session_list = app.query_one(SessionList)
+        items = list(session_list.query(ListItem))
+        # Only the visible session shows up.
+        assert len(items) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_session_list_missing_db_is_no_crash(
+    tmp_path: Path,
+) -> None:
+    """AC #252 item 5: a missing / corrupt DB is logged, not crashed on.
+
+    The TUI must stay usable when the session DB can't be opened —
+    refresh leaves the SessionList empty + a warning in the log.
+    """
+    from cothis.tui import CothisApp, SessionList
+
+    bogus_path = tmp_path / "does-not-exist.db"
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # No raise; the call logs + returns.
+        app.refresh_session_list(bogus_path)
+        await pilot.pause()
+        # The app stays alive + queryable when storage can't be opened.
+        assert app.query_one(SessionList) is not None
