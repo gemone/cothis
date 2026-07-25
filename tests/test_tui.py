@@ -178,3 +178,87 @@ async def test_user_message_brackets_are_escaped() -> None:
         view = app.query_one(ConversationView)
         assert "\\[click\\]" in view.renderable_str
         assert "[click]" not in view.renderable_str.replace("\\[click\\]", "")
+
+
+@pytest.mark.asyncio
+async def test_tool_call_flushes_text_segment_for_dom_order() -> None:
+    """Card mount flushes the active text segment so DOM order matches event order.
+
+    Regression guard for the Rule 3 violation on #228: without the
+    flush, all text accumulated in one Markdown widget and a card
+    mounted between two deltas rendered below both. With the flush,
+    each card finalises the current segment; the next delta starts a
+    fresh Markdown widget below the card.
+    """
+    from textual.widgets import Markdown
+
+    from cothis.tui import ConversationView, CothisApp, ToolCallCard
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        view.append_delta("text", "before-card")
+        await pilot.pause()
+        view.append_tool_call("fs.read")
+        await pilot.pause()
+        view.append_delta("text", "after-card")
+        await pilot.pause()
+
+        # Two separate Markdown segments exist (one per text span).
+        markdowns = list(view.query(Markdown))
+        assert len(markdowns) == 2
+
+        # The card sits between them in DOM order — verify by walking
+        # immediate children of the ConversationView scroll container.
+        children = list(view.children)
+        positions_md = [i for i, c in enumerate(children) if isinstance(c, Markdown)]
+        positions_card = [i for i, c in enumerate(children) if isinstance(c, ToolCallCard)]
+        assert len(positions_card) == 1
+        assert positions_md[0] < positions_card[0] < positions_md[1]
+
+
+@pytest.mark.asyncio
+async def test_append_delta_segmented_streaming_is_linear_not_quadratic() -> None:
+    """AC #267: doubling N appends with periodic flushes ≤ 3.5× wall time, not 4×.
+
+    The hot path is ``append_delta`` between tool calls (which flush the
+    segment). Without Fix A (``list[str]`` accumulator) each ``+=`` was
+    O(buffer_size); without Pattern 2 (segment flush on tool_call) the
+    buffer grew unbounded across the whole turn. Combined, each segment
+    is bounded by ``deltas_per_segment × chunk_size``, so total work is
+    linear in N × chunk_size.
+
+    Threshold 3.5× leaves headroom for CI runner variance + Textual's
+    per-widget layout overhead (which grows linearly with conversation
+    length). A pre-fix regression to true O(N²) gives ~4× on this
+    workload — the threshold catches that while not flaking on overhead.
+    """
+    import time
+
+    from cothis.tui import ConversationView, CothisApp
+
+    async def _run(n_deltas: int, flush_every: int) -> float:
+        app = CothisApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            view = app.query_one(ConversationView)
+            t0 = time.perf_counter()
+            for i in range(n_deltas):
+                view.append_delta("text", f"line{i}\n")
+                if (i + 1) % flush_every == 0:
+                    view.append_tool_call("fs.read")
+            await pilot.pause()
+            return time.perf_counter() - t0
+
+    # Two workloads: 200 deltas vs 400 deltas, flushing every 50.
+    # Larger flush interval → per-segment buffer cost dominates over
+    # per-widget mount overhead, isolating the regression we're guarding.
+    t_small = await _run(200, flush_every=50)
+    t_large = await _run(400, flush_every=50)
+    ratio = t_large / t_small if t_small > 0 else float("inf")
+    assert ratio <= 3.5, (
+        f"expected ≤3.5× slowdown on 2× workload (linear + overhead); "
+        f"got {ratio:.2f}× (small={t_small*1000:.1f}ms, large={t_large*1000:.1f}ms) — "
+        f"buffer is accumulating O(N²) work somewhere"
+    )
