@@ -103,6 +103,10 @@ class WorkerHandle:
     cwd: str = ""
     status: str = "running"  # "running" | "restarting" | "errored"
     restart_count: int = 0
+    # Stashed at spawn time so ``monitor_once`` can auto-restart (#250
+    # slice C) without the caller re-passing model/provider.
+    model: str = ""
+    provider: str = ""
 
 
 class Supervisor:
@@ -274,6 +278,8 @@ class Supervisor:
             token=bind["token"],
             cwd=str(cwd),
             status="running",
+            model=model,
+            provider=provider,
         )
         self._workers[session_id] = handle
         self._procs[session_id] = proc
