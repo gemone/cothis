@@ -875,3 +875,78 @@ async def test_refresh_session_list_skips_branch_when_no_worktree(
         assert "branch:" not in label_str, (
             f"no branch expected when worktrees empty; got {label_str!r}"
         )
+
+
+# ---------------------------------------------------------------------
+# New-session binding (#234 — Ctrl-N fires ``on_new_session`` hook
+# with the visible worktrees). The picker modal is a follow-up; this
+# PR lands the foundation (binding + hook + dispatch).
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_action_new_session_fires_hook_with_worktrees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234: ``action_new_session`` calls ``on_new_session`` with the worktree list.
+
+    Subclass captures the call; ``list_worktrees`` is stubbed so the
+    test is hermetic (no real git binary).
+    """
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp
+
+    class _CapturingApp(CothisApp):
+        def __init__(self) -> None:
+            super().__init__()
+            self.captured: list = []
+
+        def on_new_session(self, worktrees: list) -> None:  # type: ignore[override]
+            self.captured = worktrees
+
+    monkeypatch.chdir(tmp_path)
+    fake_worktrees = [Worktree(tmp_path, "feature-branch")]
+
+    def fake_list_worktrees(_cwd: Path) -> list[Worktree]:
+        return fake_worktrees
+
+    monkeypatch.setattr("cothis.git.list_worktrees", fake_list_worktrees)
+
+    app = _CapturingApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_new_session()
+        await pilot.pause()
+
+    assert app.captured == fake_worktrees
+
+
+@pytest.mark.asyncio
+async def test_action_new_session_passes_empty_list_when_not_in_git_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234: when ``list_worktrees`` returns ``[]``, the hook gets an empty list.
+
+    Degradation contract: action still fires the hook (with empty worktrees)
+    so the subclass can decide how to render the no-worktrees state.
+    """
+    from cothis.tui import CothisApp
+
+    class _CapturingApp(CothisApp):
+        def __init__(self) -> None:
+            super().__init__()
+            self.captured: list | None = None
+
+        def on_new_session(self, worktrees: list) -> None:  # type: ignore[override]
+            self.captured = worktrees
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("cothis.git.list_worktrees", lambda _cwd: [])
+
+    app = _CapturingApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_new_session()
+        await pilot.pause()
+
+    assert app.captured == []
