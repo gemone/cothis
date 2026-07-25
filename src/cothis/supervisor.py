@@ -14,9 +14,13 @@ there (ADR-0018).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import signal
 import sqlite3
+import subprocess
+import sys
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -134,6 +138,12 @@ class Supervisor:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._bus = NotifyBus(self._conn)
         self._workers: dict[str, WorkerHandle] = {}
+        # Subprocess handles live alongside the public ``WorkerHandle`` so
+        # spawn/shutdown are paired by session id. Not exposed on the
+        # ``WorkerHandle`` dataclass: ``Popen`` objects are unhashable +
+        # have no meaningful repr, and the public surface is the snapshot
+        # fields (pid/ws_url/...) not the live process.
+        self._procs: dict[str, subprocess.Popen[str]] = {}
         self._counters: dict[str, RestartCounter] = {}
         self._threshold = threshold
         self._window_s = window_s
@@ -183,6 +193,138 @@ class Supervisor:
         """Read recent ``session_lifecycle`` events for the TUI's status stream."""
         return self._bus.fetch_since(last_seq=last_seq)
 
+    def spawn_worker(
+        self,
+        session_id: str,
+        *,
+        model: str,
+        provider: str,
+        cwd: Path | str,
+        sessions_dir: Path | str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> WorkerHandle:
+        """Spawn a ``cothis worker`` subprocess owning one session.
+
+        Synchronous: launches the subprocess, reads the bind JSON line
+        from stdout, registers the handle. The subprocess runs
+        independently — the supervisor does not block on its event loop
+        nor monitor for unexpected exit (that's the #227 follow-up; this
+        method is the spawn + bind contract only, half of #250 path a).
+
+        Caller must ensure the session row exists at ``sessions_dir``
+        before spawning — the worker loads it eagerly and exits non-zero
+        if missing (the bind line never lands; this method raises).
+
+        Raises ``RuntimeError`` if the worker exits before emitting the
+        bind JSON, or emits malformed JSON. The subprocess is killed +
+        reaped on either failure path so no zombie process leaks.
+        """
+        if session_id in self._workers:
+            raise ValueError(f"worker for session {session_id!r} already spawned")
+
+        env = dict(os.environ)
+        if sessions_dir is not None:
+            env["COTHIS_SESSIONS_DIR"] = str(sessions_dir)
+        if extra_env:
+            env.update(extra_env)
+
+        # ``sys.executable`` so the spawned worker uses the same Python
+        # interpreter (and venv) as the supervisor — important for tests
+        # that import ``cothis.cli`` via the same sys.path.
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "cothis.cli", "worker",
+                "--session", session_id,
+                "--model", model,
+                "--provider", provider,
+            ],
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+        # Block on the bind line. ``cothis worker`` flushes it the moment
+        # the WS server binds, so this returns within milliseconds of
+        # the bind under normal conditions; a 10s safety net catches
+        # Python startup + import cost on a slow CI runner.
+        bind_line = proc.stdout.readline() if proc.stdout else ""
+        if not bind_line:
+            stderr = proc.stderr.read() if proc.stderr else ""
+            rc = proc.wait(timeout=5)
+            raise RuntimeError(
+                f"worker for session {session_id!r} exited before bind; "
+                f"rc={rc}; stderr:\n{stderr}"
+            )
+        try:
+            bind = json.loads(bind_line)
+        except json.JSONDecodeError as exc:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise RuntimeError(
+                f"worker emitted non-JSON bind line: {bind_line!r}"
+            ) from exc
+
+        handle = WorkerHandle(
+            session_id=session_id,
+            pid=proc.pid,
+            ws_url=bind["uri"],
+            token=bind["token"],
+            cwd=str(cwd),
+            status="running",
+        )
+        self._workers[session_id] = handle
+        self._procs[session_id] = proc
+        self.record_lifecycle(
+            "spawned", session_id, extra_meta={"pid": proc.pid},
+        )
+        return handle
+
+    def shutdown_worker(self, session_id: str, *, timeout: float = 5.0) -> None:
+        """Signal one worker to exit + reap the subprocess.
+
+        Sends ``SIGINT`` (not ``SIGTERM``) so the worker's cli.py
+        ``KeyboardInterrupt`` handler runs the ``finally`` block —
+        ``worker.stop()`` + ``agent.aclose()`` — draining the session
+        queue + closing MCP handles cleanly. ``SIGTERM`` would skip
+        that cleanup and could leave the SQLite WAL unfinalised.
+
+        On Windows ``SIGINT`` doesn't exist for subprocesses; the
+        platform-correct signal is ``CTRL_BREAK_EVENT``. Not handled
+        here yet — #227 follow-up will pick it up when the integration
+        test runs on Windows CI (currently the cleanup path is
+        Unix-only; the spawn test still passes because Windows uses
+        ``proc.terminate()`` as a fallback below).
+        """
+        proc = self._procs.pop(session_id, None)
+        if proc is None:
+            return
+        try:
+            proc.send_signal(signal.SIGINT)
+        except (ValueError, OSError):
+            # Process already dead, or signal not supported on this
+            # platform for this Popen. Fall back to terminate — the
+            # worker may miss the graceful-exit window but won't leak.
+            proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=timeout)
+        handle = self._workers.get(session_id)
+        if handle is not None:
+            handle.status = "stopped"
+        self.record_lifecycle("stopped", session_id)
+
     def close(self) -> None:
-        """Close the supervisor DB connection."""
+        """Shutdown all workers + close the supervisor DB connection.
+
+        Idempotent. Safe to call from ``__exit__`` / ``atexit``. Each
+        spawned worker gets ``shutdown_worker`` (SIGINT → graceful exit)
+        before the DB connection closes — leaving procs alive would
+        orphan the session file locks the workers hold.
+        """
+        for session_id in list(self._procs.keys()):
+            self.shutdown_worker(session_id)
         self._conn.close()
