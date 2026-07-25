@@ -107,6 +107,8 @@ class WorkerHandle:
     # slice C) without the caller re-passing model/provider.
     model: str = ""
     provider: str = ""
+    sessions_dir: str = ""
+    extra_env: dict = field(default_factory=dict)
 
 
 class Supervisor:
@@ -280,6 +282,8 @@ class Supervisor:
             status="running",
             model=model,
             provider=provider,
+            sessions_dir=str(sessions_dir) if sessions_dir else "",
+            extra_env=dict(extra_env) if extra_env else {},
         )
         self._workers[session_id] = handle
         self._procs[session_id] = proc
@@ -383,6 +387,61 @@ class Supervisor:
         while True:
             self.monitor_once()
             await asyncio.sleep(interval_s)
+
+    def _restart_worker(self, session_id: str) -> WorkerHandle | None:
+        """Re-spawn a crashed worker using the stashed model/provider.
+
+        Called after ``monitor_once`` detects a crash (handle marked
+        ``errored``, proc popped). Reads ``model`` + ``provider`` +
+        ``cwd`` off the old handle, clears the slot so ``spawn_worker``
+        doesn't raise ``ValueError``, then re-spawns. On success:
+        ``RestartCounter.record()`` + ``record_lifecycle("restarted")``.
+
+        Returns the new ``WorkerHandle`` on success, ``None`` on
+        failure (spawn error logged + handle left ``errored`` so the
+        monitor doesn't retry infinitely on the same tick).
+
+        Backoff delay (``backoff_seconds(count)``) is the caller's
+        responsibility — ``monitor_worker_health`` sleeps between
+        ``monitor_once`` calls; the restart itself is synchronous.
+        """
+        old = self._workers.get(session_id)
+        if old is None:
+            logger.warning("supervisor: cannot restart %s — no handle", session_id)
+            return None
+        if old.status != "errored":
+            logger.debug(
+                "supervisor: skipping restart for %s (status=%s, not errored)",
+                session_id, old.status,
+            )
+            return None
+
+        # Clear the slot so spawn_worker doesn't reject the re-spawn.
+        self._workers.pop(session_id, None)
+        self._procs.pop(session_id, None)
+
+        try:
+            new_handle = self.spawn_worker(
+                session_id,
+                model=old.model,
+                provider=old.provider,
+                cwd=old.cwd,
+                sessions_dir=Path(old.sessions_dir) if old.sessions_dir else None,
+                extra_env=dict(old.extra_env) if old.extra_env else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort restart
+            logger.error(
+                "supervisor: restart failed for %s: %s", session_id, exc,
+            )
+            # Re-register the old handle as errored so status() still
+            # shows the session + the monitor can retry next tick.
+            self._workers[session_id] = old
+            return None
+
+        self._counter_for(session_id).record()
+        self.record_lifecycle("restarted", session_id)
+        logger.info("supervisor: restarted worker %s", session_id)
+        return new_handle
 
     def close(self) -> None:
         """Shutdown all workers + close the supervisor DB connection.

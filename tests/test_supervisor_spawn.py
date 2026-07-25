@@ -279,3 +279,63 @@ async def test_monitor_once_detects_crash_and_records_lifecycle(
         assert crashed_again == []
     finally:
         sup.close()
+
+
+# ---------------------------------------------------------------------
+# _restart_worker (#250 slice C — auto-restart)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restart_worker_re_spawns_after_crash(tmp_path: Path) -> None:
+    """AC #250 slice C: ``_restart_worker`` re-spawns a crashed worker.
+
+    Kill the worker (SIGKILL), detect via ``monitor_once``, then call
+    ``_restart_worker`` — verifies the new worker is running + the
+    ``restarted`` lifecycle event is recorded.
+    """
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    db_path = sessions_dir / "session.db"
+
+    session = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    session.append_message("user", [{"type": "text", "text": "hi"}])
+    sid = session.session_id
+    session.close()
+
+    sup = Supervisor(tmp_path / "supervisor.db")
+    try:
+        sup.spawn_worker(
+            sid,
+            model="openai/gpt-oss-120b",
+            provider="openrouter",
+            cwd=tmp_path,
+            sessions_dir=sessions_dir,
+            extra_env={"OPENROUTER_API_KEY": "test-dummy-not-used"},
+        )
+
+        # Crash the worker.
+        proc = sup._procs[sid]
+        proc.kill()
+        proc.wait(timeout=5)
+        sup.monitor_once()
+        assert sup._workers[sid].status == "errored"
+
+        # Restart.
+        new_handle = sup._restart_worker(sid)
+        assert new_handle is not None
+        assert new_handle.status == "running"
+        assert new_handle.model == "openai/gpt-oss-120b"
+        assert new_handle.provider == "openrouter"
+        assert sup.check_worker_health(sid) == "running"
+
+        # Lifecycle: "restarted" event recorded.
+        events = sup.lifecycle_since(0)
+        restarted = [e for e in events if e.event_type == "restarted"]
+        assert len(restarted) == 1
+        assert restarted[0].session_id == sid
+
+        # Clean up the re-spawned worker.
+        sup.shutdown_worker(sid)
+    finally:
+        sup.close()
