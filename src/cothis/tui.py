@@ -327,6 +327,10 @@ class CothisApp(App):
     # and we don't need to call any methods on it outside this file.
     _ws: Any = None
     _ws_pump_task: asyncio.Task[None] | None = None
+    # Active session id (#230 slice A) — the session the user is currently
+    # interacting with. Future slices route ``send_run_turn`` to the active
+    # session's WS + highlight the entry in ``SessionList``.
+    _active_session_id: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -462,11 +466,37 @@ class CothisApp(App):
     def on_session_selected(self, session_id: str) -> None:
         """Hook called when the user picks a session in SessionList.
 
-        Default behaviour: log + return. Callers that want to spawn a
-        worker + attach WS on selection subclass ``CothisApp`` and
-        override this method, OR monkeypatch the bound method on an
-        existing instance (tests use the latter pattern).
+        Default behaviour: ``set_active_session(session_id)`` + log.
+        Callers that want to spawn a worker + attach WS on selection
+        subclass ``CothisApp`` and override this method, OR monkeypatch
+        the bound method on an existing instance.
         """
+        self.set_active_session(session_id)
+
+    # -----------------------------------------------------------------
+    # Active-session tracking (#230 slice A)
+    # -----------------------------------------------------------------
+
+    def set_active_session(self, session_id: str) -> None:
+        """Mark ``session_id`` as the active session + fire the change hook.
+
+        Called by ``on_session_selected`` and by callers that spawn a
+        new session (``on_new_session`` override → spawn → ``set_active``).
+        Future slices use this to route ``send_run_turn`` to the right
+        WS connection (#230 slice C) + highlight the focused entry.
+        """
+        previous = self._active_session_id
+        self._active_session_id = session_id
+        if previous != session_id:
+            self.on_active_session_changed(session_id)
+
+    def on_active_session_changed(self, session_id: str) -> None:
+        """Hook fired when the active session changes (#230 slice A).
+
+        Default: log at INFO. Subclasses override to update the
+        SessionList highlight (Slice D) or re-route input focus.
+        """
+        logger.info("tui: active session changed → %s", session_id)
         logger.info("tui: session selected: %s", session_id)
 
     # -----------------------------------------------------------------
