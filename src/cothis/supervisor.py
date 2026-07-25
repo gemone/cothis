@@ -14,6 +14,7 @@ there (ADR-0018).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -335,6 +336,47 @@ class Supervisor:
         if handle is not None:
             return "stopped" if handle.status == "stopped" else "exited"
         return "unknown"
+
+    def monitor_once(self) -> list[str]:
+        """One pass of crash detection: return the session_ids that crashed.
+
+        For each spawned worker, calls ``check_worker_health``; if the
+        result is ``'exited'`` (unexpected crash, NOT ``'stopped'``),
+        records a ``crashed`` lifecycle event + marks the handle as
+        ``errored``. Returns the list of crashed session_ids so the
+        caller (the async loop or a test) can decide whether to restart.
+
+        Does NOT restart — that's Slice C (needs model/provider info
+        stashed at spawn time). This slice just detects + records.
+        """
+        crashed: list[str] = []
+        for session_id in list(self._procs.keys()):
+            health = self.check_worker_health(session_id)
+            if health == "exited":
+                logger.warning(
+                    "supervisor: worker %s crashed unexpectedly", session_id,
+                )
+                self.record_lifecycle("crashed", session_id)
+                handle = self._workers.get(session_id)
+                if handle is not None:
+                    handle.status = "errored"
+                # Pop the dead proc so subsequent monitor_once calls
+                # don't re-flag the same crash.
+                self._procs.pop(session_id, None)
+                crashed.append(session_id)
+        return crashed
+
+    async def monitor_worker_health(self, interval_s: float = 1.0) -> None:
+        """Background loop: poll ``monitor_once`` at ``interval_s`` cadence.
+
+        Runs until cancelled (the caller cancels the task when the
+        supervisor shuts down). Each iteration detects crashes + records
+        lifecycle events; restart logic (Slice C) will hook into the
+        returned crashed-session list.
+        """
+        while True:
+            self.monitor_once()
+            await asyncio.sleep(interval_s)
 
     def close(self) -> None:
         """Shutdown all workers + close the supervisor DB connection.
