@@ -217,6 +217,9 @@ class _FakeSession:
     def __init__(self) -> None:
         self._active: set[str] = set()
         self._archived: set[str] = set()
+        # Mirror of Session._active_skill_meta (#256). Tests that don't
+        # populate it stay empty → cache miss → falls back to discover_skills.
+        self._active_skill_meta: dict[str, Any] = {}
 
     def is_skill_active(self, name: str) -> bool:
         return name in self._active
@@ -308,3 +311,70 @@ def _make_skill(name: str) -> Any:
         body=f"{name} body",
         source=_Path(f"/tmp/{name}/SKILL.md"),
     )
+
+
+# ---------------------------------------------------------------------
+# Warm-cache path (#256)
+#
+# When ``_active_skill_meta`` has the Skill object (populated by
+# ``load_skill``), ``_deactivate_active_skill`` must read ``deactivation``
+# off the cache and NOT call ``discover_skills`` — the catalog scan was
+# O(K) per deactivate, now O(1).
+# ---------------------------------------------------------------------
+
+
+def test_deactivate_skill_with_warm_cache_does_not_call_discover_skills() -> None:
+    """AC #256: warm cache → no catalog rescan on deactivate."""
+    session = _FakeSession()
+    skill = _make_skill("python")
+    session._active.add("python")
+    session._active_skill_meta["python"] = skill  # warm the cache
+
+    with patch("cothis.skills.discover_skills") as mock_discover:
+        result = deactivate_skill(name="python", _session=session)
+
+    assert mock_discover.call_count == 0, (
+        "warm cache should make discover_skills unreachable on deactivate"
+    )
+    assert session.is_skill_archived("python")
+    assert "python" in result
+
+
+def test_deactivate_skill_warm_cache_respects_summarize_declaration() -> None:
+    """The cached Skill's deactivation field is honoured (Summarize note)."""
+    session = _FakeSession()
+    from pathlib import Path as _Path
+
+    from cothis.skills import Skill
+
+    session._active.add("git-commit")
+    session._active_skill_meta["git-commit"] = Skill(
+        name="git-commit",
+        description="git workflow",
+        body="body",
+        source=_Path("/tmp/git-commit/SKILL.md"),
+        deactivation="summarize",
+    )
+
+    with patch("cothis.skills.discover_skills") as mock_discover:
+        result = deactivate_skill(name="git-commit", _session=session)
+
+    assert mock_discover.call_count == 0
+    assert "summarize" in result.lower()
+    assert "not yet implemented" in result.lower()
+
+
+def test_deactivate_skill_cache_miss_falls_back_to_discover() -> None:
+    """Cold-replay path: empty cache → discover_skills still drives the field."""
+    session = _FakeSession()
+    session._active.add("python")  # active but no cached Skill (cold replay)
+    skill = _make_skill("python")
+
+    with patch("cothis.skills.discover_skills", return_value=[skill]) as mock_discover:
+        result = deactivate_skill(name="python", _session=session)
+
+    assert mock_discover.call_count == 1, (
+        "cold cache must fall back to discover_skills exactly once"
+    )
+    assert session.is_skill_archived("python")
+    assert "python" in result
