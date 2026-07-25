@@ -281,6 +281,10 @@ class CothisApp(App):
     #main {
         height: 1fr;
     }
+    SessionList > ListItem.active-session {
+        background: $boost;
+        text-style: bold;
+    }
     """
 
     BINDINGS = [
@@ -517,13 +521,25 @@ class CothisApp(App):
             self.on_active_session_changed(session_id)
 
     def on_active_session_changed(self, session_id: str) -> None:
-        """Hook fired when the active session changes (#230 slice A).
+        """Hook fired when the active session changes (#230 slice A/D).
 
-        Default: log at INFO. Subclasses override to update the
-        SessionList highlight (Slice D) or re-route input focus.
+        Default: update SessionList visual highlight — the matching
+        ListItem gains ``active-session`` CSS class; all others lose
+        it. Subclasses can override for additional effects (input
+        focus routing etc.) but should call ``super().on_active_session_changed()``
+        to preserve the highlight.
         """
         logger.info("tui: active session changed → %s", session_id)
-        logger.info("tui: session selected: %s", session_id)
+        try:
+            session_list = self.query_one(SessionList)
+        except Exception:  # noqa: BLE001 — compose may not have run yet
+            return
+        target_id = f"s_{session_id}"
+        for item in session_list.query(ListItem):
+            if item.id == target_id:
+                item.add_class("active-session")
+            else:
+                item.remove_class("active-session")
 
     # -----------------------------------------------------------------
     # WS attach (#252 item 1) — caller supplies URI + bearer token
