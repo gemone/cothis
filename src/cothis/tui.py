@@ -98,8 +98,10 @@ class ConversationView(VerticalScroll):
     """Center pane — scrollable Markdown + tool-call cards.
 
     ``append_delta`` is the primary API the WS client calls per
-    ``assistant_delta`` message. ``append_tool_call`` renders inline
-    cards for ``tool_call_started`` events.
+    ``assistant_delta`` message. ``append_tool_call`` mounts a card
+    between text segments so DOM order matches event order (each
+    card flushes the active text segment; the next delta starts a
+    fresh segment below the card).
     """
 
     DEFAULT_CSS = """
@@ -112,22 +114,31 @@ class ConversationView(VerticalScroll):
 
     def __init__(self) -> None:
         super().__init__()
-        self._text_buf: str = ""
+        # ``list[str]`` accumulator (#267): ``+=`` on a Python ``str`` is
+        # O(N) per call (immutable copy); ``list.append`` is amortised O(1).
+        # ``renderable_str`` joins lazily — only tests + the Markdown render
+        # path need the joined string, not the per-delta append path.
+        self._text_buf: list[str] = []
+        # Pattern 2 (#267 + #228 Rule 3): one Markdown widget per text
+        # segment. ``append_tool_call`` flushes the active segment (clears
+        # the buffer + resets this handle) so the next delta mounts a fresh
+        # widget below the card, preserving DOM/event order.
+        self._active_markdown: Markdown | None = None
 
     @property
     def renderable_str(self) -> str:
-        """Accumulated text-delta source — for tests + debugging."""
-        return self._text_buf
+        """Accumulated text-delta source for the active segment — tests + debugging."""
+        return "".join(self._text_buf)
 
     def append_delta(self, kind: str, text: str) -> None:
         """Route a ContentDelta to the right rendering path.
 
-        ``kind="text"`` → accumulate + re-render Markdown.
+        ``kind="text"`` → accumulate + re-render the active Markdown segment.
         ``kind="thinking"`` → logged but not rendered (collapsible block
         lands when the toggle UX is designed).
         """
         if kind == "text":
-            self._text_buf += text
+            self._text_buf.append(text)
             self._refresh_markdown()
         elif kind == "thinking":
             logger.debug("dropping thinking delta (%d chars)", len(text))
@@ -139,24 +150,45 @@ class ConversationView(VerticalScroll):
         or markup can't activate inside the Markdown widget.
         """
         safe = text.replace("[", "\\[").replace("]", "\\]")
-        self._text_buf += f"\n> **you**: {safe}\n\n"
+        self._text_buf.append(f"\n> **you**: {safe}\n\n")
         self._refresh_markdown()
 
     def append_tool_call(self, name: str, status: str = "running") -> ToolCallCard:
-        """Mount an inline tool-call card; return it for status updates."""
+        """Mount an inline tool-call card; return it for status updates.
+
+        Flushes the active text segment (current buffer + Markdown widget)
+        so the next text delta starts a fresh segment below this card.
+        Without the flush, all text would accumulate in one Markdown
+        widget and the card would render below all of it, regardless
+        of when it was mounted — violating the "tool calls render as
+        inline cards" acceptance criterion on #228 (Rule 3).
+        """
         self._refresh_markdown()
+        self._text_buf = []
+        self._active_markdown = None
         card = ToolCallCard(name=name, status=status)
         self.mount(card)
         return card
 
     def _refresh_markdown(self) -> None:
-        """Re-render the accumulated Markdown widget."""
-        from textual.css.query import NoMatches
+        """Update the active Markdown segment, or mount a new one if none.
 
-        try:
-            self.query_one(Markdown).update(self._text_buf)
-        except NoMatches:
-            self.mount(Markdown(self._text_buf))
+        When ``_active_markdown`` is ``None`` (initial state, or after a
+        tool-call card reset the segment), mount a fresh widget so the
+        next text deltas accumulate into a new segment below any prior
+        cards. Otherwise update the existing active widget in place.
+
+        Per-call cost is bounded by the active segment's size, not by
+        total conversation size — each ``append_tool_call`` starts a
+        new segment so a long conversation with N tool calls has N
+        small segments instead of one growing buffer (#267).
+        """
+        source = "".join(self._text_buf)
+        if self._active_markdown is None:
+            self._active_markdown = Markdown(source)
+            self.mount(self._active_markdown)
+        else:
+            self._active_markdown.update(source)
 
 
 class InputBar(Container):
