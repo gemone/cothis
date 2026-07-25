@@ -364,7 +364,7 @@ async def test_process_request_claims_slot_atomically_with_cap_check() -> None:
     only manifests when ``process_request`` does NOT claim the slot, so
     we test ``process_request`` in isolation.
     """
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
 
     import cothis.ws as ws_mod
     from cothis.ws import WebSocketServerTransport
@@ -378,13 +378,15 @@ async def test_process_request_claims_slot_atomically_with_cap_check() -> None:
         server.sockets = []
         return server
 
-    real_serve = ws_mod.serve
-    try:
-        ws_mod.serve = fake_serve
-        transport = WebSocketServerTransport(max_concurrent_conns=4)
-        await transport.bind(handler=lambda c: None, auth=lambda r: None)
-    finally:
-        ws_mod.serve = real_serve
+    async def _stub_handler(conn: Any) -> None:
+        return None
+
+    def _stub_auth(request: Any) -> Any:
+        return None
+
+    transport = WebSocketServerTransport(max_concurrent_conns=4)
+    with patch.object(ws_mod, "serve", fake_serve):
+        await transport.bind(handler=_stub_handler, auth=_stub_auth)
 
     process_request = captured["process_request"]
     assert process_request is not None, "bind must install a process_request"
