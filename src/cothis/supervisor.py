@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -51,10 +52,11 @@ def backoff_seconds(restart_count: int) -> float:
 class RestartCounter:
     """Rolling-window counter; ``is_over_threshold`` triggers errored state.
 
-    Records restart timestamps; queries count the records still inside
-    the window. The window slides forward at query time — old
-    timestamps are not actively pruned (a periodic compaction would
-    do that, but the cost of keeping stale timestamps is tiny).
+    Records restart timestamps; ``count()`` returns how many fall inside
+    the window and prunes the stale prefix in place. Timestamps are
+    monotonic by construction (``record()`` always appends
+    ``datetime.now(UTC)``), so stale entries form a contiguous prefix —
+    ``bisect_left`` finds the cutoff index and ``del [:idx]`` drops them.
     """
 
     threshold: int = _DEFAULT_THRESHOLD
@@ -66,9 +68,19 @@ class RestartCounter:
         self._restarts.append(datetime.now(UTC))
 
     def count(self) -> int:
-        """Number of restarts inside the rolling window."""
+        """Number of restarts inside the rolling window.
+
+        Prunes the stale prefix as a side effect: without this, a
+        sustained crash loop (1 restart/s) grows ``_restarts``
+        unbounded and every ``count()`` call is O(N) in lifetime
+        restarts — quadratic in the very condition the supervisor
+        exists to survive.
+        """
         cutoff = datetime.now(UTC) - timedelta(seconds=self.window_s)
-        return sum(1 for r in self._restarts if r >= cutoff)
+        idx = bisect_left(self._restarts, cutoff)
+        if idx:
+            del self._restarts[:idx]
+        return len(self._restarts)
 
     def is_over_threshold(self) -> bool:
         """Past the configured threshold → mark session ``errored``."""

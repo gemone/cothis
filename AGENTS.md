@@ -233,6 +233,10 @@ Each rule is enforced by `tests/test_text_boundary_audit.py` as a source-level s
 - **#166** — `_parse_skill_md` used `errors='replace'`, silently substituting U+FFFD for undecodable bytes → garbled bytes flowed into `Skill.body` → `<skill_content>` → the system prompt (silent prompt-injection vector).
 - **#96** — `_apply_hunk` hardcoded `\n` on replacement lines; CRLF files got mixed endings, no-trailing-newline files gained spurious trailing newlines. Anti-pattern now forbidden; motivating code deleted in #213.
 
+## Supervisor restart counter
+
+`RestartCounter._restarts` prunes on `count()` — bounded by `window_s × max_restart_rate`, not by supervisor uptime. Timestamps are monotonic by construction (`record()` appends `datetime.now(UTC)`), so stale entries form a contiguous prefix; `count()` finds the cutoff via `bisect_left`, drops the prefix in place, and returns `len(...)`. Without this, a sustained crash loop (1 restart/s) grows `_restarts` unbounded and every `count()` call (one per `record_lifecycle`) is O(N) in lifetime restarts — quadratic in the very condition the supervisor exists to survive.
+
 ## Agent skills
 
 ### Issue tracker

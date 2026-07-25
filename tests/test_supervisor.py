@@ -113,6 +113,47 @@ def test_restart_counter_keeps_recent_entries() -> None:
     assert rc.count() == 2
 
 
+def test_count_prunes_stale_prefix_to_window_size() -> None:
+    """count() drops the stale prefix — list stays bounded by the window.
+
+    Simulates a sustained crash loop: 10_000 record() calls at 1s
+    cadence. Without pruning, ``_restarts`` grows to 10_000; with the
+    bisect-based prune, it collapses back to ≤ window_s.
+    """
+    from cothis.supervisor import RestartCounter
+
+    rc = RestartCounter(threshold=999, window_s=600)
+    now = datetime.now(UTC)
+    # Index i has timestamp (now - (10000-i)s); the newest entry is now-1s,
+    # so all 10_000 entries are strictly in the past relative to count()'s cutoff.
+    rc._restarts = [now - timedelta(seconds=10000 - i) for i in range(10000)]
+
+    rc.count()
+
+    # Window is 600s; the most recent 600 entries (now-600 .. now-1) survive.
+    assert len(rc._restarts) <= 600
+
+
+def test_count_after_ten_thousand_records_is_sub_millisecond() -> None:
+    """count() on a 10k-entry counter completes in < 1 ms (bisect + slice).
+
+    The first call prunes ~9_400 stale entries; subsequent calls operate
+    on the bounded list. Average must stay under 1 ms — the prior O(N)
+    scan grew linearly with lifetime restarts.
+    """
+    import timeit
+
+    from cothis.supervisor import RestartCounter
+
+    rc = RestartCounter(threshold=999, window_s=600)
+    now = datetime.now(UTC)
+    rc._restarts = [now - timedelta(seconds=10000 - i) for i in range(10000)]
+
+    elapsed = timeit.timeit(rc.count, number=100)
+    per_call_ms = (elapsed / 100) * 1000
+    assert per_call_ms < 1.0, f"count() avg {per_call_ms:.3f}ms over 100 calls"
+
+
 # ---------------------------------------------------------------------
 # Lifecycle events on supervisor DB
 # ---------------------------------------------------------------------
