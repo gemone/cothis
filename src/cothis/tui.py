@@ -300,6 +300,47 @@ class ConfigMenuModal(ModalScreen[str | None]):
             self.dismiss(None)
 
 
+class AskUserModal(ModalScreen[str | None]):
+    """Modal for interactive tool questions (#229 slice E).
+
+    Shows ``prompt`` + one ``Button`` per choice. On click: dismiss
+    with the chosen value. Esc or Cancel: dismiss with ``None``
+    (the caller treats ``None`` as "user declined").
+    """
+
+    DEFAULT_CSS = """
+    AskUserModal {
+        align: center middle;
+    }
+    AskUserModal > Label {
+        padding: 0 2;
+        width: 100%;
+    }
+    """
+
+    BINDINGS = [("escape", "dismiss_modal", "Cancel")]
+
+    def __init__(self, prompt: str, choices: list[str]) -> None:
+        self._prompt = prompt
+        self._choices = list(choices)
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        yield Label(self._prompt, id="ask-prompt")
+        for choice in self._choices:
+            yield Button(choice, id=f"choice-{choice}")
+        yield Button("Cancel", id="ask-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ask-cancel":
+            self.dismiss(None)
+        elif event.button.id and event.button.id.startswith("choice-"):
+            self.dismiss(event.button.id[len("choice-"):])
+
+
 # ---------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------

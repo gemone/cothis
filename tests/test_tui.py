@@ -1339,3 +1339,67 @@ async def test_send_run_turn_routes_to_active_session_ws(
         await app.detach_session_ws("session-a")
         await app.detach_session_ws("session-b")
         await pilot.pause()
+
+
+# ---------------------------------------------------------------------
+# AskUserModal (#229 slice E)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ask_user_modal_renders_prompt_and_choices() -> None:
+    """AC #229 slice E: modal shows prompt + one button per choice."""
+    from textual.widgets import Button, Label
+
+    from cothis.tui import AskUserModal, CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(AskUserModal("Deploy to prod?", ["yes", "no"]))
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, AskUserModal)
+
+        labels = list(modal.query(Label))
+        assert any("Deploy to prod?" in str(getattr(l, "_Static__content", "")) for l in labels)
+
+        buttons = list(modal.query(Button))
+        button_labels = [b.label.plain if hasattr(b.label, "plain") else str(b.label) for b in buttons]
+        assert "yes" in button_labels
+        assert "no" in button_labels
+        assert "Cancel" in button_labels
+
+        modal.action_dismiss_modal()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_ask_user_modal_choice_button_dismisses_with_value() -> None:
+    """AC #229 slice E: clicking a choice button dismisses with that value."""
+    from textual.widgets import Button
+
+    from cothis.tui import AskUserModal, CothisApp
+
+    captured: list = []
+
+    def on_dismiss(value: str | None) -> None:
+        captured.append(value)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(AskUserModal("Continue?", ["y", "n"]), on_dismiss)
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, AskUserModal)
+
+        yes_button = next(
+            b for b in modal.query(Button) if b.id == "choice-y"
+        )
+        await pilot.click(yes_button)
+        await pilot.pause()
+
+    assert captured == ["y"]
