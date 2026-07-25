@@ -1081,3 +1081,63 @@ async def test_action_menu_fires_on_menu_open_hook() -> None:
         await pilot.pause()
 
     assert app.menu_fired is True
+
+
+# ---------------------------------------------------------------------
+# Active-session highlight (#230 slice D) — SessionList items gain
+# ``active-session`` CSS class when their session becomes active.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_active_session_highlights_matching_list_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #230 slice D: the active session's ListItem gains ``active-session`` class.
+
+    Seeds two sessions, selects one, verifies only its ListItem has
+    the ``active-session`` class; the other doesn't.
+    """
+    from textual.widgets import ListItem
+
+    from cothis.session import Session
+    from cothis.tui import CothisApp, SessionList
+
+    db_path = tmp_path / "session.db"
+
+    s1 = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s1.append_message("user", [{"type": "text", "text": "one"}])
+    sid1 = s1.session_id
+    s1.close()
+
+    s2 = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s2.append_message("user", [{"type": "text", "text": "two"}])
+    sid2 = s2.session_id
+    s2.close()
+
+    monkeypatch.chdir(tmp_path)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+
+        # Activate the first session.
+        app.set_active_session(sid1)
+        await pilot.pause()
+
+        items = list(app.query_one(SessionList).query(ListItem))
+        assert len(items) == 2
+        classes = {item.id: item.classes for item in items}
+        assert "active-session" in classes[f"s_{sid1}"]
+        assert "active-session" not in classes[f"s_{sid2}"]
+
+        # Switch to the second session.
+        app.set_active_session(sid2)
+        await pilot.pause()
+
+        items = list(app.query_one(SessionList).query(ListItem))
+        classes = {item.id: item.classes for item in items}
+        assert "active-session" not in classes[f"s_{sid1}"]
+        assert "active-session" in classes[f"s_{sid2}"]
