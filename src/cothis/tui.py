@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 
     import websockets
 
+    from cothis.git import Worktree
+
 logger = logging.getLogger(__name__)
 
 _TOOL_STATUS_ICONS = {"running": ">>", "done": "OK", "failed": "XX"}
@@ -391,6 +393,59 @@ class AskUserModal(ModalScreen[str | None]):
             self.dismiss(None)
         elif event.button.id and event.button.id.startswith("choice-"):
             self.dismiss(event.button.id[len("choice-"):])
+
+
+class WorktreePickerModal(ModalScreen[str | None]):
+    """Modal for choosing a git worktree for a new session (#234 slice B).
+
+    Shows one ``Button`` per worktree (label = branch name when on a
+    branch, else the path basename). On click: dismiss with the
+    worktree's ``path`` as a string — that's what the caller stuffs
+    into the new session's ``cwd``. Esc or Cancel: dismiss with
+    ``None`` (the caller treats ``None`` as "user cancelled, no new
+    session").
+
+    Per the AskUserModal convention: this slice ships the modal class
+    only; ``CothisApp.on_new_session`` wiring (push the picker on
+    Ctrl-N, create the session on dismiss) lands in a follow-up.
+    """
+
+    DEFAULT_CSS = """
+    WorktreePickerModal {
+        align: center middle;
+    }
+    WorktreePickerModal > Label {
+        padding: 0 2;
+        width: 100%;
+    }
+    """
+
+    BINDINGS = [("escape", "dismiss_modal", "Cancel")]
+
+    def __init__(self, worktrees: list[Worktree]) -> None:
+        self._worktrees = list(worktrees)
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        yield Label("Pick a worktree for the new session", id="worktree-prompt")
+        # Index-based IDs: paths contain ``/`` which Textual IDs reject.
+        # The button label is branch name (preferred) or path basename
+        # for detached HEAD — branch is what the user thinks in terms of.
+        for i, wt in enumerate(self._worktrees):
+            label = wt.branch or wt.path.name
+            yield Button(label, id=f"wt-{i}")
+        yield Button("Cancel", id="worktree-cancel")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "worktree-cancel":
+            self.dismiss(None)
+        elif bid.startswith("wt-"):
+            idx = int(bid[len("wt-") :])
+            self.dismiss(str(self._worktrees[idx].path))
 
 
 # ---------------------------------------------------------------------
