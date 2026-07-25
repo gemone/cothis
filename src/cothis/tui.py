@@ -384,7 +384,44 @@ class CothisApp(App):
             cwd_hint = str(row.cwd) if row.cwd else "(no cwd)"
             # Parens (not square brackets) — Textual parses ``[...]`` as
             # markup tags, so a bracketed cwd path raises MarkupError.
-            session_list.append(ListItem(Label(f"{label}  ({cwd_hint})")))
+            # ``id`` prefix ``s_`` because Textual IDs can't begin with a
+            # number — session ids are hex and may start with a digit.
+            # ``on_list_view_selected`` strips the prefix.
+            session_list.append(
+                ListItem(Label(f"{label}  ({cwd_hint})"), id=f"s_{row.id}")
+            )
+
+    # -----------------------------------------------------------------
+    # Session selection (#252 item 5 — selection half; list-half landed
+    # in #280). The user clicks a ListItem in SessionList; ListView
+    # posts a ``Selected`` event; the handler reads the session id off
+    # the item (set as Textual ``id`` by ``refresh_session_list``) and
+    # calls ``on_session_selected`` — a hook subclasses / tests can
+    # override to wire up spawn-and-attach.
+    # -----------------------------------------------------------------
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Read the selected ListItem's session id; call the hook."""
+        # The event also fires for ListView subclasses; we only care
+        # about SessionList. Both have the same API, so this handler
+        # is fine as-is — but narrow explicitly to SessionList to avoid
+        # triggering on any future ListView in the app.
+        if not isinstance(event.list_view, SessionList):
+            return
+        session_id = event.item.id
+        if not session_id or not session_id.startswith("s_"):
+            return
+        self.on_session_selected(session_id[2:])
+
+    def on_session_selected(self, session_id: str) -> None:
+        """Hook called when the user picks a session in SessionList.
+
+        Default behaviour: log + return. Callers that want to spawn a
+        worker + attach WS on selection subclass ``CothisApp`` and
+        override this method, OR monkeypatch the bound method on an
+        existing instance (tests use the latter pattern).
+        """
+        logger.info("tui: session selected: %s", session_id)
 
     # -----------------------------------------------------------------
     # WS attach (#252 item 1) — caller supplies URI + bearer token
