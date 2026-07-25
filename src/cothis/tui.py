@@ -27,7 +27,9 @@ from typing import TYPE_CHECKING
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import (
+    Button,
     Header,
     Label,
     ListItem,
@@ -258,6 +260,46 @@ class InputBar(Container):
         self.query_one(TextArea).text = ""
 
 
+class ConfigMenuModal(ModalScreen[str | None]):
+    """Config menu modal — lists configurable skills (#235 slice B).
+
+    Displays the skill names from ``list_configurable_skills`` as a
+    read-only list. Slice C will add toggleable entries; Slice D will
+    persist selections. For now the modal is informational: the user
+    sees what's available + closes with Esc or the Close button.
+    """
+
+    DEFAULT_CSS = """
+    ConfigMenuModal {
+        align: center middle;
+    }
+    ConfigMenuModal > Label {
+        padding: 0 2;
+    }
+    """
+
+    BINDINGS = [("escape", "dismiss_modal", "Close")]
+
+    def __init__(self, skills: list[str]) -> None:
+        self._skills = skills
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        yield Label("Configurable Skills", id="menu-title")
+        if not self._skills:
+            yield Label("(no skills configured)", id="menu-empty")
+        for name in self._skills:
+            yield Label(f"  • {name}")
+        yield Button("Close", id="menu-close")
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "menu-close":
+            self.dismiss(None)
+
+
 # ---------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------
@@ -349,6 +391,8 @@ class CothisApp(App):
         re-runs ``discover_tools`` with the chosen layers (Slice C/D).
         """
         logger.info("tui: menu action fired (Ctrl-M)")
+        skills = self.list_configurable_skills()
+        self.push_screen(ConfigMenuModal(skills))
 
     def list_configurable_skills(self) -> list[str]:
         """Return the names of skills discoverable from the current cwd.

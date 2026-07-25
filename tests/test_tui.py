@@ -1123,6 +1123,41 @@ async def test_list_configurable_skills_empty_when_none_installed(
         assert app.list_configurable_skills() == []
 
 
+@pytest.mark.asyncio
+async def test_config_menu_modal_renders_skill_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #235 slice B: ``action_menu`` pushes ConfigMenuModal with skill names."""
+    from pathlib import Path as _Path
+
+    from cothis.skills import Skill
+    from cothis.tui import ConfigMenuModal, CothisApp
+
+    fake_skills = [
+        Skill(name="git-commit", description="d1", body="b1", source=_Path("/x")),
+        Skill(name="fs-read", description="d2", body="b2", source=_Path("/y")),
+    ]
+    monkeypatch.setattr(
+        "cothis.skills.discover_skills", lambda _cwd: fake_skills,
+    )
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_menu()
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, ConfigMenuModal)
+        labels = [str(getattr(l, "_Static__content", "")) for l in modal.query("Label")]
+        label_text = " ".join(labels)
+        assert "git-commit" in label_text
+        assert "fs-read" in label_text
+
+        modal.action_dismiss_modal()
+        await pilot.pause()
+
+
 # ---------------------------------------------------------------------
 # Active-session highlight (#230 slice D) — SessionList items gain
 # ``active-session`` CSS class when their session becomes active.
