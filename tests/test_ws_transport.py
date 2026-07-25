@@ -29,7 +29,6 @@ import pytest
 from cothis.agent import ToolCallEvent
 from cothis.worker import SessionWorker
 
-
 # ---------------------------------------------------------------------
 # Fakes: a WSTransport / Connection pair with no socket
 # ---------------------------------------------------------------------
