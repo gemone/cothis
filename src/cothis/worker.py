@@ -20,6 +20,7 @@ turn timeout; it names no ``asyncio`` symbol. See ADR-0017 §6.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -109,7 +110,16 @@ class SessionWorker:
         return None
 
     async def _handle_conn(self, conn: Connection) -> None:
-        """Dispatch control messages until the connection closes."""
+        """Dispatch control messages until the connection closes.
+
+        ``run_turn`` is dispatched as a background task so control
+        messages (``resolve_ask``, ``ping``, ``shutdown``) can be
+        processed while the turn runs (#229 deadlock prevention).
+        Without this, a tool that blocks on a Future (waiting for
+        ``resolve_ask``) would deadlock — the ``async for`` loop can't
+        read the next message until ``_stream_turn`` returns.
+        """
+        self._active_turn: asyncio.Task[None] | None = None
         try:
             async for raw in conn:
                 try:
@@ -124,8 +134,21 @@ class SessionWorker:
                         json.dumps({"type": "error", "message": "expected {type: ...}"})
                     )
                     continue
-                await self._dispatch(conn, msg)
-                if msg["type"] == "shutdown":
+                typ = msg["type"]
+                if typ == "run_turn":
+                    # Cancel any active turn before starting a new one
+                    # (the client shouldn't send concurrent turns, but
+                    # guard against it anyway).
+                    if self._active_turn and not self._active_turn.done():
+                        self._active_turn.cancel()
+                    self._active_turn = asyncio.create_task(
+                        self._dispatch(conn, msg)
+                    )
+                else:
+                    await self._dispatch(conn, msg)
+                if typ == "shutdown":
+                    if self._active_turn and not self._active_turn.done():
+                        self._active_turn.cancel()
                     return
         except Exception as exc:  # noqa: BLE001
             logger.warning("SessionWorker connection error: %s", exc)
