@@ -379,9 +379,23 @@ class CothisApp(App):
 
         session_list = self.query_one(SessionList)
         session_list.clear()
+        # Look up worktrees once; each session's label is enriched with
+        # its worktree's branch when the session cwd belongs to a known
+        # worktree (#234 AC #3). Failure to list worktrees (not a git
+        # repo, git binary missing) degrades to plain cwd labels — the
+        # list stays usable.
+        from cothis.git import find_worktree_for_path, list_worktrees
+
+        worktrees = list_worktrees(Path.cwd())
         for row in rows:
             label = row.title or f"session {row.id[:8]}"
             cwd_hint = str(row.cwd) if row.cwd else "(no cwd)"
+            wt = (
+                find_worktree_for_path(Path(row.cwd), worktrees)
+                if row.cwd else None
+            )
+            if wt is not None and wt.branch is not None:
+                cwd_hint = f"{cwd_hint} · branch:{wt.branch}"
             # Parens (not square brackets) — Textual parses ``[...]`` as
             # markup tags, so a bracketed cwd path raises MarkupError.
             # ``id`` prefix ``s_`` because Textual IDs can't begin with a
