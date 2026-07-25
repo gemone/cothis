@@ -237,6 +237,10 @@ Each rule is enforced by `tests/test_text_boundary_audit.py` as a source-level s
 
 `RestartCounter._restarts` prunes on `count()` — bounded by `window_s × max_restart_rate`, not by supervisor uptime. Timestamps are monotonic by construction (`record()` appends `datetime.now(UTC)`), so stale entries form a contiguous prefix; `count()` finds the cutoff via `bisect_left`, drops the prefix in place, and returns `len(...)`. Without this, a sustained crash loop (1 restart/s) grows `_restarts` unbounded and every `count()` call (one per `record_lifecycle`) is O(N) in lifetime restarts — quadratic in the very condition the supervisor exists to survive.
 
+## WebSocketServerTransport concurrent connection cap
+
+`_active_conns` is claimed in `process_request` (during the WS handshake, before the 101 response is sent), not in `conn_handler` (which runs after). The check-then-increment is two adjacent statements with no `await` between them — atomic under single-threaded async. Without this, the gap between observe-`_active_conns < cap` (in `process_request`) and `_active_conns += 1` (in `conn_handler`) spans the handshake-response send: N simultaneous handshakes all observe `_active_conns < cap` and pass, leaving the cap structurally unenforced (#264).
+
 ## Agent skills
 
 ### Issue tracker
