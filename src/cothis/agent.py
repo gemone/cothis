@@ -565,6 +565,26 @@ class ToolCallEvent:
     arguments: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ToolResultEvent:
+    """Streamed event: a tool call completed (success or failure).
+
+    Yielded by ``Agent.run_stream`` AFTER ``_execute_tool`` returns so the
+    consumer (TUI via WS, or the legacy REPL) can render a completion
+    indicator, the duration, and a pointer to the persisted result row.
+
+    ``result_pointer`` format: ``session:<sid>:tool:<call_id>`` when a
+    Session is attached, ``None`` in ephemeral (``ask``) mode. The TUI
+    resolves it via ``Session.load_block`` to fetch the ``tool_result``
+    body for rendering without round-tripping through the model.
+    """
+
+    tool: str
+    is_error: bool
+    duration_ms: int
+    result_pointer: str | None
+
+
 class MaxIterationsError(RuntimeError):
     """Raised when the agent exhausts its iteration budget before finishing."""
 
@@ -877,7 +897,7 @@ class Agent(BaseModel):
             f"Agent did not finish within {self.max_iterations} iterations."
         )
 
-    async def run_stream(self, user_input: str) -> AsyncIterator[ContentDelta | ToolCallEvent]:
+    async def run_stream(self, user_input: str) -> AsyncIterator[ContentDelta | ToolCallEvent | ToolResultEvent]:
         """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
 
         Wraps the body in ``workdir_context(self.cwd)`` so every tool call
@@ -887,7 +907,7 @@ class Agent(BaseModel):
             async for event in self._run_stream_inner(user_input):
                 yield event
 
-    async def _run_stream_inner(self, user_input: str) -> AsyncIterator[ContentDelta | ToolCallEvent]:
+    async def _run_stream_inner(self, user_input: str) -> AsyncIterator[ContentDelta | ToolCallEvent | ToolResultEvent]:
         """Run the ReAct loop on Anthropic ``MessageStreamEvent``, yielding deltas.
 
         Yields:
@@ -1041,7 +1061,19 @@ class Agent(BaseModel):
                     )
                     yield ToolCallEvent(name=display_name, arguments=block["input"])
                     skill = self._skill_for_block(block)
+                    started_at = time.monotonic()
                     is_error, output = await self._execute_tool(block)
+                    duration_ms = int((time.monotonic() - started_at) * 1000)
+                    pointer = (
+                        f"session:{self._session.session_id}:tool:{block['id']}"
+                        if self._session is not None else None
+                    )
+                    yield ToolResultEvent(
+                        tool=display_name,
+                        is_error=is_error,
+                        duration_ms=duration_ms,
+                        result_pointer=pointer,
+                    )
                     self._merge_tool_result(block["id"], output, is_error, skill=skill)
                 continue
 

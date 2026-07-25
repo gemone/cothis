@@ -28,7 +28,7 @@ from rich.console import Console  # cost: ~15ms
 from rich.live import Live  # cost: ~5ms
 from rich.markdown import Markdown  # cost: ~5ms
 
-from cothis.agent import Agent, MaxIterationsError, ToolCallEvent
+from cothis.agent import Agent, MaxIterationsError, ToolCallEvent, ToolResultEvent
 from cothis.session import (
     Session,
     SessionHasChildrenError,
@@ -361,6 +361,11 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
                     accumulated = ""
                     status.start()
                 console.print(_format_tool_call(event), style="dim")
+                continue
+            if isinstance(event, ToolResultEvent):
+                # Legacy REPL doesn't render tool completion inline — the
+                # next assistant delta implicitly signals "tools done".
+                # Consumed by the TUI via WS instead (#254).
                 continue
             # Content delta — first one spins up Live, subsequent ones update it.
             if live is None:
