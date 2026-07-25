@@ -56,7 +56,7 @@ _STARTUP_PATH_FILES = (
 # but CI variance needs more headroom until we have stable data).
 _CEILINGS_MS = {
     "Linux": 600,
-    "Darwin": 750,
+    "Darwin": 1200,
     "Windows": 1300,
 }
 

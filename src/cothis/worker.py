@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 
-from cothis.agent import Agent, ToolCallEvent
+from cothis.agent import Agent, ContentDelta, ToolCallEvent
 from cothis.ws import (
     AuthCheck,
     Connection,
@@ -160,9 +160,13 @@ class SessionWorker:
         try:
             with anyio.fail_after(_TURN_TIMEOUT_S):
                 async for event in self._agent.run_stream(prompt):
-                    if isinstance(event, str):
+                    if isinstance(event, ContentDelta):
                         await conn.send(
-                            json.dumps({"type": "assistant_delta", "text": event})
+                            json.dumps({
+                                "type": "assistant_delta",
+                                "kind": event.kind,
+                                "text": event.text,
+                            })
                         )
                     elif isinstance(event, ToolCallEvent):
                         await conn.send(

@@ -332,7 +332,8 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
       * ``ToolCallEvent``  — printed inline (``calling fs.read(...)``) so the
         user can see why a multi-step turn is taking time. Printed *above*
         the spinner's animation row, which rich's Status handles cleanly.
-      * ``str``            — a content delta of the final answer.
+      * ``ContentDelta``   — a content delta of the final answer (``kind``
+        separates normal text from thinking; only ``text`` is rendered here).
 
     The ReAct loop is multi-turn: tool-call turns and content turns alternate.
     This consumer drives a two-state display:
@@ -364,13 +365,13 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
             # Content delta — first one spins up Live, subsequent ones update it.
             if live is None:
                 status.stop()
-                accumulated = event
+                accumulated = event.text
                 live = Live(
                     Markdown(accumulated), console=console, refresh_per_second=10
                 )
                 live.start()
             else:
-                accumulated += event
+                accumulated += event.text
                 live.update(Markdown(accumulated))
     except MaxIterationsError as exc:
         has_max_iterations_error = True

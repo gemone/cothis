@@ -22,11 +22,11 @@ if TYPE_CHECKING:
 
 def _mock_agent() -> Any:
     """Agent stub whose ``run_stream`` yields one delta + closes."""
-    from cothis.agent import ToolCallEvent
+    from cothis.agent import ContentDelta, ToolCallEvent
 
     async def _run_stream(prompt: str):
-        yield "hello "
-        yield "world"
+        yield ContentDelta(kind="text", text="hello ")
+        yield ContentDelta(kind="text", text="world")
         yield ToolCallEvent(name="fs.read", arguments={"path": "a.py"})
 
     agent = MagicMock()
@@ -181,8 +181,8 @@ async def test_worker_run_turn_emits_assistant_delta_and_tool_call() -> None:
             while len(received) < 3:
                 raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 received.append(json.loads(raw))
-            assert received[0] == {"type": "assistant_delta", "text": "hello "}
-            assert received[1] == {"type": "assistant_delta", "text": "world"}
+            assert received[0] == {"type": "assistant_delta", "kind": "text", "text": "hello "}
+            assert received[1] == {"type": "assistant_delta", "kind": "text", "text": "world"}
             assert received[2] == {
                 "type": "tool_call_started",
                 "tool": "fs.read",

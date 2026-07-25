@@ -177,7 +177,13 @@ async def test_ping_pong_via_fake_transport() -> None:
 @pytest.mark.asyncio
 async def test_run_turn_streams_deltas_via_fake_transport() -> None:
     """``run_turn`` forwards each agent event — driven through the seam."""
-    events = ["hello ", "world", ToolCallEvent(name="fs.read", arguments={"path": "a.py"})]
+    from cothis.agent import ContentDelta
+
+    events = [
+        ContentDelta(kind="text", text="hello "),
+        ContentDelta(kind="text", text="world"),
+        ToolCallEvent(name="fs.read", arguments={"path": "a.py"}),
+    ]
     transport = FakeTransport()
     worker = SessionWorker(_scripted_agent(events), transport=transport)
     await worker.start()
@@ -186,8 +192,16 @@ async def test_run_turn_streams_deltas_via_fake_transport() -> None:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
         await conn.wait_for_send(3)
         got = [json.loads(f) for f in conn.sent[:3]]
-        assert got[0] == {"type": "assistant_delta", "text": "hello "}
-        assert got[1] == {"type": "assistant_delta", "text": "world"}
+        assert got[0] == {
+            "type": "assistant_delta",
+            "kind": "text",
+            "text": "hello ",
+        }
+        assert got[1] == {
+            "type": "assistant_delta",
+            "kind": "text",
+            "text": "world",
+        }
         assert got[2] == {
             "type": "tool_call_started",
             "tool": "fs.read",
