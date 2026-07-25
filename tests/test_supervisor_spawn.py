@@ -169,3 +169,49 @@ def test_spawn_worker_duplicate_session_id_rejected(tmp_path: Path) -> None:
             )
     finally:
         sup.close()
+
+
+# ---------------------------------------------------------------------
+# check_worker_health (#250 crash-monitoring foundation)
+# ---------------------------------------------------------------------
+
+
+def test_check_worker_health_unknown_for_unspawned(tmp_path: Path) -> None:
+    """AC #250: returns ``'unknown'`` for a never-spawned session."""
+    sup = Supervisor(tmp_path / "supervisor.db")
+    try:
+        assert sup.check_worker_health("0" * 32) == "unknown"
+    finally:
+        sup.close()
+
+
+@pytest.mark.asyncio
+async def test_check_worker_health_running_then_exited(tmp_path: Path) -> None:
+    """AC #250: ``'running'`` while alive, ``'exited'`` after shutdown."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    db_path = sessions_dir / "session.db"
+
+    session = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    session.append_message("user", [{"type": "text", "text": "hi"}])
+    sid = session.session_id
+    session.close()
+
+    sup = Supervisor(tmp_path / "supervisor.db")
+    try:
+        sup.spawn_worker(
+            sid,
+            model="openai/gpt-oss-120b",
+            provider="openrouter",
+            cwd=tmp_path,
+            sessions_dir=sessions_dir,
+            extra_env={"OPENROUTER_API_KEY": "test-dummy-not-used"},
+        )
+        assert sup.check_worker_health(sid) == "running"
+
+        sup.shutdown_worker(sid)
+        # After deliberate shutdown_worker: handle is marked "stopped"
+        # (not "exited", which would be an unexpected crash).
+        assert sup.check_worker_health(sid) == "stopped"
+    finally:
+        sup.close()

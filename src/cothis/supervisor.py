@@ -317,6 +317,25 @@ class Supervisor:
             handle.status = "stopped"
         self.record_lifecycle("stopped", session_id)
 
+    def check_worker_health(self, session_id: str) -> str:
+        """Return ``'running'`` if the worker is alive, ``'exited'`` if dead.
+
+        ``'stopped'`` when the worker was deliberately shut down via
+        ``shutdown_worker`` (proc popped from ``_procs`` + handle
+        marked ``stopped``). ``'unknown'`` when the session was never
+        spawned. The distinction between ``'exited'`` (crash) and
+        ``'stopped'`` (user-initiated) is what the crash monitor
+        (#250 follow-up) uses to decide whether to auto-restart.
+        """
+        proc = self._procs.get(session_id)
+        if proc is not None:
+            return "exited" if proc.poll() is not None else "running"
+        # Proc was popped by shutdown_worker → check the handle.
+        handle = self._workers.get(session_id)
+        if handle is not None:
+            return "stopped" if handle.status == "stopped" else "exited"
+        return "unknown"
+
     def close(self) -> None:
         """Shutdown all workers + close the supervisor DB connection.
 
