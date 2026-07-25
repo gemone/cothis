@@ -1010,18 +1010,21 @@ async def test_ask_user_request_dispatches_to_hook(
 
 
 @pytest.mark.asyncio
-async def test_ask_user_request_auto_reject_sends_resolve_ask(
+async def test_ask_user_request_mounts_modal_and_routes_pick_to_resolve_ask(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #229 slice C: default hook auto-sends ``resolve_ask`` with ``value=None``.
+    """AC #229 slice F: ``ask_user_request`` → mount modal → pick → ``resolve_ask``.
 
-    The auto-reject prevents the worker from blocking forever on a Future
-    that has no modal to resolve it (tests, headless runs, pre-Slice-E
-    TUI usage). The outbound frame lands on the fake WS's ``sent`` list.
+    Replaces the slice-C auto-reject stub. Now the default
+    ``on_ask_user_request`` pushes ``AskUserModal``; when the user
+    clicks a choice button the dismiss callback fires + sends
+    ``resolve_ask`` with the chosen value over the active session's WS.
     """
     import json as _json
 
-    from cothis.tui import CothisApp
+    from textual.widgets import Button
+
+    from cothis.tui import AskUserModal, CothisApp
 
     fake = _FakeWS([
         _json.dumps({
@@ -1044,6 +1047,17 @@ async def test_ask_user_request_auto_reject_sends_resolve_ask(
         for _ in range(3):
             await pilot.pause()
 
+        modal = app.screen
+        assert isinstance(modal, AskUserModal), (
+            f"expected AskUserModal on top; got {type(app.screen).__name__}"
+        )
+
+        yes_button = next(
+            b for b in modal.query(Button) if b.id == "choice-y"
+        )
+        await pilot.click(yes_button)
+        await pilot.pause()
+
     resolve_frames = [
         _json.loads(f) for f in fake.sent
         if _json.loads(f).get("type") == "resolve_ask"
@@ -1052,7 +1066,66 @@ async def test_ask_user_request_auto_reject_sends_resolve_ask(
         f"expected 1 resolve_ask frame; got {resolve_frames}"
     )
     assert resolve_frames[0] == {
-        "type": "resolve_ask", "ask_id": "ask_99", "value": None,
+        "type": "resolve_ask", "ask_id": "ask_99", "value": "y",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ask_user_request_cancel_sends_resolve_ask_with_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #229 slice F: cancelling the modal → ``resolve_ask`` with ``value=None``.
+
+    The agent treats ``None`` as "user declined" and the tool returns
+    accordingly. This is the correct behaviour for Esc / Cancel — the
+    alternative (no reply at all) would leave the agent's Future pending
+    until turn timeout, which is much worse than a prompt "no".
+    """
+    import json as _json
+
+    from textual.widgets import Button
+
+    from cothis.tui import AskUserModal, CothisApp
+
+    fake = _FakeWS([
+        _json.dumps({
+            "type": "ask_user_request",
+            "ask_id": "ask_cancel",
+            "prompt": "Deploy?",
+            "choices": ["yes", "no"],
+        }),
+    ])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        for _ in range(3):
+            await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, AskUserModal)
+
+        cancel_button = next(
+            b for b in modal.query(Button) if b.id == "ask-cancel"
+        )
+        await pilot.click(cancel_button)
+        await pilot.pause()
+
+    resolve_frames = [
+        _json.loads(f) for f in fake.sent
+        if _json.loads(f).get("type") == "resolve_ask"
+    ]
+    assert len(resolve_frames) == 1, (
+        f"expected 1 resolve_ask frame; got {resolve_frames}"
+    )
+    assert resolve_frames[0] == {
+        "type": "resolve_ask", "ask_id": "ask_cancel", "value": None,
     }
 
 
