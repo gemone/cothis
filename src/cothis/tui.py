@@ -580,10 +580,36 @@ class CothisApp(App):
                     "no matching card; dropping",
                     msg.get("tool"), call_id,
                 )
+        elif typ == "ask_user_request":
+            # #229 slice C: forward to the overridable hook. Default
+            # auto-rejects (sends resolve_ask with value=None) so the
+            # worker doesn't block in tests; subclasses mount a modal
+            # (Slice E).
+            self.on_ask_user_request(
+                ask_id=msg.get("ask_id", ""),
+                prompt=msg.get("prompt", ""),
+                choices=msg.get("choices", []),
+            )
         elif typ == "error":
             logger.warning("tui: worker error: %s", msg.get("message", ""))
         else:
             logger.debug("tui: ignoring unknown WS message type: %r", typ)
+
+    def on_ask_user_request(
+        self, *, ask_id: str, prompt: str, choices: list,
+    ) -> None:
+        """Hook fired when the worker asks the user for input (#229 slice C).
+
+        Default: auto-reject — send ``resolve_ask`` with ``value=None``
+        so the worker's Future (Slice D) resolves + the tool returns
+        promptly. Subclasses override to mount a modal (Slice E) that
+        shows ``prompt`` + ``choices`` + sends the user's pick back.
+        """
+        logger.info("tui: ask_user_request %s: %s", ask_id, prompt)
+        if self._ws is not None:
+            asyncio.create_task(self._ws.send(json.dumps({
+                "type": "resolve_ask", "ask_id": ask_id, "value": None,
+            })))
 
 
 def run() -> None:
