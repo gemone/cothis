@@ -174,6 +174,7 @@ class SessionWorker:
                                 "type": "tool_call_started",
                                 "tool": event.name,
                                 "arguments": event.arguments,
+                                "call_id": event.call_id,
                             })
                         )
                     elif isinstance(event, ToolResultEvent):
@@ -184,6 +185,7 @@ class SessionWorker:
                                 "is_error": event.is_error,
                                 "duration_ms": event.duration_ms,
                                 "pointer": event.result_pointer,
+                                "call_id": event.call_id,
                             })
                         )
         except TimeoutError:

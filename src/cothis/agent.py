@@ -559,10 +559,17 @@ class ToolCallEvent:
     can surface "calling fs.read(...)" inline. ``arguments`` is the parsed
     dict (matches what will be passed to the tool); the raw JSON string is
     dropped because the parsed form is what the user wants to read.
+
+    ``call_id`` is the Anthropic ``tool_use`` block's ``id`` (e.g.
+    ``"tu_abc123"``) — the stable identifier the consumer uses to pair
+    this start event with the matching ``ToolResultEvent``. Without it,
+    pairing by tool name is ambiguous when the same tool runs twice in
+    one turn.
     """
 
     name: str
     arguments: dict[str, Any]
+    call_id: str
 
 
 @dataclass(frozen=True)
@@ -572,6 +579,10 @@ class ToolResultEvent:
     Yielded by ``Agent.run_stream`` AFTER ``_execute_tool`` returns so the
     consumer (TUI via WS, or the legacy REPL) can render a completion
     indicator, the duration, and a pointer to the persisted result row.
+
+    ``call_id`` mirrors ``ToolCallEvent.call_id`` — same ``tool_use``
+    block, same id. The consumer pairs start + result by ``call_id`` to
+    update the matching ``ToolCallCard``'s status badge.
 
     ``result_pointer`` format: ``session:<sid>:tool:<call_id>`` when a
     Session is attached, ``None`` in ephemeral (``ask``) mode. The TUI
@@ -583,6 +594,7 @@ class ToolResultEvent:
     is_error: bool
     duration_ms: int
     result_pointer: str | None
+    call_id: str
 
 
 class MaxIterationsError(RuntimeError):
@@ -1059,7 +1071,11 @@ class Agent(BaseModel):
                         "__name__",
                         block["name"],
                     )
-                    yield ToolCallEvent(name=display_name, arguments=block["input"])
+                    yield ToolCallEvent(
+                        name=display_name,
+                        arguments=block["input"],
+                        call_id=block["id"],
+                    )
                     skill = self._skill_for_block(block)
                     started_at = time.monotonic()
                     is_error, output = await self._execute_tool(block)
@@ -1073,6 +1089,7 @@ class Agent(BaseModel):
                         is_error=is_error,
                         duration_ms=duration_ms,
                         result_pointer=pointer,
+                        call_id=block["id"],
                     )
                     self._merge_tool_result(block["id"], output, is_error, skill=skill)
                 continue
