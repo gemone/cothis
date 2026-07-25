@@ -499,3 +499,164 @@ async def test_action_send_prompt_no_forwarding_when_not_attached() -> None:
         # No WS attached → ``send_run_turn`` is a no-op. The view's
         # content matches exactly the local echo (no extra frames).
         assert app._ws is None
+
+
+@pytest.mark.asyncio
+async def test_tool_call_result_pointer_updates_card_status_by_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 4: result frame flips the matching card's badge by call_id.
+
+    Two ``tool_call_started`` frames with different call_ids mount two
+    cards. A ``tool_call_result_pointer`` frame with the second call_id
+    flips ONLY the second card's status — pairing by call_id, not by
+    tool name (which would be ambiguous if both ran the same tool).
+    """
+    import json as _json
+
+    from cothis.tui import CothisApp, ToolCallCard
+
+    frames = [
+        _json.dumps({
+            "type": "tool_call_started",
+            "tool": "fs.read",
+            "arguments": {"path": "a.py"},
+            "call_id": "tu_first",
+        }),
+        _json.dumps({
+            "type": "tool_call_started",
+            "tool": "fs.read",
+            "arguments": {"path": "b.py"},
+            "call_id": "tu_second",
+        }),
+        _json.dumps({
+            "type": "tool_call_result_pointer",
+            "tool": "fs.read",
+            "is_error": False,
+            "duration_ms": 5,
+            "pointer": "session:s:tool:tu_second",
+            "call_id": "tu_second",
+        }),
+    ]
+    fake = _FakeWS(frames)
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        for _ in range(len(frames) + 1):
+            await pilot.pause()
+
+        cards = list(app.query(ToolCallCard))
+        assert len(cards) == 2
+        # Pairing by call_id, not by index — find the card with tu_second.
+        by_call_id = {c._call_id: c for c in cards}
+        assert "tu_first" in by_call_id
+        assert "tu_second" in by_call_id
+        # First card untouched (still "running"); second flipped to "done".
+        assert by_call_id["tu_first"]._status == "running"
+        assert by_call_id["tu_second"]._status == "done"
+        await app.detach_ws()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_result_pointer_error_flips_card_to_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 4: ``is_error=True`` flips the card to ``failed``."""
+    import json as _json
+
+    from cothis.tui import CothisApp, ToolCallCard
+
+    frames = [
+        _json.dumps({
+            "type": "tool_call_started",
+            "tool": "fs.read",
+            "arguments": {"path": "a.py"},
+            "call_id": "tu_err",
+        }),
+        _json.dumps({
+            "type": "tool_call_result_pointer",
+            "tool": "fs.read",
+            "is_error": True,
+            "duration_ms": 5,
+            "pointer": None,
+            "call_id": "tu_err",
+        }),
+    ]
+    fake = _FakeWS(frames)
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        for _ in range(len(frames) + 1):
+            await pilot.pause()
+
+        cards = list(app.query(ToolCallCard))
+        assert len(cards) == 1
+        assert cards[0]._status == "failed"
+        await app.detach_ws()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_result_pointer_without_call_id_is_no_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 4: result frame missing call_id is dropped (no crash).
+
+    Guards against legacy workers that haven't been updated to emit
+    ``call_id`` — the TUI must not KeyError on ``_cards_by_call_id``.
+    """
+    import json as _json
+
+    from cothis.tui import CothisApp, ToolCallCard
+
+    frames = [
+        _json.dumps({
+            "type": "tool_call_started",
+            "tool": "fs.read",
+            "arguments": {"path": "a.py"},
+            "call_id": "tu_x",
+        }),
+        # Result frame without call_id — legacy shape.
+        _json.dumps({
+            "type": "tool_call_result_pointer",
+            "tool": "fs.read",
+            "is_error": False,
+            "duration_ms": 5,
+            "pointer": None,
+        }),
+    ]
+    fake = _FakeWS(frames)
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        for _ in range(len(frames) + 1):
+            await pilot.pause()
+
+        # Card stays in "running" because the result had no call_id to pair.
+        cards = list(app.query(ToolCallCard))
+        assert len(cards) == 1
+        assert cards[0]._status == "running"
+        await app.detach_ws()
+        await pilot.pause()

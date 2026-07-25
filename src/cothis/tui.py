@@ -70,9 +70,10 @@ class SessionList(ListView):
 class ToolCallCard(Static):
     """Inline card for one tool dispatch — name + status badge.
 
-    Status reflects only the start event today; wiring to
-    ``tool_call_completed``/``tool_call_failed`` (notify bus
-    events from #224) lands when the WS client attaches (#250).
+    ``call_id`` is the stable per-call identifier (Anthropic
+    ``tool_use.id``) that pairs this card with the matching
+    ``tool_call_result_pointer`` frame (#252 item 4). ``None`` for
+    legacy callers that haven't been updated yet.
     """
 
     DEFAULT_CSS = """
@@ -84,9 +85,12 @@ class ToolCallCard(Static):
     }
     """
 
-    def __init__(self, name: str, status: str = "running") -> None:
+    def __init__(
+        self, name: str, status: str = "running", call_id: str | None = None,
+    ) -> None:
         self._name = name
         self._status = status
+        self._call_id = call_id
         super().__init__(self._render_str())
 
     def set_status(self, status: str) -> None:
@@ -128,6 +132,10 @@ class ConversationView(VerticalScroll):
         # the buffer + resets this handle) so the next delta mounts a fresh
         # widget below the card, preserving DOM/event order.
         self._active_markdown: Markdown | None = None
+        # Cards indexed by ``call_id`` (#252 item 4) so result frames
+        # can update the matching card's status badge without ambiguity
+        # when the same tool runs twice in one turn.
+        self._cards_by_call_id: dict[str, ToolCallCard] = {}
 
     @property
     def renderable_str(self) -> str:
@@ -157,7 +165,9 @@ class ConversationView(VerticalScroll):
         self._text_buf.append(f"\n> **you**: {safe}\n\n")
         self._refresh_markdown()
 
-    def append_tool_call(self, name: str, status: str = "running") -> ToolCallCard:
+    def append_tool_call(
+        self, name: str, status: str = "running", call_id: str | None = None,
+    ) -> ToolCallCard:
         """Mount an inline tool-call card; return it for status updates.
 
         Flushes the active text segment (current buffer + Markdown widget)
@@ -166,12 +176,34 @@ class ConversationView(VerticalScroll):
         widget and the card would render below all of it, regardless
         of when it was mounted — violating the "tool calls render as
         inline cards" acceptance criterion on #228 (Rule 3).
+
+        ``call_id`` indexes the card in ``_cards_by_call_id`` so a
+        subsequent ``tool_call_result_pointer`` frame can find it (#252
+        item 4). ``None`` keeps the legacy un-indexed behaviour (no
+        status update will land for this card).
         """
         self._refresh_markdown()
         self._text_buf = []
         self._active_markdown = None
-        card = ToolCallCard(name=name, status=status)
+        card = ToolCallCard(name=name, status=status, call_id=call_id)
+        if call_id is not None:
+            self._cards_by_call_id[call_id] = card
         self.mount(card)
+        return card
+
+    def update_tool_call_status(
+        self, call_id: str, *, is_error: bool,
+    ) -> ToolCallCard | None:
+        """Flip a card's status badge to ``done`` / ``failed`` by call_id.
+
+        Returns the card if found, ``None`` if no card is indexed under
+        ``call_id`` (e.g. the start frame predates this wiring, or the
+        card was mounted by a caller that didn't pass call_id).
+        """
+        card = self._cards_by_call_id.get(call_id)
+        if card is None:
+            return None
+        card.set_status("failed" if is_error else "done")
         return card
 
     def _refresh_markdown(self) -> None:
@@ -305,9 +337,13 @@ class CothisApp(App):
         """
         self.query_one(ConversationView).append_delta(kind, text)
 
-    def append_tool_call(self, name: str, status: str = "running") -> Any:
+    def append_tool_call(
+        self, name: str, status: str = "running", call_id: str | None = None,
+    ) -> Any:
         """Forward a WS ``tool_call_started`` to the conversation view."""
-        return self.query_one(ConversationView).append_tool_call(name, status)
+        return self.query_one(ConversationView).append_tool_call(
+            name, status, call_id=call_id,
+        )
 
     # -----------------------------------------------------------------
     # WS attach (#252 item 1) — caller supplies URI + bearer token
@@ -394,17 +430,32 @@ class CothisApp(App):
                 msg.get("kind", "text"), msg.get("text", ""),
             )
         elif typ == "tool_call_started":
-            self.append_tool_call(msg.get("tool", "?"))
-        elif typ == "tool_call_result_pointer":
-            # #254 result frame — update the matching ToolCallCard's
-            # status. Card identity isn't stable yet (cards are mounted
-            # by name without a call_id); landing the card-id wiring
-            # is a follow-up under #252 item 4.
-            logger.debug(
-                "tui: tool_call_result_pointer for %s (is_error=%s) — "
-                "card status update not yet wired",
-                msg.get("tool"), msg.get("is_error"),
+            self.append_tool_call(
+                msg.get("tool", "?"), call_id=msg.get("call_id"),
             )
+        elif typ == "tool_call_result_pointer":
+            # #252 item 4: flip the matching card's status badge by
+            # call_id. Falls back to a debug log when the card isn't
+            # found (start frame predated call_id wiring, or a stale
+            # result arrives after the user cleared the view).
+            call_id = msg.get("call_id")
+            if call_id is None:
+                logger.debug(
+                    "tui: tool_call_result_pointer without call_id for "
+                    "tool %s — cannot pair with a card",
+                    msg.get("tool"),
+                )
+                return
+            view = self.query_one(ConversationView)
+            card = view.update_tool_call_status(
+                call_id, is_error=bool(msg.get("is_error")),
+            )
+            if card is None:
+                logger.debug(
+                    "tui: tool_call_result_pointer for %s (call_id=%s) — "
+                    "no matching card; dropping",
+                    msg.get("tool"), call_id,
+                )
         elif typ == "error":
             logger.warning("tui: worker error: %s", msg.get("message", ""))
         else:
