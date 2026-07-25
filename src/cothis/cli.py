@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import json
 import logging
 import os
 import shutil
@@ -647,6 +648,126 @@ def archive_cmd(
                 f"run 'cothis history' to list hot sessions"
             )
         console.print(f"archived session [cyan]{action}[/cyan]")
+
+
+# ---------------------------------------------------------------------
+# Worker subprocess entrypoint (#250, deferred from #225)
+#
+# Spawns one ``SessionWorker`` that owns a single session + binds a WS
+# server on a random loopback port. Prints one JSON line to stdout
+# (``{"uri": ..., "token": ...}``) when the bind completes, then serves
+# until a ``shutdown`` control message arrives. The Supervisor (#227)
+# reads the JSON line to learn the URI + bearer token; the future
+# integration test (#250 path (a)) drives this via ``subprocess.Popen``.
+# ---------------------------------------------------------------------
+
+
+@app.command()
+def worker(
+    session: str = typer.Option(
+        ...,
+        "--session",
+        "-s",
+        help="Session id to load (created by the Supervisor before spawning).",
+    ),
+    provider: str = typer.Option(
+        "openrouter",
+        "--provider",
+        "-p",
+        envvar="COTHIS_PROVIDER",
+        help="any-llm provider key (mirrors ``chat``).",
+    ),
+    model: str = typer.Option(
+        "openai/gpt-oss-120b",
+        "--model",
+        "-m",
+        envvar="COTHIS_MODEL",
+        help="Model identifier for the chosen provider.",
+    ),
+    max_iterations: int = typer.Option(
+        30, "--max-iterations", help="LLM round-trip cap."
+    ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        envvar="COTHIS_MAX_TOKENS",
+        help="Output-token cap. Default: resolved from bundled litellm metadata.",
+    ),
+) -> None:
+    """Run one SessionWorker for ``--session``; emit bind JSON, serve forever.
+
+    Bind handshake on stdout (single JSON line, flushed):
+
+        {"uri": "ws://127.0.0.1:<port>/agent", "token": "<bearer>"}
+
+    Then runs the accept loop until ``shutdown`` arrives on the WS or
+    the process is killed externally. Exit code 0 on clean shutdown.
+    """
+    asyncio.run(
+        _worker_session(
+            session=session,
+            model=model,
+            provider=provider,
+            max_iterations=max_iterations,
+            max_tokens=max_tokens,
+        )
+    )
+
+
+async def _worker_session(
+    *,
+    session: str,
+    model: str,
+    provider: str,
+    max_iterations: int,
+    max_tokens: int | None,
+) -> None:
+    """Build Agent + Session + SessionWorker; emit bind JSON; serve."""
+    from cothis.worker import SessionWorker
+
+    _validate_session_id_arg(session)
+    db_path = _resolve_db_path()
+    try:
+        loaded = Session.load(db_path, session, cwd=Path.cwd())
+    except KeyError:
+        raise typer.BadParameter(
+            f"session {session!r} not found; run `cothis history` to list"
+        )
+    try:
+        agent = Agent(
+            model=model,
+            provider=provider,
+            tools=discover_tools(_PROJECT_TOOLS_DIR, _user_tools_dir()),
+            system=DEFAULT_SYSTEM_PROMPT,
+            max_iterations=max_iterations,
+            max_tokens=max_tokens,
+            cwd=Path.cwd(),
+            preactivate_skills=[],
+        )
+        agent.attach_session(loaded)
+
+        worker = SessionWorker(agent)
+        uri = await worker.start()
+        # Bind handshake: emit one JSON line + flush so the supervisor
+        # reading line-by-line sees it immediately. ``token`` is the
+        # bearer the client must present on the WS handshake.
+        print(json.dumps({"uri": uri, "token": worker.token}), flush=True)
+        try:
+            await worker.serve_forever()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # ``shutdown`` from a client closes the WS server, which the
+            # websockets library surfaces as CancelledError on the
+            # ``serve_forever`` await. Treat as the normal exit signal —
+            # cleanup runs in finally, process exits 0.
+            pass
+    finally:
+        # ``worker.stop`` is idempotent; ``agent.aclose`` tears down MCP
+        # handles + drains the session queue. Both run on every exit path
+        # so a Ctrl-C / kill between bind + serve still cleans up.
+        if "worker" in locals():
+            await worker.stop()
+        if "agent" in locals():
+            await agent.aclose()
 
 
 def main() -> None:
