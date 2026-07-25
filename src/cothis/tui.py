@@ -350,6 +350,18 @@ class CothisApp(App):
         """
         logger.info("tui: menu action fired (Ctrl-M)")
 
+    def list_configurable_skills(self) -> list[str]:
+        """Return the names of skills discoverable from the current cwd.
+
+        Wraps ``cothis.skills.discover_skills`` so the menu modal
+        (Slice B, not yet implemented) can display the list without
+        importing the skills module directly. Returns an empty list
+        when no skills are installed.
+        """
+        from cothis.skills import discover_skills
+
+        return [s.name for s in discover_skills(Path.cwd())]
+
     # WS attach state (#252 item 1). ``None`` until ``attach_ws`` runs;
     # ``attach_ws`` re-uses these slots idempotently. Typed as ``Any``
     # because websockets' client connection class moved across versions
