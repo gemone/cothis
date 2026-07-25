@@ -736,3 +736,58 @@ async def test_refresh_session_list_missing_db_is_no_crash(
         await pilot.pause()
         # The app stays alive + queryable when storage can't be opened.
         assert app.query_one(SessionList) is not None
+
+
+@pytest.mark.asyncio
+async def test_session_selection_fires_hook_with_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 5 (selection): clicking a ListItem fires ``on_session_selected``.
+
+    The hook receives the session id (without the ``s_`` prefix that
+    Textual imposes because hex session ids can begin with a digit).
+    Subclasses override the hook to wire spawn-and-attach; this test
+    uses a capturing subclass to verify the call.
+    """
+    from textual.widgets import ListItem
+
+    from cothis.session import Session
+    from cothis.tui import CothisApp, SessionList
+
+    class _CapturingApp(CothisApp):
+        def __init__(self) -> None:
+            super().__init__()
+            self.captured: list[str] = []
+
+        def on_session_selected(self, session_id: str) -> None:
+            self.captured.append(session_id)
+
+    db_path = tmp_path / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s.append_message("user", [{"type": "text", "text": "hi"}])
+    sid = s.session_id
+    s.close()
+
+    monkeypatch.chdir(tmp_path)
+
+    app = _CapturingApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+
+        session_list = app.query_one(SessionList)
+        items = list(session_list.query(ListItem))
+        assert len(items) == 1
+        # Trigger selection by posting a Selected message directly. The
+        # user-facing way is keyboard enter on the cursor, but the test
+        # harness wants the explicit message — it bypasses the focus /
+        # cursor-position dance that flaked earlier pilot runs.
+        first_item = items[0]
+        session_list.post_message(SessionList.Selected(session_list, first_item, 0))
+        await pilot.pause()
+
+    assert app.captured == [sid], (
+        f"expected on_session_selected called once with {sid!r}; "
+        f"got {app.captured!r}"
+    )
