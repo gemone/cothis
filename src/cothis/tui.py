@@ -287,6 +287,7 @@ class CothisApp(App):
         Binding("ctrl+enter", "send_prompt", "Send", show=False),
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("n", "new_session", "New session", show=True),
+        Binding("ctrl+m", "menu", "Menu", show=True),
     ]
 
     def action_new_session(self) -> None:
@@ -319,6 +320,31 @@ class CothisApp(App):
             "tui: new-session action fired; %d worktree(s) visible",
             len(worktrees),
         )
+
+    # -----------------------------------------------------------------
+    # Menu binding (#235 slice A) — Ctrl-M opens the config menu.
+    # The modal listing skills / MCP / LSP servers lands in Slice B;
+    # this is the binding + dispatch contract only.
+    # -----------------------------------------------------------------
+
+    def action_menu(self) -> None:
+        """Trigger the config menu (#235).
+
+        Calls ``on_menu_open`` — an overridable hook the subclass wires
+        to a ``ModalScreen`` that lists discoverable skills, MCP servers,
+        and LSP servers. Default: log + return.
+        """
+        self.on_menu_open()
+
+    def on_menu_open(self) -> None:
+        """Hook fired by ``action_menu`` (Ctrl-M).
+
+        Default: log + return. Subclasses override to mount a modal
+        (Slice B) that lists skills via ``discover_tools``, MCP servers
+        via ``MCPServer``, and any LSP servers. Selecting entries
+        re-runs ``discover_tools`` with the chosen layers (Slice C/D).
+        """
+        logger.info("tui: menu action fired (Ctrl-M)")
 
     # WS attach state (#252 item 1). ``None`` until ``attach_ws`` runs;
     # ``attach_ws`` re-uses these slots idempotently. Typed as ``Any``
