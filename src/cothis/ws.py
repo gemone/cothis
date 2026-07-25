@@ -170,7 +170,11 @@ class WebSocketServerTransport:
         auth: AuthCheck,
     ) -> None:
         async def conn_handler(conn: ServerConnection) -> None:
-            self._active_conns += 1
+            # Slot was already claimed in ``process_request`` before the
+            # handshake response went out (#264). The decrement in finally
+            # is the only bookkeeping here — increment moved to close the
+            # check-then-claim race that let N simultaneous handshakes
+            # all pass the cap.
             try:
                 await handler(_WSConn(conn))
             finally:
@@ -181,7 +185,18 @@ class WebSocketServerTransport:
                 return _http_401()
             if self._active_conns >= self._max_conns:
                 return _http_503()
-            return auth(request)
+            response = auth(request)
+            if response is not None:
+                return response
+            # Claim the slot atomically with the cap check: the two
+            # statements are adjacent with no ``await`` between them, so
+            # single-threaded async guarantees no other coroutine runs
+            # between observe-less-than-cap and increment (#264). The
+            # websockets library invokes ``process_request`` during the
+            # handshake — before the 101 response is sent — so the
+            # increment lands before the next caller's check.
+            self._active_conns += 1
+            return None
 
         # ``serve`` binds immediately and returns; ``serve_forever`` runs the
         # accept loop (called separately from ``serve`` below).

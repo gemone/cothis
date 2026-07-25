@@ -123,6 +123,66 @@ async def test_worker_accepts_valid_token() -> None:
 
 
 # ---------------------------------------------------------------------
+# Concurrent handshake cap (#264)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_handshakes_enforce_max_conns_cap() -> None:
+    """AC #264: 5 simultaneous handshakes against a cap=4 transport → 4×101 + 1×503.
+
+    Without the fix (increment in ``conn_handler`` rather than ``process_request``)
+    the check-then-increment gap spans the handshake response being sent, so all
+    N callers observe ``_active_conns < cap`` and pass. With the fix the
+    increment lands atomically with the cap check (no ``await`` between them),
+    so exactly ``max_concurrent_conns`` callers upgrade and the rest see 503.
+    """
+    from cothis.worker import SessionWorker
+    from cothis.ws import WebSocketServerTransport
+
+    transport = WebSocketServerTransport(max_concurrent_conns=4)
+    worker = SessionWorker(_mock_agent(), transport=transport)
+    uri = await worker.start()
+    auth_header = {"Authorization": f"Bearer {worker.token}"}
+
+    async def attempt() -> str:
+        try:
+            async with websockets.connect(uri, additional_headers=auth_header):
+                # Hold the connection open so the slot stays claimed while
+                # sibling handshakes arrive. The slow recv blocks until we
+                # gather results from all attempts and stop the worker.
+                try:
+                    await asyncio.wait_for(
+                        # Block until the worker stops + closes peers, OR a
+                        # 2s safety timeout (well below the test's overall
+                        # budget).
+                        asyncio.sleep(2.0),
+                        timeout=2.5,
+                    )
+                except TimeoutError:
+                    pass
+                return "ok"
+        except websockets.exceptions.InvalidStatus as exc:
+            if exc.response.status_code == 503:
+                return "rejected-503"
+            raise
+
+    try:
+        results = await asyncio.gather(*(attempt() for _ in range(5)))
+    finally:
+        await worker.stop()
+
+    assert results.count("ok") == 4, (
+        f"expected 4 successful upgrades, got {results.count('ok')}; "
+        f"full results: {sorted(results)}"
+    )
+    assert results.count("rejected-503") == 1, (
+        f"expected 1 503 rejection, got {results.count('rejected-503')}; "
+        f"full results: {sorted(results)}"
+    )
+
+
+# ---------------------------------------------------------------------
 # Control messages
 # ---------------------------------------------------------------------
 

@@ -332,4 +332,81 @@ async def test_turn_timeout_emits_error(monkeypatch) -> None:
         assert msg == {"type": "error", "message": "turn timeout"}
     finally:
         await conn.feed(None)
-        await worker.stop()
+
+
+# ---------------------------------------------------------------------
+# Concurrent handshake cap (#264)
+#
+# The cap is enforced inside ``WebSocketServerTransport.bind``'s
+# ``process_request`` closure. ``process_request`` runs during the WS
+# handshake (before the 101 response goes out); the connection handler
+# runs after. The race that #264 fixes lives in the gap between those
+# two: if the slot-claim (``_active_conns += 1``) is deferred to the
+# handler, N simultaneous handshakes all observe ``_active_conns < cap``
+# and pass. The fix moves the increment into ``process_request`` so
+# check-then-claim is two adjacent statements with no ``await`` between
+# them — atomic under single-threaded async.
+#
+# The integration test in ``test_session_worker.py`` exercises this
+# end-to-end via real ``websockets.connect``; this unit test is the
+# deterministic regression guard. Driving ``process_request`` directly
+# (no socket, no event-loop yielding) means the test catches the bug
+# regardless of how the websockets library schedules handshakes.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_request_claims_slot_atomically_with_cap_check() -> None:
+    """AC #264: 5 sequential process_request calls against cap=4 → 4×None + 1×503.
+
+    Substitutes ``cothis.ws.serve`` with a capture stub so we can drive
+    the closure directly — the bug (increment deferred to conn_handler)
+    only manifests when ``process_request`` does NOT claim the slot, so
+    we test ``process_request`` in isolation.
+    """
+    from unittest.mock import MagicMock
+
+    import cothis.ws as ws_mod
+    from cothis.ws import WebSocketServerTransport
+
+    captured: dict[str, Any] = {}
+
+    async def fake_serve(handler: Any, host: str, port: int, **kwargs: Any) -> Any:
+        captured["handler"] = handler
+        captured["process_request"] = kwargs.get("process_request")
+        server = MagicMock()
+        server.sockets = []
+        return server
+
+    real_serve = ws_mod.serve
+    try:
+        ws_mod.serve = fake_serve
+        transport = WebSocketServerTransport(max_concurrent_conns=4)
+        await transport.bind(handler=lambda c: None, auth=lambda r: None)
+    finally:
+        ws_mod.serve = real_serve
+
+    process_request = captured["process_request"]
+    assert process_request is not None, "bind must install a process_request"
+
+    class _FakeRequest:
+        path = "/agent"
+        headers: dict[str, str] = {}
+
+    results = [process_request(MagicMock(), _FakeRequest()) for _ in range(5)]
+    statuses = [getattr(r, "status_code", None) for r in results]
+
+    # First 4: accept (None response). 5th: 503.
+    assert results[:4] == [None, None, None, None], (
+        f"first 4 should be accepted (None); got {results[:4]}"
+    )
+    assert statuses[4] == 503, (
+        f"5th call should return 503; got status={statuses[4]!r}, "
+        f"full results: {results}"
+    )
+    # Slot accounting: after 4 accepts, _active_conns == cap. After the
+    # 5th was rejected, it must NOT have incremented (else a future call
+    # would observe a stale counter).
+    assert transport._active_conns == 4, (
+        f"_active_conns should be 4 after 4 accepts; got {transport._active_conns}"
+    )
