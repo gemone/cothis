@@ -791,3 +791,87 @@ async def test_session_selection_fires_hook_with_session_id(
         f"expected on_session_selected called once with {sid!r}; "
         f"got {app.captured!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_refresh_session_list_enriches_label_with_worktree_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 #3: SessionList label includes ``branch:<name>`` when the session's cwd is in a known worktree.
+
+    Stubs ``list_worktrees`` so the test is hermetic (no real git binary
+    needed). When the stub returns a Worktree whose path is an ancestor
+    of the session's cwd, the label gains ``· branch:<name>``.
+    """
+    from textual.widgets import Label, ListItem
+
+    from cothis.git import Worktree
+    from cothis.session import Session
+    from cothis.tui import CothisApp, SessionList
+
+    db_path = tmp_path / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s.append_message("user", [{"type": "text", "text": "hi"}])
+    s.close()
+
+    monkeypatch.chdir(tmp_path)
+
+    def fake_list_worktrees(_cwd: Path) -> list[Worktree]:
+        return [Worktree(tmp_path, "feature-branch")]
+
+    monkeypatch.setattr("cothis.git.list_worktrees", fake_list_worktrees)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+
+        session_list = app.query_one(SessionList)
+        items = list(session_list.query(ListItem))
+        assert len(items) == 1
+        label_widget = items[0].query_one(Label)
+        # ``Label`` inherits ``Static``; the source text lives on the
+        # mangled private attr ``_Static__content``.
+        label_str = str(getattr(label_widget, "_Static__content"))
+        assert "branch:feature-branch" in label_str, (
+            f"expected branch enrichment in label; got {label_str!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_refresh_session_list_skips_branch_when_no_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 #3: when ``list_worktrees`` returns ``[]``, label has no branch suffix.
+
+    The cwd-only label is preserved — the TUI degrades cleanly when
+    not in a git repo or git binary missing.
+    """
+    from textual.widgets import Label, ListItem
+
+    from cothis.session import Session
+    from cothis.tui import CothisApp, SessionList
+
+    db_path = tmp_path / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s.append_message("user", [{"type": "text", "text": "hi"}])
+    s.close()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("cothis.git.list_worktrees", lambda _cwd: [])
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+
+        session_list = app.query_one(SessionList)
+        items = list(session_list.query(ListItem))
+        assert len(items) == 1
+        label_widget = items[0].query_one(Label)
+        label_str = str(getattr(label_widget, "_Static__content"))
+        assert "branch:" not in label_str, (
+            f"no branch expected when worktrees empty; got {label_str!r}"
+        )

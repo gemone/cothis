@@ -109,3 +109,28 @@ def _parse_porcelain(output: str) -> list[Worktree]:
     if current_path is not None:
         worktrees.append(Worktree(current_path, current_branch))
     return worktrees
+
+
+def find_worktree_for_path(
+    path: Path, worktrees: list[Worktree],
+) -> Worktree | None:
+    """Return the worktree whose ``path`` is ``path`` or an ancestor of it.
+
+    ``None`` when ``path`` is outside every known worktree (e.g. the
+    session predates a worktree move, or the user is running cothis
+    outside any git repo). Used by the SessionList enrichment (#234
+    AC #3) to label each session with its worktree's branch.
+
+    Ties on equal-length ancestors resolve by iteration order — git's
+    porcelain output is ordered by creation, so the most-recently
+    created worktree with a matching prefix wins. In practice worktrees
+    are mutually exclusive (a path belongs to exactly one), so ties
+    don't occur.
+    """
+    for wt in worktrees:
+        try:
+            path.relative_to(wt.path)
+        except ValueError:
+            continue
+        return wt
+    return None

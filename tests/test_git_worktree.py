@@ -13,7 +13,12 @@ from unittest.mock import patch
 
 import pytest
 
-from cothis.git import Worktree, _parse_porcelain, list_worktrees
+from cothis.git import (
+    Worktree,
+    _parse_porcelain,
+    find_worktree_for_path,
+    list_worktrees,
+)
 
 
 def test_parse_porcelain_returns_paths_and_short_branches() -> None:
@@ -157,3 +162,35 @@ def test_list_worktrees_real_repo_returns_at_least_one_entry(
     # The main repo's branch may be ``master`` or ``main`` depending on
     # git defaults — verify the worktree's explicit branch at least.
     assert branches[tmp_path / "wt2"] == "feature"
+
+
+# ---------------------------------------------------------------------
+# find_worktree_for_path — used by SessionList enrichment (#234 AC #3)
+# ---------------------------------------------------------------------
+
+
+def test_find_worktree_for_path_returns_matching_worktree() -> None:
+    """A path inside a worktree returns that worktree."""
+    worktrees = [
+        Worktree(Path("/repo/main"), "main"),
+        Worktree(Path("/repo/other"), "feature"),
+    ]
+    result = find_worktree_for_path(Path("/repo/main/src"), worktrees)
+    assert result == worktrees[0]
+
+
+def test_find_worktree_for_path_returns_worktree_for_exact_match() -> None:
+    """A path equal to a worktree's root returns that worktree."""
+    worktrees = [Worktree(Path("/repo/main"), "main")]
+    assert find_worktree_for_path(Path("/repo/main"), worktrees) == worktrees[0]
+
+
+def test_find_worktree_for_path_returns_none_outside_any_worktree() -> None:
+    """A path outside every worktree → None."""
+    worktrees = [Worktree(Path("/repo/main"), "main")]
+    assert find_worktree_for_path(Path("/elsewhere"), worktrees) is None
+
+
+def test_find_worktree_for_path_empty_list_returns_none() -> None:
+    """No worktrees → None for any path (degrades to plain label)."""
+    assert find_worktree_for_path(Path("/anywhere"), []) is None
