@@ -18,6 +18,9 @@ class _FakeSession:
 
     def __init__(self) -> None:
         self._active: set[str] = set()
+        # Mirrors Session._active_skill_meta (#256) — populated by load_skill
+        # so deactivate_skill can read deactivation off the cache.
+        self._active_skill_meta: dict[str, Any] = {}
 
     def is_skill_active(self, name: str) -> bool:
         return name in self._active

@@ -254,6 +254,11 @@ def load_skill(name: str, _session: Any) -> str:
     skill = by_name[name]
     if _session is not None:
         _session._activate_skill(name)
+        # Stash the Skill so ``_deactivate_active_skill`` can read the
+        # deactivation field off the cache instead of re-scanning the
+        # 3-layer catalog (#256). Cold-replay (prior session) leaves
+        # this dict empty; deactivation falls back to discover_skills.
+        _session._active_skill_meta[name] = skill
 
     parts = [f"<skill_content name={name!r}>\n{skill.body}\n</skill_content>"]
 
@@ -412,27 +417,33 @@ def _deactivate_active_skill(name: str, _session: Any) -> str:
     """Run the archival + build the result message for an active skill.
 
     Factored out so the order-of-checks in ``deactivate_skill`` stays
-    flat. Reads the deactivation declaration if the skill is still on
-    disk (Summarize fallback from #170); missing-from-disk skills use
-    the Delete strategy directly (no declaration to read).
+    flat. Reads the deactivation declaration off the activation cache
+    when available (avoids re-scanning the 3-layer catalog per
+    deactivate, #256). On cache miss — typically a skill cold-replayed
+    from rows in a resumed session — falls back to ``discover_skills``
+    so the Summarize-vs-Delete declaration is still honoured.
     """
     deactivation = "delete"
     summary_note = ""
-    catalog = discover_skills(Path.cwd())
-    by_name = {s.name: s for s in catalog}
-    if name in by_name:
-        deactivation = by_name[name].deactivation
-        if deactivation == "summarize":
-            logger.warning(
-                "skills: %r declares deactivation: summarize, which is not "
-                "yet implemented; falling back to Delete strategy.",
-                name,
-            )
-            summary_note = (
-                f" (Note: {name!r} declares deactivation: summarize; the "
-                f"Summarize strategy is not yet implemented — used Delete "
-                f"fallback.)"
-            )
+    cached = getattr(_session, "_active_skill_meta", {}).get(name)
+    if cached is not None:
+        deactivation = cached.deactivation
+    else:
+        catalog = discover_skills(Path.cwd())
+        by_name = {s.name: s for s in catalog}
+        if name in by_name:
+            deactivation = by_name[name].deactivation
+    if deactivation == "summarize":
+        logger.warning(
+            "skills: %r declares deactivation: summarize, which is not "
+            "yet implemented; falling back to Delete strategy.",
+            name,
+        )
+        summary_note = (
+            f" (Note: {name!r} declares deactivation: summarize; the "
+            f"Summarize strategy is not yet implemented — used Delete "
+            f"fallback.)"
+        )
     _session._deactivate_skill(name)
     return (
         f"Skill {name!r} archived. Future blocks for this skill will be "

@@ -47,7 +47,7 @@ import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from filelock import FileLock, Timeout
 
@@ -61,6 +61,9 @@ from cothis.session.archive import (
 )
 from cothis.session.graph import SessionNotFoundError
 from cothis.session.storage import BlockRow, SessionRow, Storage, is_visible
+
+if TYPE_CHECKING:
+    from cothis.skills import Skill
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +516,13 @@ class Session:
         # ``load_skill`` adds names here; the catalog + active set drive
         # handler decisions (catalog membership, not text sniffing).
         self._active_skills: set[str] = set()
+        # Runtime-only cache of the ``Skill`` objects whose names are in
+        # ``_active_skills``. Populated by ``load_skill`` at activation;
+        # ``_deactivate_active_skill`` reads ``deactivation`` off this dict
+        # instead of re-scanning the 3-layer catalog (#256). Cold-replay
+        # (skills activated in a prior session, restored from rows) leaves
+        # this empty — readers fall back to ``discover_skills`` on miss.
+        self._active_skill_meta: dict[str, Skill] = {}
         # cothis: archived skills state (#167). Runtime-only; not persisted.
         # ``deactivate_skill`` adds names here; future block writes for
         # these skills write ``state='archived'`` directly (Half A of
