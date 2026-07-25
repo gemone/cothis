@@ -126,13 +126,22 @@ driven by the type of `command:`:
   ```
 - **shell mode** — `command:` is a string. A `shell:` field naming the
   interpreter (`bash`, `pwsh`, …) is supported; if omitted, cothis
-  auto-selects the OS default (`sh` on POSIX, `cmd` on Windows). The
-  string is passed to that shell, supporting pipes / `&&` / redirection.
-  The shell must be on PATH or the tool is not registered.
+  auto-selects the OS default (`sh` on POSIX). The string is passed to
+  that shell, supporting pipes / `&&` / redirection. The shell must be
+  on PATH or the tool is not registered.
   ```yaml
   shell: bash
   command: grep foo file | wc -l
   ```
+
+  **`shell: cmd` is rejected.** cmd.exe cannot safely quote argument
+  values — `&`, `|`, and `%VAR%` are live metacharacters that
+  `subprocess.list2cmdline` does not neutralise, so a value like
+  `foo&echo PWNED` would inject. Declare `shell: pwsh` (PowerShell —
+  single-quote quoting is sound) or switch to argv mode (`command:
+  [list]`, inherently safe). On Windows, authors who omit `shell:`
+  must declare `shell: pwsh` or use argv mode; the compile error names
+  both migration paths.
 
 Arguments are declared under `args:` and substituted into the command at
 `{arg_name}` placeholders. Only args actually referenced by the selected
@@ -156,6 +165,41 @@ platforms:
 
 Tools whose executable (argv[0] or the declared `shell:`) is not on PATH
 are silently not registered — the LLM never sees a tool it can't run here.
+
+#### Multiple tools per file (`tools:`)
+
+Related commands can share one YAML file under a top-level `tools:` list.
+Each entry is a full tool spec (the same `name` / `command` / `args:` /
+`platforms:` shape as above) and compiles to its own tool. Use this to
+keep a family of subcommands together:
+
+```yaml
+# .agents/tools/uv.yaml — every uv subcommand as its own tool
+tools:
+  - name: uv.add
+    description: Add a package to the project.
+    command: ["uv", "add", "{package}"]
+    args:
+      - name: package
+        type: str
+        description: Package name (with optional version, e.g. "requests>=2").
+  - name: uv.run
+    description: Run a command in the project environment.
+    command: ["uv", "run", "{cmd}"]
+    args:
+      - name: cmd
+        type: str
+```
+
+Rules:
+
+- A `tools:` list is the **only** key allowed at the top level of such a
+  file — don't mix it with single-tool fields (`name:`, `command:`, …).
+- Each entry is validated exactly like a standalone tool file, so a nested
+  `tools:` inside an entry is rejected.
+- Tool `name:`s must be unique within the file (duplicates raise, naming
+  both entries). Gating still applies per tool: an entry whose executable
+  is off PATH is skipped without affecting the others.
 
 ### Python tools (built-in `@tool`)
 

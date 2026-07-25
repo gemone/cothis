@@ -332,7 +332,8 @@ async def _stream_answer(agent: Agent, prompt: str) -> None:
       * ``ToolCallEvent``  — printed inline (``calling fs.read(...)``) so the
         user can see why a multi-step turn is taking time. Printed *above*
         the spinner's animation row, which rich's Status handles cleanly.
-      * ``str``            — a content delta of the final answer.
+      * ``ContentDelta``   — a content delta of the final answer (``kind``
+        separates normal text from thinking; only ``text`` is rendered here).
 
     The ReAct loop is multi-turn: tool-call turns and content turns alternate.
     This consumer drives a two-state display:
