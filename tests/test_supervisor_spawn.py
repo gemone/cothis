@@ -81,6 +81,9 @@ async def test_spawn_worker_returns_handle_with_live_ws(tmp_path: Path) -> None:
         assert handle.ws_url.startswith("ws://127.0.0.1:")
         assert len(handle.token) >= 32
         assert handle.status == "running"
+        # model + provider stashed for auto-restart (#250 slice C enabler)
+        assert handle.model == "openai/gpt-oss-120b"
+        assert handle.provider == "openrouter"
 
         # Real WS round-trip via the supervisor-mediated URI + token.
         async with websockets.connect(
