@@ -97,7 +97,7 @@ async def test_send_prompt_echoes_into_conversation() -> None:
         await pilot.pause()
         bar = app.query_one(InputBar)
         bar.set_text("what is 2+2?")
-        app.action_send_prompt()
+        await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
         assert "what is 2+2?" in view.renderable_str
@@ -114,7 +114,7 @@ async def test_send_prompt_ignores_empty_input() -> None:
         await pilot.pause()
         view = app.query_one(ConversationView)
         before = view.renderable_str
-        app.action_send_prompt()
+        await app.action_send_prompt()
         await pilot.pause()
         assert view.renderable_str == before
 
@@ -173,7 +173,7 @@ async def test_user_message_brackets_are_escaped() -> None:
         await pilot.pause()
         bar = app.query_one(InputBar)
         bar.set_text("[click](javascript:alert(1))")
-        app.action_send_prompt()
+        await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
         assert "\\[click\\]" in view.renderable_str
@@ -430,3 +430,72 @@ async def test_detach_ws_closes_connection_and_is_idempotent(
         # Double-detach must not raise.
         await app.detach_ws()
         await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_action_send_prompt_forwards_run_turn_when_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #252 item 3: ``action_send_prompt`` forwards a run_turn when WS attached.
+
+    Local echo still renders the user's prompt; ``run_turn`` lands on
+    the WS as a JSON control message with the same prompt payload.
+    """
+    import json as _json
+
+    from cothis.tui import ConversationView, CothisApp, InputBar
+
+    fake = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        await pilot.pause()
+        bar = app.query_one(InputBar)
+        bar.set_text("what is 2+2?")
+        await app.action_send_prompt()
+        await pilot.pause()
+
+        # Local echo: user prompt lands in the view.
+        view = app.query_one(ConversationView)
+        assert "what is 2+2?" in view.renderable_str
+        # Bar cleared.
+        assert bar.get_text() == ""
+        # Outbound: run_turn control message on the WS.
+        assert len(fake.sent) == 1
+        assert _json.loads(fake.sent[0]) == {
+            "type": "run_turn",
+            "prompt": "what is 2+2?",
+        }
+        await app.detach_ws()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_action_send_prompt_no_forwarding_when_not_attached() -> None:
+    """AC #252 item 3: when no WS, action_send_prompt is local-echo only.
+
+    Pre-attach behaviour preserved: no run_turn is sent anywhere (there
+    is nowhere to send to); the user still sees their prompt.
+    """
+    from cothis.tui import ConversationView, CothisApp, InputBar
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        bar = app.query_one(InputBar)
+        bar.set_text("hello")
+        await app.action_send_prompt()
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        assert "hello" in view.renderable_str
+        assert bar.get_text() == ""
+        # No WS attached → ``send_run_turn`` is a no-op. The view's
+        # content matches exactly the local echo (no extra frames).
+        assert app._ws is None

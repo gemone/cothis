@@ -274,12 +274,18 @@ class CothisApp(App):
             yield ConversationView()
         yield InputBar()
 
-    def action_send_prompt(self) -> None:
-        """Read InputBar text → render in conversation → clear bar.
+    async def action_send_prompt(self) -> None:
+        """Read InputBar text → render locally → forward to worker if attached.
 
-        The actual WS ``run_turn`` forward will be wired here once the
-        worker CLI entrypoint (#250) lands. For now this is the local
-        echo path that the pilot tests exercise.
+        Local echo always runs (the user expects to see their prompt
+        immediately). When a WS is attached (#252 item 1), the prompt
+        is also forwarded as a ``run_turn`` control message — the
+        worker drives the assistant-side rendering via subsequent
+        ``assistant_delta`` frames pumped by ``_pump_ws``.
+
+        Textual actions can be async; the framework awaits coroutine
+        results, so ``await self.send_run_turn(text)`` blocks the
+        action until the frame is on the wire (typically <1 ms).
         """
         bar = self.query_one(InputBar)
         text = bar.get_text().strip()
@@ -288,6 +294,8 @@ class CothisApp(App):
         view = self.query_one(ConversationView)
         view.append_user_message(text)
         bar.clear()
+        if self._ws is not None:
+            await self.send_run_turn(text)
 
     def append_assistant_delta(self, kind: str = "text", text: str = "") -> None:
         """Forward a WS ``assistant_delta`` to the conversation view.
