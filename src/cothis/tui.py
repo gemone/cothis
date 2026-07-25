@@ -865,18 +865,40 @@ class CothisApp(App):
     def on_ask_user_request(
         self, *, ask_id: str, prompt: str, choices: list,
     ) -> None:
-        """Hook fired when the worker asks the user for input (#229 slice C).
+        """Mount ``AskUserModal``; route the user's pick to ``resolve_ask``.
 
-        Default: auto-reject — send ``resolve_ask`` with ``value=None``
-        so the worker's Future (Slice D) resolves + the tool returns
-        promptly. Subclasses override to mount a modal (Slice E) that
-        shows ``prompt`` + ``choices`` + sends the user's pick back.
+        Hook fired when the worker emits an ``ask_user_request`` (#229).
+        The modal shows ``prompt`` + one button per choice; on dismiss
+        the chosen value (or ``None`` for Esc / Cancel) is sent back over
+        the active session's WS as a ``resolve_ask`` control message —
+        which the worker forwards to ``Agent.resolve_ask``, unblocking
+        the tool that called ``_ask_user``.
+
+        Replies target the active session's WS (``_ws_by_session`` with
+        a ``_ws`` fallback for the single-session case). If the WS has
+        been detached by the time the user picks, the reply is dropped
+        — the agent's Future will simply not resolve and the turn will
+        hit the worker's ``_TURN_TIMEOUT_S``.
         """
         logger.info("tui: ask_user_request %s: %s", ask_id, prompt)
-        if self._ws is not None:
-            asyncio.create_task(self._ws.send(json.dumps({
-                "type": "resolve_ask", "ask_id": ask_id, "value": None,
+
+        def _on_dismiss(value: str | None) -> None:
+            ws = (
+                self._ws_by_session.get(self._active_session_id or "")
+                or self._ws
+            )
+            if ws is None:
+                logger.warning(
+                    "tui: no active WS when resolving ask_id=%s; "
+                    "reply dropped",
+                    ask_id,
+                )
+                return
+            asyncio.create_task(ws.send(json.dumps({
+                "type": "resolve_ask", "ask_id": ask_id, "value": value,
             })))
+
+        self.push_screen(AskUserModal(prompt, choices), _on_dismiss)
 
 
 def run() -> None:
