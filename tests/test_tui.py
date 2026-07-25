@@ -1457,3 +1457,44 @@ async def test_ask_user_modal_choice_button_dismisses_with_value() -> None:
         await pilot.pause()
 
     assert captured == ["y"]
+
+
+# ---------------------------------------------------------------------
+# Skill selection persistence (#235 slice D)
+# ---------------------------------------------------------------------
+
+
+def test_save_and_load_skill_selection_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #235 slice D: save → load round-trips the selected set."""
+    from cothis.tui import load_skill_selection, save_skill_selection
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+
+    save_skill_selection({"git-commit", "fs-read"})
+    loaded = load_skill_selection()
+    assert loaded == {"git-commit", "fs-read"}
+
+
+def test_load_skill_selection_empty_when_file_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #235 slice D: no file → empty set (first run)."""
+    from cothis.tui import load_skill_selection
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    assert load_skill_selection() == set()
+
+
+def test_load_skill_selection_handles_corrupt_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #235 slice D: corrupt JSON → empty set + no crash."""
+    from cothis.tui import _skill_selection_path, load_skill_selection
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    path = _skill_selection_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not valid json", encoding="utf-8")
+    assert load_skill_selection() == set()
