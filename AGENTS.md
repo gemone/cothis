@@ -241,6 +241,22 @@ Each rule is enforced by `tests/test_text_boundary_audit.py` as a source-level s
 
 `_active_conns` is claimed in `process_request` (during the WS handshake, before the 101 response is sent), not in `conn_handler` (which runs after). The check-then-increment is two adjacent statements with no `await` between them — atomic under single-threaded async. Without this, the gap between observe-`_active_conns < cap` (in `process_request`) and `_active_conns += 1` (in `conn_handler`) spans the handshake-response send: N simultaneous handshakes all observe `_active_conns < cap` and pass, leaving the cap structurally unenforced (#264).
 
+## Worker subprocess + bind handshake
+
+`cothis worker --session <id>` is the subprocess entrypoint (#250 path a). On bind it prints one JSON line `{"uri": "ws://127.0.0.1:<port>/agent", "token": "<bearer>"}` to stdout (flushed) then serves until a `shutdown` control message arrives. `Supervisor.spawn_worker(session_id, *, model, provider, cwd, sessions_dir)` (#274) launches this subprocess via `subprocess.Popen`, reads the bind line, and registers a `WorkerHandle`. `shutdown_worker` sends `SIGINT` (not `SIGTERM`) so the worker's `cli.py` `KeyboardInterrupt` handler runs the `finally` block — `worker.stop()` + `agent.aclose()` — draining the session queue + closing MCP handles cleanly. `Supervisor.close()` walks every spawned worker + shuts them down before closing the DB connection; leaving procs alive would orphan the session file locks.
+
+## Tool event call_id pairing
+
+`ToolCallEvent` and `ToolResultEvent` both carry `call_id: str` (the Anthropic `tool_use.id`, e.g. `tu_abc123`). The worker forwards it in `tool_call_started` and `tool_call_result_pointer` WS messages. The TUI pairs start + result by `call_id` (not by tool name — ambiguous when the same tool runs twice in one turn) to flip the matching `ToolCallCard`'s status badge to `done` / `failed`. The pairing is the #252 item 4 contract; the legacy no-`call_id` path (older workers) drops cleanly at the dispatch site with a debug log, no crash.
+
+## TUI WS attach + hook-based dispatch
+
+`CothisApp` opens a WS client via `attach_ws(uri, token)` (#275) — caller decides how the worker was spawned (`Supervisor.spawn_worker` or direct `cothis worker` subprocess). Inbound frames are pumped by a background task that dispatches by `type`: `assistant_delta` → `ConversationView.append_delta`, `tool_call_started` → `append_tool_call` (mounts a `ToolCallCard`), `tool_call_result_pointer` → `update_tool_call_status` (badge flip by `call_id`). `action_send_prompt` (#276) forwards a `run_turn` control message when attached; local echo always runs. `on_session_selected(session_id)` (#281) is the overridable hook fired when the user picks a session in `SessionList`; `on_new_session(worktrees)` (#284) is fired by `Ctrl-N` with the result of `list_worktrees`. Both default to log + return; subclasses wire the real spawn-and-attach flow.
+
+## Git introspection (read-only)
+
+`cothis.git` exposes `list_worktrees(cwd) -> list[Worktree]` and `find_worktree_for_path(path, worktrees) -> Worktree | None` for the session picker (#234). `list_worktrees` shells out to `git worktree list --porcelain` with a 5s timeout; failure modes (missing binary, not-a-repo, timeout) degrade to an empty list so the picker UI falls back to "current directory only" without distinguishing cause. `Worktree` is a NamedTuple `(path, branch)` with the short branch name (`refs/heads/main` → `main`); detached HEAD → `branch=None`. `refresh_session_list` uses `find_worktree_for_path` to enrich each session's label with `· branch:<name>` when the session's cwd belongs to a known worktree.
+
 ## Agent skills
 
 ### Issue tracker
