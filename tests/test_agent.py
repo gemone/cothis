@@ -55,6 +55,7 @@ from cothis.agent import (
     ContentDelta,
     MaxIterationsError,
     ToolCallEvent,
+    ToolResultEvent,
     _apply_stream_delta,
     _assemble_system,
     _assistant_msg_from_response,
@@ -800,7 +801,93 @@ async def test_run_stream_tool_turn_yields_event_then_final(
     assert isinstance(out[0], ToolCallEvent)
     assert out[0].name == "add"
     assert out[0].arguments == {"a": 2, "b": 3}
-    assert out[1].kind == "text" and out[1].text == "5"
+    # Post-#254: out[1] is ToolResultEvent (yielded after _execute_tool);
+    # the ContentDelta lands once turn2 runs.
+    assert isinstance(out[1], ToolResultEvent)
+    assert out[1].tool == "add"
+    assert out[1].is_error is False
+    deltas = [e for e in out if isinstance(e, ContentDelta)]
+    assert deltas[0].kind == "text" and deltas[0].text == "5"
+
+
+@pytest.mark.asyncio
+async def test_run_stream_yields_tool_result_event_with_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #254: each tool dispatch yields a ``ToolResultEvent`` after completion.
+
+    The event carries the tool's display name, ``is_error`` flag,
+    a non-negative ``duration_ms``, and ``result_pointer=None`` when no
+    Session is attached (the ephemeral ``ask`` path). Ordered immediately
+    after the matching ``ToolCallEvent`` so consumers can pair them by
+    adjacency.
+    """
+
+    def boom(**kw: Any) -> str:
+        raise RuntimeError("kaboom")
+
+    def add(**kw: Any) -> str:
+        return "ok"
+
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["add"] = add
+    agent._tool_map["boom"] = boom
+
+    def turn1() -> list[Any]:
+        return [
+            _message_start("m1"),
+            _block_start(
+                0, ToolUseBlock(type="tool_use", id="tu1", name="add", input={})
+            ),
+            _block_start(
+                1, ToolUseBlock(type="tool_use", id="tu2", name="boom", input={})
+            ),
+            _block_stop(0),
+            _block_stop(1),
+            _msg_delta("tool_use"),
+            _msg_stop(),
+        ]
+
+    def turn2() -> list[Any]:
+        return [
+            _message_start("m2"),
+            _block_start(0, TextBlock(type="text", text="")),
+            _block_delta(0, TextDelta(type="text_delta", text="done")),
+            _block_stop(0),
+            _msg_delta("end_turn"),
+            _msg_stop(),
+        ]
+
+    turn = {"i": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        turn["i"] += 1
+        return _stream_from(turn1() if turn["i"] == 1 else turn2())
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    out = await _drain(agent.run_stream("hi"))
+
+    results = [e for e in out if isinstance(e, ToolResultEvent)]
+    assert len(results) == 2, f"expected 2 ToolResultEvents; got {results}"
+
+    # Each ToolResultEvent follows its ToolCallEvent (adjacency pairing).
+    calls = [i for i, e in enumerate(out) if isinstance(e, ToolCallEvent)]
+    assert len(calls) == 2
+    for call_idx, result in zip(calls, results, strict=True):
+        assert isinstance(out[call_idx + 1], ToolResultEvent)
+        assert out[call_idx + 1] is result
+
+    # First tool (``add``) — success.
+    assert results[0].tool == "add"
+    assert results[0].is_error is False
+    assert results[0].duration_ms >= 0
+    assert results[0].result_pointer is None  # no Session attached
+
+    # Second tool (``boom``) — error captured, not raised.
+    assert results[1].tool == "boom"
+    assert results[1].is_error is True
+    assert results[1].duration_ms >= 0
+    assert results[1].result_pointer is None
 
 
 @pytest.mark.asyncio
@@ -894,7 +981,10 @@ async def test_run_stream_max_tokens_mid_tool_call_still_executes(
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
     assert isinstance(out[0], ToolCallEvent)
-    assert out[1].kind == "text" and out[1].text == "recovered"
+    # Post-#254: ToolResultEvent is yielded between ToolCallEvent and the
+    # next-turn ContentDelta. Find the delta by type, not position.
+    deltas = [e for e in out if isinstance(e, ContentDelta)]
+    assert deltas[0].kind == "text" and deltas[0].text == "recovered"
     # tool_use paired with tool_result — session valid.
     tool_result_msgs = [
         m

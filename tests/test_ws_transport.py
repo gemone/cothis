@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from cothis.agent import ToolCallEvent
+from cothis.agent import ToolCallEvent, ToolResultEvent
 from cothis.worker import SessionWorker
 
 # ---------------------------------------------------------------------
@@ -206,6 +206,48 @@ async def test_run_turn_streams_deltas_via_fake_transport() -> None:
             "type": "tool_call_started",
             "tool": "fs.read",
             "arguments": {"path": "a.py"},
+        }
+    finally:
+        await conn.feed(None)
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_run_turn_forwards_tool_result_pointer_via_fake_transport() -> None:
+    """AC #254: ``ToolResultEvent`` from the agent → ``tool_call_result_pointer`` WS message.
+
+    The worker's module docstring documents this message type; before #254 it
+    was aspirational. Now the worker forwards ``tool`` / ``is_error`` /
+    ``duration_ms`` / ``pointer`` fields so the TUI can render completion.
+    """
+    events = [
+        ToolCallEvent(name="fs.read", arguments={"path": "a.py"}),
+        ToolResultEvent(
+            tool="fs.read",
+            is_error=False,
+            duration_ms=12,
+            result_pointer="session:s1:tool:tu1",
+        ),
+    ]
+    transport = FakeTransport()
+    worker = SessionWorker(_scripted_agent(events), transport=transport)
+    await worker.start()
+    conn = await transport.accept()
+    try:
+        await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
+        await conn.wait_for_send(2)
+        got = [json.loads(f) for f in conn.sent[:2]]
+        assert got[0] == {
+            "type": "tool_call_started",
+            "tool": "fs.read",
+            "arguments": {"path": "a.py"},
+        }
+        assert got[1] == {
+            "type": "tool_call_result_pointer",
+            "tool": "fs.read",
+            "is_error": False,
+            "duration_ms": 12,
+            "pointer": "session:s1:tool:tu1",
         }
     finally:
         await conn.feed(None)

@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 
-from cothis.agent import Agent, ContentDelta, ToolCallEvent
+from cothis.agent import Agent, ContentDelta, ToolCallEvent, ToolResultEvent
 from cothis.ws import (
     AuthCheck,
     Connection,
@@ -174,6 +174,16 @@ class SessionWorker:
                                 "type": "tool_call_started",
                                 "tool": event.name,
                                 "arguments": event.arguments,
+                            })
+                        )
+                    elif isinstance(event, ToolResultEvent):
+                        await conn.send(
+                            json.dumps({
+                                "type": "tool_call_result_pointer",
+                                "tool": event.tool,
+                                "is_error": event.is_error,
+                                "duration_ms": event.duration_ms,
+                                "pointer": event.result_pointer,
                             })
                         )
         except TimeoutError:
