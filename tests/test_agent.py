@@ -1626,3 +1626,54 @@ async def test_aclose_isolates_cleanup_steps_on_release_failure() -> None:
     assert agent._mcp_group is None
     assert agent._mcp_started is False
     assert agent._handles_started is False
+
+
+# ---------------------------------------------------------------------
+# _ask_user + resolve_ask (#229 B+D-2)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ask_user_blocks_until_resolve_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #229: ``_ask_user`` blocks until ``resolve_ask`` resolves the Future."""
+    from cothis.agent import AskUserRequestEvent
+
+    agent = _patched_agent(monkeypatch)
+    captured: list[AskUserRequestEvent] = []
+
+    def on_ask(event: AskUserRequestEvent) -> None:
+        captured.append(event)
+        asyncio.get_event_loop().call_later(
+            0.01, agent.resolve_ask, event.ask_id, "yes",
+        )
+
+    setattr(agent, "_on_ask_user", on_ask)
+
+    result = await agent._ask_user("Deploy?", ["yes", "no"])
+
+    assert result == "yes"
+    assert len(captured) == 1
+    assert captured[0].prompt == "Deploy?"
+    assert captured[0].choices == ["yes", "no"]
+    assert captured[0].ask_id
+
+
+@pytest.mark.asyncio
+async def test_ask_user_without_callback_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #229: ``_ask_user`` without ``_on_ask_user`` → RuntimeError."""
+    agent = _patched_agent(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="_on_ask_user"):
+        await agent._ask_user("?", ["a"])
+
+
+def test_resolve_ask_unknown_id_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #229: ``resolve_ask`` with unknown ask_id → silent no-op."""
+    agent = _patched_agent(monkeypatch)
+    agent.resolve_ask("nonexistent", "value")

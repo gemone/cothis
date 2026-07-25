@@ -15,11 +15,13 @@ Example
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -595,6 +597,25 @@ class ToolResultEvent:
     duration_ms: int
     result_pointer: str | None
     call_id: str
+
+
+@dataclass(frozen=True)
+class AskUserRequestEvent:
+    """Streamed event: a tool is asking the user for input (#229).
+
+    Yielded by ``Agent.run_stream`` when a tool calls ``_ask_user``.
+    The consumer (TUI via WS) shows a modal with ``prompt`` + ``choices``
+    and sends the user's pick back as a ``resolve_ask`` control message.
+    The agent's Future (keyed by ``ask_id``) is resolved, the tool
+    unblocks, and ``run_stream`` continues.
+
+    Requires the worker's concurrent-dispatch refactor (#316) so the
+    ``resolve_ask`` message can arrive while ``_stream_turn`` is blocked.
+    """
+
+    ask_id: str
+    prompt: str
+    choices: list[str]
 
 
 class MaxIterationsError(RuntimeError):
@@ -1445,6 +1466,48 @@ class Agent(BaseModel):
             elif self.system is None:
                 self.system = system_additions
         self._preactivation_done = True
+
+    # -----------------------------------------------------------------
+    # Interactive ask_user (#229 B+D-2)
+    #
+    # Tools call ``_ask_user`` to block on user input. The event is
+    # emitted via ``_on_ask_user`` callback (set by the worker) so it
+    # reaches the WS client immediately — before the tool blocks.
+    # ``resolve_ask`` resolves the Future when the WS client replies.
+    # -----------------------------------------------------------------
+
+    async def _ask_user(self, prompt: str, choices: list[str]) -> str:
+        """Block until the user picks a choice; return the value.
+
+        Creates a Future keyed by ``ask_id``, emits an
+        ``AskUserRequestEvent`` via the ``_on_ask_user`` callback (set
+        by the worker), then awaits the Future. The worker's
+        ``resolve_ask`` handler resolves it via ``resolve_ask``.
+
+        Without the callback (``ask`` mode / no worker), raises
+        ``RuntimeError`` — interactive asking requires a live WS consumer.
+        """
+        ask_id = secrets.token_hex(8)
+        if not hasattr(self, "_pending_asks"):
+            self._pending_asks: dict[str, asyncio.Future[str]] = {}
+        fut: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+        self._pending_asks[ask_id] = fut
+        event = AskUserRequestEvent(ask_id=ask_id, prompt=prompt, choices=choices)
+        callback = getattr(self, "_on_ask_user", None)
+        if callback is None:
+            raise RuntimeError(
+                "_ask_user requires the worker to install _on_ask_user; "
+                "use the WS-attached worker path, not the ephemeral ask path."
+            )
+        callback(event)
+        return await fut
+
+    def resolve_ask(self, ask_id: str, value: str | None) -> None:
+        """Resolve a pending ``_ask_user`` Future; no-op if unknown/done."""
+        asks: dict[str, asyncio.Future[str]] = getattr(self, "_pending_asks", {})
+        fut = asks.pop(ask_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(value or "")
 
     async def _execute_tool(self, tool_use: dict[str, Any]) -> tuple[bool, str]:
         """Dispatch a single ``tool_use`` block; return ``(is_error, output)``.
