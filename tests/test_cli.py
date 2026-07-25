@@ -501,3 +501,29 @@ def test_main_generic_exception_still_error_path(
     with pytest.raises(SystemExit) as exc_info:
         cli_mod.main()
     assert exc_info.value.code == 1
+
+
+def test_tui_command_dispatches_to_cothis_tui_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #237: ``cothis tui`` launches the Textual app via ``cothis.tui.run``.
+
+    The test monkeypatches ``cothis.tui.run`` to a sentinel so the
+    actual Textual event loop isn't started (which would block the
+    test). Verifies the command is registered + dispatches correctly.
+    """
+    import cothis.cli as cli_mod
+    import cothis.tui as tui_mod
+
+    called: list[bool] = []
+
+    def fake_run() -> None:
+        called.append(True)
+
+    monkeypatch.setattr(tui_mod, "run", fake_run)
+
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["tui"])
+    assert result.exit_code == 0, f"tui command failed: {result.output}"
+    assert called == [True], "cothis.tui.run was not called"
