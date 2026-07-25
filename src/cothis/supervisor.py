@@ -377,15 +377,33 @@ class Supervisor:
         return crashed
 
     async def monitor_worker_health(self, interval_s: float = 1.0) -> None:
-        """Background loop: poll ``monitor_once`` at ``interval_s`` cadence.
+        """Background loop: detect crashes → backoff → restart → repeat.
+
+        Each iteration: ``monitor_once`` returns crashed session_ids.
+        For each: check ``_should_restart`` (threshold guard); if True,
+        sleep ``backoff_seconds(count)`` then ``_restart_worker``; if
+        False (over threshold), leave the session ``errored`` so the
+        TUI surfaces a diagnose action.
 
         Runs until cancelled (the caller cancels the task when the
-        supervisor shuts down). Each iteration detects crashes + records
-        lifecycle events; restart logic (Slice C) will hook into the
-        returned crashed-session list.
+        supervisor shuts down).
         """
         while True:
-            self.monitor_once()
+            crashed = self.monitor_once()
+            for session_id in crashed:
+                if not self._should_restart(session_id):
+                    logger.warning(
+                        "supervisor: %s over restart threshold; leaving errored",
+                        session_id,
+                    )
+                    continue
+                delay = backoff_seconds(self._counter_for(session_id).count())
+                logger.info(
+                    "supervisor: restarting %s after %.1fs backoff",
+                    session_id, delay,
+                )
+                await asyncio.sleep(delay)
+                self._restart_worker(session_id)
             await asyncio.sleep(interval_s)
 
     def _restart_worker(self, session_id: str) -> WorkerHandle | None:
@@ -442,6 +460,17 @@ class Supervisor:
         self.record_lifecycle("restarted", session_id)
         logger.info("supervisor: restarted worker %s", session_id)
         return new_handle
+
+    def _should_restart(self, session_id: str) -> bool:
+        """Return ``True`` if the session is under the restart threshold.
+
+        When ``RestartCounter.is_over_threshold()`` returns ``True``
+        (too many restarts in the rolling window), the session is left
+        ``errored`` instead of being restarted again — the supervisor
+        gives up on a persistently crashing worker so the user can
+        diagnose the issue via the TUI's status badge.
+        """
+        return not self._counter_for(session_id).is_over_threshold()
 
     def close(self) -> None:
         """Shutdown all workers + close the supervisor DB connection.
