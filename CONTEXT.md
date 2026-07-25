@@ -229,14 +229,15 @@ each element is one argv item, spaces/special chars are safe by default.
 **shell mode** — `command:` is a string, passed to a `shell:`
 interpreter with `shell=True`; supports pipes / `&&` / redirection. The
 `shell:` field names the gated interpreter; if omitted, cothis auto-selects
-the OS default (`sh` on POSIX, `cmd` on Windows — story 16). Shell-mode
-arg values are quoted per interpreter (`shlex.quote` for POSIX,
-`subprocess.list2cmdline` for `cmd`). On POSIX this fully closes
-injection (story 22); on `cmd.exe` it is partial — whitespace-bearing
-values are double-quoted, but values like `foo&bar` pass through
-unquoted and `%VAR%` expansion is undefended (see the `cothis:` ceiling
-on `_shell_quote`). Argv mode (`command:` as a list) is fully safe on
-all platforms — prefer it for untrusted input.
+the OS default (`sh` on POSIX — story 16). Shell-mode arg values are
+quoted per interpreter (`shlex.quote` for POSIX / PowerShell). On POSIX
+this fully closes injection (story 22); **`cmd.exe` is rejected at
+compile time** — `subprocess.list2cmdline` only double-quotes
+whitespace-bearing values, so `foo&bar` / `%VAR%` pass through as live
+metacharacters (see the `cothis:` ceiling on `_shell_quote`). The
+compile-time `ValueError` names both safe alternatives (`shell: pwsh`,
+argv mode). Argv mode (`command:` as a list) is fully safe on all
+platforms — prefer it for untrusted input.
 _Avoid_: command type (collides with arg type), run style.
 
 **Platform**:
