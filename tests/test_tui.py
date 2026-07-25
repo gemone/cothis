@@ -12,12 +12,10 @@ Covers the 3-pane layout + interactivity API:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 @pytest.mark.asyncio
@@ -1530,6 +1528,159 @@ async def test_ask_user_modal_choice_button_dismisses_with_value() -> None:
         await pilot.pause()
 
     assert captured == ["y"]
+
+
+# ---------------------------------------------------------------------
+# WorktreePickerModal (#234 slice B)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worktree_picker_renders_one_button_per_worktree_plus_cancel() -> None:
+    """AC #234 slice B: modal shows branch-labeled buttons + Cancel.
+
+    A worktree on a branch shows the branch name; a detached worktree
+    falls back to its path basename. The Cancel button is always
+    present so the user can bail out without creating a session.
+    """
+    from textual.widgets import Button
+
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    worktrees = [
+        Worktree(path=Path("/repo/main"), branch="main"),
+        Worktree(path=Path("/repo/feature-x"), branch="feature/x"),
+        Worktree(path=Path("/repo/detached"), branch=None),
+    ]
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(WorktreePickerModal(worktrees))
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal)
+
+        buttons = list(modal.query(Button))
+        labels = [
+            b.label.plain if hasattr(b.label, "plain") else str(b.label)
+            for b in buttons
+        ]
+        # Branch buttons show branch name; detached shows path basename.
+        assert "main" in labels
+        assert "feature/x" in labels
+        assert "detached" in labels
+        assert "Cancel" in labels
+        # One button per worktree + 1 Cancel.
+        assert len(buttons) == len(worktrees) + 1
+
+        modal.action_dismiss_modal()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_worktree_picker_button_dismisses_with_path_str() -> None:
+    """AC #234 slice B: clicking a worktree button dismisses with its path.
+
+    The dismiss value is the path as a string — what the caller stuffs
+    into the new session's ``cwd``. Index-based IDs (paths contain
+    ``/`` which Textual IDs reject) so the lookup is by button position.
+    """
+    from textual.widgets import Button
+
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    worktrees = [
+        Worktree(path=Path("/repo/main"), branch="main"),
+        Worktree(path=Path("/repo/feature"), branch="feature/y"),
+    ]
+    captured: list[str | None] = []
+
+    def on_dismiss(value: str | None) -> None:
+        captured.append(value)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(WorktreePickerModal(worktrees), on_dismiss)
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal)
+
+        # Click the second button (feature/y) — verifies index-based ID
+        # routing works for non-first entries.
+        feature_button = next(
+            b for b in modal.query(Button) if b.id == "wt-1"
+        )
+        await pilot.click(feature_button)
+        await pilot.pause()
+
+    assert captured == [str(Path("/repo/feature"))]
+
+
+@pytest.mark.asyncio
+async def test_worktree_picker_cancel_dismisses_with_none() -> None:
+    """AC #234 slice B: Cancel button dismisses with ``None``.
+
+    ``None`` is the "user cancelled, no new session" signal — callers
+    treat it distinctly from any path string.
+    """
+    from textual.widgets import Button
+
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    worktrees = [Worktree(path=Path("/repo/main"), branch="main")]
+    captured: list[str | None] = []
+
+    def on_dismiss(value: str | None) -> None:
+        captured.append(value)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(WorktreePickerModal(worktrees), on_dismiss)
+        await pilot.pause()
+
+        modal = app.screen
+        cancel_button = next(
+            b for b in modal.query(Button) if b.id == "worktree-cancel"
+        )
+        await pilot.click(cancel_button)
+        await pilot.pause()
+
+    assert captured == [None]
+
+
+@pytest.mark.asyncio
+async def test_worktree_picker_empty_list_renders_only_cancel() -> None:
+    """AC #234 slice B: empty worktree list → just the Cancel button.
+
+    Edge case: not a git repo, or git binary missing — ``list_worktrees``
+    returns ``[]``. The modal still mounts (no crash) so the user sees
+    an explicit "nothing to pick" rather than a silent no-op. Future
+    wiring may add a "create session in current cwd" fallback.
+    """
+    from textual.widgets import Button
+
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(WorktreePickerModal([]))
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal)
+
+        buttons = list(modal.query(Button))
+        assert len(buttons) == 1
+        assert buttons[0].id == "worktree-cancel"
 
 
 # ---------------------------------------------------------------------
