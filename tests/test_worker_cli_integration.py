@@ -74,6 +74,11 @@ async def test_worker_cli_emits_bind_json_and_serves_ws(tmp_path: Path) -> None:
         # Same env-driven DB resolution the rest of the CLI uses; isolates
         # the test from the user's ``$COTHIS_HOME``.
         "COTHIS_SESSIONS_DIR": str(tmp_path),
+        # Agent construction validates the provider API key eagerly; CI
+        # runners have no real key. The test only exercises bind +
+        # ping/pong + shutdown — never an actual LLM call — so a dummy
+        # key satisfies the constructor guard.
+        "OPENROUTER_API_KEY": "test-dummy-not-used",
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "cothis.cli", "worker", "--session", sid],
@@ -151,6 +156,10 @@ async def test_worker_cli_unknown_session_exits_nonzero(tmp_path: Path) -> None:
     env = {
         **os.environ,
         "COTHIS_SESSIONS_DIR": str(tmp_path),
+        # Dummy key — see happy-path test for rationale. The unknown-session
+        # path exits before any LLM call, but Agent construction still
+        # validates the key eagerly.
+        "OPENROUTER_API_KEY": "test-dummy-not-used",
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "cothis.cli", "worker",
