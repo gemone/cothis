@@ -5,7 +5,7 @@ Covers the 3-pane layout + interactivity API:
 - 3 panes exist + are queryable.
 - ``ConversationView.append_delta(kind, text)`` routes text vs thinking.
 - ``ConversationView.append_tool_call`` mounts an inline card.
-- ``InputBar`` accepts multi-line text + clears on send.
+- the input ``TextArea`` accepts multi-line text + clears on send.
 - ``action_send_prompt`` echoes the user prompt into the conversation.
 - ``append_assistant_delta`` + ``append_tool_call`` forward to the view.
 """
@@ -28,7 +28,7 @@ async def test_app_launches_with_three_panes() -> None:
         await pilot.pause()
         assert app.query_one("SessionList") is not None
         assert app.query_one(ConversationView) is not None
-        assert app.query_one("InputBar") is not None
+        assert app.query_one("#input") is not None
 
 
 @pytest.mark.asyncio
@@ -79,37 +79,41 @@ async def test_tool_call_card_mounts() -> None:
 
 @pytest.mark.asyncio
 async def test_input_bar_accepts_text() -> None:
-    """InputBar holds a TextArea that can hold multi-line content."""
-    from cothis.tui import CothisApp, InputBar
+    """The input TextArea holds multi-line content."""
+    from textual.widgets import TextArea
+
+    from cothis.tui import CothisApp
 
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        bar = app.query_one(InputBar)
-        bar.set_text("line one\nline two")
-        assert bar.get_text() == "line one\nline two"
+        bar = app.query_one("#input", TextArea)
+        bar.text = "line one\nline two"
+        assert bar.text == "line one\nline two"
 
 
 @pytest.mark.asyncio
 async def test_send_prompt_echoes_into_conversation() -> None:
-    """``action_send_prompt`` posts the InputBar text to ConversationView + clears."""
-    from cothis.tui import ConversationView, CothisApp, InputBar
+    """``action_send_prompt`` posts the input text to ConversationView + clears."""
+    from textual.widgets import TextArea
+
+    from cothis.tui import ConversationView, CothisApp
 
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        bar = app.query_one(InputBar)
-        bar.set_text("what is 2+2?")
+        bar = app.query_one("#input", TextArea)
+        bar.text = "what is 2+2?"
         await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
         assert "what is 2+2?" in view.renderable_str
-        assert bar.get_text() == ""
+        assert bar.text == ""
 
 
 @pytest.mark.asyncio
 async def test_send_prompt_ignores_empty_input() -> None:
-    """Empty InputBar → no echo, no crash."""
+    """Empty input → no echo, no crash."""
     from cothis.tui import ConversationView, CothisApp
 
     app = CothisApp()
@@ -152,30 +156,34 @@ async def test_append_tool_call_via_app() -> None:
 @pytest.mark.asyncio
 async def test_ctrl_enter_keypress_sends_prompt() -> None:
     """Ctrl+Enter binding triggers send_prompt via the actual keypress."""
-    from cothis.tui import ConversationView, CothisApp, InputBar
+    from textual.widgets import TextArea
+
+    from cothis.tui import ConversationView, CothisApp
 
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        bar = app.query_one(InputBar)
-        bar.set_text("via keypress")
+        bar = app.query_one("#input", TextArea)
+        bar.text = "via keypress"
         await pilot.press("ctrl+enter")
         await pilot.pause()
         view = app.query_one(ConversationView)
         assert "via keypress" in view.renderable_str
-        assert bar.get_text() == ""
+        assert bar.text == ""
 
 
 @pytest.mark.asyncio
 async def test_user_message_brackets_are_escaped() -> None:
     """Brackets in user text are escaped so Markdown injection is blocked."""
-    from cothis.tui import ConversationView, CothisApp, InputBar
+    from textual.widgets import TextArea
+
+    from cothis.tui import ConversationView, CothisApp
 
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        bar = app.query_one(InputBar)
-        bar.set_text("[click](javascript:alert(1))")
+        bar = app.query_one("#input", TextArea)
+        bar.text = "[click](javascript:alert(1))"
         await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
@@ -446,7 +454,9 @@ async def test_action_send_prompt_forwards_run_turn_when_attached(
     """
     import json as _json
 
-    from cothis.tui import ConversationView, CothisApp, InputBar
+    from textual.widgets import TextArea
+
+    from cothis.tui import ConversationView, CothisApp
 
     fake = _FakeWS([])
 
@@ -460,8 +470,8 @@ async def test_action_send_prompt_forwards_run_turn_when_attached(
         await pilot.pause()
         await app.attach_ws("ws://fake/agent", "tok")
         await pilot.pause()
-        bar = app.query_one(InputBar)
-        bar.set_text("what is 2+2?")
+        bar = app.query_one("#input", TextArea)
+        bar.text = "what is 2+2?"
         await app.action_send_prompt()
         await pilot.pause()
 
@@ -469,7 +479,7 @@ async def test_action_send_prompt_forwards_run_turn_when_attached(
         view = app.query_one(ConversationView)
         assert "what is 2+2?" in view.renderable_str
         # Bar cleared.
-        assert bar.get_text() == ""
+        assert bar.text == ""
         # Outbound: run_turn control message on the WS.
         assert len(fake.sent) == 1
         assert _json.loads(fake.sent[0]) == {
@@ -487,18 +497,20 @@ async def test_action_send_prompt_no_forwarding_when_not_attached() -> None:
     Pre-attach behaviour preserved: no run_turn is sent anywhere (there
     is nowhere to send to); the user still sees their prompt.
     """
-    from cothis.tui import ConversationView, CothisApp, InputBar
+    from textual.widgets import TextArea
+
+    from cothis.tui import ConversationView, CothisApp
 
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        bar = app.query_one(InputBar)
-        bar.set_text("hello")
+        bar = app.query_one("#input", TextArea)
+        bar.text = "hello"
         await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
         assert "hello" in view.renderable_str
-        assert bar.get_text() == ""
+        assert bar.text == ""
         # No WS attached → ``send_run_turn`` is a no-op. The view's
         # content matches exactly the local echo (no extra frames).
         assert app._ws is None
