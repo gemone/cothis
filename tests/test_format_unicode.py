@@ -73,3 +73,32 @@ def test_yaml_path_still_keeps_cjk_native(
     monkeypatch.setenv("COTHIS_TOOL_OUTPUT_FORMAT", "yaml")
     out: Any = format_tool_output({"file": "笔记.md"})
     assert "笔记" in out
+
+
+def test_format_module_import_does_not_load_yaml() -> None:
+    """AC #279: ``import cothis.tools.format`` must not import ``yaml``.
+
+    ``yaml`` is ~18ms cold. The default json/csv/tsv paths never touch
+    it, so importing it eagerly at module top taxes every cold ``cothis``
+    invocation. The lazy import inside ``format_tool_output``'s YAML
+    branch means a fresh process that just imports the module pays $0.
+
+    Verified via subprocess so the test starts from a clean module
+    cache (the parent test process has already imported yaml via other
+    tests; checking ``sys.modules`` here would always show it).
+    """
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import sys, cothis.tools.format; "
+            "print('yaml' in sys.modules)",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == "False", (
+        f"import cothis.tools.format should NOT import yaml; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
