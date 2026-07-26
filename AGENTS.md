@@ -237,6 +237,12 @@ Each rule is enforced by `tests/test_text_boundary_audit.py` as a source-level s
 
 `RestartCounter._restarts` prunes on `count()` — bounded by `window_s × max_restart_rate`, not by supervisor uptime. Timestamps are monotonic by construction (`record()` appends `datetime.now(UTC)`), so stale entries form a contiguous prefix; `count()` finds the cutoff via `bisect_left`, drops the prefix in place, and returns `len(...)`. Without this, a sustained crash loop (1 restart/s) grows `_restarts` unbounded and every `count()` call (one per `record_lifecycle`) is O(N) in lifetime restarts — quadratic in the very condition the supervisor exists to survive.
 
+## Supervisor crash-restart loop
+
+`monitor_worker_health(interval_s=1.0)` is the continuous loop that ties detection → backoff → restart together. Each iteration: `monitor_once()` returns the session_ids that crashed since the last call (subprocess exited unexpectedly, detected via `poll()`); for each, `_should_restart(session_id)` checks the threshold guard (`count() < threshold` within `window_s`); if True, sleep `backoff_seconds(count)` then `_restart_worker(session_id)`; if False (over threshold), leave the handle `errored` so the TUI surfaces a diagnose action rather than hammering restart.
+
+`backoff_seconds(count) = min(300, 2 ** count)` — exponential, capped at 5 minutes. The cap matters: a long-broken worker shouldn't lock the loop for an unbounded sleep. The loop is `while True` — the caller cancels the task when the supervisor shuts down. `monitor_once` is idempotent (pops the proc on crash detection), so a cancelled-then-restarted loop doesn't re-flag the same crash.
+
 ## WebSocketServerTransport concurrent connection cap
 
 `_active_conns` is claimed in `process_request` (during the WS handshake, before the 101 response is sent), not in `conn_handler` (which runs after). The check-then-increment is two adjacent statements with no `await` between them — atomic under single-threaded async. Without this, the gap between observe-`_active_conns < cap` (in `process_request`) and `_active_conns += 1` (in `conn_handler`) spans the handshake-response send: N simultaneous handshakes all observe `_active_conns < cap` and pass, leaving the cap structurally unenforced (#264).
