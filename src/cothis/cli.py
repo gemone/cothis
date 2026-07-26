@@ -253,13 +253,17 @@ def chat(
     with a notice. Pass ``--legacy`` to force the REPL.
     """
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
-    # Flags not yet supported by the TUI fall back to legacy.
+    # Staged migration (#237): default to TUI; --legacy keeps the REPL.
+    # --resume is supported via the TUI's on_mount auto-spawn.
+    # --skill still falls back to legacy (not yet wired in the TUI).
     if not legacy:
-        if resume is None and not skill:
-            _launch_tui_app(model=model, provider=provider)
+        if not skill:
+            if resume is not None:
+                _validate_session_id_arg(resume)
+            _launch_tui_app(model=model, provider=provider, resume=resume)
             return
         console.print(
-            "[dim]--resume / --skill not yet supported by the TUI; "
+            "[dim]--skill not yet supported by the TUI; "
             "using legacy REPL. Pass --legacy to silence this notice.[/dim]"
         )
     asyncio.run(
@@ -706,8 +710,13 @@ class _DrivenCothisApp:
         model: str,
         provider: str,
         provider_env: dict[str, str],
+        resume_session_id: str | None = None,
     ) -> CothisApp:
-        """Return a ``CothisApp`` subclass instance with spawn wired into on_worktree_pick."""
+        """Return a ``CothisApp`` subclass instance with spawn wired into on_worktree_pick.
+
+        If ``resume_session_id`` is set, the app auto-spawns a worker for that
+        session on ``on_mount`` (bypasses the worktree picker).
+        """
         import secrets
 
         from cothis.session import Session
@@ -747,15 +756,38 @@ class _DrivenCothisApp:
                     self.attach_session_ws(sid, handle.ws_url, handle.token),
                 )
 
+            async def on_mount(self) -> None:
+                # Auto-spawn for --resume: bypass the worktree picker
+                # and attach the resumed session directly.
+                if resume_session_id is None:
+                    return
+                handle = supervisor.spawn_worker(
+                    resume_session_id,
+                    model=model,
+                    provider=provider,
+                    cwd=Path.cwd(),
+                    sessions_dir=sessions_dir,
+                    extra_env=provider_env,
+                )
+                logging.getLogger(__name__).info(
+                    "tui: resumed session %s", resume_session_id[:8],
+                )
+                await self.attach_session_ws(
+                    resume_session_id, handle.ws_url, handle.token,
+                )
+
         return _App()
 
 
-def _launch_tui_app(model: str, provider: str) -> None:
+def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> None:
     """Construct Supervisor + _DrivenCothisApp and launch the Textual TUI.
 
     Shared between ``cothis tui`` and ``cothis chat`` (default TUI path,
     #237 staged migration). Both commands construct the same Supervisor +
     spawn-wired app; the only difference is the entrypoint name.
+
+    ``resume`` (optional): if set, auto-spawn a worker for the existing
+    session on startup (bypasses the worktree picker).
     """
     from cothis.supervisor import Supervisor
     from cothis.tui import run as run_tui
@@ -775,6 +807,7 @@ def _launch_tui_app(model: str, provider: str) -> None:
         model=model,
         provider=provider,
         provider_env=provider_env,
+        resume_session_id=resume,
     )
     run_tui(app=app)
 

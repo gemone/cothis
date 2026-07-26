@@ -648,3 +648,60 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     # attach_session_ws scheduled (create_task was stubbed; verify the coro
     # is what ``on_worktree_pick`` would have scheduled).
     assert len(scheduled) == 1
+
+
+def test_launch_tui_app_passes_resume_to_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #237 follow-up: ``_launch_tui_app`` forwards ``resume`` to ``build()``.
+
+    The TUI's ``on_mount`` auto-spawns a worker for the resumed session
+    when ``resume_session_id`` is set. This test verifies the wiring:
+    ``_launch_tui_app(resume=<id>)`` → ``build(resume_session_id=<id>)``.
+    """
+    import cothis.cli as cli_mod
+
+    captured: dict = {}
+
+    def fake_build(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    def fake_run(app: object | None = None) -> None:
+        pass
+
+    monkeypatch.setattr(cli_mod._DrivenCothisApp, "build", fake_build)
+    monkeypatch.setattr("cothis.supervisor.Supervisor", lambda *a, **kw: object())
+    monkeypatch.setattr("cothis.tui.run", fake_run)
+
+    session_id = "a" * 32
+    cli_mod._launch_tui_app(model="m", provider="p", resume=session_id)
+
+    assert captured.get("resume_session_id") == session_id, (
+        f"expected resume_session_id={session_id!r}; got "
+        f"{captured.get('resume_session_id')!r}"
+    )
+
+
+def test_launch_tui_app_without_resume_passes_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``resume``, ``build()`` receives ``resume_session_id=None``."""
+    import cothis.cli as cli_mod
+
+    captured: dict = {}
+
+    def fake_build(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    def fake_run(app: object | None = None) -> None:
+        pass
+
+    monkeypatch.setattr(cli_mod._DrivenCothisApp, "build", fake_build)
+    monkeypatch.setattr("cothis.supervisor.Supervisor", lambda *a, **kw: object())
+    monkeypatch.setattr("cothis.tui.run", fake_run)
+
+    cli_mod._launch_tui_app(model="m", provider="p")
+
+    assert captured.get("resume_session_id") is None
