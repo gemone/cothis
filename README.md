@@ -86,50 +86,44 @@ uv run cothis -v ask "list the files in src"
 VERBOSE=1 uv run cothis ask "list the files in src"
 ```
 
-### `chat` — interactive multi-turn session
+### `chat` — interactive multi-turn session (launches the TUI)
 
 ```bash
 uv run cothis chat
 ```
 
-`chat` reuses one agent across turns, so conversation history
-accumulates. Each turn's final answer is streamed token-by-token and
-rendered as Markdown; tool calls (`fs.read`, `fs.list`, `fs.create`, `fs.modify`, and
-any custom tools you've added) are printed inline as `calling <name>(<args>)`. Exit
-with `Ctrl-D` or `Ctrl-C`.
-
-The same `--provider` / `-p`, `--model` / `-m`, and `--max-iterations`
-flags apply as to `ask`:
+`chat` now launches the **Textual TUI** by default (#237): a 3-pane
+layout — `SessionList` (left) + `ConversationView` (center) + `InputBar`
+(bottom). Press `n` to create a new session (worktree picker or current
+directory); type a prompt + `Ctrl+Enter` to send. The worker streams
+deltas, tool-call cards, and interactive questions (`AskUserModal`).
 
 ```bash
 uv run cothis chat -m anthropic/claude-3.5-haiku
+```
+
+The same `--provider` / `-p`, `--model` / `-m` flags apply as to `ask`.
+
+`--legacy` keeps the old REPL (for `--resume` / `--skill` which the TUI
+doesn't yet support):
+
+```bash
+uv run cothis chat --legacy --resume <session_id>
 ```
 
 Run `cothis --help`, `cothis ask --help`, or `cothis chat --help` for
 the full list of flags.
 
 
-### `tui` — Textual TUI (opt-in)
+### `tui` — alias for the default TUI path
 
 ```bash
 uv run cothis tui
 ```
 
-The Textual TUI is the future default (the legacy REPL stays until
-feature parity lands via #237). It offers a 3-pane layout —
-`SessionList` (left) + `ConversationView` (center) + `InputBar`
-(bottom) — and supports spawning sessions bound to git worktrees via
-the `n` keypress (Supervisor-backed, #234). The same `--model` /
-`--provider` flags apply as to `chat`.
-
-Once a session is attached (via the worktree picker or its "Current
-directory" fallback), the TUI drives a full multi-turn session
-end-to-end: ``run_turn`` forwards prompts over WS, the worker streams
-``assistant_delta`` / ``tool_call_started`` / ``tool_call_result_pointer``
-/ ``ask_user_request`` frames, and the TUI renders each (Markdown
-segments, inline tool-call cards, ``AskUserModal`` for interactive
-tool questions). ``chat`` remains the default for now; ``tui`` is
-the preview of the future default (#237).
+Same as `chat` — launches the Textual TUI with Supervisor-backed session
+spawn. Provided as a separate entrypoint for users who want the TUI
+without the `chat` name. Same `--model` / `--provider` flags.
 
 
 ### Session management — `history` / `delete` / `archive`
