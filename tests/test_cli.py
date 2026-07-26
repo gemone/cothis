@@ -705,3 +705,37 @@ def test_launch_tui_app_without_resume_passes_none(
     cli_mod._launch_tui_app(model="m", provider="p")
 
     assert captured.get("resume_session_id") is None
+
+
+def test_chat_legacy_with_resume_runs_repl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #237: ``chat --legacy --resume <id>`` runs the legacy REPL, not the TUI.
+
+    ``--legacy`` takes precedence over ``--resume`` — the user explicitly
+    asked for the old REPL, so the TUI path is skipped even though
+    ``--resume`` is supported in the TUI (#365).
+    """
+    import asyncio
+
+    import cothis.cli as cli_mod
+
+    tui_called: list[bool] = []
+    asyncio_called: list[bool] = []
+
+    def fake_launch(*args: object, **kwargs: object) -> None:
+        tui_called.append(True)
+
+    def fake_run(coro: Any) -> None:
+        asyncio_called.append(True)
+        coro.close()
+
+    monkeypatch.setattr(cli_mod, "_launch_tui_app", fake_launch)
+    monkeypatch.setattr(asyncio, "run", fake_run)
+
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["chat", "--legacy", "--resume", "a" * 32])
+    assert result.exit_code == 0, f"chat --legacy --resume failed: {result.output}"
+    assert tui_called == [], "TUI should NOT be called with --legacy"
+    assert len(asyncio_called) == 1, "legacy REPL should be called"
