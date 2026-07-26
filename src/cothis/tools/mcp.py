@@ -39,8 +39,8 @@ if TYPE_CHECKING:
     from mcp.types import Tool as McpTool
 
 
-_MCP_STDIO_KEYS = {"type", "name", "description", "command", "args", "env", "keepalive", "pin"}
-_MCP_HTTP_KEYS = {"type", "name", "description", "url", "headers", "keepalive", "pin"}
+_MCP_STDIO_KEYS = {"type", "name", "description", "command", "args", "env", "keepalive"}
+_MCP_HTTP_KEYS = {"type", "name", "description", "url", "headers", "keepalive"}
 
 
 def _normalize_mcp_result(result: CallToolResult) -> str:
@@ -251,14 +251,12 @@ class MCPServer(_HookableTool):
         params: Any,
         diagnostic: str = "",
         keepalive: float = 600.0,
-        pin: bool = False,
     ) -> None:
         super().__init__()
         self.__name__ = name
         self.params = params
         self._diagnostic = diagnostic
         self.keepalive = keepalive
-        self.pin = pin
 
     @property
     def _label(self) -> str:
@@ -346,7 +344,6 @@ def _make_mcp_server(
     diagnostic: str,
     source: str | None,
     keepalive: float = 600.0,
-    pin: bool = False,
 ) -> MCPServer:
     """Label guard + ``mcp:`` handle prefix for stdio/http builders (ADR-0005)."""
     where = f" in {source}" if source else ""
@@ -361,7 +358,6 @@ def _make_mcp_server(
         params=params,
         diagnostic=diagnostic,
         keepalive=keepalive,
-        pin=pin,
     )
     server._source = source
     return server
@@ -382,16 +378,6 @@ def _parse_keepalive(spec: dict[str, Any], source: str | None) -> float:
         msg = f"MCP server: 'keepalive' must be > 0{where}"
         raise ValueError(msg)
     return value
-
-
-def _parse_pin(spec: dict[str, Any], source: str | None) -> bool:
-    """Parse the optional ``pin:`` boolean field with validation."""
-    raw = spec.get("pin", False)
-    if not isinstance(raw, bool):
-        where = f" in {source}" if source else ""
-        msg = f"MCP server: 'pin' must be a boolean{where}"
-        raise ValueError(msg)
-    return raw
 
 
 def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> MCPServer:
@@ -444,7 +430,6 @@ def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> MCPServ
         diagnostic=f"command={command!r} args={args!r}",
         source=source,
         keepalive=_parse_keepalive(spec, source),
-        pin=_parse_pin(spec, source),
     )
 
 
@@ -478,5 +463,4 @@ def _build_mcp_http_server(spec: dict[str, Any], source: str | None) -> MCPServe
         diagnostic=f"url={_scrub_url(url)!r}",
         source=source,
         keepalive=_parse_keepalive(spec, source),
-        pin=_parse_pin(spec, source),
     )
