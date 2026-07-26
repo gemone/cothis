@@ -1260,11 +1260,12 @@ class Agent(BaseModel):
             # pool entry. The startup connection is adopted as the handle's
             # first acquire (no wasted reconnect): the session is seeded onto
             # the instance, and ``adopt`` marks it live. ``keepalive`` comes
-            # from the YAML declaration; ``pin`` is forced True regardless of
-            # ``server.pin`` — MCP sessions are framework-managed (created at
-            # startup, released at ``aclose``) and must not be reclaimed
-            # mid-chat. The reaper's anyio cancel scopes during MCP teardown
-            # crash prompt_toolkit's background tasks.
+            # from the YAML declaration; ``pin`` is forced True — MCP sessions
+            # are framework-managed (created at startup, released at
+            # ``aclose``) and must not be reclaimed mid-chat. The reaper's
+            # anyio cancel scopes during MCP teardown crash prompt_toolkit's
+            # background tasks. (``MCPServer`` had a ``pin`` field historically
+            # but it was never honoured; removed in #287.)
             handle_cls = type(
                 f"MCPSessionHandle_{server._label}",
                 (MCPSessionHandle,),

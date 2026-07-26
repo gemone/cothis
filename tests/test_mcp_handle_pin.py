@@ -73,10 +73,18 @@ def _patch_in_memory_transport(
 
 
 @pytest.mark.asyncio
-async def test_mcp_handle_is_pinned_regardless_of_server_pin(
+async def test_mcp_handle_is_pinned_at_adopt_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Even with ``server.pin=False``, the adopted handle is pinned."""
+    """MCP session handles are always pinned — framework-managed lifecycle.
+
+    Pinning is forced by ``Agent._ensure_mcp`` because MCP sessions are
+    created at startup + released at ``aclose``. The reaper must not
+    reclaim them mid-chat (anyio cancel scopes during teardown crash
+    prompt_toolkit). Historically ``MCPServer`` had a ``pin`` field
+    that was silently ignored; it's removed (#287), but the forced
+    behaviour is unchanged.
+    """
     from cothis.agent import Agent
     from cothis.tools.mcp import MCPServer
 
@@ -84,7 +92,7 @@ async def test_mcp_handle_is_pinned_regardless_of_server_pin(
     fastmcp = _make_server()
     _patch_in_memory_transport(monkeypatch, fastmcp)
 
-    server = MCPServer(name="mcp:test", params=None, pin=False)
+    server = MCPServer(name="mcp:test", params=None)
     agent = Agent(model="x", provider="openrouter", tools=[server])
     await agent._ensure_mcp()
     try:
@@ -94,7 +102,7 @@ async def test_mcp_handle_is_pinned_regardless_of_server_pin(
         cls = getattr(tool, "_handle_cls")
         slot = agent._handle_manager._slots[cls]
         assert cls.pin is True, (
-            "MCPSessionHandle must be pinned regardless of server.pin"
+            "MCPSessionHandle must be pinned at adopt time"
         )
         assert slot.is_pinned, (
             "adopted slot must report is_pinned=True so the reaper skips it"
@@ -117,7 +125,7 @@ async def test_mcp_handle_not_reclaimed_by_reaper(
     fastmcp = _make_server()
     _patch_in_memory_transport(monkeypatch, fastmcp)
 
-    server = MCPServer(name="mcp:test", params=None, pin=False)
+    server = MCPServer(name="mcp:test", params=None)
     agent = Agent(model="x", provider="openrouter", tools=[server])
     await agent._ensure_mcp()
     try:
