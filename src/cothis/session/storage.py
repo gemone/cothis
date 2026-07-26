@@ -204,13 +204,35 @@ def is_visible(session_cwd: Path, observer_cwd: Path) -> bool:
     Single source of truth: ``Storage.list_sessions_in_cwd_tree``,
     ``Session.load(cwd=...)``, and the ``cothis history <id>`` picker
     all call this helper.
+
+    For loops over many sessions, call ``_is_visible_with_resolved_observer``
+    directly with ``observer_cwd.resolve()`` computed once outside the
+    loop — see ``list_sessions_in_cwd_tree`` for the pattern. Hoisting
+    the resolution saves N×D lstat syscalls (N rows × D path components
+    in observer_cwd) on a 10k-session history list (#331).
+    """
+    try:
+        return _is_visible_with_resolved_observer(
+            session_cwd, observer_cwd.resolve(),
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _is_visible_with_resolved_observer(
+    session_cwd: Path, observer_cwd_resolved: Path,
+) -> bool:
+    """Fast-path ``is_visible`` for callers that have pre-resolved ``observer_cwd``.
+
+    ``observer_cwd_resolved`` must already be absolute + symlink-free
+    (caller did the ``.resolve()`` once). ``session_cwd`` is resolved
+    here per call because it varies per row.
     """
     try:
         s = session_cwd.resolve()
-        o = observer_cwd.resolve()
     except (OSError, ValueError):
         return False
-    return o == s or o.is_relative_to(s)
+    return observer_cwd_resolved == s or observer_cwd_resolved.is_relative_to(s)
 
 
 def display_cwd(session_cwd: Path, observer_cwd: Path) -> str:
@@ -467,7 +489,19 @@ class Storage:
         back to ``created_at`` desc, then ``id`` for determinism.
         """
         all_rows = self.list_sessions()
-        visible = [row for row in all_rows if is_visible(Path(row.cwd), cwd)]
+        # Hoist ``cwd.resolve()`` out of the per-row filter: observer_cwd
+        # is invariant across the comprehension, so resolving it once
+        # saves N×D lstat syscalls (N rows × D path components in
+        # observer_cwd). On a 10k-session DB with a 4-deep observer_cwd
+        # that's 40,000 → 4 syscalls. See #331.
+        try:
+            cwd_resolved = cwd.resolve()
+        except (OSError, ValueError):
+            return []
+        visible = [
+            row for row in all_rows
+            if _is_visible_with_resolved_observer(Path(row.cwd), cwd_resolved)
+        ]
         visible.sort(key=lambda r: (r.updated_at, r.created_at, r.id), reverse=True)
         return visible
 
