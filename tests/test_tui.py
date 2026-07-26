@@ -1655,8 +1655,9 @@ async def test_worktree_picker_renders_one_button_per_worktree_plus_cancel() -> 
         assert "feature/x" in labels
         assert "detached" in labels
         assert "Cancel" in labels
-        # One button per worktree + 1 Cancel.
-        assert len(buttons) == len(worktrees) + 1
+        assert "Current directory" in labels
+        # One button per worktree + 1 Current-directory fallback + 1 Cancel.
+        assert len(buttons) == len(worktrees) + 2
 
         modal.action_dismiss_modal()
         await pilot.pause()
@@ -1739,6 +1740,51 @@ async def test_worktree_picker_cancel_dismisses_with_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_worktree_picker_current_dir_dismisses_with_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``Current directory`` button dismisses with ``str(Path.cwd())``.
+
+    Fallback path for non-git cwds (no worktrees) + a quick "just use
+    here" option when worktrees ARE available. The dismiss value is
+    ``Path.cwd()`` as a string — same shape as the worktree paths, so
+    ``on_worktree_pick`` handles both uniformly.
+    """
+    from textual.widgets import Button
+
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    monkeypatch.chdir(tmp_path)
+    captured: list[str | None] = []
+
+    def on_dismiss(value: str | None) -> None:
+        captured.append(value)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Even with worktrees present, the cwd button shows — it's a
+        # first-class fallback, not just for the empty-list case.
+        app.push_screen(
+            WorktreePickerModal([Worktree(Path("/repo/main"), "main")]),
+            on_dismiss,
+        )
+        await pilot.pause()
+
+        modal = app.screen
+        cwd_button = next(
+            b for b in modal.query(Button) if b.id == "worktree-cwd"
+        )
+        await pilot.click(cwd_button)
+        await pilot.pause()
+
+    assert captured == [str(tmp_path)], (
+        f"cwd button should dismiss with str(Path.cwd()); got {captured}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_worktree_picker_empty_list_renders_only_cancel() -> None:
     """AC #234 slice B: empty worktree list → just the Cancel button.
 
@@ -1762,8 +1808,10 @@ async def test_worktree_picker_empty_list_renders_only_cancel() -> None:
         assert isinstance(modal, WorktreePickerModal)
 
         buttons = list(modal.query(Button))
-        assert len(buttons) == 1
-        assert buttons[0].id == "worktree-cancel"
+        # Empty list: just the current-directory fallback + Cancel.
+        assert len(buttons) == 2
+        button_ids = {b.id for b in buttons}
+        assert button_ids == {"worktree-cwd", "worktree-cancel"}
 
         # Empty-list label points the user at the fix outside cothis.
         # Plain-text comparison via ``str(content)`` — Textual's Label

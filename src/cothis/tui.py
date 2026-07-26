@@ -429,11 +429,11 @@ class WorktreePickerModal(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         if not self._worktrees:
             # Empty-list UX: the default "Pick a worktree" label would
-            # mislead — there's nothing to pick. The hint suggests the
-            # user add a worktree outside the TUI; cothis only discovers
-            # worktrees, it doesn't create them (out of scope per #234).
+            # mislead — there's nothing to pick. The current-directory
+            # button is the only useful option here (besides Cancel).
             yield Label(
-                "No worktrees found. Run `git worktree add <path>` outside cothis, then retry.",
+                "No worktrees found. Pick the current directory below, "
+                "or run `git worktree add <path>` outside cothis, then retry.",
                 id="worktree-prompt",
             )
         else:
@@ -444,6 +444,11 @@ class WorktreePickerModal(ModalScreen[str | None]):
             for i, wt in enumerate(self._worktrees):
                 label = wt.branch or wt.path.name
                 yield Button(label, id=f"wt-{i}")
+        # Always-present fallback: a session scoped to the current cwd
+        # (the directory the TUI was launched from). Gives users a path
+        # forward in a non-git cwd, and a quick "just use here" option
+        # even when worktrees are available.
+        yield Button("Current directory", id="worktree-cwd")
         yield Button("Cancel", id="worktree-cancel")
 
     def action_dismiss_modal(self) -> None:
@@ -453,6 +458,8 @@ class WorktreePickerModal(ModalScreen[str | None]):
         bid = event.button.id or ""
         if bid == "worktree-cancel":
             self.dismiss(None)
+        elif bid == "worktree-cwd":
+            self.dismiss(str(Path.cwd()))
         elif bid.startswith("wt-"):
             idx = int(bid[len("wt-") :])
             self.dismiss(str(self._worktrees[idx].path))
