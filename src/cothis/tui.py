@@ -970,9 +970,17 @@ class CothisApp(App):
             })))
 
 
-def run() -> None:
-    """Entry point: ``python -m cothis.tui``."""
-    app = CothisApp()
+def run(app: CothisApp | None = None) -> None:
+    """Entry point: ``python -m cothis.tui``.
+
+    ``app`` lets a caller (e.g. the CLI ``tui`` command) pass a
+    subclass of ``CothisApp`` with hooks overridden for production
+    wiring (Supervisor-backed spawn, real session routing). Default
+    is a bare ``CothisApp`` — useful for development, tests, and
+    scenarios where the TUI runs without a Supervisor.
+    """
+    if app is None:
+        app = CothisApp()
     app.run()
 
 
