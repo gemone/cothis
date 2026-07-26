@@ -18,6 +18,7 @@ lifecycle hooks. See ADR-0005 §2 (deferred connect) and §4 (name prefix).
 
 from __future__ import annotations
 
+import asyncio
 import re
 import shutil
 from pathlib import Path
@@ -317,6 +318,27 @@ class MCPServer(_HookableTool):
         before = set(tools_attr)
         try:
             session = await group.connect_to_server(self.params)
+        except asyncio.CancelledError:
+            # cothis: a sibling task in the MCP SDK's task group died
+            # (typically the post_writer task on a flaky remote HTTP
+            # transport), anyio cancelled the group, and the handshake
+            # await surfaced CancelledError. Since 3.8 CancelledError
+            # inherits from BaseException (not Exception), the broad
+            # ``Exception`` clause below does NOT catch it — without this
+            # branch it escapes connect_into → _ensure_mcp and cancels the
+            # whole agent turn, blocking even unrelated local tools
+            # (fs.read / fs.delete). Same treatment as
+            # HandleManager._release (core.py, the #185 fix). The server
+            # contributes no tools; the rest of the agent's tools still
+            # load (#370).
+            detail = f" ({self._diagnostic})" if self._diagnostic else ""
+            logger.warning(
+                "MCP server %r handshake cancelled%s (likely a flaky remote "
+                "transport); contributing no tools.",
+                self.__name__,
+                detail,
+            )
+            return [], None
         except Exception as exc:  # noqa: BLE001 — any startup failure is non-fatal
             detail = f" ({self._diagnostic})" if self._diagnostic else ""
             logger.warning(
