@@ -495,48 +495,75 @@ def _tool_uses_in(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _init_stream_block(content_block: Any) -> dict[str, Any]:
     """Seed a block dict from ``ContentBlockStartEvent.content_block``.
 
-    The start event's ``content_block`` already carries the block's type and
-    initial fields (``ToolUseBlock``: ``id``/``name``/``input={}``;
-    ``TextBlock``: ``text=""``; ``ThinkingBlock``: ``thinking=""``). Dump it
-    and add a private ``_input_json`` accumulator for ``tool_use`` partials.
+    The start event's ``content_block`` carries the block's type and initial
+    fields (``ToolUseBlock``: ``id``/``name``/``input={}``; ``TextBlock``:
+    ``text=""``; ``ThinkingBlock``: ``thinking=""``). Dump it and seed a
+    ``list[str]`` accumulator for the per-delta field (#376): appending to a
+    list is O(1), where the previous dict-held ``str`` concat was O(N²) —
+    the dict-held ref has refcount ≥ 2, so CPython's in-place concat never
+    fires and each token copies the whole accumulator. The buffer is joined
+    once in ``_finalize_stream_block``.
     """
     d = content_block.model_dump(exclude_none=True)
-    if d.get("type") == "tool_use":
-        d["_input_json"] = ""
+    btype = d.get("type")
+    if btype == "tool_use":
+        d["_input_json_buf"] = []
+    elif btype == "text":
+        d["_text_buf"] = []
+    elif btype == "thinking":
+        d["_thinking_buf"] = []
     return d
 
 
 def _apply_stream_delta(block: dict[str, Any], delta: Any) -> None:
     """Accumulate one ``ContentBlockDeltaEvent.delta`` into ``block`` in place.
 
-    ``TextDelta``/``ThinkingDelta`` append; ``SignatureDelta`` overwrites (it
-    carries the block's final signature, finalised at ``content_block_stop`` —
-    appending would corrupt it); ``InputJSONDelta`` appends to the private
-    ``_input_json`` string, parsed by ``_finalize_stream_block``.
+    Text/thinking/input-json deltas append to a ``list[str]`` buffer (#376),
+    joined once at ``_finalize_stream_block`` — O(1) per token instead of the
+    O(N²) dict-held ``str`` concat. ``SignatureDelta`` overwrites (it carries
+    the block's final signature, finalised at ``content_block_stop`` —
+    appending would corrupt it). ``setdefault`` keeps a misrouted delta from
+    crashing mid-stream (the buffer is normally seeded by
+    ``_init_stream_block`` for the matching block type).
     """
     dtype = delta.type
     if dtype == "text_delta":
-        block["text"] = block.get("text", "") + delta.text
+        block.setdefault("_text_buf", []).append(delta.text)
     elif dtype == "thinking_delta":
-        block["thinking"] = block.get("thinking", "") + delta.thinking
+        block.setdefault("_thinking_buf", []).append(delta.thinking)
     elif dtype == "signature_delta":
         block["signature"] = delta.signature
     elif dtype == "input_json_delta":
-        block["_input_json"] = block.get("_input_json", "") + delta.partial_json
+        block.setdefault("_input_json_buf", []).append(delta.partial_json)
 
 
 def _finalize_stream_block(block: dict[str, Any]) -> None:
-    """Parse a ``tool_use`` block's accumulated ``_input_json`` into ``input``."""
-    if block.get("type") != "tool_use":
-        return
-    raw = block.pop("_input_json", "")
-    # cothis: partial_json should be complete JSON by content_block_stop.
-    # Malformed → empty dict so dispatch surfaces a clean error rather than
-    # crashing mid-stream. Upgrade path: surface the bad JSON to the model.
-    try:
-        block["input"] = json.loads(raw) if raw else {}
-    except json.JSONDecodeError:
-        block["input"] = {}
+    """Join the per-delta list buffers into the block's final fields (#376).
+
+    Text/thinking: the accumulated deltas are joined onto the block's field
+    (the start-event field is ``""``, so this is just the joined deltas).
+    tool_use: the ``_input_json_buf`` partials are joined and parsed into
+    ``input``. The finalized block shape is unchanged for
+    ``_coalesce_content`` / ``_request_messages`` / storage — only the
+    accumulation strategy changed, not the result.
+    """
+    btype = block.get("type")
+    if btype == "text":
+        block["text"] = block.get("text", "") + "".join(block.pop("_text_buf", []))
+    elif btype == "thinking":
+        block["thinking"] = block.get("thinking", "") + "".join(
+            block.pop("_thinking_buf", [])
+        )
+    elif btype == "tool_use":
+        raw = "".join(block.pop("_input_json_buf", []))
+        # cothis: partial_json should be complete JSON by content_block_stop.
+        # Malformed → empty dict so dispatch surfaces a clean error rather
+        # than crashing mid-stream. Upgrade path: surface the bad JSON to the
+        # model.
+        try:
+            block["input"] = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            block["input"] = {}
 
 
 @dataclass(frozen=True)

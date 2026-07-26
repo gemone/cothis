@@ -305,14 +305,16 @@ def test_init_stream_block_seeds_tool_use_with_input_accumulator() -> None:
         ToolUseBlock(type="tool_use", id="tu1", name="add", input={})
     )
     assert block["type"] == "tool_use"
-    assert block["_input_json"] == ""
+    assert block["_input_json_buf"] == []
 
 
 def test_apply_delta_text_appends() -> None:
     block = {"type": "text", "text": ""}
     _apply_stream_delta(block, TextDelta(type="text_delta", text="Hel"))
     _apply_stream_delta(block, TextDelta(type="text_delta", text="lo"))
+    _finalize_stream_block(block)
     assert block["text"] == "Hello"
+    assert "_text_buf" not in block
 
 
 def test_apply_delta_input_json_accumulates_then_finalize_parses() -> None:
@@ -321,7 +323,6 @@ def test_apply_delta_input_json_accumulates_then_finalize_parses() -> None:
         "id": "tu1",
         "name": "add",
         "input": {},
-        "_input_json": "",
     }
     _apply_stream_delta(
         block, InputJSONDelta(type="input_json_delta", partial_json='{"a"')
@@ -331,7 +332,7 @@ def test_apply_delta_input_json_accumulates_then_finalize_parses() -> None:
     )
     _finalize_stream_block(block)
     assert block["input"] == {"a": 2}
-    assert "_input_json" not in block
+    assert "_input_json_buf" not in block
 
 
 def test_apply_delta_signature_overwrites_not_appends() -> None:
@@ -352,7 +353,9 @@ def test_apply_delta_thinking_appends() -> None:
     _apply_stream_delta(
         block, ThinkingDelta(type="thinking_delta", thinking=" ...")
     )
+    _finalize_stream_block(block)
     assert block["thinking"] == "hm ..."
+    assert "_thinking_buf" not in block
 
 
 def test_finalize_stream_block_malformed_json_falls_back_to_empty() -> None:
@@ -361,7 +364,7 @@ def test_finalize_stream_block_malformed_json_falls_back_to_empty() -> None:
         "id": "tu1",
         "name": "x",
         "input": {},
-        "_input_json": "{bad",
+        "_input_json_buf": ["{bad"],
     }
     _finalize_stream_block(block)
     assert block["input"] == {}
@@ -371,6 +374,75 @@ def test_finalize_stream_block_noop_for_text() -> None:
     block = {"type": "text", "text": "hi"}
     _finalize_stream_block(block)  # must not raise or mutate
     assert block == {"type": "text", "text": "hi"}
+
+
+def test_apply_stream_delta_accumulation_is_linear_not_quadratic() -> None:
+    """#376: 4× the delta count must stay ~linear, not quadratic.
+
+    The old dict-held ``block["text"] = block.get("text", "") + delta`` was
+    O(N²): the dict-held ref has refcount ≥ 2, so CPython's in-place concat
+    never fires and each token copies the whole accumulator. The list-buffer
+    accumulator is O(N): 4× input → ~4× wall, not the ~12-55× the quadratic
+    form produces once the string-copy cost dominates (measured at this 8k→32k
+    range). Mirrors the consumer-side guard
+    ``test_append_delta_segmented_streaming_is_linear_not_quadratic`` (#267);
+    this is the producer-side equivalent the original fix missed.
+    """
+    import time
+
+    delta = TextDelta(type="text_delta", text="abcd ")
+
+    def _run(n: int) -> float:
+        block = {"type": "text", "text": ""}
+        t0 = time.perf_counter()
+        for _ in range(n):
+            _apply_stream_delta(block, delta)
+        _finalize_stream_block(block)
+        return time.perf_counter() - t0
+
+    t_small = _run(8000)
+    t_large = _run(32000)
+    ratio = t_large / t_small if t_small > 0 else float("inf")
+    assert ratio <= 8.0, (
+        f"expected ≤8× slowdown on 4× deltas (linear); got {ratio:.2f}× "
+        f"(small={t_small * 1000:.1f}ms, large={t_large * 1000:.1f}ms) — "
+        f"accumulator is O(N²)"
+    )
+
+
+def test_finalized_blocks_match_naive_concat() -> None:
+    """#376 AC: finalized text/thinking/input is byte-identical to the old form.
+
+    Only the accumulation strategy changed (list+join vs per-token str concat);
+    the finalized block dict must match what the previous form produced, so
+    ``_coalesce_content`` / ``_request_messages`` / session storage/replay are
+    unaffected.
+    """
+    # text
+    block = {"type": "text", "text": ""}
+    parts = ["Hel", "lo, ", "world", "!"]
+    for p in parts:
+        _apply_stream_delta(block, TextDelta(type="text_delta", text=p))
+    _finalize_stream_block(block)
+    assert block["text"] == "".join(parts)
+
+    # thinking
+    block = {"type": "thinking", "thinking": "", "signature": ""}
+    parts = ["hm", " ...", " think"]
+    for p in parts:
+        _apply_stream_delta(block, ThinkingDelta(type="thinking_delta", thinking=p))
+    _finalize_stream_block(block)
+    assert block["thinking"] == "".join(parts)
+
+    # tool_use input — JSON split across partials
+    block = {"type": "tool_use", "id": "tu1", "name": "x", "input": {}}
+    partials = ['{"pa', 'th": "/x', '.py", ', '"n": 3}']
+    for p in partials:
+        _apply_stream_delta(
+            block, InputJSONDelta(type="input_json_delta", partial_json=p)
+        )
+    _finalize_stream_block(block)
+    assert block["input"] == json.loads("".join(partials))
 
 
 # --- run() turn decision ----------------------------------------------------
