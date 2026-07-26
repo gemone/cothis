@@ -394,6 +394,10 @@ read automatically by `any-llm` based on the chosen provider.
 | `COTHIS_AGENTS_PATTERN`    | Comma-separated filenames scanned for the AGENTS.md context block (first match per layer wins). | `AGENTS.md` |
 | `COTHIS_AGENTS_ORDER`      | Ordered layer names for AGENTS.md assembly. Unknown names are skipped. | `user-agents,user-cothis,project` |
 | `COTHIS_AGENTS_USER_GLOBAL`| If falsy (`0`/`false`/`no`/`off`), skip the user-global layers (`~/.agents`, `~/.cothis`). | `1` |
+| `COTHIS_HOME`              | Root for user-global state: tools, skills, agents.db, supervisor.db. | `~/.cothis` |
+| `COTHIS_SESSIONS_TYPE`     | Set to `project` to scope sessions to `<cwd>/.agents/sessions/session.db` (per-project layout). | *(unset — single global db)* |
+| `COTHIS_SESSIONS_DIR`      | Override the sessions directory (split layout: `<dir>/session.db`). | *(unset)* |
+| `COTHIS_PROFILE_STARTUP`   | If set, re-exec under `-X importtime` and exit before any third-party import. Startup-latency profiling. | *(unset)* |
 | `DEBUG`                    | If truthy, show all debug logs + tracebacks. | *(unset)*           |
 | `VERBOSE`                  | If truthy, show cothis tool-call I/O (no openai/httpx noise). | *(unset)* |
 
