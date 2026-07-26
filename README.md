@@ -109,6 +109,24 @@ Run `cothis --help`, `cothis ask --help`, or `cothis chat --help` for
 the full list of flags.
 
 
+### `tui` — Textual TUI (opt-in)
+
+```bash
+uv run cothis tui
+```
+
+The Textual TUI is the future default (the legacy REPL stays until
+feature parity lands via #237). It offers a 3-pane layout —
+`SessionList` (left) + `ConversationView` (center) + `InputBar`
+(bottom) — and supports spawning sessions bound to git worktrees via
+the `n` keypress (Supervisor-backed, #234). The same `--model` /
+`--provider` flags apply as to `chat`.
+
+Still pre-parity — the TUI cannot yet drive a full multi-turn session
+with tool-call execution end-to-end. Use `chat` for production work;
+try `tui` to preview the UX.
+
+
 ## Custom tools
 
 cothis discovers shell tools as YAML files under `.agents/tools/` (relative
