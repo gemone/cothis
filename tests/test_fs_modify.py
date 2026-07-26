@@ -211,3 +211,34 @@ def test_fs_modify_description_has_example() -> None:
 
     desc = schema_for(_modify).get("description", "")
     assert "fs.modify(" in desc
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_leaves_no_temp_files_after_write(tmp_path: Path) -> None:
+    """AC #351: atomic write leaves no ``*.tmp`` orphan after success.
+
+    The write-temp-then-rename pattern creates a sibling temp file
+    during the write. After the rename succeeds, the temp should be
+    gone — if the cleanup path is broken (e.g., rename succeeds but
+    the temp isn't the same inode), orphans accumulate in the user's
+    source tree.
+
+    Regression guard: after a successful ``fs.modify``, the file's
+    directory should contain only the original file (no ``.tmp``).
+    """
+    from cothis.tools.fs.modify import _modify
+
+    f = _make_file(tmp_path, "target.py", 5)
+    dir_before = set(p.name for p in tmp_path.iterdir())
+
+    with workdir_context(tmp_path):
+        await _modify(path="target.py", start_line=2, end_line=3, content="replaced\n")
+
+    dir_after = set(p.name for p in tmp_path.iterdir())
+    # No new files should exist (temp file cleaned up by os.replace).
+    assert dir_after == dir_before, (
+        f"directory should be unchanged after atomic write; "
+        f"new files: {dir_after - dir_before}"
+    )
+    # The modification landed.
+    assert "replaced" in f.read_text()
