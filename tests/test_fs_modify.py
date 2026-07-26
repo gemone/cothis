@@ -273,3 +273,44 @@ async def test_fs_modify_preserves_file_permissions(tmp_path: Path) -> None:
         f"permissions should be preserved (was 0o{original_mode:o}); "
         f"got 0o{mode:o}"
     )
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_atomic_write_cleans_up_temp_on_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #351: if the rename crashes mid-write, the temp is cleaned up + original is intact.
+
+    The ``except BaseException`` block in ``_atomic_write_text`` calls
+    ``os.unlink(tmp_path)`` on any failure. Without it, a crashed
+    ``os.replace`` would leave a ``*.tmp`` orphan in the user's source
+    tree. This test simulates the crash + verifies both the cleanup
+    AND the original file's content survived.
+    """
+    import os as os_mod
+
+    from cothis.tools.fs.modify import _modify
+
+    f = _make_file(tmp_path, "target.py", 5)
+    original_content = f.read_text()
+
+    # Crash during the rename step.
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash during os.replace")
+
+    monkeypatch.setattr(os_mod, "replace", boom)
+
+    with workdir_context(tmp_path):
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await _modify(path="target.py", start_line=1, end_line=1, content="replaced\n")
+
+    # Original file is untouched (the rename never succeeded).
+    assert f.read_text() == original_content, (
+        "original content should survive a crashed rename"
+    )
+    # No temp file orphaned in the directory.
+    files = list(tmp_path.iterdir())
+    assert all(not p.name.endswith(".tmp") for p in files), (
+        f"temp file should be cleaned up after crash; found: "
+        f"{[p.name for p in files if p.name.endswith('.tmp')]}"
+    )
