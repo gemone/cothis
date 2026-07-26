@@ -8,7 +8,7 @@ can add more as YAML shell tools, Python `@tool` functions, or MCP servers
 under `.agents/tools/` (see [Custom tools](#custom-tools)).
 
 - `cothis ask "..."` — one-shot prompt, plain-text output (pipe-friendly).
-- `cothis chat` — interactive multi-turn session, streamed Markdown output.
+- `cothis chat` — interactive multi-turn session in the Textual TUI (3-pane layout, worktree-aware sessions, `--legacy` for the old REPL).
 
 Requires Python ≥ 3.14.
 
