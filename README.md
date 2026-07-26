@@ -103,12 +103,17 @@ uv run cothis chat -m anthropic/claude-3.5-haiku
 ```
 
 The same `--provider` / `-p`, `--model` / `-m` flags apply as to `ask`.
-
-`--legacy` keeps the old REPL (for `--resume` / `--skill` which the TUI
-doesn't yet support):
+`--resume` also works in the TUI (auto-spawns the session on startup):
 
 ```bash
-uv run cothis chat --legacy --resume <session_id>
+uv run cothis chat --resume <session_id>
+```
+
+`--legacy` keeps the old REPL (for `--skill` which the TUI doesn't yet
+support):
+
+```bash
+uv run cothis chat --legacy --skill <name>
 ```
 
 Run `cothis --help`, `cothis ask --help`, or `cothis chat --help` for
