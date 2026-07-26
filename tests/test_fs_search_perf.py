@@ -71,3 +71,38 @@ def test_wall_clock_cap_returns_partial_results_across_many_files(
     # Partial results — the cap fired before all 5000 were scanned.
     assert isinstance(result, list)
     assert 0 <= len(result) < 5000
+
+
+def test_walk_and_prune_skips_ignored_dirs(tmp_path: Path) -> None:
+    """AC #321: ``os.walk`` + ``dirnames[:]`` pruning skips descent into ``_IGNORED_DIRS``.
+
+    Regression guard for the walk-and-prune refactor. Before: ``root.rglob("*")``
+    yielded files under ``node_modules/`` / ``.git/`` / ``.venv/`` etc., then
+    filtered them per-path. After: descent never enters those dirs.
+
+    Test shape: place a unique pattern in BOTH a regular file AND a file inside
+    ``node_modules/``. Only the regular file's match should be returned — the
+    node_modules file is never visited because the dir is pruned during walk.
+    """
+    from cothis.tools.fs._hygiene import workdir_context
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("NEEDLE_FOUND_IN_SRC\n", encoding="utf-8")
+    # File inside an ignored dir — would match the same pattern, but the walker
+    # should never descend into node_modules to read it.
+    nm_dir = tmp_path / "node_modules" / "pkg"
+    nm_dir.mkdir(parents=True)
+    (nm_dir / "should_not_scan.js").write_text(
+        "NEEDLE_FOUND_IN_SRC\n", encoding="utf-8"
+    )
+
+    with workdir_context(tmp_path):
+        result = fs_search(pattern="NEEDLE_FOUND_IN_SRC", path=".", max_results=10)
+
+    assert isinstance(result, list)
+    # Exactly one match — the src/app.py one. The node_modules copy was never visited.
+    assert len(result) == 1, (
+        f"expected 1 match (src/app.py only); got {len(result)}: {result}"
+    )
+    assert "src/app.py" in result[0]["file"]
+    assert "node_modules" not in result[0]["file"]
