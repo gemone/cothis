@@ -265,10 +265,10 @@ Letting the user start a session bound to a specific git worktree:
 
 1. **Keypress** — `n` triggers `action_new_session` (slice A).
 2. **Discover** — `list_worktrees(cwd)` runs `git worktree list --porcelain` (5s timeout; empty list when not a repo / git missing / timeout).
-3. **Pick** — `on_new_session(worktrees)` pushes `WorktreePickerModal` (slice B + C). One button per worktree (label = branch name, or path basename for detached HEAD); Cancel/Esc dismisses with `None`.
-4. **Route** — `on_worktree_pick(path)` is the contract for "create a session bound to this cwd" (slice D). Default: log. Slice E (CLI integration) will override to call `Supervisor.spawn_worker` + `SessionStorage.new` + `attach_session_ws`.
+3. **Pick** — `on_new_session(worktrees)` pushes `WorktreePickerModal` (slice B + C). One button per worktree (label = branch name, or path basename for detached HEAD) + a always-present "Current directory" fallback (dismisses with `str(Path.cwd())` — the path forward in a non-git cwd) + Cancel/Esc (dismisses with `None`).
+4. **Route** — `on_worktree_pick(path)` is the contract for "create a session bound to this cwd" (slice D). The CLI's `_DrivenCothisApp` overrides it (slice E, `cothis.cli`) to call `Supervisor.spawn_worker` + `Session.new` + `attach_session_ws`.
 
-`SessionList` already enriches each row with `· branch:<name>` via `find_worktree_for_path` — that's the read-only display side. Sessions filterable/groupable by worktree is filed as #234 slice F.
+`SessionList` enriches each row with `· branch:<name>` via `find_worktree_for_path` (display side) and sorts by cwd for visual grouping by worktree (slice F).
 
 ## Interactive ask_user flow (#229)
 
