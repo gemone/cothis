@@ -22,8 +22,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import yaml
-
 from cothis.slash import SlashContext
 from cothis.slash import register as slash_register
 from cothis.tools.core import tool
@@ -142,6 +140,11 @@ def _parse_skill_md(path: Path) -> Skill | None:
 
     raw_yaml = match.group(1)
     body = text[match.end():]
+
+    # Lazy import: yaml costs ~18ms cold. Skill parsing only fires when
+    # ``discover_skills`` finds a ``SKILL.md`` to parse; users with no
+    # installed skills (the common case) pay $0 (#279).
+    import yaml
 
     try:
         meta = yaml.safe_load(raw_yaml)

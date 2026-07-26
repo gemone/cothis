@@ -4,7 +4,9 @@ Extracted from the original ``tools.py``. ``format_tool_output`` is called by
 ``Agent._execute`` on every structured (dict/list) tool result; the format is
 chosen via ``COTHIS_TOOL_OUTPUT_FORMAT`` (``json`` | ``csv`` | ``tsv`` |
 ``yaml``), defaulting to ``json``. Has no dependency on the rest of the tools
-package — only stdlib (``csv``/``io``/``json``/``os``) plus ``yaml``.
+package — only stdlib (``csv``/``io``/``json``/``os``). ``yaml`` is imported
+lazily inside the YAML branch (#279): ~18ms cold-start cost on every ``cothis``
+invocation, paid only by users who opt into ``COTHIS_TOOL_OUTPUT_FORMAT=yaml``.
 """
 
 from __future__ import annotations
@@ -14,8 +16,6 @@ import io
 import json
 import os
 from typing import TYPE_CHECKING
-
-import yaml
 
 if TYPE_CHECKING:
     from typing import Any
@@ -95,6 +95,10 @@ def format_tool_output(result: Any) -> str:
         if rendered is not None:
             return rendered
     if fmt == "yaml":
+        # Lazy import: yaml costs ~18ms cold and only the YAML branch needs it.
+        # The default json/csv/tsv paths never touch it (#279).
+        import yaml
+
         # ``allow_unicode=True`` keeps CJK / emoji readable; ``sort_keys=False``
         # preserves insertion order so the model sees fields in the author's
         # intended order.
