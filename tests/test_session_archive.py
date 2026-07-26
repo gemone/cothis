@@ -19,8 +19,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import pytest
-
 from cothis.session import Session
 from cothis.session.archive import (
     ArchiveIndex,
@@ -34,6 +32,8 @@ if TYPE_CHECKING:
     import json
     from pathlib import Path
     from typing import Any
+
+    import pytest
 
 
 # ---------------------------------------------------------------------
@@ -377,3 +377,108 @@ def test_validate_archive_db_rejects_traversal(tmp_path: Path) -> None:
     # in depth for symlinked archives the regex happens to allow.
     assert _validate_archive_db("../../etc/passwd", archive_dir) is False
     assert _validate_archive_db("/etc/passwd", archive_dir) is False
+
+
+# ---------------------------------------------------------------------
+# Batch VACUUM optimisation (#302)
+#
+# ``run_archival_pass`` previously called ``archive_session`` once per
+# idle session, and ``archive_session`` ran ``VACUUM`` at the end of
+# every call. For N sessions on a hot DB of size M, that was O(N×M)
+# disk I/O — a 100 MB DB + 50 idle sessions = 5 GB of writes per pass.
+#
+# Fix: ``archive_session(vacuum=False)`` per call + one ``VACUUM`` after
+# the loop → O(M) total. The per-call ``vacuum=True`` default is kept
+# for the single-session CLI path (``cothis archive <id>``) where the
+# user is waiting on the reclaim.
+# ---------------------------------------------------------------------
+
+
+def test_archive_session_vacuum_false_skips_vacuum(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #302: ``archive_session(vacuum=False)`` skips the per-call VACUUM.
+
+    Captures SQL statements via ``Connection.set_trace_callback`` and
+    asserts no ``VACUUM`` is issued when ``vacuum=False``. Default
+    (``vacuum=True``) still fires one VACUUM — that contract is the
+    single-session CLI path.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "session.db"
+    sid = _seed_session(db_path, tmp_path, texts=["one"])
+    archive_dir = tmp_path / "archive"
+
+    # Wrap sqlite3.connect so we can capture SQL via set_trace_callback.
+    real_connect = sqlite3.connect
+    sql_log: list[str] = []
+
+    def tracking_connect(path, *args, **kwargs):
+        conn = real_connect(path, *args, **kwargs)
+        conn.set_trace_callback(lambda stmt: sql_log.append(stmt))
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    archive_session(
+        hot_db_path=db_path,
+        archive_dir=archive_dir,
+        session_id=sid,
+        archive_db_name="2026-07.db",
+        archived_at="2026-07-20T00:00:00+00:00",
+        index=ArchiveIndex(archive_dir / "index.json"),
+        vacuum=False,
+    )
+
+    vacuum_calls = [s for s in sql_log if s.strip().upper() == "VACUUM"]
+    assert vacuum_calls == [], (
+        f"vacuum=False must skip VACUUM; got {len(vacuum_calls)} call(s)"
+    )
+
+
+def test_run_archival_pass_vacuums_once_for_n_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #302: ``run_archival_pass`` issues ONE VACUUM regardless of N.
+
+    Pre-fix: ``archive_session`` ran VACUUM at the end of every call;
+    an N-session pass ran N VACUUMs. Post-fix: per-call VACUUM is
+    skipped + one batch VACUUM at the end.
+
+    Seeds 3 idle sessions + captures SQL — asserts exactly one VACUUM
+    fires across the whole pass.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "session.db"
+    archive_dir = tmp_path / "archive"
+
+    # Seed 3 sessions, each old enough to cross the threshold.
+    sids = [_seed_session(db_path, tmp_path, texts=[f"msg-{i}"]) for i in range(3)]
+    for sid in sids:
+        _set_updated_at(db_path, sid, "2020-01-01T00:00:00+00:00")
+    _clear_archive_state(db_path)
+
+    # Capture SQL via per-connection trace callback.
+    real_connect = sqlite3.connect
+    sql_log: list[str] = []
+
+    def tracking_connect(path, *args, **kwargs):
+        conn = real_connect(path, *args, **kwargs)
+        conn.set_trace_callback(lambda stmt: sql_log.append(stmt))
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+
+    run_archival_pass(
+        hot_db_path=db_path,
+        archive_dir=archive_dir,
+        threshold_days=1,
+        now_iso="2026-07-20T00:00:00+00:00",
+    )
+
+    vacuum_calls = [s for s in sql_log if s.strip().upper() == "VACUUM"]
+    assert len(vacuum_calls) == 1, (
+        f"expected 1 batch VACUUM; got {len(vacuum_calls)} "
+        f"(per-call VACUUMs not skipped?)"
+    )
