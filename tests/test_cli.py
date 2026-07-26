@@ -12,9 +12,15 @@ user-global) and the cross-layer ceiling (raises until #10/#11 land).
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from cothis.supervisor import Supervisor
 
 from cothis.agent import ToolCallEvent
 from cothis.cli import _format_tool_call
@@ -508,22 +514,137 @@ def test_tui_command_dispatches_to_cothis_tui_run(
 ) -> None:
     """AC #237: ``cothis tui`` launches the Textual app via ``cothis.tui.run``.
 
-    The test monkeypatches ``cothis.tui.run`` to a sentinel so the
-    actual Textual event loop isn't started (which would block the
-    test). Verifies the command is registered + dispatches correctly.
+    The test monkeypatches ``cothis.tui.run`` so the actual Textual event
+    loop isn't started (which would block the test). After slice E (#234),
+    ``tui`` passes a ``CothisApp`` subclass instance (``_DrivenCothisApp``)
+    into ``run`` rather than letting ``run`` construct a bare ``CothisApp``.
+    The test verifies the dispatch + that an app instance is passed.
     """
     import cothis.cli as cli_mod
     import cothis.tui as tui_mod
 
-    called: list[bool] = []
+    captured: list[object] = []
 
-    def fake_run() -> None:
-        called.append(True)
+    def fake_run(app: object | None = None) -> None:
+        captured.append(app)
 
     monkeypatch.setattr(tui_mod, "run", fake_run)
+    # Supervisor opens a SQLite DB at ``$COTHIS_HOME/supervisor.db`` by
+    # default. Stub its construction so the test doesn't touch the
+    # filesystem.
+    monkeypatch.setattr(
+        "cothis.supervisor.Supervisor",
+        lambda *a, **kw: object(),
+    )
 
     from typer.testing import CliRunner
     runner = CliRunner()
     result = runner.invoke(cli_mod.app, ["tui"])
     assert result.exit_code == 0, f"tui command failed: {result.output}"
-    assert called == [True], "cothis.tui.run was not called"
+    assert len(captured) == 1, (
+        f"cothis.tui.run was not called once; got {captured}"
+    )
+    assert captured[0] is not None, (
+        "tui command should pass a CothisApp subclass instance, not None"
+    )
+
+
+def test_driven_cothis_app_on_worktree_pick_spawns_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AC #234 slice E: ``_DrivenCothisApp.on_worktree_pick`` spawns a session bound to the picked cwd.
+
+    The driven app overrides slice D's logging stub with the real spawn
+    recipe: Session.new → Supervisor.spawn_worker → schedule
+    attach_session_ws. This test stubs Session + Supervisor so the
+    spawn args are verifiable without a real subprocess.
+    """
+    import cothis.cli as cli_mod
+
+    # Stub Session.new to avoid touching the filesystem.
+    sent_session_rows: list[dict] = []
+
+    class _FakeSession:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+
+        def append_message(self, role, content):  # noqa: ANN001
+            sent_session_rows.append({"role": role, "content": content})
+
+        def close(self) -> None:
+            pass
+
+    def fake_session_new(db_path, *, cwd, model, flush_sync):  # noqa: ANN001
+        return _FakeSession(session_id="deadbeef" * 4)
+
+    monkeypatch.setattr(
+        "cothis.session.Session.new", fake_session_new,
+    )
+
+    # Fake Supervisor that records spawn_worker args + returns a handle-like obj.
+    spawn_calls: list[dict] = []
+
+    class _FakeHandle:
+        ws_url = "ws://127.0.0.1:9999/agent"
+        token = "fake-bearer-token"
+
+    class _FakeSupervisor:
+        def spawn_worker(self, sid, *, model, provider, cwd, sessions_dir, extra_env):  # noqa: ANN001
+            spawn_calls.append({
+                "sid": sid,
+                "model": model,
+                "provider": provider,
+                "cwd": cwd,
+                "sessions_dir": sessions_dir,
+                "extra_env": extra_env,
+            })
+            return _FakeHandle()
+
+    # Stub ``asyncio.create_task`` so the scheduled attach doesn't run.
+    scheduled: list = []
+    monkeypatch.setattr(
+        "asyncio.create_task", lambda coro: scheduled.append(coro),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sup = _FakeSupervisor()
+    # ty needs a cast to accept the fake as the Supervisor parameter —
+    # the fake quacks like Supervisor for the spawn_worker call only.
+    from typing import cast
+
+    app = cli_mod._DrivenCothisApp.build(
+        supervisor=cast("Supervisor", sup),
+        sessions_dir=sessions_dir,
+        model="test-model",
+        provider="test-provider",
+        provider_env={"TEST_API_KEY": "val"},
+    )
+
+    # Stub ``attach_session_ws`` so the scheduled task doesn't try to use
+    # real WS infrastructure. It's enough that ``on_worktree_pick`` schedules it.
+    attach_calls: list = []
+    setattr(app, "attach_session_ws", lambda sid, ws_url, token: attach_calls.append((sid, ws_url, token)))
+
+    cwd = tmp_path / "worktree-feat"
+    cwd.mkdir()
+    app.on_worktree_pick(str(cwd))
+
+    # Session row seeded with a placeholder user message naming the cwd.
+    assert len(sent_session_rows) == 1
+    assert sent_session_rows[0]["role"] == "user"
+    assert "worktree-feat" in sent_session_rows[0]["content"][0]["text"]
+
+    # spawn_worker called once with the right args.
+    assert len(spawn_calls) == 1
+    call = spawn_calls[0]
+    assert call["sid"] == "deadbeef" * 4
+    assert call["model"] == "test-model"
+    assert call["provider"] == "test-provider"
+    assert call["cwd"] == cwd
+    assert call["sessions_dir"] == sessions_dir
+    assert call["extra_env"] == {"TEST_API_KEY": "val"}
+
+    # attach_session_ws scheduled (create_task was stubbed; verify the coro
+    # is what ``on_worktree_pick`` would have scheduled).
+    assert len(scheduled) == 1

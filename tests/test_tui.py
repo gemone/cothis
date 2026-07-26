@@ -1032,6 +1032,209 @@ async def test_action_new_session_passes_empty_list_when_not_in_git_repo(
     assert app.captured == []
 
 
+@pytest.mark.asyncio
+async def test_on_new_session_default_mounts_worktree_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 slice C: default ``on_new_session`` pushes ``WorktreePickerModal``.
+
+    Replaces the slice-A no-op stub. Now Ctrl-N → ``action_new_session``
+    → ``on_new_session`` mounts the picker (added in slice B) so the
+    user sees the worktree list. Slice D will wire session creation on
+    dismiss; this slice closes the "modal mounts" wiring contract.
+    """
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.on_new_session([Worktree(Path("/repo/main"), "main")])
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal), (
+            f"expected WorktreePickerModal on top; "
+            f"got {type(app.screen).__name__}"
+        )
+
+        modal.action_dismiss_modal()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_action_new_session_keypress_pushes_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 slice C: ``n`` keypress → ``action_new_session`` → picker mounts.
+
+    End-to-end via the actual keypress binding (``n``, not ``ctrl+n`` —
+    the binding was added in slice A). The default ``on_new_session``
+    mounts ``WorktreePickerModal``; the test verifies the modal is on
+    top of the screen stack after the keypress.
+    """
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    monkeypatch.setattr(
+        "cothis.git.list_worktrees",
+        lambda _cwd: [
+            Worktree(Path("/repo/main"), "main"),
+            Worktree(Path("/repo/feat"), "feature/x"),
+        ],
+    )
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal)
+
+        modal.action_dismiss_modal()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_on_worktree_pick_default_logs_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC #234 slice D: default ``on_worktree_pick`` logs the chosen path.
+
+    The hook is the contract for "create a session bound to this cwd"
+    — slice E (CLI integration) overrides it to call
+    ``Supervisor.spawn_worker`` etc. The default impl logs so the
+    wiring is observable without spawning, mirroring the other no-op
+    hooks (``on_session_selected``, ``on_menu_open``) that subclasses
+    override.
+    """
+    import logging
+
+    from cothis.tui import CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        with caplog.at_level(logging.INFO, logger="cothis.tui"):
+            app.on_worktree_pick("/repo/feature-branch")
+            await pilot.pause()
+
+    assert any(
+        "/repo/feature-branch" in r.getMessage() and "worktree picked" in r.getMessage()
+        for r in caplog.records
+    ), [
+        f"expected 'worktree picked' log with the path; "
+        f"got {[r.getMessage() for r in caplog.records]}"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_picker_dismiss_routes_to_on_worktree_pick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 slice D: ``WorktreePickerModal`` dismiss → ``on_worktree_pick``.
+
+    Subclass captures the routed path via ``on_worktree_pick`` (the
+    contract that slice E will override). The picker is mounted via
+    the default ``on_new_session`` (slice C); picking a button
+    dismisses + routes to the hook. Verifies the wiring end-to-end
+    without spawning.
+    """
+    from textual.widgets import Button
+
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    captured: list[str] = []
+
+    class _CapturingApp(CothisApp):
+        def on_worktree_pick(self, path: str) -> None:  # type: ignore[override]
+            captured.append(path)
+
+    monkeypatch.setattr(
+        "cothis.git.list_worktrees",
+        lambda _cwd: [
+            Worktree(Path("/repo/main"), "main"),
+            Worktree(Path("/repo/feat"), "feature/x"),
+        ],
+    )
+
+    app = _CapturingApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Mount the picker via the default on_new_session hook.
+        app.on_new_session([
+            Worktree(Path("/repo/main"), "main"),
+            Worktree(Path("/repo/feat"), "feature/x"),
+        ])
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal)
+
+        # Click the second worktree's button — routes to on_worktree_pick
+        # with that path (index-based ID per slice B).
+        feature_button = next(
+            b for b in modal.query(Button) if b.id == "wt-1"
+        )
+        await pilot.click(feature_button)
+        await pilot.pause()
+
+    assert captured == [str(Path("/repo/feat"))], (
+        f"expected on_worktree_pick to be called with /repo/feat; "
+        f"got {captured}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_picker_dismiss_cancel_does_not_call_on_worktree_pick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 slice D: cancelling the picker → ``on_worktree_pick`` NOT called.
+
+    Cancellation (Esc / Cancel button) is distinct from picking a
+    worktree. The ``on_new_session`` dismiss callback short-circuits
+    on ``None`` — so the hook isn't fired with a sentinel value the
+    caller would have to filter.
+    """
+    from textual.widgets import Button
+
+    from cothis.git import Worktree
+    from cothis.tui import CothisApp, WorktreePickerModal
+
+    captured: list[str] = []
+
+    class _CapturingApp(CothisApp):
+        def on_worktree_pick(self, path: str) -> None:  # type: ignore[override]
+            captured.append(path)
+
+    monkeypatch.setattr(
+        "cothis.git.list_worktrees",
+        lambda _cwd: [Worktree(Path("/repo/main"), "main")],
+    )
+
+    app = _CapturingApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.on_new_session([Worktree(Path("/repo/main"), "main")])
+        await pilot.pause()
+
+        modal = app.screen
+        assert isinstance(modal, WorktreePickerModal)
+
+        cancel_button = next(
+            b for b in modal.query(Button) if b.id == "worktree-cancel"
+        )
+        await pilot.click(cancel_button)
+        await pilot.pause()
+
+    assert captured == [], (
+        f"on_worktree_pick should not be called on cancel; got {captured}"
+    )
+
+
 # ---------------------------------------------------------------------
 # ask_user_request dispatch (#229 slice C) — TUI side. Worker-side
 # Future blocking is Slice D; modal UI is Slice E.

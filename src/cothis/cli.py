@@ -11,6 +11,7 @@ import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # Must run before cothis.agent imports any_llm.
 os.environ.setdefault("ANY_LLM_UNIFIED_EXCEPTIONS", "1")
@@ -658,19 +659,126 @@ def archive_cmd(
 # ---------------------------------------------------------------------
 
 
-@app.command()
-def tui() -> None:
-    """Launch the Textual TUI (3-pane layout + WS attach hooks).
+class _DrivenCothisApp:
+    """Production CothisApp wiring: spawn-on-pick via real Supervisor (#234 slice E).
 
-    Opt-in today (``chat`` still launches the legacy REPL). The TUI
-    exposes ``attach_ws`` / ``on_session_selected`` / ``on_new_session``
-    hooks (#275, #281, #284) that a caller wires to a Supervisor
-    (#274 spawn_worker) for end-to-end session driving. The picker
-    modal (#234) + interactive notify (#229) land in follow-ups.
+    Defined as a factory function (not a class statement at module level) because
+    it needs ``CothisApp`` which is imported lazily — Textual is heavy (~200ms)
+    and the CLI's other commands mustn't pay that cost on import. The factory
+    returns a ``CothisApp`` subclass whose ``on_worktree_pick`` runs the spawn
+    recipe (Session.new + Supervisor.spawn_worker + schedule attach_session_ws).
+
+    Tests construct the subclass directly via this factory + mock Supervisor /
+    Session to verify the spawn args without spawning real subprocesses.
     """
+
+    if TYPE_CHECKING:
+        from cothis.supervisor import Supervisor
+        from cothis.tui import CothisApp
+
+    @staticmethod
+    def build(
+        *,
+        supervisor: Supervisor,
+        sessions_dir: Path,
+        model: str,
+        provider: str,
+        provider_env: dict[str, str],
+    ) -> CothisApp:
+        """Return a ``CothisApp`` subclass instance with spawn wired into on_worktree_pick."""
+        import secrets
+
+        from cothis.session import Session
+        from cothis.tui import CothisApp
+
+        class _App(CothisApp):
+            def on_worktree_pick(self, path: str) -> None:  # type: ignore[override]
+                cwd = Path(path)
+                sessions_dir.mkdir(parents=True, exist_ok=True)
+                db_path = sessions_dir / f"session-{secrets.token_hex(8)}.db"
+                session = Session.new(
+                    db_path, cwd=cwd, model=model, flush_sync=True,
+                )
+                session.append_message(
+                    "user",
+                    [{"type": "text", "text": f"(session created in {cwd.name})"}],
+                )
+                sid = session.session_id
+                session.close()
+
+                handle = supervisor.spawn_worker(
+                    sid,
+                    model=model,
+                    provider=provider,
+                    cwd=cwd,
+                    sessions_dir=sessions_dir,
+                    extra_env=provider_env,
+                )
+
+                logging.getLogger(__name__).info(
+                    "tui: spawned session %s in %s", sid[:8], cwd,
+                )
+
+                # ``attach_session_ws`` is async; ``create_task`` keeps the
+                # sync callback (Textual modal dismiss) unblocked.
+                asyncio.create_task(
+                    self.attach_session_ws(sid, handle.ws_url, handle.token),
+                )
+
+        return _App()
+
+
+@app.command()
+def tui(
+    model: str = typer.Option(
+        "openai/gpt-oss-120b",
+        "--model",
+        "-m",
+        envvar="COTHIS_MODEL",
+        help="any-llm model id (mirrors ``chat``). Used when spawning new sessions.",
+    ),
+    provider: str = typer.Option(
+        "openrouter",
+        "--provider",
+        "-p",
+        envvar="COTHIS_PROVIDER",
+        help="any-llm provider key (mirrors ``chat``). Used when spawning new sessions.",
+    ),
+) -> None:
+    """Launch the Textual TUI with Supervisor-backed session spawn (#234 slice E).
+
+    Wires ``on_worktree_pick`` (slice D's hook) to a real Supervisor: when
+    the user picks a worktree via the ``n`` keypress, a new session bound to
+    that cwd is created + a worker is spawned + the TUI auto-attaches its WS.
+
+    All other CothisApp hooks (``on_session_selected``, ``on_menu_open``,
+    ``on_ask_user_request``) keep their default behaviour (mount modal /
+    log). Slice F+ will wire the remaining hooks for full multi-session UX.
+    """
+    from cothis.supervisor import Supervisor
     from cothis.tui import run as run_tui
 
-    run_tui()
+    sessions_dir = Path.cwd() / ".cothis" / "sessions"
+    sup = Supervisor()
+
+    # Pass through provider API keys so the worker subprocess can validate
+    # its Agent constructor eagerly. The keys themselves are read from
+    # ``os.environ`` (already loaded by typer/click); they don't leak into
+    # logs or argv (spawn_worker sets them via subprocess ``env=``).
+    provider_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k.endswith("_API_KEY") and v
+    }
+
+    app = _DrivenCothisApp.build(
+        supervisor=sup,
+        sessions_dir=sessions_dir,
+        model=model,
+        provider=provider,
+        provider_env=provider_env,
+    )
+    run_tui(app=app)
 
 
 # ---------------------------------------------------------------------
