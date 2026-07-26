@@ -1006,9 +1006,24 @@ class HandleManager:
     counter (#60). Single source of truth vs the prior four parallel dicts.
     """
 
-    def __init__(self, *, max_handles: int = 8, reaper_interval: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        max_handles: int = 8,
+        reaper_interval: float = 60.0,
+        now: Callable[[], float] | None = None,
+    ) -> None:
         self._max_handles = max_handles
         self._reaper_interval = reaper_interval
+        # Monotonic clock for handle elapsed-time math (live_at / last_used /
+        # reclaim-idle interval). The wall clock (time.time) can jump
+        # backward — NTP step, VM suspend/resume — making reclaim_idle's
+        # ``idle = now - last_used`` go negative and leak handles (#380);
+        # ``time.monotonic`` is guaranteed non-decreasing and the slots are
+        # in-memory only (no cross-process consistency need). ``now`` is
+        # injectable so tests advance past ``keepalive`` deterministically
+        # — the injected callable MUST be monotonic.
+        self._clock = now if now is not None else time.monotonic
         self._slots: dict[type[ResourceHandle], _HandleSlot] = {}
         self._reaper_task: asyncio.Task[None] | None = None
 
@@ -1058,8 +1073,8 @@ class HandleManager:
             except Exception as exc:  # noqa: BLE001 — eager start is best-effort
                 logger.warning("eager handle %s failed to start: %s", cls.__name__, exc)
                 continue
-            slot.live_at = time.time()
-            slot.last_used = time.time()
+            slot.live_at = self._clock()
+            slot.last_used = self._clock()
             self._start_reaper()
 
     async def ensure_acquired(self, tool: Any) -> None:
@@ -1089,9 +1104,9 @@ class HandleManager:
             if unpinned_live >= self._max_handles:
                 await self._evict_coldest()
             await slot.instance.acquire()
-            slot.live_at = time.time()
+            slot.live_at = self._clock()
             self._start_reaper()
-        slot.last_used = time.time()
+        slot.last_used = self._clock()
         tool.handle = slot.instance
 
     def adopt(
@@ -1111,8 +1126,8 @@ class HandleManager:
             self._slots[cls] = slot
         else:
             slot.instance = instance
-        slot.live_at = time.time()
-        slot.last_used = time.time()
+        slot.live_at = self._clock()
+        slot.last_used = self._clock()
         self._start_reaper()
 
     def mark_inflight(self, tool: Any) -> None:
@@ -1145,7 +1160,7 @@ class HandleManager:
         if slot is not None:
             if slot.inflight > 0:
                 slot.inflight -= 1
-            slot.last_used = time.time()
+            slot.last_used = self._clock()
 
     async def _evict_coldest(self) -> None:
         """Evict the least-recently-used evictable handle to make room.
@@ -1195,7 +1210,7 @@ class HandleManager:
         Uses ``last_used`` + the handle class's ``keepalive``. Live handles
         still within their window are untouched.
         """
-        now = time.time()
+        now = self._clock()
         reclaimed = 0
         for slot in list(self._slots.values()):
             if not slot.is_live or slot.is_pinned or slot.inflight > 0:
