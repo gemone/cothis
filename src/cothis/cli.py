@@ -757,6 +757,11 @@ class _DrivenCothisApp:
                 )
 
             async def on_mount(self) -> None:
+                # Run the base on_mount (focus SessionList) so the bare `n`
+                # "new session" shortcut still works in production — the
+                # InputBar wrapper removal (#375) otherwise lets the TextArea
+                # grab launch focus and swallow `n` as text.
+                await super().on_mount()
                 # Auto-spawn for --resume: bypass the worktree picker
                 # and attach the resumed session directly.
                 if resume_session_id is None:

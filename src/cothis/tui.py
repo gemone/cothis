@@ -4,7 +4,7 @@
 
 - ``SessionList`` (left): sessions from the session table.
 - ``ConversationView`` (center): scrollable Markdown + tool-call cards.
-- ``InputBar`` (bottom): multiline input with Ctrl+Enter to send.
+- ``TextArea`` input (bottom, ``id="input"``): multiline input with Ctrl+Enter to send.
 
 Stream routing per the design-review sign-off (#228, 2026-07-24):
 ``ContentDelta(kind="text")`` renders as normal assistant content;
@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -276,36 +276,6 @@ class ConversationView(VerticalScroll):
             self._active_markdown.update(source)
 
 
-class InputBar(Container):
-    """Bottom pane — multiline input with Ctrl+Enter to send."""
-
-    DEFAULT_CSS = """
-    InputBar {
-        height: 3;
-        dock: bottom;
-        border: round $secondary;
-    }
-    InputBar TextArea {
-        height: 1fr;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        yield TextArea()
-
-    def get_text(self) -> str:
-        """Current input text."""
-        return self.query_one(TextArea).text
-
-    def set_text(self, text: str) -> None:
-        """Replace the input text."""
-        self.query_one(TextArea).text = text
-
-    def clear(self) -> None:
-        """Clear the input after send."""
-        self.query_one(TextArea).text = ""
-
-
 class ConfigMenuModal(ModalScreen[set[str] | None]):
     """Config menu modal — toggleable skill entries (#235 slice B+C).
 
@@ -492,6 +462,11 @@ class CothisApp(App):
         background: $boost;
         text-style: bold;
     }
+    TextArea#input {
+        height: 3;
+        dock: bottom;
+        border: round $secondary;
+    }
     """
 
     BINDINGS = [
@@ -630,10 +605,24 @@ class CothisApp(App):
                 id="session-list",
             )
             yield ConversationView()
-        yield InputBar()
+        yield TextArea(id="input")
+
+    async def on_mount(self) -> None:
+        """Focus the session list on launch — preserve the pre-#375 target.
+
+        Removing the ``InputBar(Container)`` wrapper (#375) lets the bare
+        ``TextArea`` grab initial focus, which would shadow the bare ``n``
+        "new session" shortcut — a focused ``TextArea`` consumes printable
+        keys as text. Re-focusing ``SessionList`` keeps that shortcut (and
+        every existing test) working. The input is still Tab-reachable,
+        exactly the issue's scenario ("focuses the input bar, and types");
+        the fix is that typing now inserts characters instead of being
+        dropped by the old wrapper.
+        """
+        self.query_one(SessionList).focus()
 
     async def action_send_prompt(self) -> None:
-        """Read InputBar text → render locally → forward to worker if attached.
+        """Read input text → render locally → forward to worker if attached.
 
         Local echo always runs (the user expects to see their prompt
         immediately). When a WS is attached (#252 item 1), the prompt
@@ -645,13 +634,13 @@ class CothisApp(App):
         results, so ``await self.send_run_turn(text)`` blocks the
         action until the frame is on the wire (typically <1 ms).
         """
-        bar = self.query_one(InputBar)
-        text = bar.get_text().strip()
+        input_widget = self.query_one("#input", TextArea)
+        text = input_widget.text.strip()
         if not text:
             return
         view = self.query_one(ConversationView)
         view.append_user_message(text)
-        bar.clear()
+        input_widget.text = ""
         if self._ws is not None:
             await self.send_run_turn(text)
 
