@@ -251,7 +251,18 @@ Each rule is enforced by `tests/test_text_boundary_audit.py` as a source-level s
 
 ## TUI WS attach + hook-based dispatch
 
-`CothisApp` opens a WS client via `attach_ws(uri, token)` (#275) — caller decides how the worker was spawned (`Supervisor.spawn_worker` or direct `cothis worker` subprocess). Inbound frames are pumped by a background task that dispatches by `type`: `assistant_delta` → `ConversationView.append_delta`, `tool_call_started` → `append_tool_call` (mounts a `ToolCallCard`), `tool_call_result_pointer` → `update_tool_call_status` (badge flip by `call_id`). `action_send_prompt` (#276) forwards a `run_turn` control message when attached; local echo always runs. `on_session_selected(session_id)` (#281) is the overridable hook fired when the user picks a session in `SessionList`; `on_new_session(worktrees)` (#284) is fired by `Ctrl-N` with the result of `list_worktrees`. Both default to log + return; subclasses wire the real spawn-and-attach flow.
+`CothisApp` opens a WS client via `attach_ws(uri, token)` (#275) — caller decides how the worker was spawned (`Supervisor.spawn_worker` or direct `cothis worker` subprocess). Inbound frames are pumped by a background task that dispatches by `type`: `assistant_delta` → `ConversationView.append_delta`, `tool_call_started` → `append_tool_call` (mounts a `ToolCallCard`), `tool_call_result_pointer` → `update_tool_call_status` (badge flip by `call_id`). `action_send_prompt` (#276) forwards a `run_turn` control message when attached; local echo always runs. `on_session_selected(session_id)` (#281) is the overridable hook fired when the user picks a session in `SessionList`; `on_new_session(worktrees)` (#284) is fired by the `n` keypress with the result of `list_worktrees` — the default impl mounts `WorktreePickerModal` (#234 slice C) and routes the chosen path to `on_worktree_pick` (slice D). `on_session_selected` still defaults to log + return; subclasses wire the real focus-routing flow.
+
+## Worktree picker flow (#234)
+
+Letting the user start a session bound to a specific git worktree:
+
+1. **Keypress** — `n` triggers `action_new_session` (slice A).
+2. **Discover** — `list_worktrees(cwd)` runs `git worktree list --porcelain` (5s timeout; empty list when not a repo / git missing / timeout).
+3. **Pick** — `on_new_session(worktrees)` pushes `WorktreePickerModal` (slice B + C). One button per worktree (label = branch name, or path basename for detached HEAD); Cancel/Esc dismisses with `None`.
+4. **Route** — `on_worktree_pick(path)` is the contract for "create a session bound to this cwd" (slice D). Default: log. Slice E (CLI integration) will override to call `Supervisor.spawn_worker` + `SessionStorage.new` + `attach_session_ws`.
+
+`SessionList` already enriches each row with `· branch:<name>` via `find_worktree_for_path` — that's the read-only display side. Sessions filterable/groupable by worktree is filed as #234 slice F.
 
 ## Interactive ask_user flow (#229)
 
