@@ -652,10 +652,12 @@ def archive_cmd(
 
 
 # ---------------------------------------------------------------------
-# TUI entrypoint (#237) — opt-in launch of the Textual app.
-# ``chat`` stays as the legacy REPL until the TUI reaches feature
-# parity (spawn-and-attach wiring, picker modal #234); then ``chat``
-# will default to TUI + ``--legacy`` keeps the old REPL.
+# TUI entrypoint (#234 slice E) — Supervisor-backed spawn on worktree pick.
+# Feature parity reached: the TUI drives full multi-turn sessions
+# (WS attach + run_turn + tool-call rendering + ask_user modal +
+# worktree picker + cwd fallback). ``chat`` stays as the legacy REPL
+# until #237 makes the TUI the default; ``--legacy`` will keep the
+# old REPL as an escape hatch during the staged migration.
 # ---------------------------------------------------------------------
 
 
