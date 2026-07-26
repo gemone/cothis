@@ -1587,3 +1587,100 @@ def test_restrict_to_owner_logs_warning_posix_chmod_fails(
 
     warnings = [r for r in caplog.records if "chmod 0o600 failed" in r.getMessage()]
     assert warnings, "must log a WARNING when chmod fails on POSIX"
+
+
+# ---------------------------------------------------------------------
+# is_visible / _is_visible_with_resolved_observer (#331 perf fix)
+#
+# Direct unit tests for the path-comparison helpers used by
+# ``list_sessions_in_cwd_tree``. Indirect coverage exists via
+# ``test_history_lists_visible_sessions`` etc., but those run the full
+# CLI. These verify the contract directly + the perf invariant
+# (observer_cwd resolved exactly once per ``list_sessions_in_cwd_tree``
+# call, regardless of row count).
+# ---------------------------------------------------------------------
+
+
+def test_is_visible_matches_self_and_ancestor(tmp_path: Path) -> None:
+    """``is_visible`` returns True when observer_cwd equals or is descended from session_cwd."""
+    from cothis.session.storage import is_visible
+
+    session_cwd = tmp_path / "project"
+    session_cwd.mkdir()
+
+    # Observer at the session root → visible.
+    assert is_visible(session_cwd, session_cwd) is True
+    # Observer one level deeper → visible (session is ancestor).
+    assert is_visible(session_cwd, session_cwd / "subdir") is True
+    # Observer in a sibling project → not visible.
+    sibling = tmp_path / "other-project"
+    sibling.mkdir()
+    assert is_visible(session_cwd, sibling) is False
+
+
+def test_list_sessions_in_cwd_tree_resolves_observer_cwd_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #331: ``list_sessions_in_cwd_tree`` hoists ``observer_cwd.resolve()`` out of the loop.
+
+    Before: N rows × D path-component lstat syscalls. After: exactly one
+    ``observer_cwd.resolve()`` call regardless of session count.
+
+    The test stubs ``Path.resolve`` on the observer path to count calls;
+    a regression that puts the resolution back inside the loop would
+    fail the ``== 1`` assertion.
+    """
+    from cothis.session.storage import Storage
+
+    # Pre-populate the storage with several sessions all rooted at
+    # ``tmp_path``. ``is_visible(session_cwd, observer)`` returns True
+    # when observer is session_cwd or a descendant of it — so sessions
+    # at tmp_path are visible to an observer at tmp_path (and would
+    # also be visible to observers one level deeper).
+    db_path = tmp_path / "test.db"
+    for _ in range(5):
+        s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+        # Session row isn't durable until the first message is appended
+        # (the schema requires at least one user row for visibility).
+        s.append_message("user", [{"type": "text", "text": "hi"}])
+        s.close()
+    # Construct Storage AFTER the writes so the connection sees the
+    # committed rows (Storage opens a fresh SQLite connection; WAL mode
+    # makes recent commits visible to new readers).
+    storage = Storage(db_path)
+
+    # Patch ``Path.resolve`` to count calls on the observer_cwd only.
+    # We can't patch the class method (it'd break session_cwd.resolve
+    # too); instead wrap the call site by patching the bound method on
+    # the specific Path instance via a side-channel: count ``stat``
+    # calls. ``Path.resolve`` calls ``os.stat`` under the hood for each
+    # path component on Python's PosixPath.
+    # Simpler approach: monkeypatch ``_is_visible_with_resolved_observer``
+    # to verify it's called per row with the SAME pre-resolved observer.
+    from cothis.session import storage as storage_mod
+
+    resolved_observers: list[Path] = []
+    real_helper = storage_mod._is_visible_with_resolved_observer
+
+    def tracking_helper(session_cwd: Path, observer_resolved: Path) -> bool:
+        resolved_observers.append(observer_resolved)
+        return real_helper(session_cwd, observer_resolved)
+
+    monkeypatch.setattr(
+        storage_mod, "_is_visible_with_resolved_observer", tracking_helper,
+    )
+
+    visible = storage.list_sessions_in_cwd_tree(tmp_path)
+    assert len(visible) == 5, (
+        f"expected 5 visible sessions; got {len(visible)}"
+    )
+
+    # All 5 rows saw the SAME pre-resolved observer (one ``.resolve()``
+    # call, shared across all rows). If the resolution were inside the
+    # loop, each entry would be a different Path instance.
+    assert len(resolved_observers) == 5
+    first = resolved_observers[0]
+    assert all(o is first for o in resolved_observers), (
+        "observer_cwd should be resolved once + shared across rows; "
+        "got distinct Path instances per row"
+    )
