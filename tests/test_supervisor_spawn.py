@@ -454,3 +454,29 @@ async def test_monitor_worker_health_skips_when_over_threshold(
         )
     finally:
         sup.close()
+
+
+# ---------------------------------------------------------------------
+# Supervisor.close() idempotency
+#
+# The docstring promises "Idempotent. Safe to call from ``__exit__`` /
+# ``atexit``." If the TUI's atexit hook fires twice (e.g., normal
+# shutdown + Python's finalisation sweep), the second call must not
+# raise — orphaned procs or a leaked DB connection would be a real
+# regression in a long-running session.
+# ---------------------------------------------------------------------
+
+
+def test_supervisor_close_is_idempotent(tmp_path: Path) -> None:
+    """AC #250: ``close()`` can be called twice without raising.
+
+    The second call walks the (now-empty) ``_procs`` dict + calls
+    ``self._conn.close()`` again. sqlite3's Connection.close() is
+    documented as idempotent (subsequent calls are no-ops), but the
+    test guards against a refactor that swaps the connection for
+    something less forgiving.
+    """
+    sup = Supervisor(tmp_path / "supervisor.db")
+    sup.close()
+    sup.close()  # must not raise
+
