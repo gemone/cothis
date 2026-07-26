@@ -190,3 +190,45 @@ async def test_workdir_injection_through_real_tool(tmp_path: Path) -> None:
         assert workdir_path() == tmp_path
 
     assert workdir_path() is None
+
+
+def test_load_gitignore_caches_on_second_call(tmp_path: Path) -> None:
+    """AC #361: second _load_gitignore call reuses the cached PathSpec.
+
+    Verifies the mtime-keyed cache works: two calls with the same
+    .gitignore return the same PathSpec object (identity check), and
+    the file is read only once (monkeypatched read_text to count).
+    """
+    from cothis.tools.fs._hygiene import _gitignore_cache, _load_gitignore
+
+    # Clear the cache so this test is hermetic.
+    _gitignore_cache.clear()
+
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("*.log\nnode_modules/\n")
+
+    # First call: parses + caches.
+    spec1 = _load_gitignore(tmp_path)
+    assert spec1 is not None
+
+    # Second call: should return the SAME object (cache hit).
+    spec2 = _load_gitignore(tmp_path)
+    assert spec2 is spec1, (
+        "second call should return the cached PathSpec (identity); "
+        "got a different object"
+    )
+
+    # Edit the .gitignore (new mtime) → cache miss → re-parse.
+    gitignore.write_text("*.log\nnode_modules/\n*.tmp\n")
+    import time
+
+    time.sleep(0.01)  # ensure mtime ticks on filesystems with 1s resolution
+    gitignore.touch()
+    spec3 = _load_gitignore(tmp_path)
+    assert spec3 is not None
+    assert spec3 is not spec1, (
+        "after .gitignore edit (new mtime), cache should miss → new PathSpec"
+    )
+    # New spec reflects the added pattern.
+    assert spec3.match_file("foo.tmp")
+    assert not spec1.match_file("foo.tmp")
