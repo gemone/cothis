@@ -12,20 +12,24 @@ keystrokes through a PTY and asserts the typed characters land in the
 regression that re-wraps the ``TextArea`` in a ``Container`` (or otherwise
 breaks key delivery under the real driver) fails here even though
 ``test_tui.py`` stays green.
+
+PTYs are a Unix concept, so the whole module is skipped on Windows.
 """
 
 from __future__ import annotations
 
-import fcntl
 import os
-import pty
 import re
 import select
 import struct
 import subprocess
 import sys
-import termios
 import time
+
+import pytest
+
+# ``pty`` only exists on Unix; skip this whole module on Windows.
+pytest.importorskip("pty")
 
 _ANSI_CSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
 _ANSI_OSC = re.compile(rb"\x1b\][^\x07]*\x07")
@@ -35,12 +39,24 @@ def _spawn_tui_pty(cols: int = 90, rows: int = 24) -> tuple[subprocess.Popen, in
     """Spawn ``python -m cothis.tui`` on a fresh PTY; return (proc, master_fd).
 
     The slave is sized via ``TIOCSWINSZ`` so Textual lays out the 3 panes
-    (input docked at the bottom) instead of falling back to 80x24 defaults
-    that can vary by runner. ``TERM=xterm-256color`` makes Textual pick its
-    real terminal driver — the code path the bug lived in.
+    (input docked at the bottom) instead of falling back to a 0x0 PTY.
+    ``TERM=xterm-256color`` makes Textual pick its real terminal driver —
+    the code path the bug lived in.
+
+    ``pty`` / ``fcntl`` / ``termios`` are imported lazily and their Unix-only
+    members reached via ``getattr`` so the type checker does not flag them on
+    Windows (the module is skipped at runtime there via ``importorskip``).
     """
-    master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    import fcntl
+    import pty
+    import termios
+
+    openpty = getattr(pty, "openpty")
+    ioctl = getattr(fcntl, "ioctl")
+    tiocswinsz = getattr(termios, "TIOCSWINSZ")
+
+    master, slave = openpty()
+    ioctl(slave, tiocswinsz, struct.pack("HHHH", rows, cols, 0, 0))
     env = {
         **os.environ,
         "TERM": "xterm-256color",

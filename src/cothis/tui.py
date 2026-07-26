@@ -607,7 +607,7 @@ class CothisApp(App):
             yield ConversationView()
         yield TextArea(id="input")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         """Focus the session list on launch — preserve the pre-#375 target.
 
         Removing the ``InputBar(Container)`` wrapper (#375) lets the bare
