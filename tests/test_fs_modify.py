@@ -242,3 +242,34 @@ async def test_fs_modify_leaves_no_temp_files_after_write(tmp_path: Path) -> Non
     )
     # The modification landed.
     assert "replaced" in f.read_text()
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_preserves_file_permissions(tmp_path: Path) -> None:
+    """AC #351 follow-up: atomic write preserves the original file's permissions.
+
+    ``mkstemp`` creates with 0o600; without a ``chmod`` before rename,
+    a file that was 0o755 (executable) silently becomes 0o600 after
+    modify. The fix captures the original mode + applies it to the temp.
+    """
+    import os
+    import sys
+
+    from cothis.tools.fs.modify import _modify
+
+    f = _make_file(tmp_path, "script.sh", 3)
+    os.chmod(f, 0o755)
+    # Windows ignores the execute bit in chmod — capture the ACTUAL
+    # mode the OS accepted, then verify the modify preserves it.
+    import stat as stat_mod
+
+    original_mode = stat_mod.S_IMODE(f.stat().st_mode)
+
+    with workdir_context(tmp_path):
+        await _modify(path="script.sh", start_line=1, end_line=1, content="#!/bin/bash\necho hi\n")
+
+    mode = stat_mod.S_IMODE(f.stat().st_mode)
+    assert mode == original_mode, (
+        f"permissions should be preserved (was 0o{original_mode:o}); "
+        f"got 0o{mode:o}"
+    )

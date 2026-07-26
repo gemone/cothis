@@ -32,7 +32,14 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     ``os.replace`` is a same-filesystem rename (atomic on POSIX +
     Windows). A crash mid-write leaves the original file untouched —
     the temp file is orphaned but the original keeps its pre-edit content.
+
+    Permissions: ``mkstemp`` creates with 0o600. For an existing file
+    being overwritten, the original permissions are preserved (captured
+    before the rename + applied to the temp).
     """
+    import stat as stat_mod
+
+    original_mode = stat_mod.S_IMODE(path.stat().st_mode) if path.exists() else None
     fd, tmp_path = tempfile.mkstemp(
         dir=path.parent, prefix=path.name + ".", suffix=".tmp",
     )
@@ -41,6 +48,8 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
+        if original_mode is not None:
+            os.chmod(tmp_path, original_mode)
         os.replace(tmp_path, path)
     except BaseException:
         try:

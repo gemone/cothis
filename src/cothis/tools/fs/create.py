@@ -30,6 +30,10 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     Same pattern as ``fs.modify``'s atomic write. For ``fs.create`` the
     destination doesn't exist yet, so ``os.replace`` creates it atomically
     (POSIX ``rename(2)`` on a non-existent target is atomic creation).
+
+    Permissions: ``mkstemp`` creates with 0o600. For a new file, the
+    umask-derived mode (0o666 & ~umask, typically 0o644) is applied so
+    the result matches what ``write_text`` would have produced.
     """
     fd, tmp_path = tempfile.mkstemp(
         dir=path.parent, prefix=path.name + ".", suffix=".tmp",
@@ -39,6 +43,10 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
+        # Apply umask-derived permissions (mkstemp defaults to 0o600).
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp_path, 0o666 & ~umask)
         os.replace(tmp_path, path)
     except BaseException:
         try:
