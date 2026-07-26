@@ -122,15 +122,37 @@ feature parity lands via #237). It offers a 3-pane layout —
 the `n` keypress (Supervisor-backed, #234). The same `--model` /
 `--provider` flags apply as to `chat`.
 
-Once a session is attached (via the worktree picker), the TUI drives a
-full multi-turn session end-to-end: ``run_turn`` forwards prompts over
-WS, the worker streams ``assistant_delta`` / ``tool_call_started`` /
-``tool_call_result_pointer`` / ``ask_user_request`` frames, and the
-TUI renders each (Markdown segments, inline tool-call cards,
-``AskUserModal`` for interactive tool questions). Sessions in a
-non-git cwd still need a fallback path to attach without a worktree
-picker (planned). ``chat`` remains the default for now; ``tui`` is
+Once a session is attached (via the worktree picker or its "Current
+directory" fallback), the TUI drives a full multi-turn session
+end-to-end: ``run_turn`` forwards prompts over WS, the worker streams
+``assistant_delta`` / ``tool_call_started`` / ``tool_call_result_pointer``
+/ ``ask_user_request`` frames, and the TUI renders each (Markdown
+segments, inline tool-call cards, ``AskUserModal`` for interactive
+tool questions). ``chat`` remains the default for now; ``tui`` is
 the preview of the future default (#237).
+
+
+### Session management — `history` / `delete` / `archive`
+
+```bash
+uv run cothis history                 # list sessions visible from cwd
+uv run cothis history <session_id>    # inspect one + pick resume/fork point
+uv run cothis delete <session_id>     # remove a leaf session
+uv run cothis archive <session_id>    # move a session to the cold store
+```
+
+`history` lists every session whose `cwd` is the current directory or an
+ancestor of it (project-root sessions are visible from subdirectories).
+With a session id: prints the message list numbered, then prompts for
+an index — `r` (or Enter on the last) resumes at the end of `main`; a
+number forks a new session from that message (git-branch semantics; the
+original is untouched).
+
+`delete` is leaf-only (refuses sessions with children). `archive` moves
+the session to a monthly cold-store DB under `<db_path parent>/archive/`
+and updates `archive/index.json`; `cothis archive restore <id>` brings
+it back. Run `cothis history --help` / `cothis delete --help` /
+`cothis archive --help` for the full flag list.
 
 
 ## Custom tools
