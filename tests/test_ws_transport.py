@@ -421,6 +421,50 @@ async def test_unknown_message_type_emits_error_via_fake_transport() -> None:
 
 
 @pytest.mark.asyncio
+async def test_attach_input_and_detach_input_accepted_silently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``attach_input`` / ``detach_input`` are accepted (stub) — no error frame.
+
+    Real terminal-attach routing lands with #230 (multi-session); until
+    then the worker recognises both message types so a future TUI doesn't
+    see ``unknown type`` errors when it starts sending them. The stub
+    contract: accept + DEBUG-log, no outbound frame.
+    """
+    import logging
+
+    transport = FakeTransport()
+    worker = SessionWorker(_scripted_agent([]), transport=transport)
+    await worker.start()
+    conn = await transport.accept()
+    try:
+        with caplog.at_level(logging.DEBUG, logger="cothis.worker"):
+            await conn.feed(json.dumps({"type": "attach_input"}))
+            await conn.feed(json.dumps({"type": "detach_input"}))
+            # Give the dispatch loop a tick to process both frames.
+            await asyncio.sleep(0.05)
+
+        # No outbound frame for either message (the stub explicitly
+        # logs + returns; an error frame would appear in ``conn.sent``
+        # if the dispatch fell through to the unknown-type branch).
+        assert conn.sent == [], (
+            f"attach_input/detach_input should not emit a frame; "
+            f"got {conn.sent!r}"
+        )
+        # Both messages were recognised (DEBUG log mentions each).
+        logged = [r.getMessage() for r in caplog.records]
+        assert any("attach_input" in m for m in logged), (
+            f"expected DEBUG log for attach_input; got {logged}"
+        )
+        assert any("detach_input" in m for m in logged), (
+            f"expected DEBUG log for detach_input; got {logged}"
+        )
+    finally:
+        await conn.feed(None)
+        await worker.stop()
+
+
+@pytest.mark.asyncio
 async def test_invalid_json_emits_error_via_fake_transport() -> None:
     """Malformed JSON is reported as an error, not a crash — no socket."""
     transport = FakeTransport()
