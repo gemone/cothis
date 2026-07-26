@@ -427,13 +427,23 @@ class WorktreePickerModal(ModalScreen[str | None]):
         super().__init__()
 
     def compose(self) -> ComposeResult:
-        yield Label("Pick a worktree for the new session", id="worktree-prompt")
-        # Index-based IDs: paths contain ``/`` which Textual IDs reject.
-        # The button label is branch name (preferred) or path basename
-        # for detached HEAD — branch is what the user thinks in terms of.
-        for i, wt in enumerate(self._worktrees):
-            label = wt.branch or wt.path.name
-            yield Button(label, id=f"wt-{i}")
+        if not self._worktrees:
+            # Empty-list UX: the default "Pick a worktree" label would
+            # mislead — there's nothing to pick. The hint suggests the
+            # user add a worktree outside the TUI; cothis only discovers
+            # worktrees, it doesn't create them (out of scope per #234).
+            yield Label(
+                "No worktrees found. Run `git worktree add <path>` outside cothis, then retry.",
+                id="worktree-prompt",
+            )
+        else:
+            yield Label("Pick a worktree for the new session", id="worktree-prompt")
+            # Index-based IDs: paths contain ``/`` which Textual IDs reject.
+            # The button label is branch name (preferred) or path basename
+            # for detached HEAD — branch is what the user thinks in terms of.
+            for i, wt in enumerate(self._worktrees):
+                label = wt.branch or wt.path.name
+                yield Button(label, id=f"wt-{i}")
         yield Button("Cancel", id="worktree-cancel")
 
     def action_dismiss_modal(self) -> None:
