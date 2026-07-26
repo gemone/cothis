@@ -17,7 +17,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-import time_machine
 
 from cothis.tools import ResourceHandle, resource, tool
 from cothis.tools.core import HandleManager, ensure_handle_ready
@@ -124,16 +123,19 @@ async def test_idle_reclamation_releases() -> None:
     def t() -> str:
         return "ok"
 
-    with time_machine.travel(0.0, tick=False) as t_clock:
-        mgr = HandleManager()
-        mgr.bind(t)
-        await ensure_handle_ready(t)
-        assert calls == ["acquire"]
+    # Injectable monotonic clock: ``time_machine.shift`` advances
+    # ``time.time`` but NOT ``time.monotonic``, so advance the injected
+    # clock directly to drive the keepalive math deterministically (#380).
+    clock = [0.0]
+    mgr = HandleManager(now=lambda: clock[0])
+    mgr.bind(t)
+    await ensure_handle_ready(t)
+    assert calls == ["acquire"]
 
-        t_clock.shift(301)  # past keepalive=300
-        n = await mgr.reclaim_idle()
-        assert n == 1
-        assert "release" in calls
+    clock[0] = 301.0  # past keepalive=300
+    n = await mgr.reclaim_idle()
+    assert n == 1
+    assert "release" in calls
 
 
 @pytest.mark.asyncio
@@ -153,16 +155,58 @@ async def test_self_healing_after_reclamation() -> None:
     def t() -> str:
         return "ok"
 
-    with time_machine.travel(0.0, tick=False) as t_clock:
-        mgr = HandleManager()
-        mgr.bind(t)
-        await ensure_handle_ready(t)
-        t_clock.shift(301)  # past keepalive
-        await mgr.reclaim_idle()
+    clock = [0.0]
+    mgr = HandleManager(now=lambda: clock[0])
+    mgr.bind(t)
+    await ensure_handle_ready(t)
+    clock[0] = 301.0  # past keepalive
+    await mgr.reclaim_idle()
 
-        # Re-acquired on next ensure — the self-healing path.
-        await ensure_handle_ready(t)
-        assert calls.count("acquire") == 2
+    # Re-acquired on next ensure — the self-healing path.
+    await ensure_handle_ready(t)
+    assert calls.count("acquire") == 2
+
+
+@pytest.mark.asyncio
+async def test_reclaim_idle_keepalive_boundary_uses_injected_clock() -> None:
+    """``reclaim_idle`` keepalive math reads the injected monotonic clock (#380).
+
+    Within the window → not reclaimed; past it → reclaimed. ``time_machine``
+    can't drive this (it shifts ``time.time`` but not ``time.monotonic``), so
+    the injectable clock is the test seam. Reverting ``self._clock`` back to
+    ``time.time()`` would bypass the injected clock and fail this test
+    (advancing ``clock[0]`` would no longer advance the code's ``now``).
+    The injected callable MUST be monotonic — a backward jump would otherwise
+    leak handles, the original bug.
+    """
+    calls: list[str] = []
+
+    @resource(keepalive=300.0)
+    class H(ResourceHandle):
+        async def acquire(self) -> None:
+            pass
+
+        async def release(self) -> None:
+            calls.append("release")
+
+    @tool("t", handle=H)
+    def t() -> str:
+        return "ok"
+
+    clock = [1000.0]
+    mgr = HandleManager(now=lambda: clock[0])
+    mgr.bind(t)
+    await ensure_handle_ready(t)  # last_used = 1000.0
+
+    # Within keepalive (idle 200 < 300) — not reclaimed.
+    clock[0] = 1200.0
+    assert await mgr.reclaim_idle() == 0
+    assert calls == []
+
+    # Past keepalive (idle 301 >= 300) — reclaimed.
+    clock[0] = 1301.0
+    assert await mgr.reclaim_idle() == 1
+    assert calls == ["release"]
 
 
 @pytest.mark.asyncio
@@ -409,7 +453,7 @@ async def test_call_done_refreshes_last_used() -> None:
 
     import time
 
-    old = time.time() - 100
+    old = time.monotonic() - 100
     mgr._slots[H].last_used = old
     mgr.call_done(t)
 
