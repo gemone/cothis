@@ -44,7 +44,11 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
         dir=path.parent, prefix=path.name + ".", suffix=".tmp",
     )
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as fh:
+        # ``newline=""`` disables write-side ``\n`` → ``os.linesep`` translation
+        # so CRLF bytes already present in ``text`` survive verbatim. No-op on
+        # POSIX; on Windows it also prevents ``\r\n`` → ``\r\r\n`` double-CR
+        # corruption (#371). Twin of the read-side fix above.
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -94,7 +98,12 @@ async def _modify(
     if start_line < 1:
         return f"Error: start_line must be ≥ 1 (got {start_line})."
 
-    original = resolved.read_text(encoding="utf-8")
+    # Read raw bytes + decode explicitly. ``read_text`` opens in universal-
+    # newline mode and translates ``\r\n`` → ``\n`` on read, which silently
+    # strips CRLF from every line and makes the CRLF-detection below dead
+    # code (#371). ``read_bytes().decode`` preserves the original endings so
+    # untouched lines keep their ``\r\n`` and the detection branch fires.
+    original = resolved.read_bytes().decode("utf-8")
     lines = original.splitlines(keepends=True)
     total = len(lines)
 

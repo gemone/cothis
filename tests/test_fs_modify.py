@@ -314,3 +314,40 @@ async def test_fs_modify_atomic_write_cleans_up_temp_on_crash(
         f"temp file should be cleaned up after crash; found: "
         f"{[p.name for p in files if p.name.endswith('.tmp')]}"
     )
+
+
+# ---------------------------------------------------------------------
+# CRLF preservation (#371)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_preserves_crlf_on_every_line(tmp_path: Path) -> None:
+    """AC #371: editing one line of a CRLF file keeps CRLF on every line.
+
+    Pre-fix, ``read_text`` ran in universal-newline mode and translated
+    ``\\r\\n`` → ``\\n`` on read, so the CRLF-detection branch was dead
+    code and the whole file silently flipped to LF — even untouched
+    lines. Verify byte-exactly that CRLF now survives the round trip.
+    """
+    from cothis.tools.fs.modify import _modify
+
+    f = tmp_path / "crlf.txt"
+    f.write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
+    with workdir_context(tmp_path):
+        result = await _modify(path="crlf.txt", start_line=2, end_line=2, content="BETA")
+    assert "updated" in result.lower()
+    # Every line keeps CRLF — the untouched lines too.
+    assert f.read_bytes() == b"alpha\r\nBETA\r\ngamma\r\n"
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_lf_file_stays_lf(tmp_path: Path) -> None:
+    """AC #371: LF files are unchanged (no CRLF regression)."""
+    from cothis.tools.fs.modify import _modify
+
+    f = tmp_path / "lf.txt"
+    f.write_bytes(b"alpha\nbeta\ngamma\n")
+    with workdir_context(tmp_path):
+        await _modify(path="lf.txt", start_line=2, end_line=2, content="BETA")
+    assert f.read_bytes() == b"alpha\nBETA\ngamma\n"
