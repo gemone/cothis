@@ -504,16 +504,20 @@ class CothisApp(App):
         self.on_new_session(worktrees)
 
     def on_new_session(self, worktrees: list) -> None:
-        """Mount ``WorktreePickerModal``; route the chosen path to a hook (#234 slice C).
+        """Mount ``WorktreePickerModal``; route the chosen path to ``on_worktree_pick`` (#234 slice C/D).
 
-        Hook fired by ``action_new_session`` (Ctrl-N). The picker shows
-        one ``Button`` per worktree; on dismiss the chosen path (or
-        ``None`` for Esc / Cancel) is logged. Session creation with the
-        chosen ``cwd`` lands in slice D — the wiring contract (modal
-        mounts, dismiss is observable) is what this slice closes.
+        Hook fired by ``action_new_session`` (the ``n`` keypress). The
+        picker shows one ``Button`` per worktree; on dismiss the chosen
+        path (or ``None`` for Esc / Cancel) is forwarded to
+        ``on_worktree_pick`` — the single entry point for "create a
+        session bound to this cwd". Slice D (this PR) introduces the
+        hook as a logging stub; slice E (CLI integration) overrides it
+        to call ``Supervisor.spawn_worker`` + ``SessionStorage.new`` +
+        ``attach_session_ws``.
 
-        Subclasses can override to capture the worktree list without
-        mounting the modal (existing tests do this).
+        Subclasses can also override ``on_new_session`` itself to
+        capture the worktree list without mounting the modal (existing
+        tests do this).
         """
         logger.info(
             "tui: new-session action fired; %d worktree(s) visible",
@@ -524,13 +528,28 @@ class CothisApp(App):
             if value is None:
                 logger.info("tui: new-session cancelled (no worktree picked)")
                 return
-            logger.info(
-                "tui: worktree picked for new session: %s "
-                "(session creation lands in slice D)",
-                value,
-            )
+            self.on_worktree_pick(value)
 
         self.push_screen(WorktreePickerModal(worktrees), _on_dismiss)
+
+    def on_worktree_pick(self, path: str) -> None:
+        """Hook fired when the user picks a worktree for a new session (#234 slice D).
+
+        Default: log the choice. The CLI / caller overrides this to
+        call ``Supervisor.spawn_worker`` + ``SessionStorage.new`` +
+        ``attach_session_ws`` with the picked path as the session cwd.
+
+        Kept as a separate hook so the TUI doesn't need to know about
+        the Supervisor/SessionStorage APIs — same inversion as
+        ``attach_ws`` (caller decides how the worker was spawned).
+        Tests / headless runs can also override to capture the path
+        without spawning.
+        """
+        logger.info(
+            "tui: worktree picked for new session: %s "
+            "(spawn + attach wiring lands in slice E)",
+            path,
+        )
 
     # -----------------------------------------------------------------
     # Menu binding (#235 slice A) — Ctrl-M opens the config menu.
