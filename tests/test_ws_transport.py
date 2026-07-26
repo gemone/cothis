@@ -538,6 +538,39 @@ async def test_turn_timeout_emits_error(monkeypatch) -> None:
         await conn.feed(None)
 
 
+@pytest.mark.asyncio
+async def test_run_stream_exception_emits_internal_error() -> None:
+    """``Agent.run_stream`` raising → ``error: internal error`` (no exception leak).
+
+    Covers the ``except Exception`` branch of ``_stream_turn``. The
+    agent's stream raises mid-iteration; the worker logs server-side
+    + emits a generic ``internal error`` to the client. Loopback-only
+    is not a license to leak exception details — the message is fixed
+    regardless of the underlying exception.
+    """
+    async def _exploding_stream(prompt: str):  # noqa: ARG001
+        # Mimic a tool or model call that raises mid-stream.
+        raise RuntimeError("boom: simulated agent failure")
+        if False:  # pragma: no cover
+            yield ""
+
+    agent = MagicMock()
+    agent.run_stream = _exploding_stream
+    agent.aclose = MagicMock(return_value=asyncio.sleep(0))
+
+    transport = FakeTransport()
+    worker = SessionWorker(agent, transport=transport)
+    await worker.start()
+    conn = await transport.accept()
+    try:
+        await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
+        await conn.wait_for_send(1, timeout=2.0)
+        msg = json.loads(conn.sent[0])
+        assert msg == {"type": "error", "message": "internal error"}
+    finally:
+        await conn.feed(None)
+
+
 # ---------------------------------------------------------------------
 # Concurrent handshake cap (#264)
 #
