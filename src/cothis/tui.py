@@ -672,7 +672,17 @@ class CothisApp(App):
         from cothis.git import find_worktree_for_path, list_worktrees
 
         worktrees = list_worktrees(Path.cwd())
-        for row in rows:
+        # Group sessions by worktree cwd (#234 AC #5). Stable sort by cwd
+        # so sessions in the same worktree land adjacent — visual grouping
+        # rather than chronological scatter. Updated_at desc stays as the
+        # tiebreaker inside a group, preserving the "recent first" feel
+        # within one worktree's sessions.
+        rows_sorted = sorted(
+            rows,
+            key=lambda r: (str(r.cwd) if r.cwd else "", r.updated_at),
+            reverse=False,
+        )
+        for row in rows_sorted:
             label = row.title or f"session {row.id[:8]}"
             cwd_hint = str(row.cwd) if row.cwd else "(no cwd)"
             wt = (

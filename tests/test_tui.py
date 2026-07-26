@@ -875,6 +875,88 @@ async def test_refresh_session_list_skips_branch_when_no_worktree(
         )
 
 
+@pytest.mark.asyncio
+async def test_refresh_session_list_groups_sessions_by_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #234 #5: sessions with the same cwd land adjacent in SessionList.
+
+    Visual grouping by worktree: stable sort by cwd, with ``updated_at``
+    as the within-group tiebreaker. Three sessions in two cwds end up
+    as [cwd-A session 1, cwd-A session 2, cwd-B session 3] or its
+    reverse — sessions in the same cwd are always adjacent.
+
+    Pre-fix: sessions were listed in (updated_at, ...) order, so
+    sessions in different cwds interleaved when their timestamps
+    differed. Users running multiple sessions across worktrees had to
+    scan the whole list to find related ones.
+    """
+    import re
+    from itertools import groupby
+
+    from textual.widgets import Label, ListItem
+
+    from cothis.session import Session
+    from cothis.session.storage import SessionRow
+    from cothis.tui import CothisApp, SessionList
+
+    db_path = tmp_path / "session.db"
+    cwd_a = tmp_path / "worktree-a"
+    cwd_b = tmp_path / "worktree-b"
+
+    # Seed three sessions, alternating cwds so chronological order would
+    # interleave them. The fix groups by cwd instead.
+    seeded: list[SessionRow] = []
+    for cwd, title in [(cwd_a, "first-in-a"), (cwd_b, "in-b"), (cwd_a, "second-in-a")]:
+        s = Session.new(db_path, cwd=cwd, model="m", flush_sync=True)
+        s.append_message("user", [{"type": "text", "text": title}])
+        s.close()
+        # Reload to capture the row's updated_at (post-flush).
+        from cothis.session.storage import Storage
+
+        storage = Storage(db_path)
+        try:
+            row = storage.load_session(s.session_id)
+            assert row is not None
+            seeded.append(row)
+        finally:
+            storage.close()
+
+    # Stub ``list_sessions_in_cwd_tree`` to return all three rows —
+    # otherwise the visibility filter (observer must be inside the
+    # session's cwd) excludes both worktree subdirs.
+    monkeypatch.setattr(
+        "cothis.session.storage.Storage.list_sessions_in_cwd_tree",
+        lambda self, cwd: seeded,
+    )
+    monkeypatch.setattr("cothis.git.list_worktrees", lambda _cwd: [])
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+
+        session_list = app.query_one(SessionList)
+        items = list(session_list.query(ListItem))
+        assert len(items) == 3
+
+        # Pull cwd out of each item's label "(path)" suffix to check grouping.
+        cwds_in_list_order: list[str] = []
+        for item in items:
+            label_str = str(getattr(item.query_one(Label), "_Static__content"))
+            match = re.search(r"\(([^)]+)\)", label_str)
+            assert match is not None, f"no cwd in label {label_str!r}"
+            cwds_in_list_order.append(match.group(1).split(" · ")[0])
+
+        # Sessions with the same cwd must be adjacent.
+        grouped_cwds = [k for k, _ in groupby(cwds_in_list_order)]
+        assert len(grouped_cwds) == 2, (
+            f"expected 2 distinct cwd groups (worktree-a, worktree-b); "
+            f"got {grouped_cwds} — sessions not adjacent within their cwd"
+        )
+
+
 # ---------------------------------------------------------------------
 # New-session binding (#234 — Ctrl-N fires ``on_new_session`` hook
 # with the visible worktrees). The picker modal is a follow-up; this
