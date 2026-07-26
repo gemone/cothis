@@ -538,6 +538,13 @@ uv run ty check                     # type check
 uv run pytest                       # unit tests (pure helpers, no network)
 ```
 
+> **Renamed the project directory?** Entry-point scripts under `.venv/bin/`
+> keep their old absolute shebang, so `.venv/bin/pytest` can silently target
+> a stale Python from the previous path. Always invoke the tools through
+> `uv run …` (`uv run pytest`, or `uv run python -m pytest` for the module
+> form); after a rename, run `uv sync --reinstall` to regenerate the
+> scripts (#286).
+
 Tests cover the silent-breakage surfaces of the project: the
 streaming chat path (by-index merge of streamed tool-call fragments,
 best-effort JSON parse for on-screen display), the YAML tool loader
