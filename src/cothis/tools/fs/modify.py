@@ -11,6 +11,8 @@ or empty (deletes those lines — the file shrinks but stays).
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 from cothis.tools.core import tool
@@ -21,6 +23,31 @@ from cothis.tools.fs._hygiene import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Write text atomically: temp file → fsync → rename over original (#351).
+
+    The temp file is created in the same directory as ``path`` so
+    ``os.replace`` is a same-filesystem rename (atomic on POSIX +
+    Windows). A crash mid-write leaves the original file untouched —
+    the temp file is orphaned but the original keeps its pre-edit content.
+    """
+    fd, tmp_path = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 _MODIFY_DESCRIPTION = """Edit an existing file by replacing a line range.
@@ -76,7 +103,7 @@ async def _modify(
         content_lines[-1] += ending
     new_lines = lines[: start_line - 1] + content_lines + lines[actual_end:]
     new_text = "".join(new_lines)
-    resolved.write_text(new_text, encoding="utf-8")
+    _atomic_write_text(resolved, new_text)
 
     new_total = len(new_text.splitlines())
     return (
