@@ -122,9 +122,15 @@ feature parity lands via #237). It offers a 3-pane layout —
 the `n` keypress (Supervisor-backed, #234). The same `--model` /
 `--provider` flags apply as to `chat`.
 
-Still pre-parity — the TUI cannot yet drive a full multi-turn session
-with tool-call execution end-to-end. Use `chat` for production work;
-try `tui` to preview the UX.
+Once a session is attached (via the worktree picker), the TUI drives a
+full multi-turn session end-to-end: ``run_turn`` forwards prompts over
+WS, the worker streams ``assistant_delta`` / ``tool_call_started`` /
+``tool_call_result_pointer`` / ``ask_user_request`` frames, and the
+TUI renders each (Markdown segments, inline tool-call cards,
+``AskUserModal`` for interactive tool questions). Sessions in a
+non-git cwd still need a fallback path to attach without a worktree
+picker (planned). ``chat`` remains the default for now; ``tui`` is
+the preview of the future default (#237).
 
 
 ## Custom tools
