@@ -828,6 +828,12 @@ def tui(
         envvar="COTHIS_PROVIDER",
         help="any-llm provider key (mirrors ``chat``). Used when spawning new sessions.",
     ),
+    resume: str | None = typer.Option(
+        None,
+        "--resume",
+        "-r",
+        help="Resume a session by id (auto-spawns on startup, bypasses the picker).",
+    ),
 ) -> None:
     """Launch the Textual TUI with Supervisor-backed session spawn (#234 slice E).
 
@@ -835,11 +841,17 @@ def tui(
     the user picks a worktree via the ``n`` keypress, a new session bound to
     that cwd is created + a worker is spawned + the TUI auto-attaches its WS.
 
+    ``--resume <id>`` auto-spawns a worker for an existing session on
+    startup (bypasses the worktree picker). ``--legacy`` is not needed
+    — ``tui`` always launches the TUI.
+
     ``on_session_selected`` still defaults to log + return (focus routing
     across sessions is a follow-up). ``on_menu_open`` + ``on_ask_user_request``
     mount their modals (ConfigMenuModal / AskUserModal) as shipped.
     """
-    _launch_tui_app(model=model, provider=provider)
+    if resume is not None:
+        _validate_session_id_arg(resume)
+    _launch_tui_app(model=model, provider=provider, resume=resume)
 
 
 # ---------------------------------------------------------------------
