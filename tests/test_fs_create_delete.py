@@ -176,3 +176,26 @@ async def test_fs_create_leaves_no_temp_files(tmp_path: Path) -> None:
     assert files == {"new.py"}, (
         f"expected only new.py; got {files} (temp file not cleaned up?)"
     )
+
+
+@pytest.mark.asyncio
+async def test_fs_create_applies_umask_permissions(tmp_path: Path) -> None:
+    """AC #351 follow-up: atomic write uses umask-derived permissions, not 0o600.
+
+    ``mkstemp`` creates with 0o600; without applying the umask, the new
+    file would be 0o600 instead of the expected 0o644 (umask 0o022).
+    """
+    import stat as stat_mod
+
+    from cothis.tools.fs.create import _create
+
+    with workdir_context(tmp_path):
+        await _create(path="new.txt", content="hello\n")
+
+    mode = stat_mod.S_IMODE((tmp_path / "new.txt").stat().st_mode)
+    # ``mkstemp`` defaults to 0o600. The fix applies umask-derived mode.
+    # POSIX with umask 0o022 → 0o644; Windows (umask=0) → 0o666.
+    # Both are correct — the regression was 0o600 (mkstemp default).
+    assert mode != 0o600, (
+        f"new file should NOT be 0o600 (mkstemp default); got 0o{mode:o}"
+    )
