@@ -802,9 +802,9 @@ def tui(
     the user picks a worktree via the ``n`` keypress, a new session bound to
     that cwd is created + a worker is spawned + the TUI auto-attaches its WS.
 
-    All other CothisApp hooks (``on_session_selected``, ``on_menu_open``,
-    ``on_ask_user_request``) keep their default behaviour (mount modal /
-    log). Slice F+ will wire the remaining hooks for full multi-session UX.
+    ``on_session_selected`` still defaults to log + return (focus routing
+    across sessions is a follow-up). ``on_menu_open`` + ``on_ask_user_request``
+    mount their modals (ConfigMenuModal / AskUserModal) as shipped.
     """
     _launch_tui_app(model=model, provider=provider)
 
