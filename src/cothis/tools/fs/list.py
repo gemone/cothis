@@ -128,10 +128,13 @@ def _list(
         without re-checking). Used by both the materialise pass (below
         cap) and the count-only drain (past cap) — the count pass
         ignores ``p_type`` and only checks ``matches``.
+
+        Cheap filters (pattern / ignored-dirs / dotfile / gitignore) run
+        BEFORE the ``is_dir()`` syscall — for a typical ``pattern="*.py"``
+        listing, 99% of paths are rejected by the cheap filters and the
+        syscall is never issued (#341).
         """
-        p_type = "dir" if p.is_dir() else "file"
-        if type and p_type != type:
-            return False, ""
+        # Cheap filters first — reject most paths without a syscall.
         if pattern and not fnmatch.fnmatch(p.name, pattern):
             return False, ""
         rel = p.relative_to(root)
@@ -142,6 +145,10 @@ def _list(
                 return False, ""
             if gitignore is not None and gitignore.match_file(rel.as_posix()):
                 return False, ""
+        # Syscall only for paths that passed the cheap filters.
+        p_type = "dir" if p.is_dir() else "file"
+        if type and p_type != type:
+            return False, ""
         return True, p_type
 
     entries: list[dict[str, str]] = []

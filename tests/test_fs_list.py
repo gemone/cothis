@@ -8,13 +8,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import pytest
-
 from cothis.tools.fs._hygiene import workdir_context
 from cothis.tools.fs.list import _list as fs_list
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 if TYPE_CHECKING:
     from typing import Any
@@ -211,3 +211,46 @@ def test_list_truncation_count_excludes_gitignored(
     assert isinstance(result, dict)
     assert len(result["entries"]) == 500
     assert result["truncated"] == 10
+
+
+def test_list_qualifies_short_circuits_is_dir_for_pattern_mismatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #341: ``is_dir()`` syscall runs only on paths that pass the cheap filters.
+
+    Pre-fix, ``_qualifies`` called ``p.is_dir()`` FIRST, then ran the
+    pattern / ignored-dirs / dotfile checks. For ``pattern="*.py"`` on a
+    project with 100k paths (1k matching), that's 99k wasted syscalls.
+
+    Post-fix, the cheap filters run first; ``is_dir()`` fires only for
+    paths that survive them. The test stubs ``Path.is_dir`` to count
+    calls + asserts the count matches the number of pattern-matching
+    entries (not the total file count).
+    """
+    from pathlib import Path as _Path
+
+    for name in ["a.py", "b.py", "c.txt", "d.txt", "e.md"]:
+        (tmp_path / name).write_text("x")
+
+    real_is_dir = _Path.is_dir
+    is_dir_calls: list[str] = []
+
+    def counting_is_dir(self):
+        is_dir_calls.append(self.name)
+        return real_is_dir(self)
+
+    monkeypatch.setattr(_Path, "is_dir", counting_is_dir)
+
+    with workdir_context(tmp_path):
+        result = fs_list(path=".", pattern="*.py")
+
+    # Pattern matches 2 files (.py). ``is_dir()`` should fire only on
+    # those 2 — not on the 3 mismatched files (.txt, .md). If the
+    # reorder regresses (is_dir back at top), count would be 5 (plus
+    # the root dir's own is_dir, which the walker calls separately).
+    mismatched_called = set(is_dir_calls) & {"c.txt", "d.txt", "e.md"}
+    assert mismatched_called == set(), (
+        f"is_dir should NOT fire on pattern-mismatched paths; "
+        f"called on: {mismatched_called}"
+    )
+    assert len(result) == 2
