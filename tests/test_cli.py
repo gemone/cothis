@@ -707,6 +707,67 @@ def test_launch_tui_app_without_resume_passes_none(
     assert captured.get("resume_session_id") is None
 
 
+# ---------------------------------------------------------------------
+# Chat → TUI dispatch routing (#237)
+#
+# ``chat`` defaults to the TUI; ``--legacy`` and ``--skill`` fall back
+# to the REPL. These tests verify the routing without launching either
+# path (both are stubbed).
+# ---------------------------------------------------------------------
+
+
+def test_chat_defaults_to_tui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #237: ``cothis chat`` (no flags) routes to ``_launch_tui_app``."""
+    import cothis.cli as cli_mod
+
+    captured: list[dict] = []
+
+    def fake_launch(model: str, provider: str, resume: str | None = None) -> None:
+        captured.append({"model": model, "provider": provider, "resume": resume})
+
+    monkeypatch.setattr(cli_mod, "_launch_tui_app", fake_launch)
+
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["chat"])
+    assert result.exit_code == 0, f"chat command failed: {result.output}"
+    assert len(captured) == 1, (
+        f"expected _launch_tui_app called once; got {captured}"
+    )
+    assert captured[0]["resume"] is None
+
+
+def test_chat_legacy_runs_repl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #237: ``cothis chat --legacy`` bypasses the TUI, runs the REPL."""
+    import asyncio
+
+    import cothis.cli as cli_mod
+
+    tui_called: list[bool] = []
+    asyncio_called: list[bool] = []
+
+    def fake_launch(*args: object, **kwargs: object) -> None:
+        tui_called.append(True)
+
+    def fake_run(coro: Any) -> None:
+        asyncio_called.append(True)
+        coro.close()
+
+    monkeypatch.setattr(cli_mod, "_launch_tui_app", fake_launch)
+    monkeypatch.setattr(asyncio, "run", fake_run)
+
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["chat", "--legacy"])
+    assert result.exit_code == 0, f"chat --legacy failed: {result.output}"
+    assert tui_called == [], "TUI should NOT be called with --legacy"
+    assert len(asyncio_called) == 1, "legacy REPL (asyncio.run) should be called"
+
+
 def test_chat_legacy_with_resume_runs_repl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -739,3 +800,32 @@ def test_chat_legacy_with_resume_runs_repl(
     assert result.exit_code == 0, f"chat --legacy --resume failed: {result.output}"
     assert tui_called == [], "TUI should NOT be called with --legacy"
     assert len(asyncio_called) == 1, "legacy REPL should be called"
+
+
+def test_chat_skill_falls_back_to_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #237: ``cothis chat --skill foo`` falls back to legacy REPL."""
+    import asyncio
+
+    import cothis.cli as cli_mod
+
+    tui_called: list[bool] = []
+    asyncio_called: list[bool] = []
+
+    def fake_launch(*args: object, **kwargs: object) -> None:
+        tui_called.append(True)
+
+    def fake_run(coro: Any) -> None:
+        asyncio_called.append(True)
+        coro.close()
+
+    monkeypatch.setattr(cli_mod, "_launch_tui_app", fake_launch)
+    monkeypatch.setattr(asyncio, "run", fake_run)
+
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["chat", "--skill", "foo"])
+    assert result.exit_code == 0, f"chat --skill failed: {result.output}"
+    assert tui_called == [], "TUI should NOT be called with --skill"
+    assert len(asyncio_called) == 1, "legacy REPL should be called for --skill"
