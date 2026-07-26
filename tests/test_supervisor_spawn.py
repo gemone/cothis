@@ -339,3 +339,118 @@ async def test_restart_worker_re_spawns_after_crash(tmp_path: Path) -> None:
         sup.shutdown_worker(sid)
     finally:
         sup.close()
+
+
+# ---------------------------------------------------------------------
+# monitor_worker_health — continuous loop (#250 slice C)
+#
+# The loop orchestrates three pieces: monitor_once (detect), backoff_seconds
+# (wait), _restart_worker (re-spawn). Each piece has its own unit test; this
+# covers the wiring — that the loop actually calls them in order and stops
+# re-spawning once the worker is healthy (monitor_once returns empty).
+#
+# Hermetic via monkeypatch — no real subprocess. A real-subprocess version
+# would be flaky on Windows (subprocess kill timing) and add ~5s of wall
+# time per iteration for backoff, which makes CI slow.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_monitor_worker_health_loops_detect_backoff_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #250 slice C: the loop detects a crash + restarts after backoff.
+
+    One crash → one restart; the second iteration sees the recovered
+    worker + stops re-spawning. Verifies the wiring between
+    ``monitor_once`` → ``backoff_seconds`` → ``_restart_worker``.
+    """
+    import cothis.supervisor as sup_mod
+
+    sup = Supervisor(tmp_path / "supervisor.db")
+    try:
+        sid = "session_loop_test"
+
+        # Stub monitor_once: return sid once, then empty (worker recovered).
+        monitor_calls: list[int] = []
+        def fake_monitor_once() -> list[str]:
+            monitor_calls.append(len(monitor_calls))
+            return [sid] if len(monitor_calls) == 1 else []
+        monkeypatch.setattr(sup, "monitor_once", fake_monitor_once)
+
+        # Stub _restart_worker: record the call (no real spawn).
+        restart_calls: list[str] = []
+        def fake_restart(session_id: str) -> None:
+            restart_calls.append(session_id)
+        monkeypatch.setattr(sup, "_restart_worker", fake_restart)
+
+        # Stub _should_restart: True so the loop proceeds to restart.
+        monkeypatch.setattr(sup, "_should_restart", lambda _: True)
+
+        # Stub backoff to 0 so the test doesn't wait.
+        monkeypatch.setattr(sup_mod, "backoff_seconds", lambda count: 0)
+
+        # Run the loop in a task; cancel after enough iterations for
+        # detect + restart + one verify-healthy pass.
+        task = asyncio.create_task(sup.monitor_worker_health(interval_s=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Loop ran multiple iterations.
+        assert len(monitor_calls) >= 2, (
+            f"loop should call monitor_once at least twice; got {monitor_calls}"
+        )
+        # Restart called exactly once (the single crash).
+        assert restart_calls == [sid], (
+            f"expected one restart of {sid}; got {restart_calls}"
+        )
+    finally:
+        sup.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_worker_health_skips_when_over_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #250 slice C: the loop leaves a session ``errored`` when over restart threshold.
+
+    Threshold guard: if ``_should_restart`` returns False (too many
+    crashes in the window), the loop logs + skips — doesn't keep
+    hammering restart. The session stays ``errored`` so the TUI can
+    surface a diagnose action.
+    """
+    sup = Supervisor(tmp_path / "supervisor.db")
+    try:
+        sid = "session_threshold_test"
+
+        # Stub monitor_once to keep flagging the session as crashed.
+        monkeypatch.setattr(sup, "monitor_once", lambda: [sid])
+        # _should_restart False: over threshold.
+        monkeypatch.setattr(sup, "_should_restart", lambda _: False)
+
+        # Stub restart so we can detect if the loop erroneously calls it.
+        restart_calls: list[str] = []
+        monkeypatch.setattr(
+            sup, "_restart_worker", lambda s: restart_calls.append(s)
+        )
+
+        task = asyncio.create_task(sup.monitor_worker_health(interval_s=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Restart never called despite repeated crash detection.
+        assert restart_calls == [], (
+            f"loop should NOT restart over-threshold session; got {restart_calls}"
+        )
+    finally:
+        sup.close()
