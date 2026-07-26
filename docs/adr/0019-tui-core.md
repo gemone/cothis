@@ -9,6 +9,14 @@ follow-ups.
 This ADR records the decisions for the MVP slice + the boundaries of
 what is intentionally deferred.
 
+> **Update (#375, PR #377):** the ``InputBar(Container)`` wrapper described
+> below was later removed — ``CothisApp.compose`` now yields the ``TextArea``
+> (``id="input"``) directly. A ``TextArea`` yielded inside a ``Container``
+> subclass's ``compose()`` dropped every keystroke under the real terminal
+> driver, so the wrapper was deleted (#375). References to ``InputBar`` /
+> its ``get_text``–``set_text`` API below are the original MVP-slice design,
+> preserved here as the historical record.
+
 ## 1. Textual, not prompt_toolkit
 
 The current ``cothis chat`` uses ``prompt_toolkit.shortcuts.PromptSession``
