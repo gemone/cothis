@@ -151,8 +151,17 @@ def archive_session(
     archive_db_name: str,
     archived_at: str,
     index: ArchiveIndex,
+    vacuum: bool = True,
 ) -> bool | None:
     """Move ``session_id``'s rows from the hot DB to ``archive_dir / archive_db_name``.
+
+    ``vacuum`` (default ``True``) rewrites the hot DB to reclaim freed
+    pages after the DELETE. Single-call callers (``cothis archive <id>``)
+    want this — the user is waiting on the reclaim. Batch callers
+    (``run_archival_pass``) pass ``vacuum=False`` per call and VACUUM
+    once after the loop — N sessions × O(M) disk I/O collapses to one
+    VACUUM × O(M), a 50× reduction on a 100 MB DB with 50 idle sessions
+    (#302).
 
     Atomic per session: ATTACH the cold DB, INSERT rows, DELETE from
     hot, COMMIT, VACUUM, DETACH. Idempotent — a second call with the
@@ -199,7 +208,8 @@ def archive_session(
                 )
         finally:
             conn.execute("DETACH DATABASE arch")
-        conn.execute("VACUUM")
+        if vacuum:
+            conn.execute("VACUUM")
     finally:
         conn.close()
 
@@ -259,11 +269,19 @@ def run_archival_pass(
             archive_db_name=f"{_month_bucket(updated_at)}.db",
             archived_at=now_iso,
             index=index,
+            # Skip per-call VACUUM; one VACUUM after the loop reclaims
+            # all freed pages in O(M) instead of O(N×M) (#302).
+            vacuum=False,
         )
         archived += 1
 
     conn = sqlite3.connect(hot_db_path)
     try:
+        # Single VACUUM after the batch — rewrites the hot DB once
+        # instead of once per archived session. For a 100 MB DB + 50
+        # idle sessions this is 100 MB of I/O instead of 5 GB.
+        if archived > 0:
+            conn.execute("VACUUM")
         conn.execute(
             "INSERT OR REPLACE INTO archive_state(key, value) VALUES ('last_run', ?)",
             (now_iso,),
