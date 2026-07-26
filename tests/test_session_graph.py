@@ -166,3 +166,80 @@ def test_empty_graph_has_no_roots() -> None:
     g = graph.build([])
     assert graph.roots(g) == []
     assert len(g) == 0
+
+
+# ---------------------------------------------------------------------
+# children_index + indexed variants (#271 perf)
+#
+# Pre-#271: ``children_of`` / ``is_leaf`` / ``subtree`` scan the whole
+# graph per call (O(N)). For loops that walk >1 node, callers should
+# build ``children_index`` once and use the ``*_indexed`` variants —
+# O(answer-size) instead of O(N²).
+# ---------------------------------------------------------------------
+
+
+def test_children_index_matches_children_of_for_all_nodes() -> None:
+    """``children_index`` produces the same answers as ``children_of``."""
+    g = _tree()
+    idx = graph.children_index(g)
+    for sid in g:
+        assert idx.get(sid, []) == graph.children_of(g, sid), (
+            f"index mismatch for {sid}: idx={idx.get(sid)}, scan={graph.children_of(g, sid)}"
+        )
+
+
+def test_children_indexed_is_o1_lookup() -> None:
+    """``children_of_indexed`` returns the indexed list directly (no scan)."""
+    g = _tree()
+    idx = graph.children_index(g)
+    # a → {c, e} per _tree()
+    assert sorted(graph.children_of_indexed(g, idx, "a")) == ["c", "e"]
+    # b is a leaf root → empty
+    assert graph.children_of_indexed(g, idx, "b") == []
+    # d (a leaf under c) → empty
+    assert graph.children_of_indexed(g, idx, "d") == []
+
+
+def test_is_leaf_indexed_matches_is_leaf_for_all_nodes() -> None:
+    """``is_leaf_indexed`` agrees with the scan-based ``is_leaf``."""
+    g = _tree()
+    idx = graph.children_index(g)
+    for sid in g:
+        assert graph.is_leaf_indexed(g, idx, sid) is graph.is_leaf(g, sid), (
+            f"is_leaf mismatch for {sid}"
+        )
+
+
+def test_subtree_indexed_matches_subtree_for_all_nodes() -> None:
+    """``subtree_indexed`` produces the same BF traversal as ``subtree``."""
+    g = _tree()
+    idx = graph.children_index(g)
+    for sid in g:
+        assert graph.subtree_indexed(g, idx, sid) == graph.subtree(g, sid), (
+            f"subtree mismatch for {sid}"
+        )
+
+
+def test_subtree_indexed_skips_full_graph_scan_per_iteration() -> None:
+    """AC #271: ``subtree_indexed`` reads ``children.get(...)`` — no ``graph.values()`` walk.
+
+    Regression guard for the perf claim. The non-indexed ``subtree`` calls
+    ``graph.values()`` once per descendant; the indexed version calls it
+    zero times (children dict is pre-built). Verified via a custom Mapping
+    subclass whose ``values()`` raises if invoked.
+    """
+    from collections.abc import Mapping
+
+    class _NoValuesDict(dict, Mapping):
+        """``dict`` subclass whose ``values()`` raises (scan detector)."""
+        def values(self):  # type: ignore[override]
+            raise AssertionError(
+                "subtree_indexed must not call graph.values() — "
+                "the index is pre-built"
+            )
+
+    # Seed the no-values dict with the tree's rows.
+    g = _NoValuesDict(_tree())
+    idx = graph.children_index(_tree())  # build index from a plain copy
+    out = graph.subtree_indexed(g, idx, "a")
+    assert set(out) == {"a", "c", "d", "e"}
