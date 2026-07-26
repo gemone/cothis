@@ -12,6 +12,7 @@ Agent integration tests where ``_ensure_mcp`` builds its own group).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -1135,5 +1136,66 @@ async def test_prefix_falls_back_to_yaml_label_when_server_name_empty(
         assert "add" not in agent._tool_map
     finally:
         await agent.aclose()
+
+
+# --- connect_into: handshake CancelledError (#370) ---------------------
+#
+# Twin of HandleManager._release's #185 fix (see test_release_cancel.py).
+# The MCP SDK runs each server's transport in an anyio task group; if a
+# sibling task (post_writer) dies on a flaky remote transport, the group
+# is cancelled and ``connect_to_server`` surfaces ``asyncio.CancelledError``.
+# Since 3.8 CancelledError is a BaseException, ``except Exception`` doesn't
+# catch it — without the explicit clause it escapes connect_into →
+# _ensure_mcp and cancels the whole agent turn (blocking even unrelated
+# local tools like fs.read / fs.delete).
+#
+# Uses a real ``ClientSessionGroup`` (matching the rest of this file) with
+# ``connect_to_server`` swapped for a raiser via ``setattr`` — the same
+# pattern as ``in_memory_group``. A hand-rolled fake would not satisfy the
+# ``ClientSessionGroup`` parameter type (ty rejects it).
+
+
+@pytest.mark.asyncio
+async def test_connect_into_swallows_handshake_cancelled_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC #370: a handshake CancelledError must not escape ``connect_into``."""
+    server = MCPServer(
+        name="mcp:flaky", params={"transport": "http"}, diagnostic="remote http"
+    )
+    async with ClientSessionGroup() as group:
+
+        async def _cancelled(params: Any, session_params: Any = None) -> None:
+            raise asyncio.CancelledError()
+
+        setattr(group, "connect_to_server", _cancelled)
+        with caplog.at_level(logging.WARNING, logger="cothis.tools.mcp"):
+            result = await server.connect_into(group)  # must not raise
+    assert result == ([], None)
+    assert any(
+        "mcp:flaky" in r.getMessage() and "cancel" in r.getMessage().lower()
+        for r in caplog.records
+    ), f"expected a cancellation warning; got {[r.getMessage() for r in caplog.records]}"
+
+
+@pytest.mark.asyncio
+async def test_connect_into_still_swallows_regular_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression (#370): the existing ``except Exception`` path still works."""
+    server = MCPServer(name="mcp:boom", params={})
+    async with ClientSessionGroup() as group:
+
+        async def _boom(params: Any, session_params: Any = None) -> None:
+            raise RuntimeError("handshake blew up")
+
+        setattr(group, "connect_to_server", _boom)
+        with caplog.at_level(logging.WARNING, logger="cothis.tools.mcp"):
+            result = await server.connect_into(group)  # must not raise
+    assert result == ([], None)
+    assert any(
+        "mcp:boom" in r.getMessage() and "failed to start" in r.getMessage()
+        for r in caplog.records
+    )
 
 

@@ -179,7 +179,7 @@ Every read of an attribute the upstream package hasn't documented as public must
 
 **In-scope examples:**
 
-- `group.tools` on `mcp.ClientSessionGroup` — guarded in `cothis.tools.mcp.connect_into` (#63, ADR-0005). The SDK may reshape its tool store or re-key entries; the guard fails loud at first connect.
+- `group.tools` on `mcp.ClientSessionGroup` — guarded in `cothis.tools.mcp.connect_into` (#63, ADR-0005). The SDK may reshape its tool store or re-key entries; the guard fails loud at first connect. The same `connect_into` also swallows `asyncio.CancelledError` from handshake task-group cancellation (#370, twin of `_release`'s #185 fix): a flaky remote server's handshake cancel can't escape and cancel the whole agent turn, so unrelated local tools still load.
 - `client._raw` on a third-party client.
 
 **Out of scope:**
