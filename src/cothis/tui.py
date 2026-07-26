@@ -11,9 +11,10 @@ Stream routing per the design-review sign-off (#228, 2026-07-24):
 ``ContentDelta(kind="thinking")`` renders dimmed. Tool calls render
 as inline cards with a status badge.
 
-WS attach + real ``run_turn`` forwarding lands when the worker CLI
-entrypoint (#250) is finalised; for now, ``send_prompt`` emits a
-``PostMessage`` that the app's action handler processes.
+WS attach (``attach_ws`` / ``attach_session_ws``) + ``run_turn``
+forwarding (``send_run_turn``) landed with #252/#319. Multi-session
+dispatch + the worktree picker (#234) are wired up; ``on_worktree_pick``
+(slice D) is the spawn contract for production CLI wiring.
 """
 
 from __future__ import annotations
@@ -99,8 +100,11 @@ def load_skill_selection() -> set[str]:
 class SessionList(ListView):
     """Left pane — sessions from the session table.
 
-    Placeholder for now; real session-table population + selection
-    handling lands when multi-session (#230) work begins.
+    Populated by ``CothisApp.refresh_session_list`` (driven from
+    ``Storage.list_sessions_in_cwd_tree``). Each row's label carries
+    the session's cwd + worktree branch when applicable (#234 AC #3);
+    rows are sorted by cwd for visual grouping by worktree (slice F).
+    Selection fires ``on_list_view_selected`` → ``on_session_selected``.
     """
 
     DEFAULT_CSS = """
@@ -404,10 +408,6 @@ class WorktreePickerModal(ModalScreen[str | None]):
     into the new session's ``cwd``. Esc or Cancel: dismiss with
     ``None`` (the caller treats ``None`` as "user cancelled, no new
     session").
-
-    Per the AskUserModal convention: this slice ships the modal class
-    only; ``CothisApp.on_new_session`` wiring (push the picker on
-    Ctrl-N, create the session on dismiss) lands in a follow-up.
     """
 
     DEFAULT_CSS = """
@@ -514,11 +514,9 @@ class CothisApp(App):
         self.on_new_session(worktrees)
 
     def on_new_session(self, worktrees: list) -> None:
-        """Hook called by ``action_new_session`` with the visible worktrees.
-
-        Default: log + return. Subclasses override to mount a picker
-        modal (``ModalScreen``) that lets the user choose a worktree
-        for the new session. The picker UI lands in a follow-up.
+        """Hook called by ``action_new_session`` (the ``n`` keypress) with the
+        visible worktrees. Default: pushes ``WorktreePickerModal`` (#234 slice
+        C) and routes the chosen path to ``on_worktree_pick`` (slice D).
         """
         logger.info(
             "tui: new-session action fired; %d worktree(s) visible",
