@@ -93,8 +93,8 @@ uv run cothis chat
 ```
 
 `chat` now launches the **Textual TUI** by default (#237): a 3-pane
-layout — `SessionList` (left) + `ConversationView` (center) + `InputBar`
-(bottom). Press `n` to create a new session (worktree picker or current
+layout — `SessionList` (left) + `ConversationView` (center) + a `TextArea`
+input (bottom). Press `n` to create a new session (worktree picker or current
 directory); type a prompt + `Ctrl+Enter` to send. The worker streams
 deltas, tool-call cards, and interactive questions (`AskUserModal`).
 

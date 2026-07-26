@@ -132,7 +132,13 @@ def test_tui_input_receives_keystrokes_over_real_pty() -> None:
             proc.kill()
         os.close(master)
 
-    assert marker.encode() in _strip_ansi(output), (
+    raw_marker = marker.encode()
+    # Raw substring search first — Textual emits the TextArea glyphs as a
+    # contiguous literal run, so this usually hits and skips the ANSI strip.
+    # The stripped fallback covers the rare case where cursor/SGR codes split
+    # the run. Textual runs the PTY in raw mode (no echo), so the marker can
+    # only be in the output if the TextArea actually rendered it.
+    assert raw_marker in output or raw_marker in _strip_ansi(output), (
         "typed marker not painted back by the TUI — the TextArea dropped the "
         "keystrokes under the real terminal driver (regression of #375). "
         "raw output tail: " + repr(output[-500:])
