@@ -1768,3 +1768,71 @@ tools:
     assert asyncio.run(by_name["uv.add"]()) == "added\n"
     assert asyncio.run(by_name["uv.run"]()) == "ran\n"
 
+
+# --- output cap (#382) -----------------------------------------------------
+
+
+def test_format_proc_result_caps_oversize_stdout() -> None:
+    """#382: stdout beyond ``_MAX_BYTES`` is capped with a truncation marker.
+
+    A YAML shell tool can emit unbounded output (``cat huge.log``, ``seq``,
+    ``find /``). ``_format_proc_result`` caps each stream at the ``fs.read``
+    bound (``_MAX_BYTES``) so the result can't blow the LLM context — the
+    same hole ``fs.read``'s cap closes. (Bounded capture for the GB-OOM path
+    is AC #2, deferred.)
+    """
+    import subprocess
+
+    from cothis.tools.fs._hygiene import _MAX_BYTES
+    from cothis.tools.yaml import _format_proc_result
+
+    huge = "x" * (_MAX_BYTES * 5)
+    proc = subprocess.CompletedProcess(
+        args=["emit"], returncode=0, stdout=huge, stderr=""
+    )
+    result = _format_proc_result(proc)
+
+    assert "[truncated:" in result
+    assert str(len(huge)) in result  # marker reports the original byte size
+    # stdout portion capped at the bound; total is bound + small marker, not 5×.
+    assert len(result) < _MAX_BYTES + 200
+
+
+def test_format_proc_result_caps_oversize_stderr_and_error_path() -> None:
+    """#382: stderr is capped too; the non-zero-exit path caps both streams."""
+    import subprocess
+
+    from cothis.tools.fs._hygiene import _MAX_BYTES
+    from cothis.tools.yaml import _format_proc_result
+
+    huge = "y" * (_MAX_BYTES * 3)
+    proc = subprocess.CompletedProcess(
+        args=["boom"], returncode=2, stdout=huge, stderr=huge
+    )
+    result = _format_proc_result(proc)
+
+    assert result.startswith("Error: exit code 2")
+    assert result.count("[truncated:") == 2  # both stdout and stderr capped
+    assert len(result) < _MAX_BYTES * 2 + 400  # two capped streams + markers
+
+
+def test_format_proc_result_within_cap_is_not_truncated() -> None:
+    """#382: output within the bound passes through verbatim (no marker)."""
+    import subprocess
+
+    from cothis.tools.fs._hygiene import _MAX_BYTES
+    from cothis.tools.yaml import _format_proc_result
+
+    proc = subprocess.CompletedProcess(
+        args=["echo"], returncode=0, stdout="hello\n", stderr=""
+    )
+    assert _format_proc_result(proc) == "hello\n"
+
+    # Just under the cap — still verbatim, no marker appended.
+    proc_under = subprocess.CompletedProcess(
+        args=["echo"], returncode=0, stdout="a" * (_MAX_BYTES - 1), stderr=""
+    )
+    result = _format_proc_result(proc_under)
+    assert "[truncated:" not in result
+    assert len(result) == _MAX_BYTES - 1
+

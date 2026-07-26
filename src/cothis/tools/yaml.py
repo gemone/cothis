@@ -36,6 +36,7 @@ from cothis.tools.core import (
     _require,
     logger,
 )
+from cothis.tools.fs._hygiene import _MAX_BYTES
 
 if TYPE_CHECKING:
     from cothis.tools.core import Tool
@@ -715,6 +716,35 @@ def _shell_argv(
     return [shell_path or "sh", "-c", command]
 
 
+def _truncate_stream(stream: str) -> str:
+    """Cap a captured subprocess stream at ``_MAX_BYTES`` characters (#382).
+
+    YAML shell tools run user-authored commands that can emit unbounded
+    output (``cat huge.log``, ``find /``, ``seq``, ``yes``). Without a cap
+    the result is stored in the conversation and re-sent to the LLM every
+    turn, blowing the context — the same hole ``fs.read``'s ``_MAX_BYTES``
+    closes.
+
+    The cap is character-based (not byte-based): it avoids slicing a UTF-8
+    code point and the silent ``errors='replace'`` decode the text-boundary
+    convention forbids. For the dominant ASCII-command-output case a
+    character cap equals the byte cap. This bounds the *returned* output
+    (the LLM-context hole); bounding the *capture* itself so a GB-emitting
+    command cannot OOM the agent before this runs is a separate concern
+    (#382 AC #2, deferred).
+    """
+    # cothis: ceiling — caps the *returned* output, not capture memory; a
+    # GB-emitting command can still OOM the agent during capture. Upgrade =
+    # bounded capture (Popen + capped read), #382 AC #2.
+    if len(stream) <= _MAX_BYTES:
+        return stream
+    return (
+        stream[:_MAX_BYTES]
+        + f"\n... [truncated: {len(stream)} characters total — narrow the "
+        "command or read a slice via fs.read]"
+    )
+
+
 def _format_proc_result(proc: Any) -> str:
     """Format a finished ``subprocess.CompletedProcess`` for the LLM.
 
@@ -725,16 +755,22 @@ def _format_proc_result(proc: Any) -> str:
     failure) is often the most actionable signal, and dropping it (the prior
     behaviour) made the LLM blind to why a command crashed mid-output.
     Story 18: capture stdout+stderr.
+
+    Each stream is capped at ``_MAX_BYTES`` via ``_truncate_stream`` (#382):
+    a verbose command can't blow the LLM context. ``fs.read`` enforces the
+    same bound.
     """
+    stdout = _truncate_stream(proc.stdout or "")
+    stderr = _truncate_stream(proc.stderr or "")
     if proc.returncode == 0:
-        if proc.stderr:
-            return f"{proc.stdout}\n[stderr]\n{proc.stderr}"
-        return proc.stdout
+        if stderr:
+            return f"{stdout}\n[stderr]\n{stderr}"
+        return stdout
     parts = [f"Error: exit code {proc.returncode}"]
-    if proc.stdout:
-        parts.append(f"[stdout]\n{proc.stdout}")
-    if proc.stderr:
-        parts.append(f"[stderr]\n{proc.stderr}")
+    if stdout:
+        parts.append(f"[stdout]\n{stdout}")
+    if stderr:
+        parts.append(f"[stderr]\n{stderr}")
     return "\n".join(parts)
 
 
