@@ -158,3 +158,21 @@ def test_fs_delete_description_has_example() -> None:
 
     desc = schema_for(_delete).get("description", "")
     assert "fs.delete(" in desc
+
+
+@pytest.mark.asyncio
+async def test_fs_create_leaves_no_temp_files(tmp_path: Path) -> None:
+    """AC #351: atomic write leaves no ``*.tmp`` orphan after create.
+
+    Same regression guard as ``fs.modify``: after a successful create,
+    the directory should contain only the new file — no temp leftover.
+    """
+    from cothis.tools.fs.create import _create
+
+    with workdir_context(tmp_path):
+        await _create(path="new.py", content="print('hi')\n")
+
+    files = set(p.name for p in tmp_path.iterdir())
+    assert files == {"new.py"}, (
+        f"expected only new.py; got {files} (temp file not cleaned up?)"
+    )

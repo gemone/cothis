@@ -9,6 +9,8 @@ Agent's cwd via ``_hygiene._resolve_under``.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 from cothis.tools.core import tool
@@ -20,6 +22,30 @@ from cothis.tools.fs._hygiene import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Write text atomically: temp file → fsync → rename (#351).
+
+    Same pattern as ``fs.modify``'s atomic write. For ``fs.create`` the
+    destination doesn't exist yet, so ``os.replace`` creates it atomically
+    (POSIX ``rename(2)`` on a non-existent target is atomic creation).
+    """
+    fd, tmp_path = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 _CREATE_DESCRIPTION = """Create a new file with the given content.
@@ -51,6 +77,6 @@ async def _create(path: str, content: str) -> str:
     if not resolved.parent.is_dir():
         return f"Error: parent directory does not exist: {resolved.parent.relative_to(cwd)}"
 
-    resolved.write_text(content, encoding="utf-8")
+    _atomic_write_text(resolved, content)
     line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
     return f"fs.create: created {path} ({line_count} lines)"
