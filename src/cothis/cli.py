@@ -230,6 +230,11 @@ def chat(
             "Synthesises a load_skill pair after the first user message."
         ),
     ),
+    legacy: bool = typer.Option(
+        False,
+        "--legacy",
+        help="Use the legacy REPL instead of the Textual TUI (#237).",
+    ),
 ) -> None:
     """Run an interactive multi-turn chat session.
 
@@ -241,7 +246,22 @@ def chat(
     ``--resume <id>`` shortcuts to the end of ``main``: no interactive
     picker. Errors with "not found, run ``cothis history``" if the id is
     missing or out of this directory's scope.
+
+    **Default: launches the Textual TUI** (#237 staged migration). The
+    TUI supports ``--model`` / ``--provider``. Flags not yet supported
+    by the TUI (``--resume``, ``--skill``) fall back to the legacy REPL
+    with a notice. Pass ``--legacy`` to force the REPL.
     """
+    # Staged migration (#237): default to TUI; --legacy keeps the REPL.
+    # Flags not yet supported by the TUI fall back to legacy.
+    if not legacy:
+        if resume is None and not skill:
+            _launch_tui_app(model=model, provider=provider)
+            return
+        console.print(
+            "[dim]--resume / --skill not yet supported by the TUI; "
+            "using legacy REPL. Pass --legacy to silence this notice.[/dim]"
+        )
     asyncio.run(
         _chat_session(
             model=model,
@@ -730,6 +750,35 @@ class _DrivenCothisApp:
         return _App()
 
 
+def _launch_tui_app(model: str, provider: str) -> None:
+    """Construct Supervisor + _DrivenCothisApp and launch the Textual TUI.
+
+    Shared between ``cothis tui`` and ``cothis chat`` (default TUI path,
+    #237 staged migration). Both commands construct the same Supervisor +
+    spawn-wired app; the only difference is the entrypoint name.
+    """
+    from cothis.supervisor import Supervisor
+    from cothis.tui import run as run_tui
+
+    sessions_dir = Path.cwd() / ".cothis" / "sessions"
+    sup = Supervisor()
+
+    provider_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k.endswith("_API_KEY") and v
+    }
+
+    app = _DrivenCothisApp.build(
+        supervisor=sup,
+        sessions_dir=sessions_dir,
+        model=model,
+        provider=provider,
+        provider_env=provider_env,
+    )
+    run_tui(app=app)
+
+
 @app.command()
 def tui(
     model: str = typer.Option(
@@ -757,30 +806,7 @@ def tui(
     ``on_ask_user_request``) keep their default behaviour (mount modal /
     log). Slice F+ will wire the remaining hooks for full multi-session UX.
     """
-    from cothis.supervisor import Supervisor
-    from cothis.tui import run as run_tui
-
-    sessions_dir = Path.cwd() / ".cothis" / "sessions"
-    sup = Supervisor()
-
-    # Pass through provider API keys so the worker subprocess can validate
-    # its Agent constructor eagerly. The keys themselves are read from
-    # ``os.environ`` (already loaded by typer/click); they don't leak into
-    # logs or argv (spawn_worker sets them via subprocess ``env=``).
-    provider_env = {
-        k: v
-        for k, v in os.environ.items()
-        if k.endswith("_API_KEY") and v
-    }
-
-    app = _DrivenCothisApp.build(
-        supervisor=sup,
-        sessions_dir=sessions_dir,
-        model=model,
-        provider=provider,
-        provider_env=provider_env,
-    )
-    run_tui(app=app)
+    _launch_tui_app(model=model, provider=provider)
 
 
 # ---------------------------------------------------------------------
