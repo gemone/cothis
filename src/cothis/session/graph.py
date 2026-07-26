@@ -45,16 +45,57 @@ def parent_seq_of(graph: dict[str, SessionRow], sid: str) -> int | None:
     return graph[sid].parent_seq
 
 
+def children_index(graph: dict[str, SessionRow]) -> dict[str, list[str]]:
+    """Derived ``parent_id → [child ids]`` index for O(answer-size) traversals.
+
+    The plain ``children_of`` / ``is_leaf`` / ``subtree`` scan the whole
+    graph per call (O(N)). For loops that walk the tree more than once
+    (e.g. rendering a fork picker), build the index once and pass it to
+    the ``*_indexed`` variants — total cost goes from O(N²) to O(N) (#271).
+
+    Immutability contract: ``build`` documents the row map as built once
+    at startup; the index is a derived view of the same immutability
+    assumption. Don't mutate the underlying graph after building the
+    index — the index won't reflect the change.
+    """
+    children: dict[str, list[str]] = {}
+    for row in graph.values():
+        if row.parent_id is None:
+            continue
+        children.setdefault(row.parent_id, []).append(row.id)
+    return children
+
+
 def children_of(graph: dict[str, SessionRow], sid: str) -> list[str]:
     """Direct children of ``sid``. Empty for leaves."""
     _require(graph, sid)
     return [r.id for r in graph.values() if r.parent_id == sid]
 
 
+def children_of_indexed(
+    graph: dict[str, SessionRow],
+    children: dict[str, list[str]],
+    sid: str,
+) -> list[str]:
+    """O(answer-size) variant of ``children_of`` using a pre-built ``children_index``."""
+    _require(graph, sid)
+    return children.get(sid, [])
+
+
 def is_leaf(graph: dict[str, SessionRow], sid: str) -> bool:
     """``True`` if ``sid`` has no children — the only nodes ``delete`` accepts."""
     _require(graph, sid)
     return not any(r.parent_id == sid for r in graph.values())
+
+
+def is_leaf_indexed(
+    graph: dict[str, SessionRow],
+    children: dict[str, list[str]],
+    sid: str,
+) -> bool:
+    """O(1) variant of ``is_leaf`` using a pre-built ``children_index``."""
+    _require(graph, sid)
+    return sid not in children or not children[sid]
 
 
 def roots(graph: dict[str, SessionRow]) -> list[str]:
@@ -85,6 +126,28 @@ def subtree(graph: dict[str, SessionRow], sid: str) -> list[str]:
         current = out[i]
         i += 1
         out.extend(r.id for r in graph.values() if r.parent_id == current)
+    return out
+
+
+def subtree_indexed(
+    graph: dict[str, SessionRow],
+    children: dict[str, list[str]],
+    sid: str,
+) -> list[str]:
+    """O(answer-size) variant of ``subtree`` using a pre-built ``children_index``.
+
+    Each iteration reads ``children.get(current, [])`` instead of scanning
+    ``graph.values()``. For a tree of depth D, the original was O(N·D); the
+    indexed version is O(answer-size) — only the descendants themselves are
+    touched.
+    """
+    _require(graph, sid)
+    out: list[str] = [sid]
+    i = 0
+    while i < len(out):
+        current = out[i]
+        i += 1
+        out.extend(children.get(current, []))
     return out
 
 
