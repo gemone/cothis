@@ -1662,10 +1662,11 @@ async def test_worktree_picker_empty_list_renders_only_cancel() -> None:
 
     Edge case: not a git repo, or git binary missing — ``list_worktrees``
     returns ``[]``. The modal still mounts (no crash) so the user sees
-    an explicit "nothing to pick" rather than a silent no-op. Future
-    wiring may add a "create session in current cwd" fallback.
+    an explicit "nothing to pick" rather than a silent no-op. The label
+    changes to a hint that suggests ``git worktree add`` (cothis only
+    discovers worktrees, it doesn't create them — out of scope per #234).
     """
-    from textual.widgets import Button
+    from textual.widgets import Button, Label
 
     from cothis.tui import CothisApp, WorktreePickerModal
 
@@ -1681,6 +1682,19 @@ async def test_worktree_picker_empty_list_renders_only_cancel() -> None:
         buttons = list(modal.query(Button))
         assert len(buttons) == 1
         assert buttons[0].id == "worktree-cancel"
+
+        # Empty-list label points the user at the fix outside cothis.
+        # Plain-text comparison via ``str(content)`` — Textual's Label
+        # stores a ``Text`` object; str() gives the rendered string.
+        labels = list(modal.query(Label))
+        assert labels, "expected at least one Label in the modal"
+        label_text = str(getattr(labels[0], "_Static__content", ""))
+        assert "No worktrees found" in label_text, (
+            f"empty-list label should mention 'No worktrees found'; got {label_text!r}"
+        )
+        assert "git worktree add" in label_text, (
+            f"empty-list label should suggest the fix; got {label_text!r}"
+        )
 
 
 # ---------------------------------------------------------------------
