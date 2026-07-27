@@ -221,6 +221,16 @@ class SessionWorker:
             logger.warning("SessionWorker connection error: %s", exc)
         finally:
             self._active_conn = None
+            # cothis: cancel + await the in-flight turn on disconnect (#396).
+            # Without this, a client that drops mid-turn leaves the background
+            # turn task running (driving the agent for a dead client) and
+            # un-awaited (asyncio "Task exception was never retrieved").
+            if self._active_turn is not None and not self._active_turn.done():
+                self._active_turn.cancel()
+                try:
+                    await self._active_turn
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     async def _dispatch(self, conn: Connection, msg: dict[str, Any]) -> None:
         """One control message → one or more WS responses."""
