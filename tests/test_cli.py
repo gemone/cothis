@@ -910,6 +910,29 @@ async def test_on_worktree_pick_real_worker_finds_session_project_mode(
         sup.close()
 
 
+def test_check_resume_exists_rejects_bogus_id(tmp_path: Path) -> None:
+    """#394: a well-formed-but-nonexistent resume id is rejected before the TUI launches.
+
+    Both the TUI default path (``chat``) and the ``tui`` command must probe
+    existence (not just format) so a misspelt/obsolete id fails fast with
+    "session … not found" instead of launching the TUI + spawning a doomed
+    worker.
+    """
+    import typer
+
+    from cothis.cli import _check_resume_exists
+
+    db_path = tmp_path / "session.db"
+    bogus = "0" * 32  # well-formed hex, nonexistent
+
+    try:
+        _check_resume_exists(db_path, bogus)
+        raise AssertionError("should have raised BadParameter")
+    except typer.BadParameter as exc:
+        assert "not found" in str(exc)
+        assert bogus in str(exc)
+
+
 def test_launch_tui_app_passes_resume_to_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

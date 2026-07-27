@@ -83,6 +83,23 @@ def _validate_session_id_arg(sid: str) -> None:
         )
 
 
+def _check_resume_exists(db_path: Path, resume: str) -> None:
+    """Fail fast if a resume id doesn't exist before launching the TUI (#394).
+
+    The TUI path validated only format, not existence — a well-formed-but-
+    nonexistent id launched the TUI and spawned a doomed worker. Mirrors
+    the legacy REPL's ``Session.load`` gate so both paths deliver the same
+    "not found" message. The loaded session is closed immediately (the
+    TUI's ``on_mount`` re-loads it).
+    """
+    try:
+        Session.load(db_path, resume, cwd=Path.cwd()).close()
+    except KeyError:
+        raise typer.BadParameter(
+            f"session {resume!r} not found; run `cothis history` to list"
+        )
+
+
 def _resolve_db_path(cwd: Path | None = None) -> Path:
     """Resolve the SQLite db path for session persistence.
 
@@ -267,6 +284,7 @@ def chat(
         if not skill:
             if resume is not None:
                 _validate_session_id_arg(resume)
+                _check_resume_exists(_resolve_db_path(), resume)
             _launch_tui_app(model=model, provider=provider, resume=resume)
             return
         console.print(
@@ -894,6 +912,7 @@ def tui(
     """
     if resume is not None:
         _validate_session_id_arg(resume)
+        _check_resume_exists(_resolve_db_path(), resume)
     _launch_tui_app(model=model, provider=provider, resume=resume)
 
 
