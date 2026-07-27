@@ -248,3 +248,31 @@ def test_audit_accepts_cost_marker(tmp_path: Path) -> None:
         if not _COST_MARKER.search(line):
             naked = True
     assert not naked, "audit flagged an import that has the marker"
+
+
+def test_prompt_toolkit_not_imported_at_cli_startup() -> None:
+    """#386: prompt_toolkit (~115ms) is chat-REPL-only.
+
+    ``import cothis.cli`` must not load it, so the non-chat commands
+    (ask/history/delete/archive/tui/worker/--help) don't pay for a REPL
+    widget they never instantiate. The static audit above can't enforce
+    this — a top-level ``prompt_toolkit`` import with a ``# cost:`` marker
+    passes it — so this runtime check asserts the deferral directly, in a
+    fresh subprocess (an in-process ``sys.modules`` check would be
+    order-dependent on whatever else the suite imported).
+    """
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, cothis.cli; print('prompt_toolkit' in sys.modules)"],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT / "src")},
+    )
+    assert result.returncode == 0, (
+        f"cothis.cli import failed in subprocess:\n{result.stderr}"
+    )
+    assert result.stdout.strip() == "False", (
+        "import cothis.cli loaded prompt_toolkit — the chat-only REPL dep "
+        "must be deferred (lazy-imported inside _chat_session, #386)."
+    )
