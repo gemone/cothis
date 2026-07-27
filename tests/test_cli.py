@@ -650,6 +650,49 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     assert len(scheduled) == 1
 
 
+def test_driven_cothis_app_on_worktree_pick_rolls_back_on_spawn_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#390: a failed ``spawn_worker`` rolls back the just-created session.
+
+    No ``session-*.db`` is left behind (no ghost surfacing in
+    ``cothis history``), and the failure is logged. Uses real
+    ``Session.new`` (creates a real db file) so the rollback's file
+    removal is exercised end-to-end, not just the row delete.
+    """
+    import logging
+    from typing import cast
+
+    import cothis.cli as cli_mod
+
+    sessions_dir = tmp_path / "sessions"
+
+    class _FailingSupervisor:
+        def spawn_worker(self, *a: object, **kw: object) -> None:
+            raise RuntimeError("worker exec failed (simulated)")
+
+    app = cli_mod._DrivenCothisApp.build(
+        supervisor=cast("Supervisor", _FailingSupervisor()),
+        sessions_dir=sessions_dir,
+        model="m",
+        provider="p",
+        provider_env={},
+    )
+
+    with caplog.at_level(logging.ERROR, logger="cothis.cli"):
+        # Must NOT raise — the rollback catches the spawn failure.
+        app.on_worktree_pick(str(tmp_path))
+
+    # AC #1: no ghost session-*.db left behind.
+    assert list(sessions_dir.glob("session-*.db")) == []
+    # AC #2: the failure + rollback is logged.
+    assert any(
+        "rolled back" in r.getMessage() and "spawn failed" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
 def test_launch_tui_app_passes_resume_to_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
