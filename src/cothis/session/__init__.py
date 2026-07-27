@@ -923,6 +923,17 @@ class Session:
             if cwd is not None and not is_visible(Path(sr.cwd), cwd):
                 raise KeyError(f"session {session_id!r} not found")
             messages, _ = _rebuild_messages(rows)
+            if sr.parent_id is not None:
+                # cothis: ancestor-chain assembly — mirror Session.load
+                # (#388) so a fork previews with its parent context, not
+                # just the fork's own messages. Read-only + lock-free.
+                # Hot-only (matches load: cold ancestors of a cold fork
+                # aren't resolved by either path — consistent limitation).
+                graph = _graph.build(storage.list_sessions())
+                ancestor_segments = cls._assemble_ancestors(
+                    graph, storage, session_id
+                )
+                messages = ancestor_segments + messages
             return messages
         finally:
             storage.close()

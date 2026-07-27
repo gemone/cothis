@@ -1275,6 +1275,52 @@ def test_load_of_forked_session_assembles_ancestor_chain(tmp_path: Path) -> None
         reloaded.close()
 
 
+def test_peek_messages_of_fork_assembles_ancestor_chain(tmp_path: Path) -> None:
+    """#388: peek_messages previews a fork with its ancestor context.
+
+    ``Session.load`` (resume) assembles the ancestor chain; ``peek_messages``
+    (the ``cothis history <id>`` preview) must too, or a fork previews
+    without its parent context — misrepresenting what resume sends to the
+    model. Mirrors ``test_load_of_forked_session_assembles_ancestor_chain``.
+    """
+    db_path = tmp_path / "session.db"
+    parent = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    parent.append_message("user", [_user_text("ancestor user")])
+    parent.append_message("assistant", [{"type": "text", "text": "ancestor reply"}])
+    parent.close()
+    parent_id = parent.session_id
+
+    ps = Storage(db_path)
+    try:
+        parent_rows = ps.load_blocks(parent_id)
+    finally:
+        ps.close()
+    cap = max(r.seq for r in parent_rows)
+
+    forked = Session.fork(
+        db_path, parent_id, cap, cwd=tmp_path, model="m", flush_sync=True
+    )
+    forked.append_message("user", [_user_text("forked user")])
+    forked.close()
+
+    # peek_messages must include ancestor + fork messages, matching load.
+    peeked = Session.peek_messages(db_path, forked.session_id)
+    loaded = Session.load(db_path, forked.session_id, flush_sync=True)
+    try:
+        assert len(peeked) == len(loaded.messages)  # AC #1: count matches
+    finally:
+        loaded.close()
+    texts = [
+        b.get("text")
+        for m in peeked
+        for b in m.get("content", [])
+        if b.get("type") == "text"
+    ]
+    assert "ancestor user" in texts
+    assert "ancestor reply" in texts
+    assert "forked user" in texts
+
+
 def test_load_respects_cwd_visibility_filter(tmp_path: Path) -> None:
     """``Session.load(cwd=...)`` hides sessions outside the cwd tree.
 
