@@ -252,6 +252,48 @@ def test_run_archival_pass_moves_idle_sessions(tmp_path: Path) -> None:
     assert index.get(new_sid) is None
 
 
+def test_peek_messages_reads_archived_cold_session(tmp_path: Path) -> None:
+    """#384: ``peek_messages`` returns messages for an archived (cold) session.
+
+    ``Session.load`` (resume) and ``Session.delete`` fall back to the cold
+    DB on a hot miss; ``peek_messages`` (the read path behind ``cothis
+    history <id>``) must too — otherwise an archived session is resumable
+    but reports "not found" under the preview command.
+    """
+    db_path = tmp_path / "session.db"
+    sid = _seed_session(db_path, tmp_path, texts=["cold-message"])
+    _set_updated_at(db_path, sid, "2026-04-13T00:00:00+00:00")  # ~100 days old
+    archive_dir = tmp_path / "archive"
+    _clear_archive_state(db_path)
+    run_archival_pass(
+        hot_db_path=db_path,
+        archive_dir=archive_dir,
+        threshold_days=90,
+        now_iso="2026-07-20T00:00:00+00:00",
+    )
+
+    # The session is now cold (hot miss).
+    hot = Storage(db_path)
+    try:
+        assert hot.load_session(sid) is None
+    finally:
+        hot.close()
+
+    # peek_messages must find it in the archive, matching Session.load.
+    loaded = Session.load(db_path, sid, flush_sync=True).messages
+    peeked = Session.peek_messages(db_path, sid)
+    assert peeked == loaded
+    assert len(peeked) == 1
+    assert any("cold-message" in str(m) for m in peeked)
+
+    # An unknown id (hot + archive miss) still raises KeyError.
+    try:
+        Session.peek_messages(db_path, "f" * 32)
+    except KeyError:
+        return
+    raise AssertionError("peek_messages should raise KeyError for an unknown id")
+
+
 def test_run_archival_pass_throttles_via_archive_state(tmp_path: Path) -> None:
     """The pass records ``last_run`` in ``archive_state`` and skips if < 24h old."""
     db_path = tmp_path / "session.db"
