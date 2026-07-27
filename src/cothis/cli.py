@@ -25,7 +25,6 @@ maybe_profile()
 
 import click  # cost: ~5ms
 import typer  # cost: ~30ms (loads click + shell completion)
-from prompt_toolkit.shortcuts import PromptSession  # cost: ~40ms
 from rich.console import Console  # cost: ~15ms
 from rich.live import Live  # cost: ~5ms
 from rich.markdown import Markdown  # cost: ~5ms
@@ -330,6 +329,10 @@ async def _chat_session(
         # ``prompt_async`` (not sync ``prompt`` via ``asyncio.to_thread``): the
         # latter races interpreter shutdown on Ctrl-C — the worker stays blocked
         # on stdin while the main thread unwinds, producing a noisy traceback.
+        # prompt_toolkit (~115ms) is chat-REPL-only — import here, not at
+        # module top, so ask/history/delete/archive/tui/worker/--help don't
+        # pay for a REPL widget they never instantiate (#386).
+        from prompt_toolkit.shortcuts import PromptSession
         prompts = PromptSession()
         try:
             while True:
