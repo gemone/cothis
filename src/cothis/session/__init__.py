@@ -891,6 +891,11 @@ class Session:
         mid-write may show a partial last message. ``KeyError`` propagates
         if the id is unknown OR (when ``cwd`` is passed) the session is
         out of scope — same predicate as :meth:`load`.
+
+        Cold fallback (#86/#384): on a hot miss, consult the archive index
+        and read the cold session in place via ATTACH — mirroring
+        :meth:`load` so an archived session is previewable, not just
+        resumable. Lock-free throughout (cold read is a read-only ATTACH).
         """
         db_path = db_path.expanduser()
         _validate_session_id(session_id)
@@ -898,10 +903,25 @@ class Session:
         try:
             sr = storage.load_session(session_id)
             if sr is None:
-                raise KeyError(f"session {session_id!r} not found")
+                # cothis: cold-read fallback — mirror Session.load so an
+                # archived (cold) session previews instead of "not found".
+                cold_index = ArchiveIndex(db_path.parent / "archive" / "index.json")
+                cold_entry = cold_index.get(session_id)
+                if cold_entry is None:
+                    raise KeyError(f"session {session_id!r} not found")
+                cold_db_path = db_path.parent / "archive" / cold_entry.archive_db
+                cold_read = _read_cold_session(cold_db_path, session_id)
+                if cold_read is None:
+                    # Index drifted: stale entry points at a missing row.
+                    # Drop it so the next archival pass isn't a phantom chase.
+                    cold_index.remove(session_id)
+                    cold_index.save()
+                    raise KeyError(f"session {session_id!r} not found")
+                sr, rows = cold_read
+            else:
+                rows = storage.load_blocks(session_id)
             if cwd is not None and not is_visible(Path(sr.cwd), cwd):
                 raise KeyError(f"session {session_id!r} not found")
-            rows = storage.load_blocks(session_id)
             messages, _ = _rebuild_messages(rows)
             return messages
         finally:
