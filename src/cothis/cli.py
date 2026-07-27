@@ -740,14 +740,29 @@ class _DrivenCothisApp:
                 sid = session.session_id
                 session.close()
 
-                handle = supervisor.spawn_worker(
-                    sid,
-                    model=model,
-                    provider=provider,
-                    cwd=cwd,
-                    sessions_dir=sessions_dir,
-                    extra_env=provider_env,
-                )
+                try:
+                    handle = supervisor.spawn_worker(
+                        sid,
+                        model=model,
+                        provider=provider,
+                        cwd=cwd,
+                        sessions_dir=sessions_dir,
+                        extra_env=provider_env,
+                    )
+                except Exception as exc:
+                    # cothis: spawn failed — roll back the just-persisted
+                    # session so it doesn't surface as a ghost in
+                    # ``cothis history`` (#390). ``delete`` drops the row;
+                    # ``unlink`` drops the (now-empty) per-session db file
+                    # (``Session.delete`` leaves the file on disk).
+                    Session.delete(db_path, sid)
+                    db_path.unlink(missing_ok=True)
+                    logging.getLogger(__name__).error(
+                        "tui: spawn failed for session %s in %s; "
+                        "rolled back: %s",
+                        sid[:8], cwd, exc,
+                    )
+                    return
 
                 logging.getLogger(__name__).info(
                     "tui: spawned session %s in %s", sid[:8], cwd,
