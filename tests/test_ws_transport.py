@@ -693,3 +693,48 @@ async def test_process_request_claims_slot_atomically_with_cap_check() -> None:
     assert transport._active_conns == 4, (
         f"_active_conns should be 4 after 4 accepts; got {transport._active_conns}"
     )
+
+
+@pytest.mark.asyncio
+async def test_handle_conn_cancels_orphan_turn_on_disconnect() -> None:
+    """#396: a client that disconnects mid-turn must not orphan the turn task.
+
+    ``_handle_conn``'s ``finally`` block cancels + awaits ``_active_turn``
+    so the background task (driving the agent for a dead client) doesn't
+    keep running after the connection closes. Pre-fix the turn was left
+    running + un-awaited (asyncio "Task exception was never retrieved").
+    """
+    from cothis.agent import ContentDelta
+
+    proceed = asyncio.Event()
+
+    async def _blocking_run_stream(prompt: str):
+        yield ContentDelta(kind="text", text="hi")
+        await proceed.wait()  # block mid-turn (simulates a long LLM/tool call)
+
+    agent = MagicMock()
+    agent.run_stream = _blocking_run_stream
+    agent.aclose = MagicMock(return_value=asyncio.sleep(0))
+    agent._session = None
+    agent._bus = None
+
+    transport = FakeTransport()
+    worker = SessionWorker(agent, transport=transport)
+    await worker.start()
+    conn = await transport.accept()
+    try:
+        await conn.feed(json.dumps({"type": "run_turn", "prompt": "x"}))
+        # Let the turn task start + block at ``proceed.wait()``.
+        await asyncio.sleep(0.1)
+        # Disconnect mid-turn (end of stream → _handle_conn's finally fires).
+        await conn.feed(None)
+        await asyncio.sleep(0.1)
+        # The orphaned turn task must be done (cancelled + awaited).
+        assert worker._active_turn is not None
+        assert worker._active_turn.done(), (
+            "_active_turn should be done after disconnect; "
+            f"cancelled={worker._active_turn.cancelled()}"
+        )
+    finally:
+        proceed.set()  # unblock if something went wrong
+        await worker.stop()
