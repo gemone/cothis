@@ -98,6 +98,14 @@ class ArchiveIndex:
     def __len__(self) -> int:
         return len(self._entries)
 
+    def entries(self) -> dict[str, ArchivedEntry]:
+        """All entries (``session_id → ArchivedEntry``), as a copy.
+
+        Used by ``cothis archive list`` (#392) to enumerate archived
+        sessions without scanning every cold DB.
+        """
+        return dict(self._entries)
+
     def get(self, session_id: str) -> ArchivedEntry | None:
         return self._entries.get(session_id)
 

@@ -583,7 +583,7 @@ def delete_cmd(
 @app.command(name="archive")
 def archive_cmd(
     action: str = typer.Argument(
-        "all", help="'all' (default), '<session_id>', 'restore <id>', 'compress <file>'"
+        "all", help="'all' (default), 'list', '<session_id>', 'restore <id>', 'compress <file>'"
     ),
     target: str = typer.Argument(
         None, help="Session id (for restore) or file path (for compress)."
@@ -597,6 +597,7 @@ def archive_cmd(
         cothis archive <session_id> # archive one session
         cothis archive restore <id> # promote archived session back
         cothis archive compress <file>  # gzip a cold DB file
+        cothis archive list           # list archived (cold) sessions
     """
     # cothis: hand-rolled dispatch instead of nested typer.Typer() because
     # the first positional arg is either a subcommand (restore/compress)
@@ -618,6 +619,18 @@ def archive_cmd(
             console.print("no sessions to archive")
         else:
             console.print(f"archived {archived} session(s)")
+    elif action == "list":
+        archived = Session.list_archived(db_path)
+        if not archived:
+            console.print("no archived sessions")
+            return
+        for sid, sr, archived_at in archived:
+            title = sr.title or f"session {sid[:8]}"
+            cwd_hint = str(sr.cwd) if sr.cwd else "(no cwd)"
+            console.print(
+                f"[cyan]{sid[:8]}…[/cyan]  {title}  "
+                f"[dim]({cwd_hint}, archived {archived_at[:10]})[/dim]"
+            )
     elif action == "restore":
         if not target:
             raise typer.BadParameter("restore requires a session id")
