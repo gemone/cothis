@@ -506,18 +506,18 @@ async def test_monitor_worker_health_invokes_on_restart_after_restart(
     fake_handle = WorkerHandle(
         session_id="a" * 32, pid=999999, ws_url="ws://old", token="old",
         status="running", model="m", provider="p", cwd=str(tmp_path),
-        sessions_dir=str(tmp_path), extra_env=None,
+        sessions_dir=str(tmp_path), extra_env={},
     )
     sup._workers["a" * 32] = fake_handle
-    sup._procs["a" * 32] = MagicMock()  # type: ignore[assignment]
-    # Make the proc look crashed.
-    sup._procs["a" * 32].poll.return_value = 1
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = 1
+    sup._procs["a" * 32] = fake_proc  # type: ignore[assignment]
 
     # Stub spawn_worker (called by _restart_worker) to return a fresh handle.
     new_handle = WorkerHandle(
         session_id="a" * 32, pid=888888, ws_url="ws://new", token="new",
         status="running", model="m", provider="p", cwd=str(tmp_path),
-        sessions_dir=str(tmp_path), extra_env=None,
+        sessions_dir=str(tmp_path), extra_env={},
     )
     monkeypatch.setattr(sup, "spawn_worker", lambda *a, **kw: new_handle)
     # Zero backoff so the restart fires within the test's sleep window.
