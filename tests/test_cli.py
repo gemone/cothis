@@ -534,7 +534,7 @@ def test_tui_command_dispatches_to_cothis_tui_run(
     # filesystem.
     monkeypatch.setattr(
         "cothis.supervisor.Supervisor",
-        lambda *a, **kw: object(),
+        lambda *a, **kw: MagicMock(),
     )
 
     from typer.testing import CliRunner

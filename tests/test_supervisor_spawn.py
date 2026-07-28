@@ -26,6 +26,8 @@ import json
 import os
 from typing import TYPE_CHECKING
 
+from unittest.mock import MagicMock
+
 import pytest
 import websockets
 
@@ -479,4 +481,66 @@ def test_supervisor_close_is_idempotent(tmp_path: Path) -> None:
     sup = Supervisor(tmp_path / "supervisor.db")
     sup.close()
     sup.close()  # must not raise
+
+
+# ---------------------------------------------------------------------
+# on_restart callback (#398 — wire monitor_worker_health into production)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_monitor_worker_health_invokes_on_restart_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#398: ``monitor_worker_health`` calls ``on_restart`` after a restart.
+
+    The callback lets the TUI re-attach to the restarted worker's fresh WS.
+    Pre-fix the monitor loop was never started in production, so crashed
+    workers silently died with no recovery. This test verifies the callback
+    contract: ``on_restart(session_id, new_handle)`` is called after
+    ``_restart_worker`` succeeds.
+    """
+    sup = Supervisor(tmp_path / "supervisor.db")
+
+    # Register a fake crashed worker.
+    from cothis.supervisor import WorkerHandle
+    fake_handle = WorkerHandle(
+        session_id="a" * 32, pid=999999, ws_url="ws://old", token="old",
+        status="running", model="m", provider="p", cwd=tmp_path,
+        sessions_dir=tmp_path, extra_env=None,
+    )
+    sup._workers["a" * 32] = fake_handle
+    sup._procs["a" * 32] = MagicMock()  # type: ignore[assignment]
+    # Make the proc look crashed.
+    sup._procs["a" * 32].poll.return_value = 1
+
+    # Stub spawn_worker (called by _restart_worker) to return a fresh handle.
+    new_handle = WorkerHandle(
+        session_id="a" * 32, pid=888888, ws_url="ws://new", token="new",
+        status="running", model="m", provider="p", cwd=tmp_path,
+        sessions_dir=tmp_path, extra_env=None,
+    )
+    monkeypatch.setattr(sup, "spawn_worker", lambda *a, **kw: new_handle)
+    # Zero backoff so the restart fires within the test's sleep window.
+    monkeypatch.setattr("cothis.supervisor.backoff_seconds", lambda count: 0.0)
+
+    # Install the callback.
+    restarted: list[tuple[str, WorkerHandle]] = []
+    sup.on_restart = lambda sid, handle: restarted.append((sid, handle))
+
+    # Run one iteration of the monitor loop (cancel after the first cycle).
+    task = asyncio.create_task(sup.monitor_worker_health(interval_s=0.01))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(restarted) == 1, (
+        f"on_restart should be called once after restart; got {restarted}"
+    )
+    assert restarted[0][0] == "a" * 32
+    assert restarted[0][1].ws_url == "ws://new"
+    sup.close()
 

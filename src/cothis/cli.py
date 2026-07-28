@@ -780,6 +780,11 @@ class _DrivenCothisApp:
                 # InputBar wrapper removal (#375) otherwise lets the TextArea
                 # grab launch focus and swallow `n` as text.
                 await super().on_mount()
+                # cothis: start the crash-monitor loop (#398). Detects
+                # crashed workers + restarts them with backoff; the
+                # ``on_restart`` callback re-attaches the TUI's WS to the
+                # new worker's fresh port/token.
+                asyncio.create_task(supervisor.monitor_worker_health())
                 # Auto-spawn for --resume: bypass the worktree picker
                 # and attach the resumed session directly.
                 if resume_session_id is None:
@@ -799,7 +804,15 @@ class _DrivenCothisApp:
                     resume_session_id, handle.ws_url, handle.token,
                 )
 
-        return _App()
+        app = _App()
+        # cothis: wire crash-restart re-attach (#398). When the monitor
+        # restarts a crashed worker, the new worker has a fresh WS port +
+        # token; the TUI must re-attach so the next prompt reaches the new
+        # worker, not the dead connection.
+        supervisor.on_restart = lambda sid, handle: asyncio.create_task(
+            app.attach_session_ws(sid, handle.ws_url, handle.token),
+        )
+        return app
 
 
 def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> None:

@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 from cothis.notify import NotifyBus
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,11 @@ class Supervisor:
         self._counters: dict[str, RestartCounter] = {}
         self._threshold = threshold
         self._window_s = window_s
+        # cothis: restart callback (#398). Set by the TUI launcher so a
+        # restarted worker's fresh WS is re-attached (the old connection is
+        # dead). ``None`` in isolation/tests (monitor_worker_health just
+        # restarts without re-attach).
+        self.on_restart: Callable[[str, WorkerHandle], Any] | None = None
 
     def _counter_for(self, session_id: str) -> RestartCounter:
         if session_id not in self._counters:
@@ -403,7 +408,9 @@ class Supervisor:
                     session_id, delay,
                 )
                 await asyncio.sleep(delay)
-                self._restart_worker(session_id)
+                new_handle = self._restart_worker(session_id)
+                if new_handle is not None and self.on_restart is not None:
+                    self.on_restart(session_id, new_handle)
             await asyncio.sleep(interval_s)
 
     def _restart_worker(self, session_id: str) -> WorkerHandle | None:
