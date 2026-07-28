@@ -215,6 +215,11 @@ async def test_tool_call_flushes_text_segment_for_dom_order() -> None:
         await pilot.pause()
         view.append_delta("text", "after-card")
         await pilot.pause()
+        # The streaming segment stays a plain Static until finalised (#407);
+        # finalise it so both text spans are Markdown widgets, as the idle
+        # timer would after streaming settles.
+        view._finalize_segment()
+        await pilot.pause()
 
         # Two separate Markdown segments exist (one per text span).
         markdowns = list(view.query(Markdown))
@@ -273,6 +278,120 @@ async def test_append_delta_segmented_streaming_is_linear_not_quadratic() -> Non
         f"got {ratio:.2f}× (small={t_small*1000:.1f}ms, large={t_large*1000:.1f}ms) — "
         f"buffer is accumulating O(N²) work somewhere"
     )
+
+
+@pytest.mark.asyncio
+async def test_streaming_parses_markdown_once_per_segment_not_per_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#407: Markdown is parsed ONCE per segment (at finalise), not per delta.
+
+    The bug re-parsed the whole segment on every text delta — O(S²) in the
+    segment size. After the fix, deltas accumulate into a plain Static and
+    ``Markdown(source)`` runs once at finalise. This guards the quadratic
+    directly: N deltas → 1 parse (pre-fix it was N).
+    """
+    import cothis.tui as tui_mod
+    from cothis.tui import ConversationView, CothisApp
+
+    # Intercept tui's ``Markdown(source)`` construction to count parses.
+    # A factory (not an ``__init__`` patch) keeps the signature precise so ty
+    # can verify it — tui only ever constructs ``Markdown(source)``.
+    parses: list[None] = []
+    real_markdown = tui_mod.Markdown
+
+    def counting_markdown(markdown: str | None = None) -> tui_mod.Markdown:
+        parses.append(None)
+        return real_markdown(markdown)
+
+    monkeypatch.setattr(tui_mod, "Markdown", counting_markdown)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        for i in range(500):
+            view.append_delta("text", f"word{i} ")
+        await pilot.pause()
+        # While streaming: NO Markdown parse (plain Static holds the text).
+        assert not parses, (
+            f"streaming parsed Markdown {len(parses)} time(s); expected 0"
+        )
+        view._finalize_segment()  # idle-timer proxy
+        await pilot.pause()
+
+    assert len(parses) == 1, (
+        f"expected exactly 1 Markdown parse per segment; got {len(parses)} "
+        f"(pre-fix re-parsed per delta)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_one_segment_refresh_time_is_linear_not_quadratic() -> None:
+    """#407 acceptance #2: total refresh time for one growing segment is O(S), not O(S²).
+
+    A pure-text answer with no tool calls is the worst case — one segment
+    growing across every delta. Pre-fix each delta re-parsed the whole segment
+    (Σ O(k·d) = O(S²)); post-fix deltas accumulate O(1) and Markdown is parsed
+    once at finalise (O(S)). Doubling the deltas should ≈ double the time, not
+    quadruple it. A warmup + best-of-two per size absorb CI contention; the 3.5×
+    threshold mirrors the #267 guard and separates post-fix (~2×) from a pre-fix
+    O(S²) regression (~4×). The deterministic guard is
+    ``test_streaming_parses_markdown_once_per_segment_not_per_delta``.
+    """
+    import time
+
+    from cothis.tui import ConversationView, CothisApp
+
+    async def _run(n: int) -> float:
+        app = CothisApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            view = app.query_one(ConversationView)
+            start = time.perf_counter()
+            for i in range(n):
+                view.append_delta("text", f"word{i} ")
+            view._finalize_segment()
+            await pilot.pause()
+            return time.perf_counter() - start
+
+    await _run(50)  # warmup: imports, widget caches, allocator
+
+    async def _best_of_two(n: int) -> float:
+        return min(await _run(n), await _run(n))
+
+    t_small = await _best_of_two(200)
+    t_large = await _best_of_two(400)
+    ratio = t_large / t_small if t_small > 0 else float("inf")
+    assert ratio <= 3.5, (
+        f"expected ≤3.5× on 2× deltas (linear + overhead); got {ratio:.2f}× "
+        f"(small={t_small * 1000:.1f}ms, large={t_large * 1000:.1f}ms) — "
+        f"per-delta cost is growing with segment size (O(S²))"
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_defers_markdown_until_finalize() -> None:
+    """#407: a streaming segment renders plain text (no Markdown) until
+    finalise swaps in a single Markdown widget."""
+    from textual.widgets import Markdown
+
+    from cothis.tui import ConversationView, CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        for chunk in ("hello ", "world"):
+            view.append_delta("text", chunk)
+        await pilot.pause()
+        # While streaming: no Markdown yet; the text is buffered.
+        assert list(view.query(Markdown)) == []
+        assert view.renderable_str == "hello world"
+        # Finalise (idle-timer proxy): one Markdown widget mounts.
+        view._finalize_segment()
+        await pilot.pause()
+        assert len(list(view.query(Markdown))) == 1
 
 
 # ---------------------------------------------------------------------
