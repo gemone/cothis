@@ -234,6 +234,48 @@ def test_archive_restore_brings_session_back(
     assert idx.get(sid) is None
 
 
+def test_archive_restore_drifted_session_reports_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#405: ``restore <drifted-id>`` reports the graceful not-found, no traceback.
+
+    When the cold DB lost the row (stale-index drift), ``promote_session``
+    self-heals + returns False, so the CLI falls through to its documented
+    "not found in archive index" ``BadParameter`` (exit 1) — not an
+    unhandled ``KeyError`` traceback.
+    """
+    db_path = tmp_path / "session.db"
+    sid = _seed_session(db_path, tmp_path, texts=["archived"])
+    monkeypatch.setenv("COTHIS_SESSIONS_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    archive_result = runner.invoke(app, ["archive", sid])
+    assert archive_result.exit_code == 0
+
+    # Drift: the cold DB exists but its row for ``sid`` is gone; the index
+    # still points at it. Locate the cold DB by glob (name is date-based).
+    cold_dbs = list((tmp_path / "archive").glob("*.db"))
+    assert len(cold_dbs) == 1, cold_dbs
+    conn = sqlite3.connect(cold_dbs[0])
+    try:
+        conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    restore = runner.invoke(app, ["archive", "restore", sid])
+    # Graceful not-found (BadParameter, non-zero exit) — NOT a traceback.
+    # The Rich error box may word-wrap the message, so match on "not found"
+    # (the existing not-found test does the same).
+    assert restore.exit_code != 0
+    combined = _output(restore)
+    assert "not found" in combined
+    assert "Traceback" not in combined
+    # Stale index entry self-healed.
+    idx = ArchiveIndex(db_path.parent / "archive" / "index.json")
+    assert idx.get(sid) is None
+
+
 def test_archive_restore_unknown_id_exits_nonzero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -397,6 +397,54 @@ def test_promote_session_sets_updated_at_now(tmp_path: Path) -> None:
         hot.close()
 
 
+def test_promote_session_self_heals_stale_index_drift(tmp_path: Path) -> None:
+    """#405: a cold DB that exists but lost the row self-heals, not raises.
+
+    The drift — index points at a cold DB whose ``sessions`` table no longer
+    has the row (reachable if a delete crashes between the cold-row commit
+    and the index save) — used to raise KeyError. It now mirrors
+    delete_cold_session: drop the stale entry + return False.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "session.db"
+    sid = _seed_session(db_path, tmp_path, texts=["one"])
+    archive_dir = db_path.parent / "archive"
+    index = ArchiveIndex(archive_dir / "index.json")
+    archive_session(
+        hot_db_path=db_path, archive_dir=archive_dir, session_id=sid,
+        archive_db_name="2026-07.db",
+        archived_at="2026-07-20T00:00:00+00:00", index=index,
+    )
+
+    # Drift: the cold DB still exists but its row for ``sid`` is gone;
+    # the index still claims the session lives there.
+    cold_db = archive_dir / "2026-07.db"
+    conn = sqlite3.connect(cold_db)
+    try:
+        conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        conn.execute("DELETE FROM blocks WHERE session_id=?", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert index.get(sid) is not None
+
+    # Must NOT raise — self-heals + returns False (acceptance #1).
+    result = promote_session(
+        hot_db_path=db_path, archive_dir=archive_dir,
+        session_id=sid, index=index,
+    )
+    assert result is False
+    # Stale index entry dropped.
+    assert index.get(sid) is None
+    # No spurious hot row fabricated.
+    hot = Storage(db_path)
+    try:
+        assert hot.load_session(sid) is None
+    finally:
+        hot.close()
+
+
 def test_validate_archive_db_rejects_traversal(tmp_path: Path) -> None:
     """Index entries pointing outside archive_dir are rejected by
     ``_validate_archive_db`` — blocks path traversal via tampered index."""

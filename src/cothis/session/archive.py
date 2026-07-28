@@ -304,8 +304,11 @@ def promote_session(
     """Copy ``session_id``'s rows back from cold to hot, drop the index entry.
 
     Returns ``True`` if the promotion ran, ``False`` if the session wasn't
-    in the index (already hot, or never archived). ``now_iso`` defaults
-    to wall-clock now; the caller passes it for deterministic tests.
+    in the index (already hot, or never archived), or was in the index but
+    the cold DB no longer has it — a stale-index drift, which is self-healed
+    (entry dropped) instead of raising, mirroring :func:`delete_cold_session`
+    (#405). ``now_iso`` defaults to wall-clock now; the caller passes it for
+    deterministic tests.
     """
     entry = index.get(session_id)
     if entry is None:
@@ -329,10 +332,15 @@ def promote_session(
         conn.execute("ATTACH DATABASE ? AS arch", (str(cold_db_path),))
         try:
             with conn:
-                # Explicit copy so we control updated_at (overwritten to
-                # ``now_iso`` so the session isn't immediately re-archived).
-                conn.execute("DELETE FROM main.sessions WHERE id=?", (session_id,))
-                conn.execute("DELETE FROM main.blocks WHERE session_id=?", (session_id,))
+                # Confirm the cold DB still has the row BEFORE touching hot —
+                # mirrors delete_cold_session's check-first self-heal. If the
+                # index has drifted (cold row gone, e.g. after a delete crashed
+                # between the cold-row commit and the index save), drop the
+                # stale entry + return False instead of raising KeyError, so
+                # ``cothis archive restore`` reports the clean not-found and
+                # promote-on-first-write stops dropping writes on every retry
+                # (#405). Checking first also avoids deleting any hot copy
+                # before we know the cold copy is recoverable.
                 cur = conn.execute(
                     "SELECT id, parent_id, parent_seq, cwd, cli_version, "
                     "model, title, created_at, updated_at, schema_version "
@@ -341,9 +349,18 @@ def promote_session(
                 )
                 row = cur.fetchone()
                 if row is None:
-                    raise KeyError(
-                        f"session {session_id!r} in index but not in cold DB"
+                    logger.warning(
+                        "promote_session: session %s in index but not in "
+                        "cold DB %s; dropping stale index entry.",
+                        session_id, entry.archive_db,
                     )
+                    index.remove(session_id)
+                    index.save()
+                    return False
+                # Explicit copy so we control updated_at (overwritten to
+                # ``now_iso`` so the session isn't immediately re-archived).
+                conn.execute("DELETE FROM main.sessions WHERE id=?", (session_id,))
+                conn.execute("DELETE FROM main.blocks WHERE session_id=?", (session_id,))
                 conn.execute(
                     "INSERT INTO sessions(id, parent_id, parent_seq, cwd, "
                     "cli_version, model, title, created_at, updated_at, "
