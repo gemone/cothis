@@ -1365,7 +1365,7 @@ class Session:
                 self._db_path.parent / "archive" / "index.json"
             )
             try:
-                promote_session(
+                promoted = promote_session(
                     hot_db_path=self._db_path,
                     archive_dir=self._db_path.parent / "archive",
                     session_id=self._session_id,
@@ -1384,6 +1384,16 @@ class Session:
                 )
                 return
             self._cold = False
+            if not promoted:
+                # Stale-index drift: the cold DB lost the row, so
+                # ``promote_session`` self-healed the index WITHOUT copying
+                # anything to hot. The sessions row is not in hot, but the
+                # cold load set ``_session_row_written=True`` — flag it
+                # unwritten so the row (held in memory from the load) is
+                # persisted below before the blocks. Without this every
+                # block INSERT hits the sessions FK and the write is
+                # dropped on every retry (#405).
+                self._session_row_written = False
         session_row: SessionRow | None = None
         if not self._session_row_written:
             self._maybe_write_gitignore()

@@ -321,10 +321,11 @@ def test_drain_one_survives_promote_failure(
 ) -> None:
     """``_drain_one`` logs + drops rows on promote_session failure (#144).
 
-    The cold-promote block is isolated: a raise from ``promote_session``
-    (e.g. KeyError when the cold DB row was hand-deleted) drops the
-    current batch with a ``CRITICAL`` log and the consumer stays alive
-    for subsequent writes.
+    The cold-promote block is isolated: an unexpected raise from
+    ``promote_session`` (e.g. a corrupt cold DB) drops the current batch
+    with a ``CRITICAL`` log and the consumer stays alive for subsequent
+    writes. Stale-index drift no longer raises — it self-heals; see
+    :func:`test_drain_one_heals_index_on_drifted_cold_db`.
     """
     db_path = tmp_path / "session.db"
     sid = _seed_session(db_path, tmp_path, texts=["archived"])
@@ -374,5 +375,62 @@ def test_drain_one_survives_promote_failure(
         blocks = hot.load_blocks(sid)
         texts = [b.content for b in blocks if b.content]
         assert "second-write" in texts
+    finally:
+        hot.close()
+
+
+def test_drain_one_heals_index_on_drifted_cold_db(
+    tmp_path: Path,
+) -> None:
+    """#405: promote-on-first-write heals a drifted cold DB; the write lands.
+
+    The cold DB lost the row (drift). ``promote_session`` now self-heals
+    (returns False) instead of raising, so ``_drain_one`` clears ``_cold``
+    and the write reaches hot — no longer dropped on every retry. The drift
+    is induced AFTER load (while the cold row still exists) so load itself
+    succeeds; only the subsequent promote hits the drifted state.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "session.db"
+    sid = _seed_session(db_path, tmp_path, texts=["archived"])
+    archive_dir = db_path.parent / "archive"
+    index = ArchiveIndex(archive_dir / "index.json")
+    archive_session(
+        hot_db_path=db_path, archive_dir=archive_dir, session_id=sid,
+        archive_db_name="2026-07.db",
+        archived_at="2026-07-20T00:00:00+00:00", index=index,
+    )
+
+    # Load from cold while it still has the row (sets _cold=True).
+    s = Session.load(db_path, sid, flush_sync=True)
+    try:
+        assert s._cold is True
+
+        # Induce drift AFTER load: cold row vanishes, index intact.
+        cold_db = archive_dir / "2026-07.db"
+        conn = sqlite3.connect(cold_db)
+        try:
+            conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+            conn.execute("DELETE FROM blocks WHERE session_id=?", (sid,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # First write: promote self-heals (returns, does not raise) →
+        # _drain_one clears _cold and the write reaches hot.
+        s.append_message("user", [_user_text("after-drift")])
+        assert s._cold is False
+    finally:
+        s.close()
+
+    # Index self-healed; the write landed in hot (not dropped).
+    reloaded = ArchiveIndex(archive_dir / "index.json")
+    assert reloaded.get(sid) is None
+    hot = Storage(db_path)
+    try:
+        assert hot.load_session(sid) is not None
+        texts = [b.content for b in hot.load_blocks(sid) if b.content]
+        assert "after-drift" in texts
     finally:
         hot.close()
