@@ -590,13 +590,12 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
         token = "fake-bearer-token"
 
     class _FakeSupervisor:
-        def spawn_worker(self, sid, *, model, provider, cwd, sessions_dir, extra_env):  # noqa: ANN001
+        def spawn_worker(self, sid, *, model, provider, cwd, sessions_dir=None, extra_env=None):  # noqa: ANN001
             spawn_calls.append({
                 "sid": sid,
                 "model": model,
                 "provider": provider,
                 "cwd": cwd,
-                "sessions_dir": sessions_dir,
                 "extra_env": extra_env,
             })
             return _FakeHandle()
@@ -607,7 +606,7 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
         "asyncio.create_task", lambda coro: scheduled.append(coro),
     )
 
-    sessions_dir = tmp_path / "sessions"
+    db_path = tmp_path / "agents.db"
     sup = _FakeSupervisor()
     # ty needs a cast to accept the fake as the Supervisor parameter —
     # the fake quacks like Supervisor for the spawn_worker call only.
@@ -615,7 +614,7 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
 
     app = cli_mod._DrivenCothisApp.build(
         supervisor=cast("Supervisor", sup),
-        sessions_dir=sessions_dir,
+        db_path=db_path,
         model="test-model",
         provider="test-provider",
         provider_env={"TEST_API_KEY": "val"},
@@ -642,7 +641,6 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     assert call["model"] == "test-model"
     assert call["provider"] == "test-provider"
     assert call["cwd"] == cwd
-    assert call["sessions_dir"] == sessions_dir
     assert call["extra_env"] == {"TEST_API_KEY": "val"}
 
     # attach_session_ws scheduled (create_task was stubbed; verify the coro
@@ -666,7 +664,7 @@ def test_driven_cothis_app_on_worktree_pick_rolls_back_on_spawn_failure(
 
     import cothis.cli as cli_mod
 
-    sessions_dir = tmp_path / "sessions"
+    db_path = tmp_path / "agents.db"
 
     class _FailingSupervisor:
         def spawn_worker(self, *a: object, **kw: object) -> None:
@@ -674,7 +672,7 @@ def test_driven_cothis_app_on_worktree_pick_rolls_back_on_spawn_failure(
 
     app = cli_mod._DrivenCothisApp.build(
         supervisor=cast("Supervisor", _FailingSupervisor()),
-        sessions_dir=sessions_dir,
+        db_path=db_path,
         model="m",
         provider="p",
         provider_env={},
@@ -684,13 +682,67 @@ def test_driven_cothis_app_on_worktree_pick_rolls_back_on_spawn_failure(
         # Must NOT raise — the rollback catches the spawn failure.
         app.on_worktree_pick(str(tmp_path))
 
-    # AC #1: no ghost session-*.db left behind.
-    assert list(sessions_dir.glob("session-*.db")) == []
+    # AC #1: the session row was deleted (no ghost in the shared db).
+    # The db file still exists (other sessions may live in it), but the
+    # rolled-back session must not be queryable.
+    from cothis.session import Session
+    try:
+        Session.peek_messages(db_path, "0" * 32)
+        raise AssertionError("peek should raise KeyError for unknown id")
+    except KeyError:
+        pass  # correct — the db has no sessions after rollback
     # AC #2: the failure + rollback is logged.
     assert any(
         "rolled back" in r.getMessage() and "spawn failed" in r.getMessage()
         for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
+
+
+def test_tui_created_session_visible_to_cli_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#400: a session created via ``on_worktree_pick`` is visible to
+    ``cothis history`` (``Session.list_visible`` on the shared db).
+
+    Previously the TUI stored sessions in ``<cwd>/.cothis/sessions/`` per-
+    session files — divergent from ``_resolve_db_path()`` (``agents.db`` or
+    ``.agents/sessions/session.db``). A TUI-created session was invisible to
+    ``cothis history`` / ``delete`` / ``archive`` / ``resume``.
+    """
+    from typing import cast
+
+    import cothis.cli as cli_mod
+    from cothis.session import Session
+
+    db_path = tmp_path / "agents.db"
+
+    class _FakeHandle:
+        ws_url = "ws://fake"
+        token = "tok"
+
+    class _FakeSupervisor:
+        def spawn_worker(self, sid, **kw):  # noqa: ANN001, ANN003
+            return _FakeHandle()
+
+    # Stub asyncio.create_task so the WS-attach doesn't need a running loop.
+    monkeypatch.setattr("asyncio.create_task", lambda coro: None)
+
+    app = cli_mod._DrivenCothisApp.build(
+        supervisor=cast("Supervisor", _FakeSupervisor()),
+        db_path=db_path,
+        model="m",
+        provider="p",
+        provider_env={},
+    )
+    app.on_worktree_pick(str(tmp_path))
+
+    # The session must be in the SAME db that ``cothis history`` reads
+    # (``_resolve_db_path`` → ``Session.list_visible``).
+    sessions = Session.list_visible(db_path, tmp_path)
+    assert len(sessions) == 1, (
+        f"TUI-created session should be visible to list_visible; got {sessions}"
+    )
 
 
 def test_launch_tui_app_passes_resume_to_build(

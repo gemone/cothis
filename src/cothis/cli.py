@@ -709,7 +709,7 @@ class _DrivenCothisApp:
     def build(
         *,
         supervisor: Supervisor,
-        sessions_dir: Path,
+        db_path: Path,
         model: str,
         provider: str,
         provider_env: dict[str, str],
@@ -720,16 +720,18 @@ class _DrivenCothisApp:
         If ``resume_session_id`` is set, the app auto-spawns a worker for that
         session on ``on_mount`` (bypasses the worktree picker).
         """
-        import secrets
-
         from cothis.session import Session
         from cothis.tui import CothisApp
 
         class _App(CothisApp):
             def on_worktree_pick(self, path: str) -> None:  # type: ignore[override]
                 cwd = Path(path)
-                sessions_dir.mkdir(parents=True, exist_ok=True)
-                db_path = sessions_dir / f"session-{secrets.token_hex(8)}.db"
+                # cothis: use the shared db from ``_resolve_db_path`` so
+                # TUI-created sessions are visible to ``cothis history`` /
+                # ``delete`` / ``archive`` / ``resume`` (#400). Previously
+                # the TUI stored sessions in ``<cwd>/.cothis/sessions/``
+                # per-session files — divergent from the CLI standard.
+                db_path.parent.mkdir(parents=True, exist_ok=True)
                 session = Session.new(
                     db_path, cwd=cwd, model=model, flush_sync=True,
                 )
@@ -746,17 +748,14 @@ class _DrivenCothisApp:
                         model=model,
                         provider=provider,
                         cwd=cwd,
-                        sessions_dir=sessions_dir,
                         extra_env=provider_env,
                     )
                 except Exception as exc:
                     # cothis: spawn failed — roll back the just-persisted
-                    # session so it doesn't surface as a ghost in
-                    # ``cothis history`` (#390). ``delete`` drops the row;
-                    # ``unlink`` drops the (now-empty) per-session db file
-                    # (``Session.delete`` leaves the file on disk).
+                    # session row so it doesn't surface as a ghost in
+                    # ``cothis history`` (#390). Do NOT unlink the db file
+                    # — it's the shared db (other sessions live in it).
                     Session.delete(db_path, sid)
-                    db_path.unlink(missing_ok=True)
                     logging.getLogger(__name__).error(
                         "tui: spawn failed for session %s in %s; "
                         "rolled back: %s",
@@ -789,7 +788,6 @@ class _DrivenCothisApp:
                     model=model,
                     provider=provider,
                     cwd=Path.cwd(),
-                    sessions_dir=sessions_dir,
                     extra_env=provider_env,
                 )
                 logging.getLogger(__name__).info(
@@ -815,7 +813,7 @@ def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> Non
     from cothis.supervisor import Supervisor
     from cothis.tui import run as run_tui
 
-    sessions_dir = Path.cwd() / ".cothis" / "sessions"
+    db_path = _resolve_db_path()
     sup = Supervisor()
 
     provider_env = {
@@ -826,7 +824,7 @@ def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> Non
 
     app = _DrivenCothisApp.build(
         supervisor=sup,
-        sessions_dir=sessions_dir,
+        db_path=db_path,
         model=model,
         provider=provider,
         provider_env=provider_env,
