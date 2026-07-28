@@ -534,7 +534,7 @@ def test_tui_command_dispatches_to_cothis_tui_run(
     # filesystem.
     monkeypatch.setattr(
         "cothis.supervisor.Supervisor",
-        lambda *a, **kw: object(),
+        lambda *a, **kw: MagicMock(),
     )
 
     from typer.testing import CliRunner
@@ -546,6 +546,35 @@ def test_tui_command_dispatches_to_cothis_tui_run(
     )
     assert captured[0] is not None, (
         "tui command should pass a CothisApp subclass instance, not None"
+    )
+
+
+def test_launch_tui_app_closes_supervisor_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#403: ``Supervisor.close()`` runs when the TUI exits.
+
+    Without this, spawned workers are orphaned (reparented to init), still
+    holding session locks — a later ``cothis chat --resume`` raises
+    ``SessionLockedError`` until the orphan is manually killed.
+    """
+    import cothis.cli as cli_mod
+    import cothis.tui as tui_mod
+
+    monkeypatch.setattr(tui_mod, "run", lambda app=None: None)
+
+    closed: list[bool] = []
+    fake_sup = MagicMock()
+    fake_sup.close = lambda: closed.append(True)
+    monkeypatch.setattr("cothis.supervisor.Supervisor", lambda *a, **kw: fake_sup)
+
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["tui"])
+    assert result.exit_code == 0
+    assert closed == [True], (
+        "Supervisor.close() should be called after run_tui returns; "
+        f"close was called {len(closed)} time(s)"
     )
 
 
@@ -714,7 +743,7 @@ def test_launch_tui_app_passes_resume_to_build(
         pass
 
     monkeypatch.setattr(cli_mod._DrivenCothisApp, "build", fake_build)
-    monkeypatch.setattr("cothis.supervisor.Supervisor", lambda *a, **kw: object())
+    monkeypatch.setattr("cothis.supervisor.Supervisor", lambda *a, **kw: MagicMock())
     monkeypatch.setattr("cothis.tui.run", fake_run)
 
     session_id = "a" * 32
@@ -742,7 +771,7 @@ def test_launch_tui_app_without_resume_passes_none(
         pass
 
     monkeypatch.setattr(cli_mod._DrivenCothisApp, "build", fake_build)
-    monkeypatch.setattr("cothis.supervisor.Supervisor", lambda *a, **kw: object())
+    monkeypatch.setattr("cothis.supervisor.Supervisor", lambda *a, **kw: MagicMock())
     monkeypatch.setattr("cothis.tui.run", fake_run)
 
     cli_mod._launch_tui_app(model="m", provider="p")

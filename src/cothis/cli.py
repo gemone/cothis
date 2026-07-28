@@ -832,7 +832,16 @@ def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> Non
         provider_env=provider_env,
         resume_session_id=resume,
     )
-    run_tui(app=app)
+    # cothis: graceful shutdown on TUI exit (#403). Without this, spawned
+    # workers are orphaned (reparented to init), still holding session locks
+    # — a later ``cothis chat --resume`` raises SessionLockedError until the
+    # orphan is manually killed. ``sup.close()`` sends each worker the
+    # graceful ``shutdown`` control message (flush + release), so the session
+    # is cleanly persisted and the lock released on every exit path.
+    try:
+        run_tui(app=app)
+    finally:
+        sup.close()
 
 
 @app.command()
