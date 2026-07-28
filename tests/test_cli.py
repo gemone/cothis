@@ -606,7 +606,6 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
         "asyncio.create_task", lambda coro: scheduled.append(coro),
     )
 
-    db_path = tmp_path / "agents.db"
     sup = _FakeSupervisor()
     # ty needs a cast to accept the fake as the Supervisor parameter —
     # the fake quacks like Supervisor for the spawn_worker call only.
@@ -614,7 +613,6 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
 
     app = cli_mod._DrivenCothisApp.build(
         supervisor=cast("Supervisor", sup),
-        db_path=db_path,
         model="test-model",
         provider="test-provider",
         provider_env={"TEST_API_KEY": "val"},
@@ -651,6 +649,7 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
 def test_driven_cothis_app_on_worktree_pick_rolls_back_on_spawn_failure(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#390: a failed ``spawn_worker`` rolls back the just-created session.
 
@@ -664,7 +663,10 @@ def test_driven_cothis_app_on_worktree_pick_rolls_back_on_spawn_failure(
 
     import cothis.cli as cli_mod
 
-    db_path = tmp_path / "agents.db"
+    # on_worktree_pick resolves the db itself (_resolve_db_path(cwd=worktree));
+    # pin COTHIS_HOME so that lands at tmp_path/agents.db.
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    db_path = cli_mod._resolve_db_path()
 
     class _FailingSupervisor:
         def spawn_worker(self, *a: object, **kw: object) -> None:
@@ -672,7 +674,6 @@ def test_driven_cothis_app_on_worktree_pick_rolls_back_on_spawn_failure(
 
     app = cli_mod._DrivenCothisApp.build(
         supervisor=cast("Supervisor", _FailingSupervisor()),
-        db_path=db_path,
         model="m",
         provider="p",
         provider_env={},
@@ -715,7 +716,11 @@ def test_tui_created_session_visible_to_cli_history(
     import cothis.cli as cli_mod
     from cothis.session import Session
 
-    db_path = tmp_path / "agents.db"
+    # on_worktree_pick resolves the db itself (_resolve_db_path(cwd=worktree));
+    # pin COTHIS_HOME so the TUI-created session lands at tmp_path/agents.db,
+    # the same db ``cothis history`` reads.
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    db_path = cli_mod._resolve_db_path()
 
     class _FakeHandle:
         ws_url = "ws://fake"
@@ -730,7 +735,6 @@ def test_tui_created_session_visible_to_cli_history(
 
     app = cli_mod._DrivenCothisApp.build(
         supervisor=cast("Supervisor", _FakeSupervisor()),
-        db_path=db_path,
         model="m",
         provider="p",
         provider_env={},
@@ -743,6 +747,138 @@ def test_tui_created_session_visible_to_cli_history(
     assert len(sessions) == 1, (
         f"TUI-created session should be visible to list_visible; got {sessions}"
     )
+
+
+@pytest.mark.asyncio
+async def test_on_worktree_pick_real_worker_finds_session_default_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#402 acceptance #2: a REAL worker finds the session on_worktree_pick made.
+
+    Not mocked: a real ``Supervisor`` spawns a real ``cothis worker``
+    subprocess; the worker resolves its db via ``_resolve_db_path()`` and
+    must load the session the TUI just created. The mocked-Supervisor tests
+    above can't catch the TUI-writes-here / worker-reads-there db mismatch —
+    only a real subprocess exercises the worker's own db resolution. Default
+    storage mode (``$COTHIS_HOME/agents.db``).
+    """
+    import asyncio
+    import json
+
+    import websockets
+
+    import cothis.cli as cli_mod
+    from cothis.session import Session
+    from cothis.supervisor import Supervisor
+
+    worktree = tmp_path / "worktree-feat"
+    worktree.mkdir()
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    # on_worktree_pick schedules attach_session_ws via create_task; close the
+    # coro without running it — the WS attach is not what this test exercises.
+    monkeypatch.setattr(asyncio, "create_task", lambda coro: coro.close())
+
+    sup = Supervisor(tmp_path / "sup.db")
+    try:
+        app = cli_mod._DrivenCothisApp.build(
+            supervisor=sup,
+            model="openai/gpt-oss-120b",
+            provider="openrouter",
+            provider_env={"OPENROUTER_API_KEY": "test-dummy-not-used"},
+        )
+        # A raise here means the worker exited before bind — it could not
+        # find the session: the exact #402 failure mode.
+        app.on_worktree_pick(str(worktree))
+
+        # Spawn registered exactly one running worker for the created session.
+        assert len(sup._workers) == 1, sup._workers
+        sid, handle = next(iter(sup._workers.items()))
+        assert handle.status == "running"
+        assert handle.ws_url.startswith("ws://127.0.0.1:")
+
+        # Real WS round-trip proves the bind landed and the worker is live.
+        async with websockets.connect(
+            handle.ws_url,
+            additional_headers={"Authorization": f"Bearer {handle.token}"},
+        ) as ws:
+            await ws.send(json.dumps({"type": "ping"}))
+            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            assert json.loads(raw) == {"type": "pong"}
+
+        # The session persisted (not rolled back) in the shared db.
+        msgs = Session.peek_messages(cli_mod._resolve_db_path(), sid)
+        assert msgs, "TUI-created session should persist after a successful spawn"
+    finally:
+        sup.close()
+
+
+@pytest.mark.asyncio
+async def test_on_worktree_pick_real_worker_finds_session_project_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#402: the create-session flow also works in project storage mode.
+
+    Project mode (``COTHIS_SESSIONS_TYPE=project``) resolves the db
+    cwd-relative (``<cwd>/.agents/sessions/session.db``). The worker runs in
+    the picked worktree, so on_worktree_pick must create the session in the
+    *worktree's* db — not the TUI launch dir — or the worker resolves a
+    different file and exits before bind. Regression guard for the
+    worktree-cwd divergence (the TUI launch dir here != the worktree).
+    """
+    import asyncio
+    import json
+
+    import websockets
+
+    import cothis.cli as cli_mod
+    from cothis.session import Session
+    from cothis.supervisor import Supervisor
+
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    worktree = tmp_path / "wt-proj"
+    worktree.mkdir()
+    monkeypatch.setenv("COTHIS_SESSIONS_TYPE", "project")
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    # TUI launch dir != worktree: without the worktree-relative fix,
+    # on_worktree_pick would resolve the launch-dir db while the worker
+    # resolves the worktree db → mismatch.
+    monkeypatch.chdir(launch)
+    monkeypatch.setattr(asyncio, "create_task", lambda coro: coro.close())
+
+    sup = Supervisor(tmp_path / "sup.db")
+    try:
+        app = cli_mod._DrivenCothisApp.build(
+            supervisor=sup,
+            model="openai/gpt-oss-120b",
+            provider="openrouter",
+            provider_env={"OPENROUTER_API_KEY": "test-dummy-not-used"},
+        )
+        app.on_worktree_pick(str(worktree))  # must not raise
+
+        assert len(sup._workers) == 1, sup._workers
+        sid, handle = next(iter(sup._workers.items()))
+        assert handle.status == "running"
+
+        async with websockets.connect(
+            handle.ws_url,
+            additional_headers={"Authorization": f"Bearer {handle.token}"},
+        ) as ws:
+            await ws.send(json.dumps({"type": "ping"}))
+            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            assert json.loads(raw) == {"type": "pong"}
+
+        # Session lives in the WORKTREE's db (where the worker reads), not
+        # the launch dir's.
+        wt_db = worktree / ".agents" / "sessions" / "session.db"
+        assert wt_db.exists(), f"session db should be in the worktree; got {wt_db}"
+        assert Session.peek_messages(wt_db, sid), "session missing from worktree db"
+    finally:
+        sup.close()
 
 
 def test_launch_tui_app_passes_resume_to_build(
