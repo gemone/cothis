@@ -351,3 +351,26 @@ async def test_fs_modify_lf_file_stays_lf(tmp_path: Path) -> None:
     with workdir_context(tmp_path):
         await _modify(path="lf.txt", start_line=2, end_line=2, content="BETA")
     assert f.read_bytes() == b"alpha\nBETA\ngamma\n"
+
+
+@pytest.mark.asyncio
+async def test_fs_modify_refuses_oversized_file(tmp_path: Path) -> None:
+    """#419: fs.modify refuses files larger than _MAX_BYTES (stat-first guard).
+
+    Mirrors fs.read's stat-first pattern — modify can't truncate (it needs the
+    whole file to splice), so oversized files are refused with an actionable
+    error instead of OOM-ing the worker.
+    """
+    from cothis.tools.fs._hygiene import _MAX_BYTES, workdir_context
+    from cothis.tools.fs.modify import _modify
+
+    f = tmp_path / "big.txt"
+    f.write_bytes(b"x" * (_MAX_BYTES + 1))
+    with workdir_context(tmp_path):
+        result = await _modify(
+            path="big.txt", start_line=1, end_line=1, content="y",
+        )
+    assert isinstance(result, str)
+    assert "too large" in result.lower(), result
+    # File was NOT modified.
+    assert f.read_bytes() == b"x" * (_MAX_BYTES + 1)
