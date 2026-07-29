@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -45,12 +46,24 @@ if TYPE_CHECKING:
     from typing import Any
 
     import websockets
+    from textual.timer import Timer
 
     from cothis.git import Worktree
 
 logger = logging.getLogger(__name__)
 
 _TOOL_STATUS_ICONS = {"running": ">>", "done": "OK", "failed": "XX"}
+
+# Streaming-render throttle + finalisation (#407). Re-parsing Markdown on
+# every text delta is O(S²) in the segment size (the parser runs ~1.3 µs/char
+# and a 20 KB answer is ~4000 deltas → tens of seconds of parse work). While
+# streaming, deltas accumulate into a plain ``Static`` (no Markdown parse)
+# refreshed at most every ``_STREAM_REFRESH_S``; the segment is parsed into a
+# ``Markdown`` widget ONCE, ``_STREAM_FINALIZE_S`` after the last delta (an
+# idle-debounce proxy for turn-end — the worker emits no turn-end frame) or at
+# a tool-call boundary. Net per-segment cost: O(S) appends + one O(S) parse.
+_STREAM_REFRESH_S = 0.05
+_STREAM_FINALIZE_S = 0.3
 
 
 # ---------------------------------------------------------------------
@@ -171,16 +184,26 @@ class ConversationView(VerticalScroll):
 
     def __init__(self) -> None:
         super().__init__()
-        # ``list[str]`` accumulator (#267): ``+=`` on a Python ``str`` is
-        # O(N) per call (immutable copy); ``list.append`` is amortised O(1).
-        # ``renderable_str`` joins lazily — only tests + the Markdown render
-        # path need the joined string, not the per-delta append path.
+        # ``list[str]`` accumulator (#267): ``list.append`` is amortised O(1),
+        # so the per-delta append path stays linear. ``renderable_str`` joins
+        # lazily — only the final Markdown parse needs the joined string.
         self._text_buf: list[str] = []
-        # Pattern 2 (#267 + #228 Rule 3): one Markdown widget per text
-        # segment. ``append_tool_call`` flushes the active segment (clears
-        # the buffer + resets this handle) so the next delta mounts a fresh
-        # widget below the card, preserving DOM/event order.
-        self._active_markdown: Markdown | None = None
+        # Plain-text widget shown WHILE a segment streams (#407). Mounting it
+        # avoids re-parsing Markdown on every delta; it is swapped for a
+        # ``Markdown`` widget (one parse) at finalisation.
+        self._stream_static: Static | None = None
+        # Monotonic timestamp of the last plain-text refresh (throttle).
+        self._last_stream_refresh: float = 0.0
+        # Idle-finalise debounce timer (#407): rearmed per delta; fires
+        # ``_STREAM_FINALIZE_S`` after the LAST delta to parse Markdown once.
+        # The worker emits no turn-end frame, so idle is the turn-end proxy.
+        self._finalize_timer: Timer | None = None
+        # True once the current buffer has been parsed into a mounted Markdown
+        # widget. Gates idempotent re-finalise (timer then a boundary) and
+        # signals ``append_delta`` to start a fresh segment when text resumes.
+        # The buffer is RETAINED across finalise so ``renderable_str`` (tests
+        # + inspection) still reflects the last segment's text.
+        self._finalized: bool = False
         # Cards indexed by ``call_id`` (#252 item 4) so result frames
         # can update the matching card's status badge without ambiguity
         # when the same tool runs twice in one turn.
@@ -194,46 +217,60 @@ class ConversationView(VerticalScroll):
     def append_delta(self, kind: str, text: str) -> None:
         """Route a ContentDelta to the right rendering path.
 
-        ``kind="text"`` → accumulate + re-render the active Markdown segment.
+        ``kind="text"`` → accumulate (O(1)) + cheap plain-text refresh; the
+        segment is parsed into Markdown ONCE at finalisation, not per delta
+        (#407 — per-delta Markdown re-parse was O(S²) in segment size).
         ``kind="thinking"`` → logged but not rendered (collapsible block
         lands when the toggle UX is designed).
         """
         if kind == "text":
+            # If the previous segment already finalised (idle timer fired, or
+            # a user/tool boundary), start a fresh segment below it — the old
+            # Markdown widget stays mounted; the buffer + handles reset.
+            if self._finalized:
+                self._text_buf = []
+                self._finalized = False
             self._text_buf.append(text)
-            self._refresh_markdown()
+            self._refresh_stream()
+            self._arm_finalize()
         elif kind == "thinking":
             logger.debug("dropping thinking delta (%d chars)", len(text))
 
     def append_user_message(self, text: str) -> None:
         """Render a user prompt with a distinct prefix.
 
-        User text is Markdown-escaped (brackets) so injected links
-        or markup can't activate inside the Markdown widget.
+        Finalises any streaming segment first (so the prompt is its own
+        block), then renders the escaped prompt as Markdown. This is one
+        call per user message — not per token — so it is not on the hot
+        streaming path. User text is Markdown-escaped (brackets) so
+        injected links or markup can't activate inside the widget.
         """
         safe = text.replace("[", "\\[").replace("]", "\\]")
+        self._finalize_segment()
+        self._text_buf = []
+        self._finalized = False
         self._text_buf.append(f"\n> **you**: {safe}\n\n")
-        self._refresh_markdown()
+        self._finalize_segment()
 
     def append_tool_call(
         self, name: str, status: str = "running", call_id: str | None = None,
     ) -> ToolCallCard:
         """Mount an inline tool-call card; return it for status updates.
 
-        Flushes the active text segment (current buffer + Markdown widget)
-        so the next text delta starts a fresh segment below this card.
-        Without the flush, all text would accumulate in one Markdown
-        widget and the card would render below all of it, regardless
-        of when it was mounted — violating the "tool calls render as
-        inline cards" acceptance criterion on #228 (Rule 3).
+        Finalises the active text segment (parses its Markdown once) and
+        resets the buffer so the next text delta starts a fresh segment
+        below this card. Without the reset, all text would accumulate in
+        one segment and the card would render below all of it — violating
+        the "tool calls render as inline cards" rule (#228 Rule 3).
 
         ``call_id`` indexes the card in ``_cards_by_call_id`` so a
         subsequent ``tool_call_result_pointer`` frame can find it (#252
         item 4). ``None`` keeps the legacy un-indexed behaviour (no
         status update will land for this card).
         """
-        self._refresh_markdown()
+        self._finalize_segment()
         self._text_buf = []
-        self._active_markdown = None
+        self._finalized = False
         card = ToolCallCard(name=name, status=status, call_id=call_id)
         if call_id is not None:
             self._cards_by_call_id[call_id] = card
@@ -255,25 +292,53 @@ class ConversationView(VerticalScroll):
         card.set_status("failed" if is_error else "done")
         return card
 
-    def _refresh_markdown(self) -> None:
-        """Update the active Markdown segment, or mount a new one if none.
+    def _refresh_stream(self) -> None:
+        """Mount/refresh the plain-text streaming widget, throttled.
 
-        When ``_active_markdown`` is ``None`` (initial state, or after a
-        tool-call card reset the segment), mount a fresh widget so the
-        next text deltas accumulate into a new segment below any prior
-        cards. Otherwise update the existing active widget in place.
-
-        Per-call cost is bounded by the active segment's size, not by
-        total conversation size — each ``append_tool_call`` starts a
-        new segment so a long conversation with N tool calls has N
-        small segments instead of one growing buffer (#267).
+        No Markdown parse here — that is the #407 win. The first delta of a
+        segment mounts a ``Static``; later deltas update it at most every
+        ``_STREAM_REFRESH_S`` (cheap text layout, no parser), so the per-delta
+        cost stays O(1) amortised rather than O(S) per call.
         """
+        if self._stream_static is None:
+            self._stream_static = Static("".join(self._text_buf))
+            self.mount(self._stream_static)
+            self._last_stream_refresh = time.monotonic()
+            return
+        now = time.monotonic()
+        if now - self._last_stream_refresh >= _STREAM_REFRESH_S:
+            self._stream_static.update("".join(self._text_buf))
+            self._last_stream_refresh = now
+
+    def _arm_finalize(self) -> None:
+        """(Re)arm the idle-finalise debounce — parse Markdown once after streaming settles."""
+        if self._finalize_timer is not None:
+            self._finalize_timer.stop()
+        self._finalize_timer = self.set_timer(
+            _STREAM_FINALIZE_S, self._finalize_segment,
+        )
+
+    def _finalize_segment(self) -> None:
+        """Swap the streaming ``Static`` for a ``Markdown`` widget (one parse).
+
+        Called by the idle-finalise timer (turn-end proxy) and by the segment
+        boundaries (``append_tool_call`` / ``append_user_message``). Idempotent:
+        a no-op when the buffer is empty or ``_finalized`` is already set. The
+        buffer is retained, so ``renderable_str`` still reflects the segment.
+        """
+        if self._finalize_timer is not None:
+            self._finalize_timer.stop()
+            self._finalize_timer = None
+        # Idempotent: nothing to parse, or this segment already parsed.
+        if self._finalized or not self._text_buf:
+            return
         source = "".join(self._text_buf)
-        if self._active_markdown is None:
-            self._active_markdown = Markdown(source)
-            self.mount(self._active_markdown)
-        else:
-            self._active_markdown.update(source)
+        md = Markdown(source)
+        if self._stream_static is not None:
+            self._stream_static.remove()
+            self._stream_static = None
+        self._finalized = True
+        self.mount(md)
 
 
 class ConfigMenuModal(ModalScreen[set[str] | None]):
