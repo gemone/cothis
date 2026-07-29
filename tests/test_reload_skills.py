@@ -219,3 +219,41 @@ async def test_reload_handler_directly(
     assert result is not None
     assert "x" in result
     s.close()
+
+
+@pytest.mark.asyncio
+async def test_reload_skills_clears_cache_for_in_place_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _registered: None,
+) -> None:
+    """#413: ``/reload-skills`` clears the discovery cache so an in-place
+    ``SKILL.md`` edit (layer-dir mtime unchanged) is picked up without a
+    restart (acceptance #2)."""
+    import cothis.skills as skills_mod
+    from cothis.skills import discover_skills
+    from cothis.slash import SlashContext, dispatch
+
+    skills_mod._skills_cache.clear()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path / "ch"))
+
+    alpha = tmp_path / ".agents" / "skills" / "alpha"
+    alpha.mkdir(parents=True)
+    (alpha / "SKILL.md").write_text(
+        "---\nname: alpha\ndescription: old\n---\nbody\n", encoding="utf-8",
+    )
+
+    # Populate the cache with the "old" description.
+    discover_skills(tmp_path)
+    # In-place edit (file mtime changes, layer-dir mtime does not → cache stale).
+    (alpha / "SKILL.md").write_text(
+        "---\nname: alpha\ndescription: NEW\n---\nbody\n", encoding="utf-8",
+    )
+    # Without /reload, the cache returns the stale "old" (project layer wins,
+    # so this alpha is the one under tmp_path regardless of ~/.agents).
+    stale = [s for s in discover_skills(tmp_path) if s.name == "alpha"]
+    assert stale and stale[0].description == "old"
+
+    # /reload clears the cache → the next discover sees "NEW".
+    await dispatch("/reload-skills", ctx=SlashContext())
+    refreshed = [s for s in discover_skills(tmp_path) if s.name == "alpha"]
+    assert refreshed and refreshed[0].description == "NEW"
