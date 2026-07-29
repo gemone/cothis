@@ -959,6 +959,7 @@ async def _worker_session(
     max_tokens: int | None,
 ) -> None:
     """Build Agent + Session + SessionWorker; emit bind JSON; serve."""
+    from cothis.skills import load_skill_selection
     from cothis.worker import SessionWorker
 
     _validate_session_id_arg(session)
@@ -978,7 +979,8 @@ async def _worker_session(
             max_iterations=max_iterations,
             max_tokens=max_tokens,
             cwd=Path.cwd(),
-            preactivate_skills=[],
+            # cothis: preactivate the TUI's persisted skill selection (#415).
+            preactivate_skills=sorted(load_skill_selection()),
         )
         agent.attach_session(loaded)
 

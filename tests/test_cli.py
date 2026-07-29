@@ -901,3 +901,53 @@ def test_chat_skill_falls_back_to_legacy(
     assert result.exit_code == 0, f"chat --skill failed: {result.output}"
     assert tui_called == [], "TUI should NOT be called with --skill"
     assert len(asyncio_called) == 1, "legacy REPL should be called for --skill"
+
+
+@pytest.mark.asyncio
+async def test_worker_session_preactivates_persisted_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#415: the worker agent build preactivates the persisted skill selection.
+
+    Mocks Agent/SessionWorker/Session.load so ``_worker_session`` runs without
+    a real DB or WS server; asserts ``preactivate_skills`` reads the saved set.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    import cothis.cli as cli_mod
+    import cothis.worker as worker_mod
+    from cothis.skills import save_skill_selection
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    save_skill_selection({"alpha", "beta"})
+
+    # No real DB needed — Session.load is mocked.
+    monkeypatch.setattr(
+        cli_mod.Session, "load", lambda *a, **k: MagicMock(name="loaded"),
+    )
+    # Capture the Agent(...) build kwargs.
+    captured: dict = {}
+    mock_agent = MagicMock()
+    mock_agent.attach_session = MagicMock()
+    mock_agent.aclose = AsyncMock()
+    monkeypatch.setattr(
+        cli_mod, "Agent", lambda **kw: (captured.update(kw), mock_agent)[1],
+    )
+    # SessionWorker: serve_forever exits immediately via CancelledError.
+    mock_worker = MagicMock()
+    mock_worker.start = AsyncMock(return_value="ws://127.0.0.1:1/agent")
+    mock_worker.token = "tok"
+    mock_worker.serve_forever = AsyncMock(side_effect=asyncio.CancelledError)
+    mock_worker.stop = AsyncMock()
+    monkeypatch.setattr(worker_mod, "SessionWorker", lambda agent: mock_worker)
+
+    await cli_mod._worker_session(
+        session="a" * 32, model="m", provider="p",
+        max_iterations=1, max_tokens=None,
+    )
+
+    assert captured.get("preactivate_skills") == ["alpha", "beta"], (
+        f"worker should preactivate the persisted selection; got "
+        f"{captured.get('preactivate_skills')}"
+    )
