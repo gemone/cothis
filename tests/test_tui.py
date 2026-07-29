@@ -394,6 +394,80 @@ async def test_streaming_defers_markdown_until_finalize() -> None:
         assert len(list(view.query(Markdown))) == 1
 
 
+@pytest.mark.asyncio
+async def test_streaming_auto_follows_new_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#409: while streaming, the view follows the growing content — the
+    newest text stays in view without manual scrolling (acceptance #1, #3).
+
+    ``_STREAM_REFRESH_S`` is zeroed so every delta updates the Static
+    (deterministic — no throttle timing); a tall segment forces overflow so
+    the scroll range is non-zero.
+    """
+    import cothis.tui as tui_mod
+    from cothis.tui import ConversationView, CothisApp
+
+    monkeypatch.setattr(tui_mod, "_STREAM_REFRESH_S", 0.0)
+
+    app = CothisApp()
+    async with app.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        for i in range(60):
+            view.append_delta("text", f"line {i}\n")
+            await pilot.pause()
+        # Content overflowed the viewport + the view auto-pinned to the bottom.
+        assert view.max_scroll_y > 0, "expected content to overflow the viewport"
+        assert view.scroll_y >= view.max_scroll_y - 1, (
+            f"auto-follow did not pin to the bottom; scroll_y={view.scroll_y} "
+            f"max={view.max_scroll_y}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_auto_follow_does_not_yank_user_who_scrolled_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#409 acceptance #2: a user who scrolled up to read earlier output is
+    NOT yanked back to the bottom when the next content arrives."""
+    import cothis.tui as tui_mod
+    from cothis.tui import ConversationView, CothisApp
+
+    monkeypatch.setattr(tui_mod, "_STREAM_REFRESH_S", 0.0)
+
+    app = CothisApp()
+    async with app.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        # Stream (deltas arrive over time, as in real use) + finalise → pinned.
+        for i in range(60):
+            view.append_delta("text", f"line {i}\n")
+            await pilot.pause()
+        view._finalize_segment()
+        await pilot.pause()
+        assert view.scroll_y >= view.max_scroll_y - 1  # pinned
+
+        # User scrolls UP to read earlier output.
+        view.scroll_y = 0
+        await pilot.pause()
+        scrolled_to = view.scroll_y
+
+        # More content arrives while the user is reading up top.
+        for i in range(60):
+            view.append_delta("text", f"more {i}\n")
+            await pilot.pause()
+        view._finalize_segment()
+        await pilot.pause()
+
+        # NOT yanked back down — stays where the user scrolled (allowing a
+        # 1-line float tolerance from layout clamping).
+        assert view.scroll_y <= scrolled_to + 1, (
+            f"user scrolled up to {scrolled_to} but was yanked to "
+            f"scroll_y={view.scroll_y}"
+        )
+
+
 # ---------------------------------------------------------------------
 # WS attach (#252 item 1) — caller supplies URI + bearer token; the
 # app opens a client, pumps inbound frames to ConversationView, and
