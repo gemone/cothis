@@ -274,7 +274,9 @@ class ConversationView(VerticalScroll):
         card = ToolCallCard(name=name, status=status, call_id=call_id)
         if call_id is not None:
             self._cards_by_call_id[call_id] = card
+        at_bottom = self._at_bottom()
         self.mount(card)
+        self._follow(at_bottom)
         return card
 
     def update_tool_call_status(
@@ -301,14 +303,18 @@ class ConversationView(VerticalScroll):
         cost stays O(1) amortised rather than O(S) per call.
         """
         if self._stream_static is None:
+            at_bottom = self._at_bottom()
             self._stream_static = Static("".join(self._text_buf))
             self.mount(self._stream_static)
             self._last_stream_refresh = time.monotonic()
+            self._follow(at_bottom)
             return
         now = time.monotonic()
         if now - self._last_stream_refresh >= _STREAM_REFRESH_S:
+            at_bottom = self._at_bottom()
             self._stream_static.update("".join(self._text_buf))
             self._last_stream_refresh = now
+            self._follow(at_bottom)
 
     def _arm_finalize(self) -> None:
         """(Re)arm the idle-finalise debounce — parse Markdown once after streaming settles."""
@@ -332,6 +338,7 @@ class ConversationView(VerticalScroll):
         # Idempotent: nothing to parse, or this segment already parsed.
         if self._finalized or not self._text_buf:
             return
+        at_bottom = self._at_bottom()
         source = "".join(self._text_buf)
         md = Markdown(source)
         if self._stream_static is not None:
@@ -339,6 +346,27 @@ class ConversationView(VerticalScroll):
             self._stream_static = None
         self._finalized = True
         self.mount(md)
+        self._follow(at_bottom)
+
+    def _at_bottom(self) -> bool:
+        """True when the view is within a line of the bottom.
+
+        The "user is watching the stream" state. Captured BEFORE a content
+        change so a user who scrolled up to read earlier output isn't yanked
+        back to the bottom on the next delta (#409).
+        """
+        return self.scroll_y >= self.max_scroll_y - 1
+
+    def _follow(self, was_at_bottom: bool) -> None:
+        """Re-pin to the bottom iff the user was already there.
+
+        Synchronous (``immediate=True``): Textual updates the container's
+        virtual size during ``mount`` / ``Static.update``, so the new
+        ``max_scroll_y`` is current when ``scroll_end`` reads it — no need to
+        defer past a refresh, which would race a user's manual scroll-up.
+        """
+        if was_at_bottom:
+            self.scroll_end(animate=False, immediate=True)
 
 
 class ConfigMenuModal(ModalScreen[set[str] | None]):
