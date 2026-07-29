@@ -470,13 +470,54 @@ async def test_monitor_worker_health_skips_when_over_threshold(
 def test_supervisor_close_is_idempotent(tmp_path: Path) -> None:
     """AC #250: ``close()`` can be called twice without raising.
 
-    The second call walks the (now-empty) ``_procs`` dict + calls
-    ``self._conn.close()`` again. sqlite3's Connection.close() is
-    documented as idempotent (subsequent calls are no-ops), but the
-    test guards against a refactor that swaps the connection for
-    something less forgiving.
+    The second call returns early via the ``_closed`` guard — ``close()`` now
+    compacts the bus before closing the connection, and compacting on an
+    already-closed connection would raise, so the guard (not sqlite's
+    idempotent ``Connection.close``) is what makes the double-call safe (#411).
     """
     sup = Supervisor(tmp_path / "supervisor.db")
     sup.close()
     sup.close()  # must not raise
+
+
+def test_close_compacts_old_lifecycle_events(tmp_path: Path) -> None:
+    """#411: ``close()`` compacts lifecycle events older than the retention
+    window, so the shared ``~/.cothis/supervisor.db``'s ``notify_events`` does
+    not grow without bound across sessions (the read side is not yet wired, but
+    the write side is live).
+    """
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    from cothis.supervisor import _LIFECYCLE_RETENTION_DAYS
+
+    db_path = tmp_path / "supervisor.db"
+    sup = Supervisor(db_path)
+    # An event beyond the retention window (backdated directly into the table).
+    old_ts = (
+        datetime.now(UTC) - timedelta(days=_LIFECYCLE_RETENTION_DAYS + 1)
+    ).isoformat()
+    with sup._conn:
+        sup._conn.execute(
+            "INSERT INTO notify_events(ts, topic, event_type, session_id, "
+            "meta, payload_pointer) VALUES (?, 'session_lifecycle', "
+            "'spawned', NULL, NULL, NULL)",
+            (old_ts,),
+        )
+    # A fresh event via the live write path stays.
+    sup.record_lifecycle("spawned", "s1")
+    sup.close()
+
+    # Re-open the shared DB: only the fresh event survived compaction.
+    conn = sqlite3.connect(db_path)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM notify_events"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1, (
+        f"close() should compact events older than "
+        f"{_LIFECYCLE_RETENTION_DAYS}d; got {count} rows"
+    )
 
