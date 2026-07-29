@@ -156,7 +156,7 @@ def _search(
             if d not in _IGNORED_DIRS and not d.startswith(".")
         ]
         for filename in filenames:
-            if len(results) >= max_results or files_scanned >= _MAX_FILES_SCANNED:
+            if files_scanned >= _MAX_FILES_SCANNED:
                 stop = True
                 break
             if time.perf_counter() > deadline:
@@ -183,9 +183,6 @@ def _search(
             try:
                 with p.open("r", encoding="utf-8", errors="ignore") as fh:
                     for i, line in enumerate(fh, 1):
-                        if len(results) >= max_results:
-                            stop = True
-                            break
                         if time.perf_counter() > deadline:
                             deadline_hit = True
                             stop = True
@@ -208,4 +205,8 @@ def _search(
             _DEADLINE_SECONDS, len(results),
         )
 
-    return results
+    # Sort by (file, line) so output is deterministic (not readdir-order) and
+    # the ``max_results`` cap keeps the alphabetically-first matches, not
+    # whichever the walk reached first (#417).
+    results.sort(key=lambda r: (r["file"], int(r["line"])))
+    return results[:max_results]

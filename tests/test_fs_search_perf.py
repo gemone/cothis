@@ -106,3 +106,34 @@ def test_walk_and_prune_skips_ignored_dirs(tmp_path: Path) -> None:
     )
     assert "src/app.py" in result[0]["file"]
     assert "node_modules" not in result[0]["file"]
+
+
+def test_search_results_sorted_by_file_then_line(tmp_path: Path) -> None:
+    """#417: ``fs.search`` returns results sorted by ``(file, line)``, not
+    readdir order — deterministic across filesystems."""
+    # Create files whose readdir order likely differs from alphabetical.
+    for name in ["zebra.py", "alpha.py", "middle.py"]:
+        (tmp_path / name).write_text("NEEDLE\n", encoding="utf-8")
+
+    with workdir_context(tmp_path):
+        result = fs_search(pattern="NEEDLE", path=".", max_results=10)
+
+    files = [r["file"] for r in result]
+    assert files == ["alpha.py", "middle.py", "zebra.py"], (
+        f"results should be sorted by file; got {files}"
+    )
+
+
+def test_search_truncation_keeps_alphabetically_first(tmp_path: Path) -> None:
+    """#417: when matches exceed ``max_results``, the alphabetically-first
+    ones are kept (not whichever the walk reached first)."""
+    for name in ["a.py", "b.py", "c.py", "d.py", "e.py"]:
+        (tmp_path / name).write_text("NEEDLE\n", encoding="utf-8")
+
+    with workdir_context(tmp_path):
+        result = fs_search(pattern="NEEDLE", path=".", max_results=3)
+
+    files = [r["file"] for r in result]
+    assert files == ["a.py", "b.py", "c.py"], (
+        f"max_results=3 should keep the alphabetically-first 3; got {files}"
+    )
