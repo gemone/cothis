@@ -234,3 +234,81 @@ def test_discover_ignores_non_directory_entries(
         tmp_path, cothis_home=tmp_path / "ch", user_agents=tmp_path / "ua",
     )
     assert skills == []
+
+
+# ---------------------------------------------------------------------
+# mtime-keyed discovery cache (#413)
+# ---------------------------------------------------------------------
+
+
+def test_discover_skills_cache_hit_skips_reparse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#413: a repeat call with no skill install/remove returns the cached
+    catalog without re-reading or re-parsing any ``SKILL.md`` (acceptance #1/#3)."""
+    import cothis.skills as skills_mod
+
+    skills_mod._skills_cache.clear()
+    project = tmp_path / "project"
+    cothis_home = tmp_path / "cothis_home"
+    user_agents = tmp_path / "user_agents"
+    _make_skill(project / ".agents" / "skills", "alpha")
+    _make_skill(project / ".agents" / "skills", "beta")
+
+    parses: list[str] = []
+    real_parse = skills_mod._parse_skill_md
+
+    def counting_parse(path: Path) -> Skill | None:
+        parses.append(path.name)
+        return real_parse(path)
+
+    monkeypatch.setattr(skills_mod, "_parse_skill_md", counting_parse)
+
+    first = discover_skills(
+        project, cothis_home=cothis_home, user_agents=user_agents,
+    )
+    assert {s.name for s in first} == {"alpha", "beta"}
+    assert len(parses) == 2  # one parse per SKILL.md on the cache miss
+    parses.clear()
+
+    second = discover_skills(
+        project, cothis_home=cothis_home, user_agents=user_agents,
+    )
+    assert second == first
+    assert parses == [], (
+        f"cache hit re-parsed {len(parses)} SKILL.md(s); expected 0"
+    )
+
+
+def test_discover_skills_invalidates_when_skill_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#413: installing a skill (layer-dir mtime change) invalidates the cache
+    so the next call reflects it (acceptance #2)."""
+    import os
+
+    import cothis.skills as skills_mod
+
+    skills_mod._skills_cache.clear()
+    project = tmp_path / "project"
+    cothis_home = tmp_path / "cothis_home"
+    user_agents = tmp_path / "user_agents"
+    skills_dir = project / ".agents" / "skills"
+    _make_skill(skills_dir, "alpha")
+
+    first = discover_skills(
+        project, cothis_home=cothis_home, user_agents=user_agents,
+    )
+    assert [s.name for s in first] == ["alpha"]
+
+    # Install a new skill, then force a distinct dir mtime — some filesystems
+    # have coarse mtime granularity, and os.utime makes the invalidation
+    # deterministic.
+    _make_skill(skills_dir, "beta")
+    m = skills_dir.stat().st_mtime
+    os.utime(skills_dir, (m + 100, m + 100))
+
+    second = discover_skills(
+        project, cothis_home=cothis_home, user_agents=user_agents,
+    )
+    assert [s.name for s in second] == ["alpha", "beta"]
