@@ -31,6 +31,7 @@ from cothis.tools.core import (
     _require,
     logger,
 )
+from cothis.tools.fs._hygiene import _MAX_BYTES
 
 if TYPE_CHECKING:
     from typing import NoReturn
@@ -84,6 +85,18 @@ def _normalize_mcp_result(result: CallToolResult) -> str:
         else:
             parts.append(f"[non-text block: type={btype}]")
     body = "\n".join(parts) if parts else "(no output)"
+    # Cap the result at ``_MAX_BYTES`` characters — MCP servers are external
+    # and can return unbounded output (search dumps, log tails, file echoes)
+    # that lands verbatim in the model context and poisons every subsequent
+    # turn (#421). Character-based (not byte-based) to avoid slicing a UTF-8
+    # code point — the same convention as the shell tool's ``_truncate_stream``
+    # (#382).
+    if len(body) > _MAX_BYTES:
+        body = (
+            body[:_MAX_BYTES]
+            + f"\n... [truncated: {len(body)} characters total — narrow the "
+            "query or read a slice via fs.read]"
+        )
     # ``isError`` is camelCase on the MCP pydantic model (verified against
     # mcp 1.28.1 — ``CallToolResult`` fields: content/structuredContent/isError).
     if result.isError:

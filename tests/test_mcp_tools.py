@@ -1199,3 +1199,23 @@ async def test_connect_into_still_swallows_regular_exception(
     )
 
 
+def test_normalize_truncates_oversized_result() -> None:
+    """#421: MCP results are capped at ``_MAX_BYTES`` characters.
+
+    A verbose/external MCP server can return unbounded output that lands
+    verbatim in the model context and poisons every subsequent turn. The
+    cap truncates with a marker so the model knows to narrow its query.
+    """
+    from cothis.tools.fs._hygiene import _MAX_BYTES
+
+    big = "x" * (_MAX_BYTES + 1000)
+    result = CallToolResult(
+        content=[TextContent(type="text", text=big)], isError=False,
+    )
+    out = _normalize_mcp_result(result)
+    assert len(out) < len(big), "oversized result was not truncated"
+    assert out.startswith("x" * _MAX_BYTES)
+    assert "[truncated:" in out
+    assert str(len(big)) in out
+
+
