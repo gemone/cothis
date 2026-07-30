@@ -1836,3 +1836,35 @@ def test_format_proc_result_within_cap_is_not_truncated() -> None:
     assert "[truncated:" not in result
     assert len(result) == _MAX_BYTES - 1
 
+
+@pytest.mark.asyncio
+async def test_shell_tool_times_out_on_hanging_command(tmp_path: Path) -> None:
+    """#423: a hanging command is killed by the shell-tool timeout.
+
+    ``sleep`` exceeds the timeout → ``TimeoutExpired`` is caught and surfaced
+    as a readable error instead of blocking the turn until the 300 s worker
+    turn-timeout fires.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    yaml_text = (
+        "name: hang-test\n"
+        "description: Test hanging command\n"
+        'command: ["sleep", "10"]\n'
+    )
+    tools = yaml_mod.load_yaml_tools(yaml_text)
+    assert len(tools) == 1
+    tool = tools[0]
+    assert isinstance(tool, yaml_mod._ShellTool)
+
+    # Tighten the timeout so the test is fast.
+    orig = yaml_mod._SHELL_TIMEOUT_S
+    yaml_mod._SHELL_TIMEOUT_S = 0.5
+    try:
+        result = await tool()
+    finally:
+        yaml_mod._SHELL_TIMEOUT_S = orig
+
+    assert isinstance(result, str)
+    assert "timed out" in result.lower() or "timeout" in result.lower(), result
+

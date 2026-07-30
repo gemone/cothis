@@ -555,6 +555,12 @@ def _merge_arg_specs(
 
 _FORMATTER = string.Formatter()
 
+# Shell-tool wall-clock cap (#423). A hanging command (``tail -f``, ``read``,
+# an infinite loop) can't block the turn for the full 300 s worker
+# turn-timeout. 30 s is generous for builds/tests while catching hangs far
+# sooner than the turn ceiling.
+_SHELL_TIMEOUT_S = 30.0
+
 
 def _extract_field_names(template: str) -> set[str]:
     """Return the set of named fields referenced by a Python format-string.
@@ -645,27 +651,35 @@ class _ShellTool(_HookableTool):
     async def __call__(self, **kwargs: Any) -> str:
         rendered = self._block.render(**kwargs)
         # cothis: park the blocking ``subprocess.run`` off the loop
-        # thread (#90).
-        if isinstance(rendered, list):
-            # argv mode — never reaches _shell_quote; safe on all platforms.
-            proc = await asyncio.to_thread(
-                subprocess.run, rendered, shell=False,
-                capture_output=True, text=True,
-            )
-        else:
-            argv = _shell_argv(self._shell_path, self._block.shell, rendered)
-            if argv is None:
-                # cmd.exe: keep shell=True — see _shell_argv.
+        # thread (#90). ``timeout=`` bounds wall-clock so a hanging command
+        # (``tail -f``, ``read``, infinite loop) can't block the turn for
+        # the full 300 s worker turn-timeout (#423).
+        try:
+            if isinstance(rendered, list):
+                # argv mode — never reaches _shell_quote; safe on all platforms.
                 proc = await asyncio.to_thread(
-                    subprocess.run, rendered, shell=True,
+                    subprocess.run, rendered, shell=False,
                     capture_output=True, text=True,
-                    executable=self._shell_path,
+                    timeout=_SHELL_TIMEOUT_S,
                 )
             else:
-                proc = await asyncio.to_thread(
-                    subprocess.run, argv, shell=False,
-                    capture_output=True, text=True,
-                )
+                argv = _shell_argv(self._shell_path, self._block.shell, rendered)
+                if argv is None:
+                    # cmd.exe: keep shell=True — see _shell_argv.
+                    proc = await asyncio.to_thread(
+                        subprocess.run, rendered, shell=True,
+                        capture_output=True, text=True,
+                        timeout=_SHELL_TIMEOUT_S,
+                        executable=self._shell_path,
+                    )
+                else:
+                    proc = await asyncio.to_thread(
+                        subprocess.run, argv, shell=False,
+                        capture_output=True, text=True,
+                        timeout=_SHELL_TIMEOUT_S,
+                    )
+        except subprocess.TimeoutExpired as exc:
+            return f"Error: command timed out after {_SHELL_TIMEOUT_S}s"
         return _format_proc_result(proc)
 
 
