@@ -43,6 +43,7 @@ from cothis.tools.yaml import (
 )
 
 if TYPE_CHECKING:
+    import subprocess
     from pathlib import Path
 
 
@@ -1972,7 +1973,7 @@ def test_kill_process_tree_kills_group_or_tree(
             "run",
             lambda cmd, **kwargs: captured_run.append(cmd),
         )
-        yaml_mod._kill_process_tree(FakeProc())
+        yaml_mod._kill_process_tree(cast("subprocess.Popen", FakeProc()))
         assert captured_run == [["taskkill", "/F", "/T", "/PID", "4242"]]
     else:
         killed: list[tuple[int, int]] = []
@@ -1982,5 +1983,5 @@ def test_kill_process_tree_kills_group_or_tree(
             "killpg",
             lambda pgid, sig: killed.append((pgid, sig)),
         )
-        yaml_mod._kill_process_tree(FakeProc())  # ty:ignore[invalid-argument-type]
+        yaml_mod._kill_process_tree(cast("subprocess.Popen", FakeProc()))
         assert killed == [(4242, yaml_mod.signal.SIGKILL)]
