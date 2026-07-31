@@ -215,9 +215,8 @@ def test_search_warns_when_collection_cap_binds(
 ) -> None:
     """#417: a ``_MAX_COLLECTED`` hit emits a truncation warning.
 
-    The deadline cap warns on hit; the collection cap previously returned
-    fewer results than ``max_results`` with no signal, so an autonomous
-    agent would take the truncated set as complete.
+    Without a warning, the truncated set looks complete to an autonomous
+    agent.
     """
     monkeypatch.setattr(search_module, "_MAX_COLLECTED", 2)
     for i in range(5):
@@ -236,9 +235,9 @@ def test_search_warns_when_collection_cap_binds(
 def test_search_non_positive_max_results_returns_empty(tmp_path: Path) -> None:
     """#417: ``max_results <= 0`` returns ``[]``.
 
-    The old walk-time ``len(results) >= max_results`` early-exit returned
-    ``[]`` for any non-positive cap; the new final slice would return a
-    suffix (``-1`` → all-but-last) — the guard keeps the old contract.
+    Without the guard, ``results[:max_results]`` returns a suffix for a
+    non-positive cap (``-1`` → all-but-last); the early return enforces
+    non-positive-means-empty.
     """
     (tmp_path / "a.py").write_text("NEEDLE\n", encoding="utf-8")
 
