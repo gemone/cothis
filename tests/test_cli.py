@@ -11,6 +11,7 @@ user-global) and the cross-layer ceiling (raises until #10/#11 land).
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -673,6 +674,80 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     # attach_session_ws scheduled (create_task was stubbed; verify the coro
     # is what ``on_worktree_pick`` would have scheduled).
     assert len(scheduled) == 1
+
+
+@pytest.mark.asyncio
+async def test_reattach_on_restart_swallows_and_logs_attach_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#398 review: a WS-connect failure during re-attach is logged, not lost.
+
+    Pre-fix the ``on_restart`` lambda scheduled a bare ``attach_session_ws``
+    task; a raise there became an un-retrieved task exception and the
+    re-attach vanished silently — exactly the failure the recovery path
+    must survive. ``_reattach_on_restart`` catches and logs it instead.
+    """
+    import logging as _logging
+    from typing import cast
+
+    import cothis.cli as cli_mod
+    from cothis.supervisor import Supervisor
+
+    sup = MagicMock()
+    app = cli_mod._DrivenCothisApp.build(
+        supervisor=cast("Supervisor", sup),
+        model="m", provider="p", provider_env={},
+    )
+
+    def _boom(sid, ws_url, token):  # noqa: ANN001
+        raise OSError("WS connect refused")
+
+    # ``setattr`` (not direct assignment) mirrors the existing spawn test —
+    # the real attribute is a bound method on ``CothisApp``.
+    setattr(app, "attach_session_ws", _boom)
+
+    with caplog.at_level(_logging.INFO, logger="cothis.cli"):
+        # Must not raise — that is the whole point of the wrapper. The
+        # method lives on the inner ``_App`` subclass, not ``CothisApp``.
+        await app._reattach_on_restart(  # type: ignore
+            "c" * 32, "ws://127.0.0.1:1/agent", "t",
+        )
+
+    messages = [r.message for r in caplog.records]
+    assert any("re-attaching" in m for m in messages), (
+        f"expected an info 're-attaching' signal; got {messages}"
+    )
+    assert any("re-attach failed" in m for m in messages), (
+        f"expected a 're-attach failed' warning; got {messages}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_unmount_cancels_monitor_task() -> None:
+    """#398 review: ``on_unmount`` cancels the stashed monitor task.
+
+    Without this, the event loop closes on a pending ``asyncio.sleep``
+    inside ``monitor_worker_health`` and asyncio logs
+    "Task was destroyed but it is pending!".
+    """
+    from typing import cast
+
+    import cothis.cli as cli_mod
+    from cothis.supervisor import Supervisor
+
+    sup = MagicMock()
+    app = cli_mod._DrivenCothisApp.build(
+        supervisor=cast("Supervisor", sup),
+        model="m", provider="p", provider_env={},
+    )
+
+    long_task = asyncio.create_task(asyncio.sleep(1000))
+    setattr(app, "_monitor_task", long_task)
+
+    # ``on_unmount`` lives on the inner ``_App`` subclass, not ``CothisApp``.
+    await app.on_unmount()  # type: ignore
+
+    assert long_task.cancelled(), "on_unmount should cancel the monitor task"
 
 
 def test_driven_cothis_app_on_worktree_pick_rolls_back_on_spawn_failure(
