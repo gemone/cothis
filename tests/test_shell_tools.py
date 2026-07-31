@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -1405,7 +1406,7 @@ def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
     In cmd shell mode, ``_shell_quote`` cmd-quotes each value with
     ``list2cmdline`` (``foo & bar`` → ``\"foo & bar\"``). ``__call__`` must
     dispatch this on the ``shell=True`` path, not argv mode: argv-mode
-    ``subprocess.run(list, shell=False)`` would re-apply ``list2cmdline``
+    ``Popen(list, shell=False)`` would re-apply ``list2cmdline``
     to the whole argv and escape the inner double-quotes as backslash-quote,
     which cmd.exe does not honour (the ``&`` would become a live
     metacharacter).
@@ -1417,7 +1418,7 @@ def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
     without going through ``_compile``, we build a ``CommandBlock`` with
     ``shell=\"cmd\"`` directly and drive ``_ShellTool`` from there.
 
-    Captures the exact ``subprocess.run`` call (``__call__`` is async, so
+    Captures the exact ``Popen`` call (``__call__`` is async, so
     the blocking call runs via ``asyncio.to_thread``) and pins
     ``shell=True``, the resolved executable, and the rendered string's
     inner quotes.
@@ -1441,16 +1442,16 @@ def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
     captured: dict[str, Any] = {}
 
     class _FakeProc:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            self.args = args
+            self.returncode = 0
 
-    def _spy_run(*args: Any, **kwargs: Any) -> Any:
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return _FakeProc()
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            return "", ""
 
-    monkeypatch.setattr(yaml_mod.subprocess, "run", _spy_run)
+    monkeypatch.setattr(yaml_mod.subprocess, "Popen", _FakeProc)
     asyncio.run(tool(pattern="foo & bar"))
 
     # Dispatch keeps shell=True (the cmd.exe path), not shell=False with a
@@ -1858,20 +1859,20 @@ async def test_shell_tool_times_out_on_hanging_command(
 ) -> None:
     """A hanging command is killed by the shell-tool timeout on every dispatch shape.
 
-    The ``try/except subprocess.TimeoutExpired`` wraps all three
-    ``subprocess.run`` call sites: argv-list (``shell=False``), POSIX
+    All three dispatch shapes — argv-list (``shell=False``), POSIX
     ``shell=False`` via ``_shell_argv`` (``[exe, "-c", cmd]``), and the
-    cmd.exe ``shell=True`` path. Each must pass ``timeout=_SHELL_TIMEOUT_S``
-    and surface a readable error. ``subprocess.run`` is stubbed to record the
-    call and raise ``TimeoutExpired`` (carrying partial output) so every shape
-    runs cross-platform — no real ``sh`` / ``cmd.exe`` execution — and a
-    missing-timeout regression at any site is caught.
+    cmd.exe ``shell=True`` path — must spawn with the child isolated in its
+    own process group/session, bound ``communicate`` by
+    ``timeout=_SHELL_TIMEOUT_S``, kill the whole group/tree on timeout (no
+    orphaned grandchildren), and surface a readable error with the partial
+    output. ``Popen`` and the group kill are stubbed so every shape runs
+    cross-platform — no real ``sh`` / ``cmd.exe`` execution.
     """
     import cothis.tools.yaml as yaml_mod
 
     # ``shutil.which`` is stubbed so every shape compiles cross-platform
-    # (no real ``sh`` / ``sleep`` on PATH needed); ``subprocess.run`` is
-    # stubbed below, so the resolved paths never execute.
+    # (no real ``sh`` / ``sleep`` on PATH needed); ``Popen`` is stubbed
+    # below, so the resolved paths never execute.
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
 
     if shape == "argv-list":
@@ -1892,26 +1893,53 @@ async def test_shell_tool_times_out_on_hanging_command(
         expected_shell = True
 
     captured: dict[str, object] = {}
+    procs: list[object] = []
+    killed: list[object] = []
+    timeouts: list[float | None] = []
 
-    def _fake_run(*args: object, **kwargs: object) -> object:
-        captured.update(kwargs)
-        raise yaml_mod.subprocess.TimeoutExpired(
-            cmd=str(args[0]) if args else "",
-            timeout=0.0,
-            output="half-done\n",
-            stderr="warn\n",
-        )
+    class FakeProc:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.args = args
+            procs.append(self)
 
-    monkeypatch.setattr(yaml_mod.subprocess, "run", _fake_run)
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            timeouts.append(timeout)
+            if timeout is not None:
+                raise yaml_mod.subprocess.TimeoutExpired(
+                    cmd=str(self.args), timeout=timeout,
+                    output="half-done\n", stderr="warn\n",
+                )
+            return "", ""  # post-kill drain + reap.
+
+    def _fake_kill_tree(proc: object) -> None:
+        killed.append(proc)
+
+    monkeypatch.setattr(yaml_mod.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(yaml_mod, "_kill_process_tree", _fake_kill_tree)
 
     result = await tool()
 
-    # The timeout forwarded to subprocess.run on this dispatch shape.
-    assert captured.get("timeout") == yaml_mod._SHELL_TIMEOUT_S, (
-        f"{shape}: timeout not wired into subprocess.run; captured={captured}"
+    # The timeout forwarded to communicate() on this dispatch shape, then a
+    # post-kill drain call to reap the group.
+    assert timeouts == [yaml_mod._SHELL_TIMEOUT_S, None], (
+        f"{shape}: timeout not wired into communicate; timeouts={timeouts}"
     )
     assert captured.get("shell") is expected_shell, (
         f"{shape}: wrong dispatch site; captured={captured}"
+    )
+    # Child isolated in its own group/session so the kill can cover it.
+    if sys.platform == "win32":
+        assert captured.get("creationflags") == yaml_mod.subprocess.CREATE_NEW_PROCESS_GROUP, (
+            f"{shape}: child not in its own process group; captured={captured}"
+        )
+    else:
+        assert captured.get("start_new_session") is True, (
+            f"{shape}: child not in its own session; captured={captured}"
+        )
+    # The timeout handler kills the whole group/tree, not just the child.
+    assert killed == procs, (
+        f"{shape}: timeout must kill the process group/tree; killed={killed}"
     )
     assert isinstance(result, str)
     assert "timed out" in result.lower(), result
@@ -1921,3 +1949,38 @@ async def test_shell_tool_times_out_on_hanging_command(
     assert "[stderr]" in result and "warn" in result, (
         f"partial stderr lost: {result!r}"
     )
+
+
+def test_kill_process_tree_kills_group_or_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout cleanup kills the whole group/tree, not just the child.
+
+    POSIX: ``os.killpg`` on the child's process group. Windows: ``taskkill
+    /T`` on the child PID. Verifies the cleanup covers descendants — the
+    shell-path grandchild leak — not just the immediate process.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    class FakeProc:
+        pid = 4242
+
+    if sys.platform == "win32":
+        captured_run: list[list[str]] = []
+        monkeypatch.setattr(
+            yaml_mod.subprocess,
+            "run",
+            lambda cmd, **kwargs: captured_run.append(cmd),
+        )
+        yaml_mod._kill_process_tree(FakeProc())
+        assert captured_run == [["taskkill", "/F", "/T", "/PID", "4242"]]
+    else:
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(yaml_mod.os, "getpgid", lambda pid: 4242)
+        monkeypatch.setattr(
+            yaml_mod.os,
+            "killpg",
+            lambda pgid, sig: killed.append((pgid, sig)),
+        )
+        yaml_mod._kill_process_tree(FakeProc())  # ty:ignore[invalid-argument-type]
+        assert killed == [(4242, yaml_mod.signal.SIGKILL)]
