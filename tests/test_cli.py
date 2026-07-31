@@ -910,6 +910,131 @@ async def test_on_worktree_pick_real_worker_finds_session_project_mode(
         sup.close()
 
 
+def test_check_resume_exists_rejects_bogus_id(tmp_path: Path) -> None:
+    """#394: a well-formed-but-nonexistent resume id is rejected before the TUI launches.
+
+    Both the TUI default path (``chat``) and the ``tui`` command must probe
+    existence (not just format) so a misspelt/obsolete id fails fast with
+    "session … not found" instead of launching the TUI + spawning a doomed
+    worker.
+    """
+    import typer
+
+    from cothis.cli import _check_resume_exists
+
+    db_path = tmp_path / "session.db"
+    bogus = "0" * 32  # well-formed hex, nonexistent
+
+    try:
+        _check_resume_exists(db_path, bogus)
+        raise AssertionError("should have raised BadParameter")
+    except typer.BadParameter as exc:
+        assert "not found" in str(exc)
+        assert bogus in str(exc)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["chat", "--resume", "0" * 32],
+        ["tui", "--resume", "0" * 32],
+    ],
+    ids=["chat", "tui"],
+)
+def test_resume_bogus_id_rejected_before_tui_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    """#394 AC #1+#2: both TUI entrypoints reject a bogus resume id pre-launch.
+
+    ``chat`` (default TUI path) and ``tui`` gate on existence, not just
+    format. A well-formed-but-nonexistent id exits non-zero with the legacy
+    "session … not found" message and never reaches ``_launch_tui_app`` /
+    ``Supervisor.spawn_worker`` (both stubbed to fail if touched).
+    """
+    import cothis.cli as cli_mod
+
+    monkeypatch.setenv("COTHIS_SESSIONS_DIR", str(tmp_path))
+
+    def fail_if_reached(*args: object, **kwargs: object) -> None:
+        raise AssertionError("must not launch the TUI for a bogus resume id")
+
+    monkeypatch.setattr(cli_mod, "_launch_tui_app", fail_if_reached)
+    monkeypatch.setattr(
+        "cothis.supervisor.Supervisor.spawn_worker", fail_if_reached,
+    )
+
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(cli_mod.app, argv)
+    assert result.exit_code != 0, f"expected failure, got: {result.output}"
+    assert "not found" in result.output, result.output
+    assert "0" * 32 in result.output, result.output
+
+
+def test_check_resume_exists_rejects_foreign_cwd(tmp_path: Path) -> None:
+    """#394 review: the probe enforces the cwd visibility filter.
+
+    ``Session.load(cwd=...)`` treats a session whose cwd is neither the
+    current cwd nor an ancestor as not-found (KeyError) — the same parity
+    the legacy REPL gets from ``Session.load``. The seeded cwd is a sibling
+    of the test process's cwd, so it is never an ancestor-or-equal
+    regardless of where the suite runs.
+    """
+    from pathlib import Path
+
+    import typer
+
+    from cothis.cli import _check_resume_exists
+    from cothis.session import Session
+
+    db_path = tmp_path / "session.db"
+    foreign_cwd = Path.cwd().parent / "cothis-foreign-cwd"
+    s = Session.new(db_path, cwd=foreign_cwd, model="m", flush_sync=True)
+    s.append_message("user", [{"type": "text", "text": "hi"}])
+    sid = s.session_id
+    s.close()
+
+    try:
+        _check_resume_exists(db_path, sid)
+        raise AssertionError("should have raised BadParameter")
+    except typer.BadParameter as exc:
+        assert "not found" in str(exc)
+
+
+def test_check_resume_exists_accepts_archived_session(tmp_path: Path) -> None:
+    """#394 review: the probe accepts cold/archived sessions via the #384 fallback.
+
+    ``Session.load`` falls back to the archive index on a hot miss, so an
+    archived session id must pass the probe (return ``None``) instead of
+    being reported as "not found".
+    """
+    from pathlib import Path
+
+    from cothis.cli import _check_resume_exists
+    from cothis.session import Session
+    from cothis.session.archive import ArchiveIndex, archive_session
+
+    db_path = tmp_path / "session.db"
+    s = Session.new(db_path, cwd=Path.cwd(), model="m", flush_sync=True)
+    s.append_message("user", [{"type": "text", "text": "hi"}])
+    sid = s.session_id
+    s.close()
+
+    archive_dir = tmp_path / "archive"
+    archive_session(
+        hot_db_path=db_path,
+        archive_dir=archive_dir,
+        session_id=sid,
+        archive_db_name="2026-07.db",
+        archived_at="2026-07-20T00:00:00+00:00",
+        index=ArchiveIndex(archive_dir / "index.json"),
+    )
+
+    assert _check_resume_exists(db_path, sid) is None
+
+
 def test_launch_tui_app_passes_resume_to_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
