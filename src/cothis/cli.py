@@ -83,6 +83,23 @@ def _validate_session_id_arg(sid: str) -> None:
         )
 
 
+def _check_resume_exists(db_path: Path, resume: str) -> None:
+    """Fail fast if a resume id doesn't exist before launching the TUI (#394).
+
+    The TUI path validated only format, not existence — a well-formed-but-
+    nonexistent id launched the TUI and spawned a doomed worker. Mirrors
+    the legacy REPL's ``Session.load`` gate so both paths deliver the same
+    "not found" message. The loaded session is closed immediately (the
+    TUI's ``on_mount`` re-loads it).
+    """
+    try:
+        Session.load(db_path, resume, cwd=Path.cwd()).close()
+    except KeyError:
+        raise typer.BadParameter(
+            f"session {resume!r} not found; run `cothis history` to list"
+        )
+
+
 def _resolve_db_path(cwd: Path | None = None) -> Path:
     """Resolve the SQLite db path for session persistence.
 
@@ -267,6 +284,7 @@ def chat(
         if not skill:
             if resume is not None:
                 _validate_session_id_arg(resume)
+                _check_resume_exists(_resolve_db_path(), resume)
             _launch_tui_app(model=model, provider=provider, resume=resume)
             return
         console.print(
@@ -591,7 +609,7 @@ def delete_cmd(
 @app.command(name="archive")
 def archive_cmd(
     action: str = typer.Argument(
-        "all", help="'all' (default), '<session_id>', 'restore <id>', 'compress <file>'"
+        "all", help="'all' (default), 'list', '<session_id>', 'restore <id>', 'compress <file>'"
     ),
     target: str = typer.Argument(
         None, help="Session id (for restore) or file path (for compress)."
@@ -605,6 +623,7 @@ def archive_cmd(
         cothis archive <session_id> # archive one session
         cothis archive restore <id> # promote archived session back
         cothis archive compress <file>  # gzip a cold DB file
+        cothis archive list           # list archived (cold) sessions
     """
     # cothis: hand-rolled dispatch instead of nested typer.Typer() because
     # the first positional arg is either a subcommand (restore/compress)
@@ -626,6 +645,18 @@ def archive_cmd(
             console.print("no sessions to archive")
         else:
             console.print(f"archived {archived} session(s)")
+    elif action == "list":
+        archived = Session.list_archived(db_path)
+        if not archived:
+            console.print("no archived sessions")
+            return
+        for sid, sr, archived_at in archived:
+            title = sr.title or f"session {sid[:8]}"
+            cwd_hint = str(sr.cwd)
+            console.print(
+                f"[cyan]{sid[:8]}…[/cyan]  {title}  "
+                f"[dim]({cwd_hint}, archived {archived_at[:10]})[/dim]"
+            )
     elif action == "restore":
         if not target:
             raise typer.BadParameter("restore requires a session id")
@@ -794,6 +825,16 @@ class _DrivenCothisApp:
                 # InputBar wrapper removal (#375) otherwise lets the TextArea
                 # grab launch focus and swallow `n` as text.
                 await super().on_mount()
+                # cothis: start the crash-monitor loop (#398). Detects
+                # crashed workers + restarts them with backoff; the
+                # ``on_restart`` callback re-attaches the TUI's WS to the
+                # new worker's fresh port/token. The task is stashed so
+                # ``on_unmount`` can cancel it cleanly — otherwise the
+                # event loop closes on a pending ``asyncio.sleep`` and
+                # logs "Task was destroyed but it is pending!".
+                self._monitor_task = asyncio.create_task(
+                    supervisor.monitor_worker_health(),
+                )
                 # Auto-spawn for --resume: bypass the worktree picker
                 # and attach the resumed session directly.
                 if resume_session_id is None:
@@ -812,7 +853,51 @@ class _DrivenCothisApp:
                     resume_session_id, handle.ws_url, handle.token,
                 )
 
-        return _App()
+            async def on_unmount(self) -> None:
+                # cothis: cancel the crash-monitor loop on app exit (#398
+                # review). Without this the event loop closes while the
+                # monitor task is mid-``asyncio.sleep`` and asyncio logs
+                # "Task was destroyed but it is pending!".
+                task = getattr(self, "_monitor_task", None)
+                if task is None or task.done():
+                    return
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            async def _reattach_on_restart(
+                self, sid: str, ws_url: str, token: str,
+            ) -> None:
+                # cothis: crash-restart re-attach (#398 review). Wraps
+                # ``attach_session_ws`` so a WS-connect failure on the
+                # fresh port (re-crash, slow bind, port collision — the
+                # exact failures the recovery path must survive) is logged
+                # instead of swallowed as an un-retrieved task exception.
+                logging.getLogger(__name__).info(
+                    "tui: re-attaching %s to restarted worker (ws=%s)",
+                    sid[:8], ws_url,
+                )
+                try:
+                    await self.attach_session_ws(sid, ws_url, token)
+                except Exception:  # noqa: BLE001 — best-effort re-attach
+                    logging.getLogger(__name__).warning(
+                        "tui: re-attach failed for %s (ws=%s)",
+                        sid[:8], ws_url, exc_info=True,
+                    )
+
+        app = _App()
+        # cothis: wire crash-restart re-attach (#398). When the monitor
+        # restarts a crashed worker, the new worker has a fresh WS port +
+        # token; the TUI must re-attach so the next prompt reaches the new
+        # worker, not the dead connection. Routed through
+        # ``_reattach_on_restart`` so a connect failure is logged, not
+        # lost as an un-retrieved task exception.
+        supervisor.on_restart = lambda sid, handle: asyncio.create_task(
+            app._reattach_on_restart(sid, handle.ws_url, handle.token),
+        )
+        return app
 
 
 def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> None:
@@ -894,6 +979,7 @@ def tui(
     """
     if resume is not None:
         _validate_session_id_arg(resume)
+        _check_resume_exists(_resolve_db_path(), resume)
     _launch_tui_app(model=model, provider=provider, resume=resume)
 
 
