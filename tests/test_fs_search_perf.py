@@ -132,7 +132,7 @@ def test_search_truncation_keeps_alphabetically_first(tmp_path: Path) -> None:
 
     Files are created in reverse-alphabetical order so a walk that yielded
     creation/walk order would return ``[e.py, d.py, c.py]`` — the assertion
-    only holds if the (file, line) sort actually ran (#418 review)."""
+    only holds if the (file, line) sort actually ran."""
     for name in ["e.py", "d.py", "c.py", "b.py", "a.py"]:
         (tmp_path / name).write_text("NEEDLE\n", encoding="utf-8")
 
@@ -148,7 +148,7 @@ def test_search_truncation_keeps_alphabetically_first(tmp_path: Path) -> None:
 def test_search_caps_collected_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#418 review: collection is bounded by ``_MAX_COLLECTED`` to avoid OOM.
+    """#417: collection is bounded by ``_MAX_COLLECTED`` to avoid OOM.
 
     The OOM shape is many matches *within one file* (a broad pattern over
     minified JS / log lines) — growth the file/deadline caps don't bound
@@ -175,7 +175,7 @@ def test_search_caps_collected_results(
 def test_search_stops_at_per_file_collection_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#418 review: the per-file ``_MAX_COLLECTED`` check stops the walk.
+    """#417: the per-file ``_MAX_COLLECTED`` check stops the walk.
 
     ``test_search_caps_collected_results`` isolates the per-line check;
     this covers the per-file fast path. With one match per file the
@@ -213,7 +213,7 @@ def test_search_warns_when_collection_cap_binds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """#418 review: a ``_MAX_COLLECTED`` hit emits a truncation warning.
+    """#417: a ``_MAX_COLLECTED`` hit emits a truncation warning.
 
     The deadline cap warns on hit; the collection cap previously returned
     fewer results than ``max_results`` with no signal, so an autonomous
@@ -234,7 +234,7 @@ def test_search_warns_when_collection_cap_binds(
 
 
 def test_search_non_positive_max_results_returns_empty(tmp_path: Path) -> None:
-    """#418 review: ``max_results <= 0`` returns ``[]``.
+    """#417: ``max_results <= 0`` returns ``[]``.
 
     The old walk-time ``len(results) >= max_results`` early-exit returned
     ``[]`` for any non-positive cap; the new final slice would return a
