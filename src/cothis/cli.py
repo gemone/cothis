@@ -626,7 +626,7 @@ def archive_cmd(
             return
         for sid, sr, archived_at in archived:
             title = sr.title or f"session {sid[:8]}"
-            cwd_hint = str(sr.cwd) if sr.cwd else "(no cwd)"
+            cwd_hint = str(sr.cwd)
             console.print(
                 f"[cyan]{sid[:8]}…[/cyan]  {title}  "
                 f"[dim]({cwd_hint}, archived {archived_at[:10]})[/dim]"

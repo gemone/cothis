@@ -57,6 +57,7 @@ from cothis.session.archive import (
     cold_session_children,
     delete_cold_session,
     promote_session,
+    read_cold_session_row,
     run_archival_pass,
 )
 from cothis.session.graph import SessionNotFoundError
@@ -827,13 +828,12 @@ class Session:
         archive_dir = db_path.parent / "archive"
         index = ArchiveIndex(archive_dir / "index.json")
         results: list[tuple[str, SessionRow, str]] = []
-        for sid, entry in index.entries().items():
-            cold_read = _read_cold_session(
+        for sid, entry in index.entries():
+            sr = read_cold_session_row(
                 archive_dir / entry.archive_db, sid,
             )
-            if cold_read is None:
+            if sr is None:
                 continue  # index drifted — cold row missing
-            sr, _ = cold_read
             results.append((sid, sr, entry.archived_at))
         return results
 
