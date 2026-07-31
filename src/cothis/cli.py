@@ -1056,6 +1056,7 @@ async def _worker_session(
     max_tokens: int | None,
 ) -> None:
     """Build Agent + Session + SessionWorker; emit bind JSON; serve."""
+    from cothis.skills import discover_skills, load_skill_selection
     from cothis.worker import SessionWorker
 
     _validate_session_id_arg(session)
@@ -1066,6 +1067,14 @@ async def _worker_session(
         raise typer.BadParameter(
             f"session {session!r} not found; run `cothis history` to list"
         )
+    # cothis: preactivate the TUI's persisted skill selection (#415).
+    # Filter against currently-available skills so an unavailable persisted
+    # name (a project-scoped skill chosen in another project, or one
+    # uninstalled between sessions) can't crash the worker in
+    # ``_run_preactivation`` with "Unknown skill" — mirrors the TUI's
+    # menu-open filter (``saved & set(skills)``). ``discover_skills`` is
+    # mtime-cached (#414), so the extra call is ~free.
+    available = {s.name for s in discover_skills(Path.cwd())}
     try:
         agent = Agent(
             model=model,
@@ -1075,7 +1084,7 @@ async def _worker_session(
             max_iterations=max_iterations,
             max_tokens=max_tokens,
             cwd=Path.cwd(),
-            preactivate_skills=[],
+            preactivate_skills=sorted(set(load_skill_selection()) & available),
         )
         agent.attach_session(loaded)
 

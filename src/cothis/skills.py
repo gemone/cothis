@@ -16,7 +16,9 @@ precedence wins; a ``WARNING`` is logged naming both sources).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,51 @@ if TYPE_CHECKING:
     from cothis.session import Session
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------
+# Skill-selection persistence (#235 slice D, #415)
+#
+# Read/written by the TUI's Ctrl-M config menu AND by the worker's agent
+# build (preactivation), so they live in this light module (not ``tui.py``,
+# which pulls Textual) — the worker subprocess imports here without the
+# Textual cost.
+# ---------------------------------------------------------------------
+
+
+def _skill_selection_path() -> Path:
+    """Path to the persisted skill selection JSON."""
+    home = os.environ.get("COTHIS_HOME") or Path.home() / ".cothis"
+    return Path(home) / "skill_selection.json"
+
+
+def save_skill_selection(skills: set[str]) -> None:
+    """Persist the selected skill names to ``$COTHIS_HOME/skill_selection.json``.
+
+    Overwrites the file atomically (single ``write_text`` call).
+    Sorted output for deterministic diffs.
+    """
+    path = _skill_selection_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(skills), ensure_ascii=False), encoding="utf-8")
+
+
+def load_skill_selection() -> set[str]:
+    """Load the persisted skill selection; empty set if missing or corrupt.
+
+    Missing file → ``set()`` (first run). Corrupt JSON → ``set()`` +
+    a WARNING log (don't crash the caller on a bad config file).
+    """
+    path = _skill_selection_path()
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("skills: cannot read skill selection from %s", path)
+        return set()
+    return {str(s) for s in data} if isinstance(data, list) else set()
+
 
 _SKILL_FILE = "SKILL.md"
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?\n)---\s*\n", re.DOTALL)
@@ -87,7 +134,7 @@ def discover_skills(
     """
     if cothis_home is None:
         cothis_home = Path(
-            __import__("os").environ.get("COTHIS_HOME")
+            os.environ.get("COTHIS_HOME")
             or Path.home() / ".cothis"
         )
     if user_agents is None:

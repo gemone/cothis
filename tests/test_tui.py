@@ -2244,7 +2244,7 @@ def test_save_and_load_skill_selection_round_trip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #235 slice D: save → load round-trips the selected set."""
-    from cothis.tui import load_skill_selection, save_skill_selection
+    from cothis.skills import load_skill_selection, save_skill_selection
 
     monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
 
@@ -2257,7 +2257,7 @@ def test_load_skill_selection_empty_when_file_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #235 slice D: no file → empty set (first run)."""
-    from cothis.tui import load_skill_selection
+    from cothis.skills import load_skill_selection
 
     monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
     assert load_skill_selection() == set()
@@ -2267,10 +2267,59 @@ def test_load_skill_selection_handles_corrupt_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #235 slice D: corrupt JSON → empty set + no crash."""
-    from cothis.tui import _skill_selection_path, load_skill_selection
+    from cothis.skills import _skill_selection_path, load_skill_selection
 
     monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
     path = _skill_selection_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not valid json", encoding="utf-8")
     assert load_skill_selection() == set()
+
+
+# ---------------------------------------------------------------------
+# Ctrl-M skill-config menu end-to-end wiring (#415)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_menu_open_persists_selection_on_dismiss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#415: on_menu_open's dismiss path saves the selection (production wiring)."""
+    from cothis.skills import load_skill_selection
+    from cothis.tui import ConfigMenuModal, CothisApp
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        monkeypatch.setattr(app, "list_configurable_skills", lambda: ["alpha", "beta"])
+        app.on_menu_open()  # pushes the ConfigMenuModal
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ConfigMenuModal)
+        modal.dismiss({"alpha"})  # simulate Done with "alpha" toggled on
+        await pilot.pause()
+    assert load_skill_selection() == {"alpha"}
+
+
+@pytest.mark.asyncio
+async def test_config_menu_seeds_from_saved_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#415: reopening the menu shows the previously-saved selection."""
+    from cothis.skills import save_skill_selection
+    from cothis.tui import ConfigMenuModal, CothisApp
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    save_skill_selection({"alpha", "ghost"})  # 'ghost' is not available
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        monkeypatch.setattr(app, "list_configurable_skills", lambda: ["alpha", "beta"])
+        app.on_menu_open()
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ConfigMenuModal)
+        # Seeded with saved ∩ available — the unavailable 'ghost' is dropped.
+        assert modal._selected == {"alpha"}

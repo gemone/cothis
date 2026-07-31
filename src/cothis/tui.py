@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -71,38 +70,9 @@ _STREAM_FINALIZE_S = 0.3
 # ---------------------------------------------------------------------
 
 
-def _skill_selection_path() -> Path:
-    """Path to the persisted skill selection JSON."""
-    home = os.environ.get("COTHIS_HOME") or str(Path.home() / ".cothis")
-    return Path(home) / "skill_selection.json"
-
-
-def save_skill_selection(skills: set[str]) -> None:
-    """Persist the selected skill names to ``$COTHIS_HOME/skill_selection.json``.
-
-    Overwrites the file atomically (single ``write_text`` call).
-    Sorted output for deterministic diffs.
-    """
-    path = _skill_selection_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(sorted(skills)), encoding="utf-8")
-
-
-def load_skill_selection() -> set[str]:
-    """Load the persisted skill selection; empty set if missing or corrupt.
-
-    Missing file → ``set()`` (first run). Corrupt JSON → ``set()`` +
-    a WARNING log (don't crash the TUI on a bad config file).
-    """
-    path = _skill_selection_path()
-    if not path.is_file():
-        return set()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        logger.warning("tui: cannot read skill selection from %s", path)
-        return set()
-    return {str(s) for s in data} if isinstance(data, list) else set()
+# Skill-selection persistence (save/load_skill_selection) lives in
+# ``cothis.skills`` so the worker subprocess can import it without the
+# Textual cost (#415). Imported locally where used below.
 
 
 # ---------------------------------------------------------------------
@@ -374,7 +344,8 @@ class ConfigMenuModal(ModalScreen[set[str] | None]):
 
     Each skill is a ``Button`` that toggles selected/unselected on click.
     ``Done`` dismisses with the selected set; ``Esc`` dismisses with
-    ``None`` (cancel). Slice D will persist the selection across sessions.
+    ``None`` (cancel). The selection persists across sessions via
+    ``save/load_skill_selection`` (#415).
     """
 
     DEFAULT_CSS = """
@@ -391,9 +362,11 @@ class ConfigMenuModal(ModalScreen[set[str] | None]):
 
     BINDINGS = [("escape", "dismiss_modal", "Cancel")]
 
-    def __init__(self, skills: list[str]) -> None:
+    def __init__(self, skills: list[str], *, selected: set[str] | None = None) -> None:
         self._skills = skills
-        self._selected: set[str] = set()
+        # Seed from the persisted selection (caller passes it) so the menu
+        # reflects what was saved last time (#415).
+        self._selected: set[str] = set(selected) if selected else set()
         super().__init__()
 
     def compose(self) -> ComposeResult:
@@ -401,7 +374,8 @@ class ConfigMenuModal(ModalScreen[set[str] | None]):
         if not self._skills:
             yield Label("(no skills configured)", id="menu-empty")
         for name in self._skills:
-            yield Button(name, id=f"skill-{name}", classes="skill-toggle")
+            classes = "skill-toggle -active" if name in self._selected else "skill-toggle"
+            yield Button(name, id=f"skill-{name}", classes=classes)
         yield Button("Done", id="menu-done")
 
     def action_dismiss_modal(self) -> None:
@@ -657,8 +631,22 @@ class CothisApp(App):
         re-runs ``discover_tools`` with the chosen layers (Slice C/D).
         """
         logger.info("tui: menu action fired (Ctrl-M)")
+        from cothis.skills import load_skill_selection, save_skill_selection
+
         skills = self.list_configurable_skills()
-        self.push_screen(ConfigMenuModal(skills))
+        saved = load_skill_selection()
+
+        def _on_config_done(selected: set[str] | None) -> None:
+            if selected is None:  # Esc / Cancel
+                return
+            save_skill_selection(selected)
+
+        # Seed the menu with the saved-and-still-available skills so it
+        # reflects the last choice; persist the new selection on Done (#415).
+        self.push_screen(
+            ConfigMenuModal(skills, selected=saved & set(skills)),
+            _on_config_done,
+        )
 
     def list_configurable_skills(self) -> list[str]:
         """Return the names of skills discoverable from the current cwd.
