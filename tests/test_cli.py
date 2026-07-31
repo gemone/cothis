@@ -678,7 +678,7 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
 
 @pytest.mark.asyncio
 async def test_reattach_on_restart_swallows_and_logs_attach_failure(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """#398 review: a WS-connect failure during re-attach is logged, not lost.
 
@@ -696,7 +696,6 @@ async def test_reattach_on_restart_swallows_and_logs_attach_failure(
     sup = MagicMock()
     app = cli_mod._DrivenCothisApp.build(
         supervisor=cast("Supervisor", sup),
-        sessions_dir=tmp_path / "sessions",
         model="m", provider="p", provider_env={},
     )
 
@@ -724,7 +723,7 @@ async def test_reattach_on_restart_swallows_and_logs_attach_failure(
 
 
 @pytest.mark.asyncio
-async def test_on_unmount_cancels_monitor_task(tmp_path: Path) -> None:
+async def test_on_unmount_cancels_monitor_task() -> None:
     """#398 review: ``on_unmount`` cancels the stashed monitor task.
 
     Without this, the event loop closes on a pending ``asyncio.sleep``
@@ -739,7 +738,6 @@ async def test_on_unmount_cancels_monitor_task(tmp_path: Path) -> None:
     sup = MagicMock()
     app = cli_mod._DrivenCothisApp.build(
         supervisor=cast("Supervisor", sup),
-        sessions_dir=tmp_path / "sessions",
         model="m", provider="p", provider_env={},
     )
 
