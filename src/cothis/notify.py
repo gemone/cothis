@@ -122,8 +122,10 @@ class NotifyBus:
 
         ``retention_days`` defaults to ``COTHIS_NOTIFY_RETENTION_DAYS``;
         0, negative, or unparseable → no-op (compaction is opt-in).
-        The Supervisor (#227) calls this periodically — default cadence
-        daily.
+        The Supervisor calls this on ``close()`` (retention
+        ``_LIFECYCLE_RETENTION_DAYS``) so the shared ``~/.cothis/supervisor.db``
+        stays bounded; the read side (TUI status badges) is not yet wired
+        (#227/#411).
 
         ``preserve_seqs`` (optional, #246) holds event ``seq`` values that
         must survive compaction regardless of age — i.e. events an active

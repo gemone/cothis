@@ -471,17 +471,127 @@ async def test_monitor_worker_health_skips_when_over_threshold(
 def test_supervisor_close_is_idempotent(tmp_path: Path) -> None:
     """AC #250: ``close()`` can be called twice without raising.
 
-    The second call walks the (now-empty) ``_procs`` dict + calls
-    ``self._conn.close()`` again. sqlite3's Connection.close() is
-    documented as idempotent (subsequent calls are no-ops), but the
-    test guards against a refactor that swaps the connection for
-    something less forgiving.
+    The second call returns early via the ``_closed`` guard — ``close()``
+    compacts the bus before closing the connection, and compacting on an
+    already-closed connection would raise, so the guard (not sqlite's
+    idempotent ``Connection.close``) is what makes the double-call safe (#411).
     """
     sup = Supervisor(tmp_path / "supervisor.db")
     sup.close()
     sup.close()  # must not raise
 
 
+def test_supervisor_close_runs_conn_close_if_compact_raises(
+    tmp_path: Path,
+) -> None:
+    """#411: a ``compact`` failure must not leak the DB connection.
+
+    ``compact`` is a DB write that can raise on a local sqlite error. The
+    teardown sets ``_closed`` first and runs ``conn.close()`` under
+    ``finally``, so the connection is always closed (no leak) and a
+    re-entry is a no-op that does not retry ``compact`` on the
+    half-closed connection.
+    """
+    import sqlite3
+
+    sup = Supervisor(tmp_path / "supervisor.db")
+    # compact is a NotifyBus method (plain Python) — safe to override with a
+    # raising stub that records how many times it ran.
+    compact_calls: list[int] = []
+
+    def _raising_compact(*args: object, **kwargs: object) -> None:
+        compact_calls.append(1)
+        raise sqlite3.OperationalError("disk I/O")
+
+    # ``setattr`` (not direct method assignment) avoids ty's implicit-
+    # shadowing check on the plain-Python NotifyBus method.
+    setattr(sup._bus, "compact", _raising_compact)
+
+    # The compact error propagates, but the finally clause still closed the
+    # connection and _closed is set.
+    with pytest.raises(sqlite3.OperationalError):
+        sup.close()
+
+    # Connection was closed despite compact raising (no leak).
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        sup._conn.execute("SELECT 1")
+    assert sup._closed is True
+    # Re-entry returns early — compact is not retried on the closed conn.
+    sup.close()
+    assert len(compact_calls) == 1
+
+
+def test_supervisor_close_runs_conn_close_if_shutdown_worker_raises(
+    tmp_path: Path,
+) -> None:
+    """#425: a ``shutdown_worker`` raise during close() must not leak the conn.
+
+    ``close()`` wraps the whole teardown (shutdown loop + compact) in one
+    try/finally so a ``record_lifecycle`` or ``proc.wait`` raise still runs
+    ``conn.close()`` (#425).
+    """
+    import sqlite3
+
+    sup = Supervisor(tmp_path / "supervisor.db")
+    # A registered proc so the shutdown loop runs and calls shutdown_worker.
+    sup._procs["d" * 32] = MagicMock()  # type: ignore[assignment]
+
+    def _boom(session_id: str, *, timeout: float = 5.0) -> None:
+        raise sqlite3.OperationalError("disk I/O")
+
+    # ``setattr`` (not direct method assignment) avoids ty's implicit-
+    # shadowing check.
+    setattr(sup, "shutdown_worker", _boom)
+
+    # The shutdown error propagates, but the finally still closed the conn.
+    with pytest.raises(sqlite3.OperationalError):
+        sup.close()
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        sup._conn.execute("SELECT 1")
+    assert sup._closed is True
+
+
+def test_close_compacts_old_lifecycle_events(tmp_path: Path) -> None:
+    """#411: ``close()`` compacts lifecycle events older than the retention
+    window, so the shared ``~/.cothis/supervisor.db``'s ``notify_events`` does
+    not grow without bound across sessions (the read side is not yet wired, but
+    the write side is live).
+    """
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    from cothis.supervisor import _LIFECYCLE_RETENTION_DAYS
+
+    db_path = tmp_path / "supervisor.db"
+    sup = Supervisor(db_path)
+    # An event beyond the retention window (backdated directly into the table).
+    old_ts = (
+        datetime.now(UTC) - timedelta(days=_LIFECYCLE_RETENTION_DAYS + 1)
+    ).isoformat()
+    with sup._conn:
+        sup._conn.execute(
+            "INSERT INTO notify_events(ts, topic, event_type, session_id, "
+            "meta, payload_pointer) VALUES (?, 'session_lifecycle', "
+            "'spawned', NULL, NULL, NULL)",
+            (old_ts,),
+        )
+    # A fresh event via the live write path stays.
+    sup.record_lifecycle("spawned", "s1")
+    sup.close()
+
+    # Re-open the shared DB: only the fresh event survived compaction.
+    conn = sqlite3.connect(db_path)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM notify_events"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1, (
+        f"close() should compact events older than "
+        f"{_LIFECYCLE_RETENTION_DAYS}d; got {count} rows"
+    )
 # ---------------------------------------------------------------------
 # on_restart callback (#398 — wire monitor_worker_health into production)
 # ---------------------------------------------------------------------
@@ -601,4 +711,3 @@ async def test_monitor_worker_health_survives_on_restart_raise(
         f"expected both crashed workers re-attached; calls={calls}"
     )
     sup.close()
-

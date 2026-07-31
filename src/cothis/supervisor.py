@@ -40,6 +40,12 @@ _BACKOFF_CEILING_S = 300.0
 _BACKOFF_FLOOR_S = 1.0
 _DEFAULT_THRESHOLD = 5
 _DEFAULT_WINDOW_S = 600  # 10 minutes
+# Lifecycle-event retention for the shared supervisor DB (#411). The read
+# side (TUI status badges polling ``lifecycle_since``) is not yet wired
+# (#227), but the write side is live, so ``close()`` compacts events older
+# than this to keep ``~/.cothis/supervisor.db``'s ``notify_events`` bounded
+# across sessions.
+_LIFECYCLE_RETENTION_DAYS = 14
 
 
 def backoff_seconds(restart_count: int) -> float:
@@ -115,8 +121,10 @@ class Supervisor:
     """Owns the worker-spawn lifecycle + a separate notify bus.
 
     The Supervisor writes ``session_lifecycle`` events on its OWN DB
-    (separate from any per-session DB the worker owns); the TUI polls
-    this bus for status badges.
+    (separate from any per-session DB the worker owns). The read side
+    (TUI status badges polling ``lifecycle_since``) is not yet wired
+    (#227); to keep the shared, long-lived DB bounded, ``close()``
+    compacts events older than ``_LIFECYCLE_RETENTION_DAYS`` (#411).
 
     Spawning + WS-handshake + crash-detection wiring lands with the
     integration test (#227 follow-up); this class's pure logic
@@ -154,6 +162,10 @@ class Supervisor:
         self._counters: dict[str, RestartCounter] = {}
         self._threshold = threshold
         self._window_s = window_s
+        # One-shot guard so ``close()`` is idempotent even though it
+        # compacts the bus before closing the connection (compact on an
+        # already-closed connection would raise) — #411.
+        self._closed = False
         # cothis: restart callback (#398). Set by the TUI launcher so a
         # restarted worker's fresh WS is re-attached (the old connection is
         # dead). ``None`` in isolation/tests (monitor_worker_health just
@@ -495,7 +507,24 @@ class Supervisor:
         spawned worker gets ``shutdown_worker`` (SIGINT → graceful exit)
         before the DB connection closes — leaving procs alive would
         orphan the session file locks the workers hold.
+
+        Before closing, compacts the notify bus to ``_LIFECYCLE_RETENTION_DAYS``
+        so the shared ``~/.cothis/supervisor.db`` doesn't grow without bound
+        across sessions (#411 — see the constant for why).
+
+        ``_closed`` is set before teardown so a failure in the shutdown loop
+        or in ``compact`` (a ``record_lifecycle`` / ``proc.wait`` path, or a
+        sqlite error in the compact write) can't leave the connection open or
+        let a re-entry retry on a half-closed connection; both run under
+        ``try`` with ``conn.close()`` under ``finally`` so it always executes
+        (#411, #425).
         """
-        for session_id in list(self._procs.keys()):
-            self.shutdown_worker(session_id)
-        self._conn.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            for session_id in list(self._procs.keys()):
+                self.shutdown_worker(session_id)
+            self._bus.compact(retention_days=_LIFECYCLE_RETENTION_DAYS)
+        finally:
+            self._conn.close()
