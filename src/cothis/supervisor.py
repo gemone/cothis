@@ -162,7 +162,7 @@ class Supervisor:
         self._counters: dict[str, RestartCounter] = {}
         self._threshold = threshold
         self._window_s = window_s
-        # One-shot guard so ``close()`` is idempotent even though it now
+        # One-shot guard so ``close()`` is idempotent even though it
         # compacts the bus before closing the connection (compact on an
         # already-closed connection would raise) — #411.
         self._closed = False
@@ -517,7 +517,7 @@ class Supervisor:
         sqlite error in the compact write) can't leave the connection open or
         let a re-entry retry on a half-closed connection; both run under
         ``try`` with ``conn.close()`` under ``finally`` so it always executes
-        (#412 review, extended to the shutdown loop in #425).
+        (#411, #425).
         """
         if self._closed:
             return
@@ -526,8 +526,8 @@ class Supervisor:
         # ``record_lifecycle`` / ``proc.wait`` path in ``shutdown_worker``, or
         # a sqlite error in ``compact``. Run them under one ``try`` so
         # ``conn.close()`` always executes and the shared connection can't
-        # leak on any teardown-path raise (#425 — extends #412's compact
-        # guard to cover the shutdown loop too).
+        # leak on any teardown-path raise (#425 — same guard as the #411
+        # compact path, extended to the shutdown loop).
         try:
             for session_id in list(self._procs.keys()):
                 self.shutdown_worker(session_id)

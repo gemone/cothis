@@ -471,7 +471,7 @@ async def test_monitor_worker_health_skips_when_over_threshold(
 def test_supervisor_close_is_idempotent(tmp_path: Path) -> None:
     """AC #250: ``close()`` can be called twice without raising.
 
-    The second call returns early via the ``_closed`` guard — ``close()`` now
+    The second call returns early via the ``_closed`` guard — ``close()``
     compacts the bus before closing the connection, and compacting on an
     already-closed connection would raise, so the guard (not sqlite's
     idempotent ``Connection.close``) is what makes the double-call safe (#411).
@@ -484,7 +484,7 @@ def test_supervisor_close_is_idempotent(tmp_path: Path) -> None:
 def test_supervisor_close_runs_conn_close_if_compact_raises(
     tmp_path: Path,
 ) -> None:
-    """#412 review: a ``compact`` failure must not leak the DB connection.
+    """#411: a ``compact`` failure must not leak the DB connection.
 
     ``compact`` is a DB write that can raise on a local sqlite error. The
     teardown sets ``_closed`` first and runs ``conn.close()`` under
@@ -529,8 +529,9 @@ def test_supervisor_close_runs_conn_close_if_shutdown_worker_raises(
     ``shutdown_worker`` has uncaught raise paths of its own — a
     ``record_lifecycle`` DB write, and the post-kill ``proc.wait``. The naive
     form runs the shutdown loop *outside* the try/finally guarding
-    ``conn.close()``; close() now wraps the whole teardown so the connection
-    closes on any raise (extends #412's compact guard to the shutdown loop).
+    ``conn.close()``; close() wraps the whole teardown so the connection
+    closes on any raise (same guard as the #411 compact path, extended to
+    the shutdown loop).
     """
     import sqlite3
 
@@ -713,4 +714,3 @@ async def test_monitor_worker_health_survives_on_restart_raise(
         f"expected both crashed workers re-attached; calls={calls}"
     )
     sup.close()
-
