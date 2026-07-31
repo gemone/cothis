@@ -83,7 +83,24 @@ def _validate_session_id_arg(sid: str) -> None:
         )
 
 
-def _resolve_db_path() -> Path:
+def _check_resume_exists(db_path: Path, resume: str) -> None:
+    """Fail fast if a resume id doesn't exist before launching the TUI (#394).
+
+    The TUI path validated only format, not existence — a well-formed-but-
+    nonexistent id launched the TUI and spawned a doomed worker. Mirrors
+    the legacy REPL's ``Session.load`` gate so both paths deliver the same
+    "not found" message. The loaded session is closed immediately (the
+    TUI's ``on_mount`` re-loads it).
+    """
+    try:
+        Session.load(db_path, resume, cwd=Path.cwd()).close()
+    except KeyError:
+        raise typer.BadParameter(
+            f"session {resume!r} not found; run `cothis history` to list"
+        )
+
+
+def _resolve_db_path(cwd: Path | None = None) -> Path:
     """Resolve the SQLite db path for session persistence.
 
     Three modes (highest precedence first):
@@ -95,14 +112,22 @@ def _resolve_db_path() -> Path:
     3. neither set → ``$COTHIS_HOME/agents.db``
        (default single-file layout — all sessions in one global db).
 
+    ``cwd`` defaults to the process cwd. Only project mode (1) is
+    cwd-relative; passing an explicit ``cwd`` lets a caller resolve the db
+    for a directory other than its own — the TUI uses this so a
+    worktree-pick creates the session in the *worktree's* db, matching the
+    worker subprocess that runs there (#402). The other two modes ignore
+    ``cwd`` (path-based, not cwd-based).
+
     Lock files live elsewhere (``$XDG_CACHE_HOME/cothis/<id>.lock``) and are
     resolved inside ``Session``; this function only owns the db path. Split
     modes share the ``session.db`` filename to distinguish them from the
     default ``agents.db`` (which is the unified entry the user sees by
     default and may eventually hold config/audit tables too).
     """
+    base = cwd if cwd is not None else Path.cwd()
     if os.environ.get("COTHIS_SESSIONS_TYPE") == "project":
-        return Path.cwd() / ".agents" / "sessions" / "session.db"
+        return base / ".agents" / "sessions" / "session.db"
     if dir_env := os.environ.get("COTHIS_SESSIONS_DIR"):
         return Path(dir_env).expanduser() / "session.db"
     return _cothis_home() / "agents.db"
@@ -259,6 +284,7 @@ def chat(
         if not skill:
             if resume is not None:
                 _validate_session_id_arg(resume)
+                _check_resume_exists(_resolve_db_path(), resume)
             _launch_tui_app(model=model, provider=provider, resume=resume)
             return
         console.print(
@@ -583,7 +609,7 @@ def delete_cmd(
 @app.command(name="archive")
 def archive_cmd(
     action: str = typer.Argument(
-        "all", help="'all' (default), '<session_id>', 'restore <id>', 'compress <file>'"
+        "all", help="'all' (default), 'list', '<session_id>', 'restore <id>', 'compress <file>'"
     ),
     target: str = typer.Argument(
         None, help="Session id (for restore) or file path (for compress)."
@@ -597,6 +623,7 @@ def archive_cmd(
         cothis archive <session_id> # archive one session
         cothis archive restore <id> # promote archived session back
         cothis archive compress <file>  # gzip a cold DB file
+        cothis archive list           # list archived (cold) sessions
     """
     # cothis: hand-rolled dispatch instead of nested typer.Typer() because
     # the first positional arg is either a subcommand (restore/compress)
@@ -618,6 +645,18 @@ def archive_cmd(
             console.print("no sessions to archive")
         else:
             console.print(f"archived {archived} session(s)")
+    elif action == "list":
+        archived = Session.list_archived(db_path)
+        if not archived:
+            console.print("no archived sessions")
+            return
+        for sid, sr, archived_at in archived:
+            title = sr.title or f"session {sid[:8]}"
+            cwd_hint = str(sr.cwd)
+            console.print(
+                f"[cyan]{sid[:8]}…[/cyan]  {title}  "
+                f"[dim]({cwd_hint}, archived {archived_at[:10]})[/dim]"
+            )
     elif action == "restore":
         if not target:
             raise typer.BadParameter("restore requires a session id")
@@ -709,7 +748,6 @@ class _DrivenCothisApp:
     def build(
         *,
         supervisor: Supervisor,
-        sessions_dir: Path,
         model: str,
         provider: str,
         provider_env: dict[str, str],
@@ -719,19 +757,29 @@ class _DrivenCothisApp:
 
         If ``resume_session_id`` is set, the app auto-spawns a worker for that
         session on ``on_mount`` (bypasses the worktree picker).
-        """
-        import secrets
 
+        ``on_worktree_pick`` resolves the session db itself (relative to the
+        picked worktree) so the spawned worker reads the same db in every
+        ``_resolve_db_path`` mode — including cwd-relative project mode (#402).
+        """
         from cothis.session import Session
         from cothis.tui import CothisApp
 
         class _App(CothisApp):
             def on_worktree_pick(self, path: str) -> None:  # type: ignore[override]
                 cwd = Path(path)
-                sessions_dir.mkdir(parents=True, exist_ok=True)
-                db_path = sessions_dir / f"session-{secrets.token_hex(8)}.db"
+                # Resolve the db relative to the *picked worktree* — not the
+                # TUI's launch dir — so the spawned worker (which runs in the
+                # worktree and resolves ``_resolve_db_path()`` there) reads
+                # the same db the TUI writes (#400 / #402). In default +
+                # ``COTHIS_SESSIONS_DIR`` modes the path is cwd-independent,
+                # so this matches the launch-cwd resolution; in project mode
+                # it scopes the session to its worktree instead of leaving it
+                # in the launch dir where the worker can't find it.
+                wt_db = _resolve_db_path(cwd=cwd)
+                wt_db.parent.mkdir(parents=True, exist_ok=True)
                 session = Session.new(
-                    db_path, cwd=cwd, model=model, flush_sync=True,
+                    wt_db, cwd=cwd, model=model, flush_sync=True,
                 )
                 session.append_message(
                     "user",
@@ -746,17 +794,14 @@ class _DrivenCothisApp:
                         model=model,
                         provider=provider,
                         cwd=cwd,
-                        sessions_dir=sessions_dir,
                         extra_env=provider_env,
                     )
                 except Exception as exc:
                     # cothis: spawn failed — roll back the just-persisted
-                    # session so it doesn't surface as a ghost in
-                    # ``cothis history`` (#390). ``delete`` drops the row;
-                    # ``unlink`` drops the (now-empty) per-session db file
-                    # (``Session.delete`` leaves the file on disk).
-                    Session.delete(db_path, sid)
-                    db_path.unlink(missing_ok=True)
+                    # session row so it doesn't surface as a ghost in
+                    # ``cothis history`` (#390). Do NOT unlink the db file
+                    # — it's the shared db (other sessions live in it).
+                    Session.delete(wt_db, sid)
                     logging.getLogger(__name__).error(
                         "tui: spawn failed for session %s in %s; "
                         "rolled back: %s",
@@ -799,7 +844,6 @@ class _DrivenCothisApp:
                     model=model,
                     provider=provider,
                     cwd=Path.cwd(),
-                    sessions_dir=sessions_dir,
                     extra_env=provider_env,
                 )
                 logging.getLogger(__name__).info(
@@ -869,7 +913,6 @@ def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> Non
     from cothis.supervisor import Supervisor
     from cothis.tui import run as run_tui
 
-    sessions_dir = Path.cwd() / ".cothis" / "sessions"
     sup = Supervisor()
 
     provider_env = {
@@ -880,13 +923,21 @@ def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> Non
 
     app = _DrivenCothisApp.build(
         supervisor=sup,
-        sessions_dir=sessions_dir,
         model=model,
         provider=provider,
         provider_env=provider_env,
         resume_session_id=resume,
     )
-    run_tui(app=app)
+    # cothis: graceful shutdown on TUI exit (#403). Without this, spawned
+    # workers are orphaned (reparented to init), still holding session locks
+    # — a later ``cothis chat --resume`` raises SessionLockedError until the
+    # orphan is manually killed. ``sup.close()`` sends each worker the
+    # graceful ``shutdown`` control message (flush + release), so the session
+    # is cleanly persisted and the lock released on every exit path.
+    try:
+        run_tui(app=app)
+    finally:
+        sup.close()
 
 
 @app.command()
@@ -928,6 +979,7 @@ def tui(
     """
     if resume is not None:
         _validate_session_id_arg(resume)
+        _check_resume_exists(_resolve_db_path(), resume)
     _launch_tui_app(model=model, provider=provider, resume=resume)
 
 

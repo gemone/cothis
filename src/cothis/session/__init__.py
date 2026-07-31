@@ -57,6 +57,7 @@ from cothis.session.archive import (
     cold_session_children,
     delete_cold_session,
     promote_session,
+    read_cold_session_row,
     run_archival_pass,
 )
 from cothis.session.graph import SessionNotFoundError
@@ -812,6 +813,31 @@ class Session:
             storage.close()
 
     @classmethod
+    def list_archived(
+        cls,
+        db_path: Path,
+    ) -> list[tuple[str, SessionRow, str]]:
+        """List archived (cold) sessions — the cold counterpart of ``list_visible`` (#392).
+
+        Iterates ``ArchiveIndex`` entries and reads each cold ``SessionRow``
+        via ATTACH (read-only, no copy back to hot). Returns
+        ``(session_id, SessionRow, archived_at)`` tuples for display.
+        Drifted index entries (cold row missing) are silently skipped.
+        """
+        db_path = db_path.expanduser()
+        archive_dir = db_path.parent / "archive"
+        index = ArchiveIndex(archive_dir / "index.json")
+        results: list[tuple[str, SessionRow, str]] = []
+        for sid, entry in index.entries():
+            sr = read_cold_session_row(
+                archive_dir / entry.archive_db, sid,
+            )
+            if sr is None:
+                continue  # index drifted — cold row missing
+            results.append((sid, sr, entry.archived_at))
+        return results
+
+    @classmethod
     def delete(
         cls,
         db_path: Path,
@@ -1365,7 +1391,7 @@ class Session:
                 self._db_path.parent / "archive" / "index.json"
             )
             try:
-                promote_session(
+                promoted = promote_session(
                     hot_db_path=self._db_path,
                     archive_dir=self._db_path.parent / "archive",
                     session_id=self._session_id,
@@ -1384,6 +1410,16 @@ class Session:
                 )
                 return
             self._cold = False
+            if not promoted:
+                # Stale-index drift: the cold DB lost the row, so
+                # ``promote_session`` self-healed the index WITHOUT copying
+                # anything to hot. The sessions row is not in hot, but the
+                # cold load set ``_session_row_written=True`` — flag it
+                # unwritten so the row (held in memory from the load) is
+                # persisted below before the blocks. Without this every
+                # block INSERT hits the sessions FK and the write is
+                # dropped on every retry (#405).
+                self._session_row_written = False
         session_row: SessionRow | None = None
         if not self._session_row_written:
             self._maybe_write_gitignore()

@@ -294,6 +294,41 @@ def test_peek_messages_reads_archived_cold_session(tmp_path: Path) -> None:
     raise AssertionError("peek_messages should raise KeyError for an unknown id")
 
 
+def test_list_archived_returns_archived_sessions(tmp_path: Path) -> None:
+    """#392: ``list_archived`` returns archived (cold) sessions with their ids.
+
+    The per-id read paths (peek/load/delete) all handle cold; the listing
+    must too, or archived sessions are undiscoverable (no command surfaces
+    their ids for ``restore``/``resume``).
+    """
+    db_path = tmp_path / "session.db"
+    sid = _seed_session(db_path, tmp_path, texts=["archived-msg"])
+    _set_updated_at(db_path, sid, "2026-04-13T00:00:00+00:00")  # ~100 days old
+    archive_dir = tmp_path / "archive"
+    _clear_archive_state(db_path)
+    run_archival_pass(
+        hot_db_path=db_path,
+        archive_dir=archive_dir,
+        threshold_days=90,
+        now_iso="2026-07-20T00:00:00+00:00",
+    )
+
+    # The session is now cold (hot miss).
+    hot = Storage(db_path)
+    try:
+        assert hot.load_session(sid) is None
+    finally:
+        hot.close()
+
+    # list_archived returns it — the same id peek_messages/load accept.
+    archived = Session.list_archived(db_path)
+    assert len(archived) == 1
+    listed_sid, sr, archived_at = archived[0]
+    assert listed_sid == sid
+    assert str(sr.cwd) == str(tmp_path)  # SessionRow read from cold DB
+    assert archived_at  # non-empty timestamp
+
+
 def test_run_archival_pass_throttles_via_archive_state(tmp_path: Path) -> None:
     """The pass records ``last_run`` in ``archive_state`` and skips if < 24h old."""
     db_path = tmp_path / "session.db"
@@ -393,6 +428,54 @@ def test_promote_session_sets_updated_at_now(tmp_path: Path) -> None:
         sr = hot.load_session(sid)
         assert sr is not None
         assert sr.updated_at == "2026-09-01T00:00:00+00:00"
+    finally:
+        hot.close()
+
+
+def test_promote_session_self_heals_stale_index_drift(tmp_path: Path) -> None:
+    """#405: a cold DB that exists but lost the row self-heals, not raises.
+
+    The drift — index points at a cold DB whose ``sessions`` table no longer
+    has the row (reachable if a delete crashes between the cold-row commit
+    and the index save) — used to raise KeyError. It now mirrors
+    delete_cold_session: drop the stale entry + return False.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "session.db"
+    sid = _seed_session(db_path, tmp_path, texts=["one"])
+    archive_dir = db_path.parent / "archive"
+    index = ArchiveIndex(archive_dir / "index.json")
+    archive_session(
+        hot_db_path=db_path, archive_dir=archive_dir, session_id=sid,
+        archive_db_name="2026-07.db",
+        archived_at="2026-07-20T00:00:00+00:00", index=index,
+    )
+
+    # Drift: the cold DB still exists but its row for ``sid`` is gone;
+    # the index still claims the session lives there.
+    cold_db = archive_dir / "2026-07.db"
+    conn = sqlite3.connect(cold_db)
+    try:
+        conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        conn.execute("DELETE FROM blocks WHERE session_id=?", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert index.get(sid) is not None
+
+    # Must NOT raise — self-heals + returns False (acceptance #1).
+    result = promote_session(
+        hot_db_path=db_path, archive_dir=archive_dir,
+        session_id=sid, index=index,
+    )
+    assert result is False
+    # Stale index entry dropped.
+    assert index.get(sid) is None
+    # No spurious hot row fabricated.
+    hot = Storage(db_path)
+    try:
+        assert hot.load_session(sid) is None
     finally:
         hot.close()
 
