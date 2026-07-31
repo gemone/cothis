@@ -1234,6 +1234,14 @@ async def test_worker_session_preactivates_persisted_skills(
 
     monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
     save_skill_selection({"alpha", "beta"})
+    # Make the persisted names discoverable so the worker's availability
+    # filter (mirroring the TUI menu's ``saved & set(skills)``) keeps them.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "cothis.skills.discover_skills",
+        lambda _cwd: [SimpleNamespace(name="alpha"), SimpleNamespace(name="beta")],
+    )
 
     # No real DB needed — Session.load is mocked.
     monkeypatch.setattr(
@@ -1262,5 +1270,62 @@ async def test_worker_session_preactivates_persisted_skills(
 
     assert captured.get("preactivate_skills") == ["alpha", "beta"], (
         f"worker should preactivate the persisted selection; got "
+        f"{captured.get('preactivate_skills')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_session_preactivation_filters_unavailable_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#416 review: an unavailable persisted skill must not crash the worker.
+
+    A project-scoped skill chosen in project A, or one uninstalled between
+    sessions, is absent from ``discover_skills`` at worker start. Passing it
+    to ``Agent(preactivate_skills=...)`` would crash ``_run_preactivation``
+    with "Unknown skill" (agent.py) before the worker serves. The worker
+    filters the persisted set against available skills — mirroring the TUI's
+    menu-open filter (``saved & set(skills)``).
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import cothis.cli as cli_mod
+    import cothis.worker as worker_mod
+    from cothis.skills import save_skill_selection
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    # "ghost" is persisted but not discoverable in this project.
+    save_skill_selection({"alpha", "beta", "ghost"})
+    monkeypatch.setattr(
+        "cothis.skills.discover_skills",
+        lambda _cwd: [SimpleNamespace(name="alpha"), SimpleNamespace(name="beta")],
+    )
+
+    monkeypatch.setattr(
+        cli_mod.Session, "load", lambda *a, **k: MagicMock(name="loaded"),
+    )
+    captured: dict = {}
+    mock_agent = MagicMock()
+    mock_agent.attach_session = MagicMock()
+    mock_agent.aclose = AsyncMock()
+    monkeypatch.setattr(
+        cli_mod, "Agent", lambda **kw: (captured.update(kw), mock_agent)[1],
+    )
+    mock_worker = MagicMock()
+    mock_worker.start = AsyncMock(return_value="ws://127.0.0.1:1/agent")
+    mock_worker.token = "tok"
+    mock_worker.serve_forever = AsyncMock(side_effect=asyncio.CancelledError)
+    mock_worker.stop = AsyncMock()
+    monkeypatch.setattr(worker_mod, "SessionWorker", lambda agent: mock_worker)
+
+    await cli_mod._worker_session(
+        session="a" * 32, model="m", provider="p",
+        max_iterations=1, max_tokens=None,
+    )
+
+    assert captured.get("preactivate_skills") == ["alpha", "beta"], (
+        f"unavailable persisted skill 'ghost' should be filtered out; got "
         f"{captured.get('preactivate_skills')}"
     )
