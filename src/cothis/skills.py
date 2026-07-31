@@ -34,6 +34,25 @@ logger = logging.getLogger(__name__)
 _SKILL_FILE = "SKILL.md"
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?\n)---\s*\n", re.DOTALL)
 
+# mtime-keyed cache of discovered skills (#413, mirrors #361's
+# ``_load_gitignore``). The catalog changes only when a skill is
+# installed/removed (touching the layer dir's mtime), so repeat calls in the
+# same chat skip the O(N) re-read + YAML re-parse of every ``SKILL.md``.
+# In-place edits to a ``SKILL.md`` don't change the dir mtime — callers use
+# ``/reload-skills`` (which clears this cache) for those.
+_skills_cache: dict[
+    tuple[Path, float | None, Path, float | None, Path, float | None],
+    list[Skill],
+] = {}
+
+
+def _dir_mtime(path: Path) -> float | None:
+    """A skill dir's mtime, or ``None`` when missing (cache-invalidation signal)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
 
 @dataclass(frozen=True)
 class Skill:
@@ -61,6 +80,10 @@ def discover_skills(
     Returns a list of :class:`Skill` sorted by name. Skills in
     higher-precedence layers shadow skills with the same name in
     lower-precedence layers (a ``WARNING`` names both sources).
+
+    Cached by layer-dir mtime (#413): a repeat call with no skill
+    install/remove returns the prior result without re-reading or re-parsing
+    any ``SKILL.md``. ``/reload-skills`` clears the cache for in-place edits.
     """
     if cothis_home is None:
         cothis_home = Path(
@@ -75,6 +98,18 @@ def discover_skills(
         ("user-cothis", cothis_home / "skills"),
         ("user-agents", user_agents / "skills"),
     ]
+
+    # mtime-keyed cache (#413): re-scan only when a layer dir's mtime changes
+    # (a skill install/remove touches it). Steady-state cost is O(dirs) stats,
+    # not O(skills) reads + parses.
+    cache_key = (
+        layers[0][1], _dir_mtime(layers[0][1]),
+        layers[1][1], _dir_mtime(layers[1][1]),
+        layers[2][1], _dir_mtime(layers[2][1]),
+    )
+    cached = _skills_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     by_name: dict[str, Skill] = {}
     seen_in: dict[str, str] = {}
@@ -100,7 +135,9 @@ def discover_skills(
             by_name[skill.name] = skill
             seen_in[skill.name] = layer_name
 
-    return sorted(by_name.values(), key=lambda s: s.name)
+    result = sorted(by_name.values(), key=lambda s: s.name)
+    _skills_cache[cache_key] = result
+    return result
 
 
 def _parse_skill_md(path: Path) -> Skill | None:
@@ -303,6 +340,9 @@ async def reload_skills_handler(ctx: SlashContext, args: str) -> str:
         cwd = getattr(ctx.session, "cwd", cwd)
         if not isinstance(cwd, Path):
             cwd = Path.cwd()
+    # Clear the mtime cache so in-place SKILL.md edits (dir mtime unchanged)
+    # are picked up by this manual refresh (#413).
+    _skills_cache.clear()
     try:
         skills = discover_skills(cwd)
     except Exception as exc:  # noqa: BLE001 — best-effort; surface to user
