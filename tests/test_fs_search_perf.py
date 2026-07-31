@@ -19,6 +19,8 @@ from cothis.tools.fs.search import _search as fs_search
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 
 def test_fast_path_scans_2000_lines_quickly(tmp_path: Path) -> None:
     """A 2000-line scan finishes well under the ``_DEADLINE_SECONDS`` cap (#111).
@@ -126,8 +128,12 @@ def test_search_results_sorted_by_file_then_line(tmp_path: Path) -> None:
 
 def test_search_truncation_keeps_alphabetically_first(tmp_path: Path) -> None:
     """#417: when matches exceed ``max_results``, the alphabetically-first
-    ones are kept (not whichever the walk reached first)."""
-    for name in ["a.py", "b.py", "c.py", "d.py", "e.py"]:
+    ones are kept (not whichever the walk reached first).
+
+    Files are created in reverse-alphabetical order so a walk that yielded
+    creation/walk order would return ``[e.py, d.py, c.py]`` — the assertion
+    only holds if the (file, line) sort actually ran (#418 review)."""
+    for name in ["e.py", "d.py", "c.py", "b.py", "a.py"]:
         (tmp_path / name).write_text("NEEDLE\n", encoding="utf-8")
 
     with workdir_context(tmp_path):
@@ -137,3 +143,30 @@ def test_search_truncation_keeps_alphabetically_first(tmp_path: Path) -> None:
     assert files == ["a.py", "b.py", "c.py"], (
         f"max_results=3 should keep the alphabetically-first 3; got {files}"
     )
+
+
+def test_search_caps_collected_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#418 review: collection is bounded by ``_MAX_COLLECTED`` to avoid OOM.
+
+    The OOM shape is many matches *within one file* (a broad pattern over
+    minified JS / log lines) — growth the file/deadline caps don't bound
+    because they're time/count-of-files, not memory. With the cap lowered,
+    collection stops early even when ``max_results`` is high; the per-line
+    check is the binding guard (the per-file check is just a fast path).
+    """
+    monkeypatch.setattr(search_module, "_MAX_COLLECTED", 4)
+    # One file, 50 matches — far past the cap, isolated to one file so the
+    # per-file check cannot be what binds.
+    (tmp_path / "big.py").write_text("\n".join(["NEEDLE"] * 50) + "\n")
+
+    with workdir_context(tmp_path):
+        result = fs_search(pattern="NEEDLE", path=".", max_results=100)
+
+    assert len(result) == 4, (
+        f"collection should stop at _MAX_COLLECTED=4; got {len(result)}"
+    )
+    # Cap does not bypass the sort.
+    files = [r["file"] for r in result]
+    assert files == sorted(files), f"capped results must stay sorted; got {files}"

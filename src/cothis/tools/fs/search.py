@@ -32,6 +32,15 @@ _MAX_PATTERN_LEN = 256
 _MAX_FILE_BYTES = 1_048_576  # 1 MiB — larger files are skipped entirely.
 _MAX_LINE_LEN = 4096  # skip long lines (ReDoS / log noise).
 _MAX_FILES_SCANNED = 5000  # total work cap — bounds traversal even with 0 matches.
+# cothis: coarse cap on collected matches (#418 review). Without it a broad
+# pattern (``.*``, a common token, minified JS / log lines) matched across
+# the file cap appends unbounded entries — each up to ``_MAX_LINE_LEN`` —
+# so hundreds of MB to GB of heap, OOM-killing the agent. Checked at the
+# former per-file + per-line early-exit sites; the final (file, line) sort
+# still picks the alphabetically-first ``max_results`` from the collected
+# set, which is 200x the default cap so the approximation is invisible in
+# practice.
+_MAX_COLLECTED = 10_000
 # cothis: wall-clock cap on the whole call (#111). The deadline is
 # checked at the outer (per-file) and inner (per-line) loop
 # boundaries; on hit, the call returns partial results.
@@ -156,6 +165,9 @@ def _search(
             if d not in _IGNORED_DIRS and not d.startswith(".")
         ]
         for filename in filenames:
+            if len(results) >= _MAX_COLLECTED:
+                stop = True
+                break
             if files_scanned >= _MAX_FILES_SCANNED:
                 stop = True
                 break
@@ -183,6 +195,9 @@ def _search(
             try:
                 with p.open("r", encoding="utf-8", errors="ignore") as fh:
                     for i, line in enumerate(fh, 1):
+                        if len(results) >= _MAX_COLLECTED:
+                            stop = True
+                            break
                         if time.perf_counter() > deadline:
                             deadline_hit = True
                             stop = True
