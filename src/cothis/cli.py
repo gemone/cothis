@@ -83,6 +83,23 @@ def _validate_session_id_arg(sid: str) -> None:
         )
 
 
+def _check_resume_exists(db_path: Path, resume: str) -> None:
+    """Fail fast if a resume id doesn't exist before launching the TUI (#394).
+
+    The TUI path validated only format, not existence — a well-formed-but-
+    nonexistent id launched the TUI and spawned a doomed worker. Mirrors
+    the legacy REPL's ``Session.load`` gate so both paths deliver the same
+    "not found" message. The loaded session is closed immediately (the
+    TUI's ``on_mount`` re-loads it).
+    """
+    try:
+        Session.load(db_path, resume, cwd=Path.cwd()).close()
+    except KeyError:
+        raise typer.BadParameter(
+            f"session {resume!r} not found; run `cothis history` to list"
+        )
+
+
 def _resolve_db_path(cwd: Path | None = None) -> Path:
     """Resolve the SQLite db path for session persistence.
 
@@ -267,6 +284,7 @@ def chat(
         if not skill:
             if resume is not None:
                 _validate_session_id_arg(resume)
+                _check_resume_exists(_resolve_db_path(), resume)
             _launch_tui_app(model=model, provider=provider, resume=resume)
             return
         console.print(
@@ -591,7 +609,7 @@ def delete_cmd(
 @app.command(name="archive")
 def archive_cmd(
     action: str = typer.Argument(
-        "all", help="'all' (default), '<session_id>', 'restore <id>', 'compress <file>'"
+        "all", help="'all' (default), 'list', '<session_id>', 'restore <id>', 'compress <file>'"
     ),
     target: str = typer.Argument(
         None, help="Session id (for restore) or file path (for compress)."
@@ -605,6 +623,7 @@ def archive_cmd(
         cothis archive <session_id> # archive one session
         cothis archive restore <id> # promote archived session back
         cothis archive compress <file>  # gzip a cold DB file
+        cothis archive list           # list archived (cold) sessions
     """
     # cothis: hand-rolled dispatch instead of nested typer.Typer() because
     # the first positional arg is either a subcommand (restore/compress)
@@ -626,6 +645,18 @@ def archive_cmd(
             console.print("no sessions to archive")
         else:
             console.print(f"archived {archived} session(s)")
+    elif action == "list":
+        archived = Session.list_archived(db_path)
+        if not archived:
+            console.print("no archived sessions")
+            return
+        for sid, sr, archived_at in archived:
+            title = sr.title or f"session {sid[:8]}"
+            cwd_hint = str(sr.cwd)
+            console.print(
+                f"[cyan]{sid[:8]}…[/cyan]  {title}  "
+                f"[dim]({cwd_hint}, archived {archived_at[:10]})[/dim]"
+            )
     elif action == "restore":
         if not target:
             raise typer.BadParameter("restore requires a session id")
@@ -894,6 +925,7 @@ def tui(
     """
     if resume is not None:
         _validate_session_id_arg(resume)
+        _check_resume_exists(_resolve_db_path(), resume)
     _launch_tui_app(model=model, provider=provider, resume=resume)
 
 
