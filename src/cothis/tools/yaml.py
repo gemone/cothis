@@ -605,6 +605,19 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         pass  # child already exited — no group left to kill.
 
 
+def _kill_and_reap(proc: subprocess.Popen) -> None:
+    """Kill the child's group/tree, then always reap the child.
+
+    A kill failure (permissions, missing taskkill) must not skip the reap —
+    the child would outlive the call. ``communicate`` drains the pipes and
+    reaps; with the group dead it returns promptly.
+    """
+    try:
+        _kill_process_tree(proc)
+    finally:
+        proc.communicate()
+
+
 def _extract_field_names(template: str) -> set[str]:
     """Return the set of named fields referenced by a Python format-string.
 
@@ -701,11 +714,10 @@ class _ShellTool(_HookableTool):
     def _run_blocking(self, rendered: list[str] | str) -> str:
         """Run one dispatch shape synchronously; kill the group on timeout.
 
-        ``Popen`` + ``communicate(timeout=)`` replaces ``subprocess.run`` so
-        the timeout handler can kill the whole process group/tree — the real
-        workload on the ``shell=True`` / ``_shell_argv`` paths is a grandchild
-        of the interpreter, and ``subprocess.run``'s built-in timeout would
-        leave it orphaned.
+        ``Popen`` + ``communicate(timeout=)`` let the timeout handler kill
+        the whole process group/tree — the real workload on the
+        ``shell=True`` / ``_shell_argv`` paths is a grandchild of the
+        interpreter.
         """
         kwargs = _group_popen_kwargs()
         if isinstance(rendered, list):
@@ -720,28 +732,37 @@ class _ShellTool(_HookableTool):
                 )
             else:
                 proc = subprocess.Popen(argv, shell=False, **kwargs)
+        done = False
         try:
-            stdout, stderr = proc.communicate(timeout=_SHELL_TIMEOUT_S)
-        except subprocess.TimeoutExpired as exc:
-            _kill_process_tree(proc)
-            proc.communicate()  # drain + reap; the group is already dead.
-            # ``exc.stdout``/``exc.stderr`` carry whatever the process emitted
-            # before the kill (captured via ``capture_output=True``) — surface
-            # the non-empty streams so the model sees partial progress (the
-            # build's last lines, test output) instead of a bare timeout.
-            # Mirrors ``_format_proc_result``'s [stdout]/[stderr] labels and
-            # ``_truncate_stream`` cap.
-            parts = [f"Error: command timed out after {_SHELL_TIMEOUT_S}s"]
-            stdout = _truncate_stream(_partial_stream(exc.stdout))
-            stderr = _truncate_stream(_partial_stream(exc.stderr))
-            if stdout:
-                parts.append(f"[stdout]\n{stdout}")
-            if stderr:
-                parts.append(f"[stderr]\n{stderr}")
-            return "\n".join(parts)
-        return _format_proc_result(
-            subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
-        )
+            try:
+                stdout, stderr = proc.communicate(timeout=_SHELL_TIMEOUT_S)
+            except subprocess.TimeoutExpired as exc:
+                _kill_and_reap(proc)
+                done = True
+                # ``exc.stdout``/``exc.stderr`` carry whatever the process
+                # emitted before the kill — surface the non-empty streams so
+                # the model sees partial progress (the build's last lines,
+                # test output) instead of a bare timeout. Mirrors
+                # ``_format_proc_result``'s [stdout]/[stderr] labels and
+                # ``_truncate_stream`` cap.
+                parts = [f"Error: command timed out after {_SHELL_TIMEOUT_S}s"]
+                stdout = _truncate_stream(_partial_stream(exc.stdout))
+                stderr = _truncate_stream(_partial_stream(exc.stderr))
+                if stdout:
+                    parts.append(f"[stdout]\n{stdout}")
+                if stderr:
+                    parts.append(f"[stderr]\n{stderr}")
+                return "\n".join(parts)
+            done = True
+            return _format_proc_result(
+                subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+            )
+        finally:
+            if not done:
+                # Any other failure (e.g. UnicodeDecodeError on binary output)
+                # skipped the timeout handler — the proc may still be running;
+                # kill + reap before the exception propagates.
+                _kill_and_reap(proc)
 
 
 def _shell_argv(

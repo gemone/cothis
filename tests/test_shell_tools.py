@@ -1897,6 +1897,7 @@ async def test_shell_tool_times_out_on_hanging_command(
     procs: list[object] = []
     killed: list[object] = []
     timeouts: list[float | None] = []
+    order: list[str] = []
 
     class FakeProc:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -1905,6 +1906,7 @@ async def test_shell_tool_times_out_on_hanging_command(
             procs.append(self)
 
         def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            order.append("reap" if timeout is None else "timeout-communicate")
             timeouts.append(timeout)
             if timeout is not None:
                 raise yaml_mod.subprocess.TimeoutExpired(
@@ -1914,6 +1916,7 @@ async def test_shell_tool_times_out_on_hanging_command(
             return "", ""  # post-kill drain + reap.
 
     def _fake_kill_tree(proc: object) -> None:
+        order.append("kill")
         killed.append(proc)
 
     monkeypatch.setattr(yaml_mod.subprocess, "Popen", FakeProc)
@@ -1925,6 +1928,11 @@ async def test_shell_tool_times_out_on_hanging_command(
     # post-kill drain call to reap the group.
     assert timeouts == [yaml_mod._SHELL_TIMEOUT_S, None], (
         f"{shape}: timeout not wired into communicate; timeouts={timeouts}"
+    )
+    # Kill must run before the reap: a reap-before-kill regression would leave
+    # the group alive when the child is reaped.
+    assert order == ["timeout-communicate", "kill", "reap"], (
+        f"{shape}: kill must precede the reap; order={order}"
     )
     assert captured.get("shell") is expected_shell, (
         f"{shape}: wrong dispatch site; captured={captured}"
@@ -1985,3 +1993,119 @@ def test_kill_process_tree_kills_group_or_tree(
         )
         yaml_mod._kill_process_tree(cast("subprocess.Popen", FakeProc()))
         assert killed == [(4242, yaml_mod.signal.SIGKILL)]
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_cleans_up_when_communicate_raises_non_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-timeout communicate failure still kills + reaps the proc.
+
+    ``UnicodeDecodeError`` from ``text=True`` strict decoding of binary
+    output bypasses the ``TimeoutExpired`` handler; the outer reap guard must
+    kill the group and reap the child before the exception propagates —
+    otherwise the proc outlives the call.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    tool = _shell_tool('name: hang\nshell: sh\ncommand: "cat /dev/urandom"\n')
+
+    order: list[str] = []
+    procs: list[object] = []
+    killed: list[object] = []
+
+    class FakeProc:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            procs.append(self)
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            order.append("reap" if timeout is None else "communicate")
+            if timeout is not None:
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+            return "", ""  # post-kill drain + reap.
+
+    def _fake_kill_tree(proc: object) -> None:
+        order.append("kill")
+        killed.append(proc)
+
+    monkeypatch.setattr(yaml_mod.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(yaml_mod, "_kill_process_tree", _fake_kill_tree)
+
+    with pytest.raises(UnicodeDecodeError):
+        await tool()
+
+    assert killed == procs, f"proc must be killed on non-timeout failure: {killed}"
+    assert order == ["communicate", "kill", "reap"], (
+        f"kill must precede the reap; order={order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_reaps_even_when_kill_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kill failure must not skip the reap.
+
+    The timeout path wraps kill+reap in try/finally: if ``_kill_process_tree``
+    raises (permissions, missing taskkill), the child is still reaped — a
+    bare ``kill; reap`` sequence would leak the child on a kill failure.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    tool = _shell_tool('name: hang\nshell: sh\ncommand: "sleep 10"\n')
+
+    order: list[str] = []
+
+    class FakeProc:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            order.append("reap" if timeout is None else "timeout-communicate")
+            if timeout is not None:
+                raise yaml_mod.subprocess.TimeoutExpired(
+                    cmd=str(self.args), timeout=timeout,
+                    output="half-done\n", stderr="",
+                )
+            return "", ""
+
+    def _failing_kill_tree(proc: object) -> None:
+        order.append("kill")
+        raise PermissionError("kill denied")
+
+    monkeypatch.setattr(yaml_mod.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(yaml_mod, "_kill_process_tree", _failing_kill_tree)
+
+    with pytest.raises(PermissionError):
+        await tool()
+
+    # Every kill attempt (including the failed ones) is followed by a reap —
+    # the child is never left running.
+    assert order.count("reap") >= 1, f"reap must run despite kill failures; order={order}"
+    assert order.index("kill") < order.index("reap"), (
+        f"kill must precede the reap; order={order}"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="ProcessLookupError guard is POSIX-only",
+)
+def test_kill_process_tree_swallows_already_exited_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Killing a group that already exited is a no-op, not a raise."""
+    import cothis.tools.yaml as yaml_mod
+
+    class FakeProc:
+        pid = 4242
+
+    def _raise_already_exited(pgid: int, sig: int) -> None:
+        raise ProcessLookupError(pgid)
+
+    monkeypatch.setattr(yaml_mod.os, "getpgid", lambda pid: 4242)
+    monkeypatch.setattr(yaml_mod.os, "killpg", _raise_already_exited)
+    # Must not raise: the group is already gone.
+    yaml_mod._kill_process_tree(cast("subprocess.Popen", FakeProc()))
