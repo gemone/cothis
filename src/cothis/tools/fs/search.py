@@ -32,14 +32,10 @@ _MAX_PATTERN_LEN = 256
 _MAX_FILE_BYTES = 1_048_576  # 1 MiB — larger files are skipped entirely.
 _MAX_LINE_LEN = 4096  # skip long lines (ReDoS / log noise).
 _MAX_FILES_SCANNED = 5000  # total work cap — bounds traversal even with 0 matches.
-# cothis: coarse cap on collected matches (#418 review). Without it a broad
-# pattern (``.*``, a common token, minified JS / log lines) matched across
-# the file cap appends unbounded entries — each up to ``_MAX_LINE_LEN`` —
-# so hundreds of MB to GB of heap, OOM-killing the agent. Checked at the
-# former per-file + per-line early-exit sites; the final (file, line) sort
-# still picks the alphabetically-first ``max_results`` from the collected
-# set, which is 200x the default cap so the approximation is invisible in
-# practice.
+# cothis: coarse memory cap on collected matches (#417). A broad pattern
+# over the file cap can append hundreds of MB to GB of heap (each entry up
+# to ``_MAX_LINE_LEN``); collection stops here — checked at the per-file
+# and per-line loop boundaries.
 _MAX_COLLECTED = 10_000
 # cothis: wall-clock cap on the whole call (#111). The deadline is
 # checked at the outer (per-file) and inner (per-line) loop
@@ -140,6 +136,8 @@ def _search(
         return f"Error: no such path: {path}"
     if not root.is_dir():
         return f"Error: not a directory: {path}"
+    if max_results <= 0:
+        return []
 
     logger.debug("fs.search: stdlib backend")
 
@@ -148,6 +146,7 @@ def _search(
     files_scanned = 0
     deadline = time.perf_counter() + _DEADLINE_SECONDS
     deadline_hit = False
+    collected_cap_hit = False
 
     # Walk-and-prune (#321): ``os.walk`` + in-place ``dirnames[:]`` filter
     # skips the descent into ``_IGNORED_DIRS`` and dot-dirs entirely. The
@@ -166,6 +165,7 @@ def _search(
         ]
         for filename in filenames:
             if len(results) >= _MAX_COLLECTED:
+                collected_cap_hit = True
                 stop = True
                 break
             if files_scanned >= _MAX_FILES_SCANNED:
@@ -196,6 +196,7 @@ def _search(
                 with p.open("r", encoding="utf-8", errors="ignore") as fh:
                     for i, line in enumerate(fh, 1):
                         if len(results) >= _MAX_COLLECTED:
+                            collected_cap_hit = True
                             stop = True
                             break
                         if time.perf_counter() > deadline:
@@ -212,6 +213,12 @@ def _search(
                         break
             except OSError:
                 continue
+
+    if collected_cap_hit:
+        logger.warning(
+            "fs.search: _MAX_COLLECTED cap hit; returning %d truncated results.",
+            len(results),
+        )
 
     if deadline_hit:
         logger.warning(

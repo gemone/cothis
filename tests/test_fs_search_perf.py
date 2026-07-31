@@ -9,16 +9,16 @@ executor and adds a wall-clock cap.
 
 from __future__ import annotations
 
+import logging
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from cothis.tools.fs import search as search_module
 from cothis.tools.fs._hygiene import workdir_context
 from cothis.tools.fs.search import _search as fs_search
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     import pytest
 
 
@@ -170,3 +170,81 @@ def test_search_caps_collected_results(
     # Cap does not bypass the sort.
     files = [r["file"] for r in result]
     assert files == sorted(files), f"capped results must stay sorted; got {files}"
+
+
+def test_search_stops_at_per_file_collection_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#418 review: the per-file ``_MAX_COLLECTED`` check stops the walk.
+
+    ``test_search_caps_collected_results`` isolates the per-line check;
+    this covers the per-file fast path. With one match per file the
+    per-line check would also bind at the same count, so the guard is the
+    number of files *opened*: once the cap is reached the walk must stop
+    before opening the next file.
+    """
+    monkeypatch.setattr(search_module, "_MAX_COLLECTED", 3)
+    for i in range(10):
+        (tmp_path / f"f{i:02d}.txt").write_text("NEEDLE\n", encoding="utf-8")
+
+    opened: list[str] = []
+    original_open = Path.open
+
+    def counting_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        opened.append(self.name)
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    with workdir_context(tmp_path):
+        result = fs_search(pattern="NEEDLE", path=".", max_results=100)
+
+    assert len(result) == 3, (
+        f"walk should stop at _MAX_COLLECTED=3; got {len(result)} results"
+    )
+    files = [r["file"] for r in result]
+    assert files == sorted(files), f"capped results must stay sorted; got {files}"
+    assert len(opened) == 3, (
+        f"files beyond the cap must not be opened; got {opened}"
+    )
+
+
+def test_search_warns_when_collection_cap_binds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#418 review: a ``_MAX_COLLECTED`` hit emits a truncation warning.
+
+    The deadline cap warns on hit; the collection cap previously returned
+    fewer results than ``max_results`` with no signal, so an autonomous
+    agent would take the truncated set as complete.
+    """
+    monkeypatch.setattr(search_module, "_MAX_COLLECTED", 2)
+    for i in range(5):
+        (tmp_path / f"f{i}.py").write_text("NEEDLE\n", encoding="utf-8")
+
+    with workdir_context(tmp_path):
+        with caplog.at_level(logging.WARNING, logger="cothis.tools.fs.search"):
+            result = fs_search(pattern="NEEDLE", path=".", max_results=100)
+
+    assert len(result) == 2
+    assert any(
+        "_MAX_COLLECTED cap hit" in record.message for record in caplog.records
+    ), f"expected a truncation warning; logs:\n{caplog.text}"
+
+
+def test_search_non_positive_max_results_returns_empty(tmp_path: Path) -> None:
+    """#418 review: ``max_results <= 0`` returns ``[]``.
+
+    The old walk-time ``len(results) >= max_results`` early-exit returned
+    ``[]`` for any non-positive cap; the new final slice would return a
+    suffix (``-1`` → all-but-last) — the guard keeps the old contract.
+    """
+    (tmp_path / "a.py").write_text("NEEDLE\n", encoding="utf-8")
+
+    for max_results in (0, -1):
+        with workdir_context(tmp_path):
+            result = fs_search(pattern="NEEDLE", path=".", max_results=max_results)
+        assert result == [], (
+            f"max_results={max_results} should return []; got {result}"
+        )
