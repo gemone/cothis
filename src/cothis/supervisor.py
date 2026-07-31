@@ -512,18 +512,25 @@ class Supervisor:
         so the shared ``~/.cothis/supervisor.db`` doesn't grow without bound
         across sessions (#411 — see the constant for why).
 
-        ``_closed`` is set before teardown so a failure in ``compact`` (a DB
-        write that can raise on a local sqlite error) can't leave the
-        connection open or let a re-entry retry ``compact`` on a
-        half-closed connection; ``conn.close()`` runs under ``finally``
-        so it always executes (#412 review).
+        ``_closed`` is set before teardown so a failure in the shutdown loop
+        or in ``compact`` (a ``record_lifecycle`` / ``proc.wait`` path, or a
+        sqlite error in the compact write) can't leave the connection open or
+        let a re-entry retry on a half-closed connection; both run under
+        ``try`` with ``conn.close()`` under ``finally`` so it always executes
+        (#412 review, extended to the shutdown loop in #425).
         """
         if self._closed:
             return
         self._closed = True
-        for session_id in list(self._procs.keys()):
-            self.shutdown_worker(session_id)
+        # Both the worker-shutdown loop and the bus compact can raise — a
+        # ``record_lifecycle`` / ``proc.wait`` path in ``shutdown_worker``, or
+        # a sqlite error in ``compact``. Run them under one ``try`` so
+        # ``conn.close()`` always executes and the shared connection can't
+        # leak on any teardown-path raise (#425 — extends #412's compact
+        # guard to cover the shutdown loop too).
         try:
+            for session_id in list(self._procs.keys()):
+                self.shutdown_worker(session_id)
             self._bus.compact(retention_days=_LIFECYCLE_RETENTION_DAYS)
         finally:
             self._conn.close()

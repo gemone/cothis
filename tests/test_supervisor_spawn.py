@@ -521,6 +521,39 @@ def test_supervisor_close_runs_conn_close_if_compact_raises(
     assert len(compact_calls) == 1
 
 
+def test_supervisor_close_runs_conn_close_if_shutdown_worker_raises(
+    tmp_path: Path,
+) -> None:
+    """#425: a ``shutdown_worker`` raise during close() must not leak the conn.
+
+    ``shutdown_worker`` has uncaught raise paths of its own — a
+    ``record_lifecycle`` DB write, and the post-kill ``proc.wait``. The naive
+    form runs the shutdown loop *outside* the try/finally guarding
+    ``conn.close()``; close() now wraps the whole teardown so the connection
+    closes on any raise (extends #412's compact guard to the shutdown loop).
+    """
+    import sqlite3
+
+    sup = Supervisor(tmp_path / "supervisor.db")
+    # A registered proc so the shutdown loop runs and calls shutdown_worker.
+    sup._procs["d" * 32] = MagicMock()  # type: ignore[assignment]
+
+    def _boom(session_id: str, *, timeout: float = 5.0) -> None:
+        raise sqlite3.OperationalError("disk I/O")
+
+    # ``setattr`` (not direct method assignment) avoids ty's implicit-
+    # shadowing check.
+    setattr(sup, "shutdown_worker", _boom)
+
+    # The shutdown error propagates, but the finally still closed the conn.
+    with pytest.raises(sqlite3.OperationalError):
+        sup.close()
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        sup._conn.execute("SELECT 1")
+    assert sup._closed is True
+
+
 def test_close_compacts_old_lifecycle_events(tmp_path: Path) -> None:
     """#411: ``close()`` compacts lifecycle events older than the retention
     window, so the shared ``~/.cothis/supervisor.db``'s ``notify_events`` does
