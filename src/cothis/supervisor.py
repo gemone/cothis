@@ -410,7 +410,16 @@ class Supervisor:
                 await asyncio.sleep(delay)
                 new_handle = self._restart_worker(session_id)
                 if new_handle is not None and self.on_restart is not None:
-                    self.on_restart(session_id, new_handle)
+                    # Guard the callback: a raise here would propagate up
+                    # and kill the monitor loop, disabling crash detection
+                    # for ALL workers (#398 review).
+                    try:
+                        self.on_restart(session_id, new_handle)
+                    except Exception:  # noqa: BLE001 — best-effort callback
+                        logger.exception(
+                            "supervisor: on_restart failed for %s",
+                            session_id,
+                        )
             await asyncio.sleep(interval_s)
 
     def _restart_worker(self, session_id: str) -> WorkerHandle | None:

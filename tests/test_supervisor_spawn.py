@@ -543,3 +543,62 @@ async def test_monitor_worker_health_invokes_on_restart_after_restart(
     assert restarted[0][1].ws_url == "ws://new"
     sup.close()
 
+
+@pytest.mark.asyncio
+async def test_monitor_worker_health_survives_on_restart_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#398 review: a raising ``on_restart`` must not kill the monitor loop.
+
+    ``on_restart`` runs synchronously inside ``monitor_worker_health``'s
+    per-crash loop; an unguarded raise would propagate up, abort the loop,
+    and disable crash detection for every worker. Two crashed workers are
+    registered so a single ``monitor_once`` returns both — if the raise
+    were unguarded, the second worker's restart would never be attempted.
+    """
+    sup = Supervisor(tmp_path / "supervisor.db")
+
+    from cothis.supervisor import WorkerHandle
+
+    def _fake_handle(sid: str) -> WorkerHandle:
+        return WorkerHandle(
+            session_id=sid, pid=999999, ws_url="ws://old", token="old",
+            status="running", model="m", provider="p", cwd=str(tmp_path),
+            sessions_dir=str(tmp_path), extra_env={},
+        )
+
+    sids = ["b" * 32, "c" * 32]
+    for sid in sids:
+        sup._workers[sid] = _fake_handle(sid)
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = 1
+        sup._procs[sid] = fake_proc  # type: ignore[assignment]
+
+    monkeypatch.setattr(sup, "spawn_worker", lambda sid, **kw: _fake_handle(sid))
+    monkeypatch.setattr("cothis.supervisor.backoff_seconds", lambda count: 0.0)
+
+    calls: list[str] = []
+
+    def _raising_cb(sid, handle):  # noqa: ANN001
+        calls.append(sid)
+        raise RuntimeError("boom")
+
+    sup.on_restart = _raising_cb
+
+    task = asyncio.create_task(sup.monitor_worker_health(interval_s=0.01))
+    await asyncio.sleep(0.05)
+    # If the raise propagated, the task would be done with RuntimeError.
+    assert not task.done(), "monitor loop died on on_restart raise"
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Both workers re-attached despite each on_restart raising — the guard
+    # kept the loop alive for the second crash.
+    assert set(calls) == set(sids), (
+        f"expected both crashed workers re-attached; calls={calls}"
+    )
+    sup.close()
+
