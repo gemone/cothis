@@ -1838,7 +1838,7 @@ def test_format_proc_result_within_cap_is_not_truncated() -> None:
 
 
 def test_shell_timeout_default_is_60s() -> None:
-    """#423/#424 review: the default shell-tool timeout is 60 s.
+    """#423: the default shell-tool timeout is 60 s.
 
     30 s killed real builds/test suites (``npm test``, ``pytest``, ``cargo
     build``, ``make``) mid-run. Pinned so a regression to the too-aggressive
@@ -1865,7 +1865,7 @@ async def test_shell_tool_times_out_on_hanging_command(
     and surface a readable error. ``subprocess.run`` is stubbed to record the
     call and raise ``TimeoutExpired`` (carrying partial output) so every shape
     runs cross-platform — no real ``sh`` / ``cmd.exe`` execution — and a
-    missing-timeout regression at any site is caught (#424 review).
+    missing-timeout regression at any site is caught.
     """
     import cothis.tools.yaml as yaml_mod
 
@@ -1916,9 +1916,8 @@ async def test_shell_tool_times_out_on_hanging_command(
     assert isinstance(result, str)
     assert "timed out" in result.lower(), result
     # Partial output captured before the kill is surfaced, not discarded
-    # (#424 review — mirrors ``_format_proc_result``'s [stdout]/[stderr]).
+    # (mirrors ``_format_proc_result``'s [stdout]/[stderr]).
     assert "half-done" in result, f"partial stdout lost: {result!r}"
     assert "[stderr]" in result and "warn" in result, (
         f"partial stderr lost: {result!r}"
     )
-

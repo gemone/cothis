@@ -652,9 +652,8 @@ class _ShellTool(_HookableTool):
     async def __call__(self, **kwargs: Any) -> str:
         rendered = self._block.render(**kwargs)
         # cothis: park the blocking ``subprocess.run`` off the loop
-        # thread (#90). ``timeout=`` bounds wall-clock so a hanging command
-        # (``tail -f``, ``read``, infinite loop) can't block the turn for
-        # the full 300 s worker turn-timeout (#423).
+        # thread (#90). ``timeout=`` applies the ``_SHELL_TIMEOUT_S``
+        # wall-clock cap (#423).
         try:
             if isinstance(rendered, list):
                 # argv mode — never reaches _shell_quote; safe on all platforms.
