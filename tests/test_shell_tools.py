@@ -1838,7 +1838,7 @@ def test_format_proc_result_within_cap_is_not_truncated() -> None:
 
 
 def test_shell_timeout_default_is_60s() -> None:
-    """#423: the default shell-tool timeout is 60 s.
+    """The default shell-tool timeout is 60 s.
 
     30 s killed real builds/test suites (``npm test``, ``pytest``, ``cargo
     build``, ``make``) mid-run. Pinned so a regression to the too-aggressive
@@ -1856,7 +1856,7 @@ def test_shell_timeout_default_is_60s() -> None:
 async def test_shell_tool_times_out_on_hanging_command(
     shape: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#423: a hanging command is killed by the shell-tool timeout on every dispatch shape.
+    """A hanging command is killed by the shell-tool timeout on every dispatch shape.
 
     The ``try/except subprocess.TimeoutExpired`` wraps all three
     ``subprocess.run`` call sites: argv-list (``shell=False``), POSIX
@@ -1884,7 +1884,7 @@ async def test_shell_tool_times_out_on_hanging_command(
         expected_shell = False
     else:
         # cmd.exe ``shell=True`` path. ``shell: cmd`` is rejected at compile
-        # time (#139), so build a compiled string-shell tool and repoint it
+        # time, so build a compiled string-shell tool and repoint it
         # at cmd.exe to exercise the defensive ``argv is None`` call site.
         tool = _shell_tool('name: hang\nshell: sh\ncommand: "sleep 10"\n')
         tool._block.shell = "cmd"

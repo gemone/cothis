@@ -555,11 +555,11 @@ def _merge_arg_specs(
 
 _FORMATTER = string.Formatter()
 
-# Shell-tool wall-clock cap (#423). A hanging command (``tail -f``, ``read``,
+# Shell-tool wall-clock cap. A hanging command (``tail -f``, ``read``,
 # an infinite loop) can't block the turn for the full 300 s worker
-# turn-timeout. 60 s matches #423's value — high enough for real builds/test
-# suites (``npm test``, ``pytest``, ``cargo build``, ``make``) that routinely
-# run past 30 s, while still catching hangs far below the turn ceiling.
+# turn-timeout. 60 s is high enough for real builds/test suites
+# (``npm test``, ``pytest``, ``cargo build``, ``make``) that routinely run
+# past 30 s, while still catching hangs far below the turn ceiling.
 _SHELL_TIMEOUT_S = 60.0
 
 
@@ -653,7 +653,7 @@ class _ShellTool(_HookableTool):
         rendered = self._block.render(**kwargs)
         # cothis: park the blocking ``subprocess.run`` off the loop
         # thread (#90). ``timeout=`` applies the ``_SHELL_TIMEOUT_S``
-        # wall-clock cap (#423).
+        # wall-clock cap.
         try:
             if isinstance(rendered, list):
                 # argv mode — never reaches _shell_quote; safe on all platforms.
@@ -684,7 +684,7 @@ class _ShellTool(_HookableTool):
             # the non-empty streams so the model sees partial progress (the
             # build's last lines, test output) instead of a bare timeout.
             # Mirrors ``_format_proc_result``'s [stdout]/[stderr] labels and
-            # ``_truncate_stream`` cap (#382).
+            # ``_truncate_stream`` cap.
             parts = [f"Error: command timed out after {_SHELL_TIMEOUT_S}s"]
             stdout = _truncate_stream(_partial_stream(exc.stdout))
             stderr = _truncate_stream(_partial_stream(exc.stderr))
