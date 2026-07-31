@@ -522,12 +522,6 @@ class Supervisor:
         if self._closed:
             return
         self._closed = True
-        # Both the worker-shutdown loop and the bus compact can raise — a
-        # ``record_lifecycle`` / ``proc.wait`` path in ``shutdown_worker``, or
-        # a sqlite error in ``compact``. Run them under one ``try`` so
-        # ``conn.close()`` always executes and the shared connection can't
-        # leak on any teardown-path raise (#425 — same guard as the #411
-        # compact path, extended to the shutdown loop).
         try:
             for session_id in list(self._procs.keys()):
                 self.shutdown_worker(session_id)

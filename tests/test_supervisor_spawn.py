@@ -526,12 +526,9 @@ def test_supervisor_close_runs_conn_close_if_shutdown_worker_raises(
 ) -> None:
     """#425: a ``shutdown_worker`` raise during close() must not leak the conn.
 
-    ``shutdown_worker`` has uncaught raise paths of its own — a
-    ``record_lifecycle`` DB write, and the post-kill ``proc.wait``. The naive
-    form runs the shutdown loop *outside* the try/finally guarding
-    ``conn.close()``; close() wraps the whole teardown so the connection
-    closes on any raise (same guard as the #411 compact path, extended to
-    the shutdown loop).
+    ``close()`` wraps the whole teardown (shutdown loop + compact) in one
+    try/finally so a ``record_lifecycle`` or ``proc.wait`` raise still runs
+    ``conn.close()`` (#425).
     """
     import sqlite3
 
