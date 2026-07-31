@@ -29,7 +29,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from cothis.session.storage import SessionRow
+
 if TYPE_CHECKING:
+    from collections.abc import ItemsView
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -97,6 +100,15 @@ class ArchiveIndex:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+    def entries(self) -> ItemsView[str, ArchivedEntry]:
+        """All entries (``session_id → ArchivedEntry``).
+
+        Used by ``cothis archive list`` (#392) to enumerate archived
+        sessions without scanning every cold DB. Returns the live view —
+        callers only iterate, and :class:`ArchivedEntry` is frozen.
+        """
+        return self._entries.items()
 
     def get(self, session_id: str) -> ArchivedEntry | None:
         return self._entries.get(session_id)
@@ -430,6 +442,35 @@ def _ensure_cold_schema(cold_db_path: Path) -> None:
             """
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def read_cold_session_row(
+    cold_db_path: Path,
+    session_id: str,
+) -> SessionRow | None:
+    """Read one archived session's ``SessionRow`` via ATTACH, read-only.
+
+    The cold counterpart of ``Session.load``'s cold read (#86) minus the
+    ``blocks`` SELECT — listing commands only need the row. Returns
+    ``None`` when the index points at the cold DB but the row isn't
+    there (index drifted — treat as not-found).
+    """
+    if not cold_db_path.is_file():
+        return None
+    conn = sqlite3.connect(cold_db_path, isolation_level="DEFERRED")
+    try:
+        cur = conn.execute(
+            "SELECT id, parent_id, parent_seq, cwd, cli_version, model, "
+            "title, created_at, updated_at, schema_version "
+            "FROM sessions WHERE id=?",
+            (session_id,),
+        )
+        sr_row = cur.fetchone()
+        if sr_row is None:
+            return None
+        return SessionRow(*sr_row)
     finally:
         conn.close()
 
