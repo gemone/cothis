@@ -32,7 +32,7 @@ _MAX_PATTERN_LEN = 256
 _MAX_FILE_BYTES = 1_048_576  # 1 MiB — larger files are skipped entirely.
 _MAX_LINE_LEN = 4096  # skip long lines (ReDoS / log noise).
 _MAX_FILES_SCANNED = 5000  # total work cap — bounds traversal even with 0 matches.
-# cothis: coarse memory cap on collected matches (#417). A broad pattern
+# cothis: coarse memory cap on collected matches. A broad pattern
 # over the file cap can append hundreds of MB to GB of heap (each entry up
 # to ``_MAX_LINE_LEN``); collection stops here — checked at the per-file
 # and per-line loop boundaries.
@@ -229,6 +229,6 @@ def _search(
 
     # Sort by (file, line) so output is deterministic (not readdir-order) and
     # the ``max_results`` cap keeps the alphabetically-first matches, not
-    # whichever the walk reached first (#417).
+    # whichever the walk reached first.
     results.sort(key=lambda r: (r["file"], int(r["line"])))
     return results[:max_results]

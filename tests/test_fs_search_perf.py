@@ -111,7 +111,7 @@ def test_walk_and_prune_skips_ignored_dirs(tmp_path: Path) -> None:
 
 
 def test_search_results_sorted_by_file_then_line(tmp_path: Path) -> None:
-    """#417: ``fs.search`` returns results sorted by ``(file, line)``, not
+    """``fs.search`` returns results sorted by ``(file, line)``, not
     readdir order — deterministic across filesystems."""
     # Create files whose readdir order likely differs from alphabetical.
     for name in ["zebra.py", "alpha.py", "middle.py"]:
@@ -127,7 +127,7 @@ def test_search_results_sorted_by_file_then_line(tmp_path: Path) -> None:
 
 
 def test_search_truncation_keeps_alphabetically_first(tmp_path: Path) -> None:
-    """#417: when matches exceed ``max_results``, the alphabetically-first
+    """When matches exceed ``max_results``, the alphabetically-first
     ones are kept (not whichever the walk reached first).
 
     Files are created in reverse-alphabetical order so a walk that yielded
@@ -148,7 +148,7 @@ def test_search_truncation_keeps_alphabetically_first(tmp_path: Path) -> None:
 def test_search_caps_collected_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#417: collection is bounded by ``_MAX_COLLECTED`` to avoid OOM.
+    """Collection is bounded by ``_MAX_COLLECTED`` to avoid OOM.
 
     The OOM shape is many matches *within one file* (a broad pattern over
     minified JS / log lines) — growth the file/deadline caps don't bound
@@ -175,7 +175,7 @@ def test_search_caps_collected_results(
 def test_search_stops_at_per_file_collection_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#417: the per-file ``_MAX_COLLECTED`` check stops the walk.
+    """The per-file ``_MAX_COLLECTED`` check stops the walk.
 
     ``test_search_caps_collected_results`` isolates the per-line check;
     this covers the per-file fast path. With one match per file the
@@ -213,7 +213,7 @@ def test_search_warns_when_collection_cap_binds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """#417: a ``_MAX_COLLECTED`` hit emits a truncation warning.
+    """A ``_MAX_COLLECTED`` hit emits a truncation warning.
 
     Without a warning, the truncated set looks complete to an autonomous
     agent.
@@ -233,7 +233,7 @@ def test_search_warns_when_collection_cap_binds(
 
 
 def test_search_non_positive_max_results_returns_empty(tmp_path: Path) -> None:
-    """#417: ``max_results <= 0`` returns ``[]``.
+    """``max_results <= 0`` returns ``[]``.
 
     Without the guard, ``results[:max_results]`` returns a suffix for a
     non-positive cap (``-1`` → all-but-last); the early return enforces
