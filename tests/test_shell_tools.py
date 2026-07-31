@@ -1837,34 +1837,88 @@ def test_format_proc_result_within_cap_is_not_truncated() -> None:
     assert len(result) == _MAX_BYTES - 1
 
 
-@pytest.mark.asyncio
-async def test_shell_tool_times_out_on_hanging_command(tmp_path: Path) -> None:
-    """#423: a hanging command is killed by the shell-tool timeout.
+def test_shell_timeout_default_is_60s() -> None:
+    """#423/#424 review: the default shell-tool timeout is 60 s.
 
-    ``sleep`` exceeds the timeout → ``TimeoutExpired`` is caught and surfaced
-    as a readable error instead of blocking the turn until the 300 s worker
-    turn-timeout fires.
+    30 s killed real builds/test suites (``npm test``, ``pytest``, ``cargo
+    build``, ``make``) mid-run. Pinned so a regression to the too-aggressive
+    30 s is caught.
     """
     import cothis.tools.yaml as yaml_mod
 
-    yaml_text = (
-        "name: hang-test\n"
-        "description: Test hanging command\n"
-        'command: ["sleep", "10"]\n'
+    assert yaml_mod._SHELL_TIMEOUT_S == 60.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shape", ["argv-list", "posix-shell-false", "cmd-shell-true"],
+)
+async def test_shell_tool_times_out_on_hanging_command(
+    shape: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#423: a hanging command is killed by the shell-tool timeout on every dispatch shape.
+
+    The ``try/except subprocess.TimeoutExpired`` wraps all three
+    ``subprocess.run`` call sites: argv-list (``shell=False``), POSIX
+    ``shell=False`` via ``_shell_argv`` (``[exe, "-c", cmd]``), and the
+    cmd.exe ``shell=True`` path. Each must pass ``timeout=_SHELL_TIMEOUT_S``
+    and surface a readable error. ``subprocess.run`` is stubbed to record the
+    call and raise ``TimeoutExpired`` (carrying partial output) so every shape
+    runs cross-platform — no real ``sh`` / ``cmd.exe`` execution — and a
+    missing-timeout regression at any site is caught (#424 review).
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    # ``shutil.which`` is stubbed so every shape compiles cross-platform
+    # (no real ``sh`` / ``sleep`` on PATH needed); ``subprocess.run`` is
+    # stubbed below, so the resolved paths never execute.
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    if shape == "argv-list":
+        tool = _shell_tool('name: hang\ncommand: ["sleep", "10"]\n')
+        expected_shell: bool = False
+    elif shape == "posix-shell-false":
+        # String + ``shell: sh`` → ``_shell_argv`` returns ``[sh, -c, ...]``,
+        # dispatching to the ``shell=False`` argv call site.
+        tool = _shell_tool('name: hang\nshell: sh\ncommand: "sleep 10"\n')
+        expected_shell = False
+    else:
+        # cmd.exe ``shell=True`` path. ``shell: cmd`` is rejected at compile
+        # time (#139), so build a compiled string-shell tool and repoint it
+        # at cmd.exe to exercise the defensive ``argv is None`` call site.
+        tool = _shell_tool('name: hang\nshell: sh\ncommand: "sleep 10"\n')
+        tool._block.shell = "cmd"
+        tool._shell_path = r"C:\Windows\System32\cmd.exe"
+        expected_shell = True
+
+    captured: dict[str, object] = {}
+
+    def _fake_run(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        raise yaml_mod.subprocess.TimeoutExpired(
+            cmd=str(args[0]) if args else "",
+            timeout=0.0,
+            output="half-done\n",
+            stderr="warn\n",
+        )
+
+    monkeypatch.setattr(yaml_mod.subprocess, "run", _fake_run)
+
+    result = await tool()
+
+    # The timeout forwarded to subprocess.run on this dispatch shape.
+    assert captured.get("timeout") == yaml_mod._SHELL_TIMEOUT_S, (
+        f"{shape}: timeout not wired into subprocess.run; captured={captured}"
     )
-    tools = yaml_mod.load_yaml_tools(yaml_text)
-    assert len(tools) == 1
-    tool = tools[0]
-    assert isinstance(tool, yaml_mod._ShellTool)
-
-    # Tighten the timeout so the test is fast.
-    orig = yaml_mod._SHELL_TIMEOUT_S
-    yaml_mod._SHELL_TIMEOUT_S = 0.5
-    try:
-        result = await tool()
-    finally:
-        yaml_mod._SHELL_TIMEOUT_S = orig
-
+    assert captured.get("shell") is expected_shell, (
+        f"{shape}: wrong dispatch site; captured={captured}"
+    )
     assert isinstance(result, str)
-    assert "timed out" in result.lower() or "timeout" in result.lower(), result
+    assert "timed out" in result.lower(), result
+    # Partial output captured before the kill is surfaced, not discarded
+    # (#424 review — mirrors ``_format_proc_result``'s [stdout]/[stderr]).
+    assert "half-done" in result, f"partial stdout lost: {result!r}"
+    assert "[stderr]" in result and "warn" in result, (
+        f"partial stderr lost: {result!r}"
+    )
 

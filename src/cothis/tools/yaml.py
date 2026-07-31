@@ -557,9 +557,10 @@ _FORMATTER = string.Formatter()
 
 # Shell-tool wall-clock cap (#423). A hanging command (``tail -f``, ``read``,
 # an infinite loop) can't block the turn for the full 300 s worker
-# turn-timeout. 30 s is generous for builds/tests while catching hangs far
-# sooner than the turn ceiling.
-_SHELL_TIMEOUT_S = 30.0
+# turn-timeout. 60 s matches #423's value — high enough for real builds/test
+# suites (``npm test``, ``pytest``, ``cargo build``, ``make``) that routinely
+# run past 30 s, while still catching hangs far below the turn ceiling.
+_SHELL_TIMEOUT_S = 60.0
 
 
 def _extract_field_names(template: str) -> set[str]:
@@ -679,7 +680,20 @@ class _ShellTool(_HookableTool):
                         timeout=_SHELL_TIMEOUT_S,
                     )
         except subprocess.TimeoutExpired as exc:
-            return f"Error: command timed out after {_SHELL_TIMEOUT_S}s"
+            # ``exc.stdout``/``exc.stderr`` carry whatever the process emitted
+            # before the kill (captured via ``capture_output=True``) — surface
+            # the non-empty streams so the model sees partial progress (the
+            # build's last lines, test output) instead of a bare timeout.
+            # Mirrors ``_format_proc_result``'s [stdout]/[stderr] labels and
+            # ``_truncate_stream`` cap (#382).
+            parts = [f"Error: command timed out after {_SHELL_TIMEOUT_S}s"]
+            stdout = _truncate_stream(_partial_stream(exc.stdout))
+            stderr = _truncate_stream(_partial_stream(exc.stderr))
+            if stdout:
+                parts.append(f"[stdout]\n{stdout}")
+            if stderr:
+                parts.append(f"[stderr]\n{stderr}")
+            return "\n".join(parts)
         return _format_proc_result(proc)
 
 
@@ -728,6 +742,18 @@ def _shell_argv(
     if name in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
         return [shell_path or "pwsh", "-Command", command]
     return [shell_path or "sh", "-c", command]
+
+
+def _partial_stream(stream: str | bytes | None) -> str:
+    """Coerce a ``TimeoutExpired`` stream (``str | bytes | None``) to ``str``.
+
+    With ``text=True`` the partial output is ``str``, but the exception's
+    typed attribute is the wider ``str | bytes | None``; decode bytes
+    defensively (``ignore`` — partial output past a boundary may be mid-code).
+    """
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", "ignore")
+    return stream or ""
 
 
 def _truncate_stream(stream: str) -> str:
