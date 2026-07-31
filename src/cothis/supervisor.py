@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 from cothis.notify import NotifyBus
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +166,11 @@ class Supervisor:
         # compacts the bus before closing the connection (compact on an
         # already-closed connection would raise) — #411.
         self._closed = False
+        # cothis: restart callback (#398). Set by the TUI launcher so a
+        # restarted worker's fresh WS is re-attached (the old connection is
+        # dead). ``None`` in isolation/tests (monitor_worker_health just
+        # restarts without re-attach).
+        self.on_restart: Callable[[str, WorkerHandle], Any] | None = None
 
     def _counter_for(self, session_id: str) -> RestartCounter:
         if session_id not in self._counters:
@@ -415,7 +420,18 @@ class Supervisor:
                     session_id, delay,
                 )
                 await asyncio.sleep(delay)
-                self._restart_worker(session_id)
+                new_handle = self._restart_worker(session_id)
+                if new_handle is not None and self.on_restart is not None:
+                    # Guard the callback: a raise here would propagate up
+                    # and kill the monitor loop, disabling crash detection
+                    # for ALL workers (#398 review).
+                    try:
+                        self.on_restart(session_id, new_handle)
+                    except Exception:  # noqa: BLE001 — best-effort callback
+                        logger.exception(
+                            "supervisor: on_restart failed for %s",
+                            session_id,
+                        )
             await asyncio.sleep(interval_s)
 
     def _restart_worker(self, session_id: str) -> WorkerHandle | None:
