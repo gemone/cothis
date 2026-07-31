@@ -85,17 +85,20 @@ def _normalize_mcp_result(result: CallToolResult) -> str:
         else:
             parts.append(f"[non-text block: type={btype}]")
     body = "\n".join(parts) if parts else "(no output)"
-    # Cap the result at ``_MAX_BYTES`` characters — MCP servers are external
-    # and can return unbounded output (search dumps, log tails, file echoes)
-    # that lands verbatim in the model context and poisons every subsequent
-    # turn (#421). Character-based (not byte-based) to avoid slicing a UTF-8
-    # code point — the same convention as the shell tool's ``_truncate_stream``
-    # (#382).
-    if len(body) > _MAX_BYTES:
-        body = (
-            body[:_MAX_BYTES]
-            + f"\n... [truncated: {len(body)} characters total — narrow the "
-            "query or read a slice via fs.read]"
+    # Cap the result at ``_MAX_BYTES`` bytes — MCP servers are external and
+    # can return unbounded output (search dumps, log tails, file echoes) that
+    # lands verbatim in the model context and poisons every subsequent turn
+    # (#421). Byte-based (not character-based) to match ``fs.create``'s
+    # ``len(content.encode("utf-8"))`` convention and #421's stated fix; a
+    # character cap would let 1–4 MiB of multibyte text through and silently
+    # drift the prompt budget. Slicing the encoded form + ``decode(...,
+    # "ignore")`` is codepoint-safe — it drops at most one partial trailing
+    # multibyte sequence. The body came from a remote server, so the marker
+    # points at narrowing the query (there is no local path to ``fs.read``).
+    encoded = body.encode("utf-8")
+    if len(encoded) > _MAX_BYTES:
+        body = encoded[:_MAX_BYTES].decode("utf-8", "ignore") + (
+            f"\n... [truncated: MCP result exceeded {_MAX_BYTES} bytes]"
         )
     # ``isError`` is camelCase on the MCP pydantic model (verified against
     # mcp 1.28.1 — ``CallToolResult`` fields: content/structuredContent/isError).

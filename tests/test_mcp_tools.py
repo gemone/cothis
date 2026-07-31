@@ -1200,22 +1200,30 @@ async def test_connect_into_still_swallows_regular_exception(
 
 
 def test_normalize_truncates_oversized_result() -> None:
-    """#421: MCP results are capped at ``_MAX_BYTES`` characters.
+    """#421: MCP results are capped at ``_MAX_BYTES`` bytes (not characters).
 
     A verbose/external MCP server can return unbounded output that lands
-    verbatim in the model context and poisons every subsequent turn. The
-    cap truncates with a marker so the model knows to narrow its query.
+    verbatim in the model context and poisons every subsequent turn. The cap
+    is byte-based — matching ``fs.create``'s ``len(content.encode("utf-8"))``
+    and #421's stated fix — so a body whose *character* count is under the cap
+    but whose *byte* count exceeds it still truncates (a character cap would
+    let 1–4 MiB of multibyte text through and silently drift the prompt
+    budget). ``€`` is 3 bytes in UTF-8.
     """
     from cothis.tools.fs._hygiene import _MAX_BYTES
 
-    big = "x" * (_MAX_BYTES + 1000)
+    # Char count under the cap, byte count over it → only a byte cap fires.
+    big = "€" * (_MAX_BYTES // 3 + 1000)
+    assert len(big) < _MAX_BYTES, "sanity: char count must be under the byte cap"
     result = CallToolResult(
         content=[TextContent(type="text", text=big)], isError=False,
     )
     out = _normalize_mcp_result(result)
-    assert len(out) < len(big), "oversized result was not truncated"
-    assert out.startswith("x" * _MAX_BYTES)
+
+    assert len(out.encode("utf-8")) < len(big.encode("utf-8")), "not truncated"
     assert "[truncated:" in out
-    assert str(len(big)) in out
+    assert f"exceeded {_MAX_BYTES} bytes" in out
+    # The body came from a remote MCP server — there is no local path to read.
+    assert "fs.read" not in out, "marker must not point at fs.read"
 
 
