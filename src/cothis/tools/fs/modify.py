@@ -17,6 +17,7 @@ from pathlib import Path
 
 from cothis.tools.core import tool
 from cothis.tools.fs._hygiene import (
+    _MAX_BYTES,
     WORKDIR,
     PathBoundaryError,
     _resolve_under,
@@ -97,6 +98,16 @@ async def _modify(
 
     if start_line < 1:
         return f"Error: start_line must be ≥ 1 (got {start_line})."
+
+    # Stat first to bound peak memory — fs.modify can't truncate the way
+    # fs.read does (it needs the whole file to splice), so refuse oversized
+    # files instead of OOM-ing the worker (#419).
+    size = resolved.stat().st_size
+    if size > _MAX_BYTES:
+        return (
+            f"Error: file is {size} bytes (>{_MAX_BYTES}); "
+            f"too large to modify in place — read it in chunks or use fs.create."
+        )
 
     # Read raw bytes + decode explicitly. ``read_text`` opens in universal-
     # newline mode and translates ``\r\n`` → ``\n`` on read, which silently
