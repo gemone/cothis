@@ -495,11 +495,19 @@ class Supervisor:
         Before closing, compacts the notify bus to ``_LIFECYCLE_RETENTION_DAYS``
         so the shared ``~/.cothis/supervisor.db`` doesn't grow without bound
         across sessions (#411 — see the constant for why).
+
+        ``_closed`` is set before teardown so a failure in ``compact`` (a DB
+        write that can raise on a local sqlite error) can't leave the
+        connection open or let a re-entry retry ``compact`` on a
+        half-closed connection; ``conn.close()`` runs under ``finally``
+        so it always executes (#412 review).
         """
         if self._closed:
             return
+        self._closed = True
         for session_id in list(self._procs.keys()):
             self.shutdown_worker(session_id)
-        self._bus.compact(retention_days=_LIFECYCLE_RETENTION_DAYS)
-        self._conn.close()
-        self._closed = True
+        try:
+            self._bus.compact(retention_days=_LIFECYCLE_RETENTION_DAYS)
+        finally:
+            self._conn.close()

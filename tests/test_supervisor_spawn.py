@@ -480,6 +480,46 @@ def test_supervisor_close_is_idempotent(tmp_path: Path) -> None:
     sup.close()  # must not raise
 
 
+def test_supervisor_close_runs_conn_close_if_compact_raises(
+    tmp_path: Path,
+) -> None:
+    """#412 review: a ``compact`` failure must not leak the DB connection.
+
+    ``compact`` is a DB write that can raise on a local sqlite error. The
+    teardown sets ``_closed`` first and runs ``conn.close()`` under
+    ``finally``, so the connection is always closed (no leak) and a
+    re-entry is a no-op that does not retry ``compact`` on the
+    half-closed connection.
+    """
+    import sqlite3
+
+    sup = Supervisor(tmp_path / "supervisor.db")
+    # compact is a NotifyBus method (plain Python) — safe to override with a
+    # raising stub that records how many times it ran.
+    compact_calls: list[int] = []
+
+    def _raising_compact(*args: object, **kwargs: object) -> None:
+        compact_calls.append(1)
+        raise sqlite3.OperationalError("disk I/O")
+
+    # ``setattr`` (not direct method assignment) avoids ty's implicit-
+    # shadowing check on the plain-Python NotifyBus method.
+    setattr(sup._bus, "compact", _raising_compact)
+
+    # The compact error propagates, but the finally clause still closed the
+    # connection and _closed is set.
+    with pytest.raises(sqlite3.OperationalError):
+        sup.close()
+
+    # Connection was closed despite compact raising (no leak).
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        sup._conn.execute("SELECT 1")
+    assert sup._closed is True
+    # Re-entry returns early — compact is not retried on the closed conn.
+    sup.close()
+    assert len(compact_calls) == 1
+
+
 def test_close_compacts_old_lifecycle_events(tmp_path: Path) -> None:
     """#411: ``close()`` compacts lifecycle events older than the retention
     window, so the shared ``~/.cothis/supervisor.db``'s ``notify_events`` does
