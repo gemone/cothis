@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -42,6 +43,7 @@ from cothis.tools.yaml import (
 )
 
 if TYPE_CHECKING:
+    import subprocess
     from pathlib import Path
 
 
@@ -1405,7 +1407,7 @@ def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
     In cmd shell mode, ``_shell_quote`` cmd-quotes each value with
     ``list2cmdline`` (``foo & bar`` → ``\"foo & bar\"``). ``__call__`` must
     dispatch this on the ``shell=True`` path, not argv mode: argv-mode
-    ``subprocess.run(list, shell=False)`` would re-apply ``list2cmdline``
+    ``Popen(list, shell=False)`` would re-apply ``list2cmdline``
     to the whole argv and escape the inner double-quotes as backslash-quote,
     which cmd.exe does not honour (the ``&`` would become a live
     metacharacter).
@@ -1417,7 +1419,7 @@ def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
     without going through ``_compile``, we build a ``CommandBlock`` with
     ``shell=\"cmd\"`` directly and drive ``_ShellTool`` from there.
 
-    Captures the exact ``subprocess.run`` call (``__call__`` is async, so
+    Captures the exact ``Popen`` call (``__call__`` is async, so
     the blocking call runs via ``asyncio.to_thread``) and pins
     ``shell=True``, the resolved executable, and the rendered string's
     inner quotes.
@@ -1441,16 +1443,16 @@ def test_cmd_dispatch_keeps_shell_true_and_preserves_inner_quotes(
     captured: dict[str, Any] = {}
 
     class _FakeProc:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            self.args = args
+            self.returncode = 0
 
-    def _spy_run(*args: Any, **kwargs: Any) -> Any:
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return _FakeProc()
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            return "", ""
 
-    monkeypatch.setattr(yaml_mod.subprocess, "run", _spy_run)
+    monkeypatch.setattr(yaml_mod.subprocess, "Popen", _FakeProc)
     asyncio.run(tool(pattern="foo & bar"))
 
     # Dispatch keeps shell=True (the cmd.exe path), not shell=False with a
@@ -1836,3 +1838,274 @@ def test_format_proc_result_within_cap_is_not_truncated() -> None:
     assert "[truncated:" not in result
     assert len(result) == _MAX_BYTES - 1
 
+
+def test_shell_timeout_default_is_60s() -> None:
+    """The default shell-tool timeout is 60 s.
+
+    30 s killed real builds/test suites (``npm test``, ``pytest``, ``cargo
+    build``, ``make``) mid-run. Pinned so a regression to the too-aggressive
+    30 s is caught.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    assert yaml_mod._SHELL_TIMEOUT_S == 60.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shape", ["argv-list", "posix-shell-false", "cmd-shell-true"],
+)
+async def test_shell_tool_times_out_on_hanging_command(
+    shape: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hanging command is killed by the shell-tool timeout on every dispatch shape.
+
+    All three dispatch shapes — argv-list (``shell=False``), POSIX
+    ``shell=False`` via ``_shell_argv`` (``[exe, "-c", cmd]``), and the
+    cmd.exe ``shell=True`` path — must spawn with the child isolated in its
+    own process group/session, bound ``communicate`` by
+    ``timeout=_SHELL_TIMEOUT_S``, kill the whole group/tree on timeout (no
+    orphaned grandchildren), and surface a readable error with the partial
+    output. ``Popen`` and the group kill are stubbed so every shape runs
+    cross-platform — no real ``sh`` / ``cmd.exe`` execution.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    # ``shutil.which`` is stubbed so every shape compiles cross-platform
+    # (no real ``sh`` / ``sleep`` on PATH needed); ``Popen`` is stubbed
+    # below, so the resolved paths never execute.
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    if shape == "argv-list":
+        tool = _shell_tool('name: hang\ncommand: ["sleep", "10"]\n')
+        expected_shell: bool = False
+    elif shape == "posix-shell-false":
+        # String + ``shell: sh`` → ``_shell_argv`` returns ``[sh, -c, ...]``,
+        # dispatching to the ``shell=False`` argv call site.
+        tool = _shell_tool('name: hang\nshell: sh\ncommand: "sleep 10"\n')
+        expected_shell = False
+    else:
+        # cmd.exe ``shell=True`` path. ``shell: cmd`` is rejected at compile
+        # time, so build a compiled string-shell tool and repoint it
+        # at cmd.exe to exercise the defensive ``argv is None`` call site.
+        tool = _shell_tool('name: hang\nshell: sh\ncommand: "sleep 10"\n')
+        tool._block.shell = "cmd"
+        tool._shell_path = r"C:\Windows\System32\cmd.exe"
+        expected_shell = True
+
+    captured: dict[str, object] = {}
+    procs: list[object] = []
+    killed: list[object] = []
+    timeouts: list[float | None] = []
+    order: list[str] = []
+
+    class FakeProc:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.args = args
+            procs.append(self)
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            order.append("reap" if timeout is None else "timeout-communicate")
+            timeouts.append(timeout)
+            if timeout is not None:
+                raise yaml_mod.subprocess.TimeoutExpired(
+                    cmd=str(self.args), timeout=timeout,
+                    output="half-done\n", stderr="warn\n",
+                )
+            return "", ""  # post-kill drain + reap.
+
+    def _fake_kill_tree(proc: object) -> None:
+        order.append("kill")
+        killed.append(proc)
+
+    monkeypatch.setattr(yaml_mod.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(yaml_mod, "_kill_process_tree", _fake_kill_tree)
+
+    result = await tool()
+
+    # The timeout forwarded to communicate() on this dispatch shape, then a
+    # post-kill drain call to reap the group.
+    assert timeouts == [yaml_mod._SHELL_TIMEOUT_S, None], (
+        f"{shape}: timeout not wired into communicate; timeouts={timeouts}"
+    )
+    # Kill must run before the reap: a reap-before-kill regression would leave
+    # the group alive when the child is reaped.
+    assert order == ["timeout-communicate", "kill", "reap"], (
+        f"{shape}: kill must precede the reap; order={order}"
+    )
+    assert captured.get("shell") is expected_shell, (
+        f"{shape}: wrong dispatch site; captured={captured}"
+    )
+    # Child isolated in its own group/session so the kill can cover it.
+    if sys.platform == "win32":
+        assert captured.get("creationflags") == yaml_mod.subprocess.CREATE_NEW_PROCESS_GROUP, (
+            f"{shape}: child not in its own process group; captured={captured}"
+        )
+    else:
+        assert captured.get("start_new_session") is True, (
+            f"{shape}: child not in its own session; captured={captured}"
+        )
+    # The timeout handler kills the whole group/tree, not just the child.
+    assert killed == procs, (
+        f"{shape}: timeout must kill the process group/tree; killed={killed}"
+    )
+    assert isinstance(result, str)
+    assert "timed out" in result.lower(), result
+    # Partial output captured before the kill is surfaced, not discarded
+    # (mirrors ``_format_proc_result``'s [stdout]/[stderr]).
+    assert "half-done" in result, f"partial stdout lost: {result!r}"
+    assert "[stderr]" in result and "warn" in result, (
+        f"partial stderr lost: {result!r}"
+    )
+
+
+def test_kill_process_tree_kills_group_or_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout cleanup kills the whole group/tree, not just the child.
+
+    POSIX: ``os.killpg`` on the child's process group. Windows: ``taskkill
+    /T`` on the child PID. Verifies the cleanup covers descendants — the
+    shell-path grandchild leak — not just the immediate process.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    class FakeProc:
+        pid = 4242
+
+    if sys.platform == "win32":
+        captured_run: list[list[str]] = []
+        monkeypatch.setattr(
+            yaml_mod.subprocess,
+            "run",
+            lambda cmd, **kwargs: captured_run.append(cmd),
+        )
+        yaml_mod._kill_process_tree(cast("subprocess.Popen", FakeProc()))
+        assert captured_run == [["taskkill", "/F", "/T", "/PID", "4242"]]
+    else:
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(yaml_mod.os, "getpgid", lambda pid: 4242)
+        monkeypatch.setattr(
+            yaml_mod.os,
+            "killpg",
+            lambda pgid, sig: killed.append((pgid, sig)),
+        )
+        yaml_mod._kill_process_tree(cast("subprocess.Popen", FakeProc()))
+        assert killed == [(4242, yaml_mod.signal.SIGKILL)]
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_cleans_up_when_communicate_raises_non_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-timeout communicate failure still kills + reaps the proc.
+
+    ``UnicodeDecodeError`` from ``text=True`` strict decoding of binary
+    output bypasses the ``TimeoutExpired`` handler; the outer reap guard must
+    kill the group and reap the child before the exception propagates —
+    otherwise the proc outlives the call.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    tool = _shell_tool('name: hang\nshell: sh\ncommand: "cat /dev/urandom"\n')
+
+    order: list[str] = []
+    procs: list[object] = []
+    killed: list[object] = []
+
+    class FakeProc:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            procs.append(self)
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            order.append("reap" if timeout is None else "communicate")
+            if timeout is not None:
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+            return "", ""  # post-kill drain + reap.
+
+    def _fake_kill_tree(proc: object) -> None:
+        order.append("kill")
+        killed.append(proc)
+
+    monkeypatch.setattr(yaml_mod.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(yaml_mod, "_kill_process_tree", _fake_kill_tree)
+
+    with pytest.raises(UnicodeDecodeError):
+        await tool()
+
+    assert killed == procs, f"proc must be killed on non-timeout failure: {killed}"
+    assert order == ["communicate", "kill", "reap"], (
+        f"kill must precede the reap; order={order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_reaps_even_when_kill_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kill failure must not skip the reap.
+
+    The timeout path wraps kill+reap in try/finally: if ``_kill_process_tree``
+    raises (permissions, missing taskkill), the child is still reaped — a
+    bare ``kill; reap`` sequence would leak the child on a kill failure.
+    """
+    import cothis.tools.yaml as yaml_mod
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    tool = _shell_tool('name: hang\nshell: sh\ncommand: "sleep 10"\n')
+
+    order: list[str] = []
+
+    class FakeProc:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            order.append("reap" if timeout is None else "timeout-communicate")
+            if timeout is not None:
+                raise yaml_mod.subprocess.TimeoutExpired(
+                    cmd=str(self.args), timeout=timeout,
+                    output="half-done\n", stderr="",
+                )
+            return "", ""
+
+    def _failing_kill_tree(proc: object) -> None:
+        order.append("kill")
+        raise PermissionError("kill denied")
+
+    monkeypatch.setattr(yaml_mod.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(yaml_mod, "_kill_process_tree", _failing_kill_tree)
+
+    with pytest.raises(PermissionError):
+        await tool()
+
+    # Every kill attempt (including the failed ones) is followed by a reap —
+    # the child is never left running.
+    assert order.count("reap") >= 1, f"reap must run despite kill failures; order={order}"
+    assert order.index("kill") < order.index("reap"), (
+        f"kill must precede the reap; order={order}"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="ProcessLookupError guard is POSIX-only",
+)
+def test_kill_process_tree_swallows_already_exited_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Killing a group that already exited is a no-op, not a raise."""
+    import cothis.tools.yaml as yaml_mod
+
+    class FakeProc:
+        pid = 4242
+
+    def _raise_already_exited(pgid: int, sig: int) -> None:
+        raise ProcessLookupError(pgid)
+
+    monkeypatch.setattr(yaml_mod.os, "getpgid", lambda pid: 4242)
+    monkeypatch.setattr(yaml_mod.os, "killpg", _raise_already_exited)
+    # Must not raise: the group is already gone.
+    yaml_mod._kill_process_tree(cast("subprocess.Popen", FakeProc()))

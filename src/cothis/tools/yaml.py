@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import shlex
 import shutil
+import signal
 import string
 import subprocess
 import sys
@@ -555,6 +557,66 @@ def _merge_arg_specs(
 
 _FORMATTER = string.Formatter()
 
+# Shell-tool wall-clock cap. A hanging command (``tail -f``, ``read``,
+# an infinite loop) can't block the turn for the full 300 s worker
+# turn-timeout. 60 s is high enough for real builds/test suites
+# (``npm test``, ``pytest``, ``cargo build``, ``make``) that routinely run
+# past 30 s, while still catching hangs far below the turn ceiling.
+_SHELL_TIMEOUT_S = 60.0
+
+
+def _group_popen_kwargs() -> dict[str, Any]:
+    """Popen kwargs that give the child its own process group/session.
+
+    The group is what the timeout handler kills: POSIX ``start_new_session``
+    makes the child a session leader (``killpg`` then reaches descendants);
+    Windows ``CREATE_NEW_PROCESS_GROUP`` + ``taskkill /T`` reaches the tree.
+    """
+    kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill every process in the child's group/tree, so a timeout orphans none.
+
+    ``subprocess``'s built-in timeout kills only the immediate child (the
+    ``sh``/``cmd`` interpreter or the argv binary); on the shell paths the
+    real workload (``make -j8``, a server, ``tail -f``) is a grandchild that
+    would survive and keep consuming CPU/RAM. Killing the group/tree closes
+    that gap.
+    """
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+        )
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # child already exited — no group left to kill.
+
+
+def _kill_and_reap(proc: subprocess.Popen) -> None:
+    """Kill the child's group/tree, then always reap the child.
+
+    A kill failure (permissions, missing taskkill) must not skip the reap —
+    the child would outlive the call. ``communicate`` drains the pipes and
+    reaps; with the group dead it returns promptly.
+    """
+    try:
+        _kill_process_tree(proc)
+    finally:
+        proc.communicate()
+
 
 def _extract_field_names(template: str) -> set[str]:
     """Return the set of named fields referenced by a Python format-string.
@@ -608,7 +670,7 @@ class _ShellTool(_HookableTool):
     going through any-llm's lossy ``callable_to_tool``).
 
     Dispatch (type-driven, ADR-0001):
-    - ``command`` is a list → argv mode: ``subprocess.run(list, shell=False)``.
+    - ``command`` is a list → argv mode: ``Popen(list, shell=False)``.
     - ``command`` is a str → shell mode: ``_shell_argv`` selects the dispatch
       path per interpreter — argv mode (``shell=False``) for POSIX and
       PowerShell, the ``shell=True`` path for ``cmd.exe``. See ``_shell_argv``
@@ -616,7 +678,7 @@ class _ShellTool(_HookableTool):
 
     Rendering delegates to ``CommandBlock.render`` — the list-vs-string
     render fork lives there, not here. This class carries only the dispatch
-    fork (``subprocess.run``'s argument shape) and the resolved exe path.
+    fork (``Popen``'s argument shape) and the resolved exe path.
 
     Inherits ``_HookableTool`` so ``_execute`` can run hooks uniformly without
     per-source branching. YAML tools don't register hooks today (their
@@ -644,29 +706,63 @@ class _ShellTool(_HookableTool):
 
     async def __call__(self, **kwargs: Any) -> str:
         rendered = self._block.render(**kwargs)
-        # cothis: park the blocking ``subprocess.run`` off the loop
-        # thread (#90).
+        # cothis: park the blocking subprocess call off the loop thread
+        # (#90). A timeout kills the whole process group/tree, so a hanging
+        # command can't leak grandchildren.
+        return await asyncio.to_thread(self._run_blocking, rendered)
+
+    def _run_blocking(self, rendered: list[str] | str) -> str:
+        """Run one dispatch shape synchronously; kill the group on timeout.
+
+        ``Popen`` + ``communicate(timeout=)`` let the timeout handler kill
+        the whole process group/tree — the real workload on the
+        ``shell=True`` / ``_shell_argv`` paths is a grandchild of the
+        interpreter.
+        """
+        kwargs = _group_popen_kwargs()
         if isinstance(rendered, list):
             # argv mode — never reaches _shell_quote; safe on all platforms.
-            proc = await asyncio.to_thread(
-                subprocess.run, rendered, shell=False,
-                capture_output=True, text=True,
-            )
+            proc = subprocess.Popen(rendered, shell=False, **kwargs)
         else:
             argv = _shell_argv(self._shell_path, self._block.shell, rendered)
             if argv is None:
                 # cmd.exe: keep shell=True — see _shell_argv.
-                proc = await asyncio.to_thread(
-                    subprocess.run, rendered, shell=True,
-                    capture_output=True, text=True,
-                    executable=self._shell_path,
+                proc = subprocess.Popen(
+                    rendered, shell=True, executable=self._shell_path, **kwargs,
                 )
             else:
-                proc = await asyncio.to_thread(
-                    subprocess.run, argv, shell=False,
-                    capture_output=True, text=True,
-                )
-        return _format_proc_result(proc)
+                proc = subprocess.Popen(argv, shell=False, **kwargs)
+        done = False
+        try:
+            try:
+                stdout, stderr = proc.communicate(timeout=_SHELL_TIMEOUT_S)
+            except subprocess.TimeoutExpired as exc:
+                _kill_and_reap(proc)
+                done = True
+                # ``exc.stdout``/``exc.stderr`` carry whatever the process
+                # emitted before the kill — surface the non-empty streams so
+                # the model sees partial progress (the build's last lines,
+                # test output) instead of a bare timeout. Mirrors
+                # ``_format_proc_result``'s [stdout]/[stderr] labels and
+                # ``_truncate_stream`` cap.
+                parts = [f"Error: command timed out after {_SHELL_TIMEOUT_S}s"]
+                stdout = _truncate_stream(_partial_stream(exc.stdout))
+                stderr = _truncate_stream(_partial_stream(exc.stderr))
+                if stdout:
+                    parts.append(f"[stdout]\n{stdout}")
+                if stderr:
+                    parts.append(f"[stderr]\n{stderr}")
+                return "\n".join(parts)
+            done = True
+            return _format_proc_result(
+                subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+            )
+        finally:
+            if not done:
+                # Any other failure (e.g. UnicodeDecodeError on binary output)
+                # skipped the timeout handler — the proc may still be running;
+                # kill + reap before the exception propagates.
+                _kill_and_reap(proc)
 
 
 def _shell_argv(
@@ -678,7 +774,7 @@ def _shell_argv(
     Shell mode dispatches via argv (``shell=False``) for POSIX and PowerShell
     interpreters, and via the ``shell=True`` path for ``cmd.exe``.
 
-    The argv path exists because ``subprocess.run(str, shell=True,
+    The argv path exists because ``Popen(str, shell=True,
     executable=...)`` is unreliable for non-cmd interpreters on Windows:
 
     - Python's ``shell=True`` wraps the command as ``<exe> /c "<command>"``.
@@ -714,6 +810,18 @@ def _shell_argv(
     if name in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
         return [shell_path or "pwsh", "-Command", command]
     return [shell_path or "sh", "-c", command]
+
+
+def _partial_stream(stream: str | bytes | None) -> str:
+    """Coerce a ``TimeoutExpired`` stream (``str | bytes | None``) to ``str``.
+
+    With ``text=True`` the partial output is ``str``, but the exception's
+    typed attribute is the wider ``str | bytes | None``; decode bytes
+    defensively (``ignore`` — partial output past a boundary may be mid-code).
+    """
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", "ignore")
+    return stream or ""
 
 
 def _truncate_stream(stream: str) -> str:
@@ -992,8 +1100,8 @@ def _value_mapping(
       shell-quoted for the SPECIFIC interpreter (POSIX → ``shlex.quote``;
       ``cmd`` → ``subprocess.list2cmdline``) and list elements are quoted
       individually then space-joined (story 22). Argv mode (``shell=None``) is
-      inherently safe — ``subprocess.run(list)`` does its own tokenisation — so
-      quoting only applies to shell mode.
+      inherently safe — ``Popen(list, shell=False)`` does its own
+      tokenisation — so quoting only applies to shell mode.
     - Other values pass through as-is so Python format specs can apply
       (``{n:03d}`` needs an int, not a str).
     """
