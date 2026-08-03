@@ -24,7 +24,12 @@ from cothis.model_metadata import _FALLBACK_MAX_TOKENS, resolve_max_tokens
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from any_llm.types.messages import MessageResponse, MessageStreamEvent
+    from anthropic.types import (
+        Message as MessageResponse,
+    )
+    from anthropic.types import (
+        RawMessageStreamEvent as MessageStreamEvent,
+    )
 
 
 # --- resolver ---------------------------------------------------------------
@@ -134,15 +139,11 @@ def _make_agent(
 ) -> Agent:
     """Build an Agent without making any LLM call.
 
-    ``AnyLLM.create`` is patched to a MagicMock so no provider is contacted
-    and no API key is required. The metadata-only fields we test don't need
-    the LLM, so the resulting ``_llm`` is also a MagicMock.
+    ``cothis.ai.get_provider`` is patched to a MagicMock so no provider is
+    contacted and no API key is required. The metadata-only fields we test
+    don't need the LLM, so the resulting ``_llm`` is also a MagicMock.
     """
-    import any_llm
-
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     return Agent(
         model=overrides.get("model", "openai/gpt-oss-120b"),
         provider=overrides.get("provider", "openrouter"),

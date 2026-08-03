@@ -6,7 +6,7 @@ Before writing any code, stop at the first rung that holds:
 
 1. Does this need to be built at all? (YAGNI — does the ReAct loop already cover it?)
 2. Does Python's stdlib already do this? Use it.
-3. Does `any-llm` already expose this (provider switching, tool calling, response shape)? Use it.
+3. Does `cothis.ai` already expose this (provider switching, tool calling, response shape)? Use it.
 4. Does an already-installed dependency (`pydantic`, `typer`) solve it? Use it.
 5. Can this be one function? Make it one function.
 6. Only then: write the minimum code that works.
@@ -17,7 +17,7 @@ Rules:
 - No new dependency if it can be avoided. `pyproject.toml` is lean on purpose.
 - No boilerplate nobody asked for. No config layers, no plugin systems, no settings pydantic-model wrapping what env vars already do.
 - Deletion over addition. Boring over clever. Fewest files possible.
-- Question complex requests: "Does cothis actually need X, or does the existing loop + `any-llm` cover it?"
+- Question complex requests: "Does cothis actually need X, or does the existing loop + `cothis.ai` cover it?"
 - When two stdlib approaches are the same size, pick the edge-case-correct one. Lean means less code, not the flimsier algorithm.
 - Mark intentional simplifications with a `cothis:` comment. If the shortcut has a known ceiling (single-turn tool call, no streaming, no tool-parallelism, hardcoded prompt), the comment names the ceiling and the upgrade path.
 
@@ -102,7 +102,7 @@ Every third-party top-level import in the startup path (`cothis/__init__.py`, `c
 1. **Carry an inline `# cost: ~Nms` comment** naming its measured cost — so a reviewer sees the hit in the diff. Example: `from pydantic import BaseModel  # cost: ~5ms`.
 2. **Be deferred** under `if TYPE_CHECKING:` or inside the function that first uses it. The patterns from #45 (anthropic SDK), #81 (griffe), #118 (follow-ups) are the template.
 
-Stdlib imports (`pathlib`, `typing`, `os`, `sys`, `asyncio`, …) are exempt — they're cheap and the audit ignores them. The third-party set is `any_llm`, `anthropic`, `click`, `filelock`, `griffe`, `mcp`, `pathspec`, `prompt_toolkit`, `pydantic`, `rich`, `typer`, `yaml` — derived from `pyproject.toml`'s `[project.dependencies]` plus transitive module names.
+Stdlib imports (`pathlib`, `typing`, `os`, `sys`, `asyncio`, …) are exempt — they're cheap and the audit ignores them. The third-party set is `anthropic`, `click`, `filelock`, `google`, `griffe`, `mcp`, `openai`, `pathspec`, `prompt_toolkit`, `pydantic`, `rich`, `typer`, `yaml` — derived from `pyproject.toml`'s `[project.dependencies]` plus transitive module names.
 
 Enforced by `tests/test_startup_latency.py::test_no_unjustified_third_party_imports` (AST-based, not string match — handles `if TYPE_CHECKING` blocks correctly).
 
@@ -310,3 +310,7 @@ Default canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 ### Domain docs
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+## Attribution
+
+cothis is architecturally inspired by [pi](https://github.com/earendil-works/pi) (TypeScript). We mirror pi's provider-abstraction pattern in `src/cothis/ai/` on clean-room principles; no pi source is copied.

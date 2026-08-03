@@ -154,12 +154,8 @@ def _patch_in_memory_transport(
 
 
 def _mock_llm(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub ``AnyLLM.create`` so ``Agent(...)`` needs no provider/network."""
-    import any_llm
-
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    """Stub ``cothis.ai.get_provider`` so ``Agent(...)`` needs no provider/network."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
 
 
 # --- YAML routing (discovery) ------------------------------------------
@@ -826,7 +822,9 @@ def test_flatten_exc_scrubs_url_secrets() -> None:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        group = ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [exc])
+        group = ExceptionGroup(
+            "unhandled errors in a TaskGroup (1 sub-exception)", [exc]
+        )
     msg = _flatten_exc(group)
     assert "SECRET123" not in msg
     assert "api_key" not in msg
@@ -1083,7 +1081,9 @@ async def test_duplicate_prefixed_tool_name_first_wins(
         group: ClientSessionGroup,
     ) -> tuple[list[MCPClientTool], Any]:
         tools, session = await original_connect_into(group)
-        return tools + tools[:1], session  # duplicate the first tool (same prefixed name)
+        return tools + tools[
+            :1
+        ], session  # duplicate the first tool (same prefixed name)
 
     setattr(server, "connect_into", duplicating_connect_into)
     agent = Agent(model="x", provider="openrouter", tools=[server])
@@ -1175,7 +1175,9 @@ async def test_connect_into_swallows_handshake_cancelled_error(
     assert any(
         "mcp:flaky" in r.getMessage() and "cancel" in r.getMessage().lower()
         for r in caplog.records
-    ), f"expected a cancellation warning; got {[r.getMessage() for r in caplog.records]}"
+    ), (
+        f"expected a cancellation warning; got {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1216,7 +1218,8 @@ def test_normalize_truncates_oversized_result() -> None:
     big = "€" * (_MAX_BYTES // 3 + 1000)
     assert len(big) < _MAX_BYTES, "sanity: char count must be under the byte cap"
     result = CallToolResult(
-        content=[TextContent(type="text", text=big)], isError=False,
+        content=[TextContent(type="text", text=big)],
+        isError=False,
     )
     out = _normalize_mcp_result(result)
 
@@ -1225,5 +1228,3 @@ def test_normalize_truncates_oversized_result() -> None:
     assert f"exceeded {_MAX_BYTES} bytes" in out
     # The body came from a remote MCP server — there is no local path to read.
     assert "fs.read" not in out, "marker must not point at fs.read"
-
-

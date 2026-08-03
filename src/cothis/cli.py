@@ -13,9 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-# Must run before cothis.agent imports any_llm.
-os.environ.setdefault("ANY_LLM_UNIFIED_EXCEPTIONS", "1")
-
 # If COTHIS_PROFILE_STARTUP is set, re-exec under -X importtime and exit
 # before any third-party import runs. Imports only stdlib so the
 # measurement cost is negligible when the flag is unset.
@@ -149,7 +146,7 @@ def _root(
         help="Show cothis tool-call I/O (without openai/httpx noise). Implied by --debug.",
     ),
 ) -> None:
-    """cothis — an any-llm agent loop."""
+    """cothis — a direct-SDK agent loop."""
     global _debug
     _debug = debug
     if debug or verbose:
@@ -167,7 +164,7 @@ def ask(
         "--provider",
         "-p",
         envvar="COTHIS_PROVIDER",
-        help="any-llm provider key (e.g. openrouter, mistral, openai, anthropic).",
+        help="provider key (e.g. openrouter, mistral, openai, anthropic).",
     ),
     model: str = typer.Option(
         "openai/gpt-oss-120b",
@@ -221,7 +218,7 @@ def chat(
         "--provider",
         "-p",
         envvar="COTHIS_PROVIDER",
-        help="any-llm provider key (e.g. openrouter, mistral, openai, anthropic).",
+        help="provider key (e.g. openrouter, mistral, openai, anthropic).",
     ),
     model: str = typer.Option(
         "openai/gpt-oss-120b",
@@ -947,14 +944,14 @@ def tui(
         "--model",
         "-m",
         envvar="COTHIS_MODEL",
-        help="any-llm model id (mirrors ``chat``). Used when spawning new sessions.",
+        help="model id (mirrors ``chat``). Used when spawning new sessions.",
     ),
     provider: str = typer.Option(
         "openrouter",
         "--provider",
         "-p",
         envvar="COTHIS_PROVIDER",
-        help="any-llm provider key (mirrors ``chat``). Used when spawning new sessions.",
+        help="provider key (mirrors ``chat``). Used when spawning new sessions.",
     ),
     resume: str | None = typer.Option(
         None,
@@ -1008,7 +1005,7 @@ def worker(
         "--provider",
         "-p",
         envvar="COTHIS_PROVIDER",
-        help="any-llm provider key (mirrors ``chat``).",
+        help="provider key (mirrors ``chat``).",
     ),
     model: str = typer.Option(
         "openai/gpt-oss-120b",

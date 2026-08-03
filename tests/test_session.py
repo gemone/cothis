@@ -48,7 +48,9 @@ def _user_text(text: str) -> dict[str, Any]:
     return {"type": "text", "text": text}
 
 
-def _assistant_with_tool_use(text: str, tool_id: str, tool_name: str = "fs.read") -> list[dict[str, Any]]:
+def _assistant_with_tool_use(
+    text: str, tool_id: str, tool_name: str = "fs.read"
+) -> list[dict[str, Any]]:
     return [
         {"type": "thinking", "thinking": "hmm", "signature": "sig"},
         {"type": "text", "text": text},
@@ -145,11 +147,14 @@ def test_crud_roundtrip_multiple_tool_results_share_msg_idx(tmp_path: Path) -> N
     sid = s.session_id
 
     s.append_message("user", [_user_text("do two things")])
-    s.append_message("assistant", [
-        {"type": "text", "text": "ok"},
-        {"type": "tool_use", "id": "tu1", "name": "fs.read", "input": {}},
-        {"type": "tool_use", "id": "tu2", "name": "fs.read", "input": {}},
-    ])
+    s.append_message(
+        "assistant",
+        [
+            {"type": "text", "text": "ok"},
+            {"type": "tool_use", "id": "tu1", "name": "fs.read", "input": {}},
+            {"type": "tool_use", "id": "tu2", "name": "fs.read", "input": {}},
+        ],
+    )
     # Per-exec: two separate append_block calls, same role.
     s.append_block("user", _tool_result("tu1", "result 1"))
     s.append_block("user", _tool_result("tu2", "result 2"))
@@ -168,14 +173,22 @@ def test_crud_roundtrip_image_block(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     sid = s.session_id
-    s.append_message("user", [
-        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
-    ])
+    s.append_message(
+        "user",
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "abc"},
+            },
+        ],
+    )
     s.close()
     s2 = Session.load(db_path, sid, flush_sync=True)
     assert s2.messages[0]["content"][0]["type"] == "image"
     assert s2.messages[0]["content"][0]["source"] == {
-        "type": "base64", "media_type": "image/png", "data": "abc",
+        "type": "base64",
+        "media_type": "image/png",
+        "data": "abc",
     }
     s2.close()
 
@@ -225,9 +238,7 @@ def test_storage_opens_with_deferred_isolation_and_wal(tmp_path: Path) -> None:
         storage.close()
 
 
-def test_storage_does_not_deadlock_under_threaded_contention(
-    tmp_path: Path
-) -> None:
+def test_storage_does_not_deadlock_under_threaded_contention(tmp_path: Path) -> None:
     """Smoke test: 4 threads × 30 writes complete without deadlock.
 
     Not a fairness assertion (see the structural test above for that) —
@@ -285,16 +296,22 @@ def test_reload_drops_trailing_orphan_tool_use(tmp_path: Path) -> None:
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     sid = s.session_id
     s.append_message("user", [_user_text("hi")])
-    s.append_message("assistant", [
-        {"type": "text", "text": "first"},
-        {"type": "tool_use", "id": "tu1", "name": "fs.read", "input": {}},
-    ])
+    s.append_message(
+        "assistant",
+        [
+            {"type": "text", "text": "first"},
+            {"type": "tool_use", "id": "tu1", "name": "fs.read", "input": {}},
+        ],
+    )
     # Pair the first tool_use, then start a second turn that crashes mid-tool.
     s.append_block("user", _tool_result("tu1", "ok"))
-    s.append_message("assistant", [
-        {"type": "text", "text": "second"},
-        {"type": "tool_use", "id": "tu2", "name": "fs.read", "input": {}},
-    ])
+    s.append_message(
+        "assistant",
+        [
+            {"type": "text", "text": "second"},
+            {"type": "tool_use", "id": "tu2", "name": "fs.read", "input": {}},
+        ],
+    )
     # No tool_result for tu2 — simulated crash.
     s.close()
 
@@ -318,10 +335,13 @@ def test_reload_truncate_is_persisted_not_just_in_memory(
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     sid = s.session_id
     s.append_message("user", [_user_text("q1")])
-    s.append_message("assistant", [
-        {"type": "text", "text": "a1"},
-        {"type": "tool_use", "id": "tu_orphan", "name": "fs.read", "input": {}},
-    ])
+    s.append_message(
+        "assistant",
+        [
+            {"type": "text", "text": "a1"},
+            {"type": "tool_use", "id": "tu_orphan", "name": "fs.read", "input": {}},
+        ],
+    )
     s.close()  # Simulated crash: no tool_result for tu_orphan.
 
     # Reload 1 — orphan dropped from memory AND from disk.
@@ -360,9 +380,7 @@ def test_session_row_written_flag_set_after_successful_write(
     """
     # Squash retry backoff to zero so the test doesn't sleep ~2.6s on the
     # 3 retry attempts before the poison-row drop kicks in.
-    monkeypatch.setattr(
-        "cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0)
-    )
+    monkeypatch.setattr("cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0))
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     # First write_atomic: fail every attempt so the row stays unwritten.
@@ -412,9 +430,7 @@ def test_transient_write_failure_recovered_by_retry(
     """
     # Zero backoff: the test isn't validating the backoff schedule, only
     # the recovery contract. Avoids a 100ms sleep per retry.
-    monkeypatch.setattr(
-        "cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0)
-    )
+    monkeypatch.setattr("cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0))
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     real_write = s._storage.write_atomic
@@ -454,9 +470,7 @@ def test_persistent_write_failure_drops_after_retries_no_deadlock(
     failing batch is dropped and the consumer moves on; the next enqueue
     must succeed.
     """
-    monkeypatch.setattr(
-        "cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0)
-    )
+    monkeypatch.setattr("cothis.session._WRITE_RETRY_BACKOFFS", (0.0, 0.0, 0.0))
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     real_write = s._storage.write_atomic
@@ -498,9 +512,7 @@ def test_retry_backoff_interrupted_by_close(
     """
     # Use a real backoff (so _stop.wait actually waits) — but we'll set
     # _stop immediately after the first failed attempt to simulate close.
-    monkeypatch.setattr(
-        "cothis.session._WRITE_RETRY_BACKOFFS", (10.0, 10.0, 10.0)
-    )
+    monkeypatch.setattr("cothis.session._WRITE_RETRY_BACKOFFS", (10.0, 10.0, 10.0))
     db_path = tmp_path / "sessions" / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     call_count = {"n": 0}
@@ -543,13 +555,17 @@ def test_reload_keeps_full_history_when_no_orphans(tmp_path: Path) -> None:
     s2 = Session.load(db_path, sid, flush_sync=True)
     assert len(s2.messages) == 4
     assert [m["role"] for m in s2.messages] == [
-        "user", "assistant", "user", "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
     ]
     s2.close()
 
 
 def test_reload_inserts_sentinel_when_first_message_is_assistant(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """``_rebuild_messages`` inserts a sentinel user turn when the first
     message is assistant (#146, ADR-0008 follow-up).
@@ -822,14 +838,27 @@ def test_storage_reopen_is_idempotent(tmp_path: Path) -> None:
     db = tmp_path / "test.db"
     s1 = Storage(db)
     from cothis.session.storage import BlockRow, SessionRow
+
     sr = SessionRow(
-        id="s1", parent_id=None, parent_seq=None, cwd="/x",
-        cli_version="0.1.0", model="m", title="t",
-        created_at="2026-01-01T00:00:00Z", updated_at="2026-01-01T00:00:00Z",
+        id="s1",
+        parent_id=None,
+        parent_seq=None,
+        cwd="/x",
+        cli_version="0.1.0",
+        model="m",
+        title="t",
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
     )
     br = BlockRow(
-        session_id="s1", seq=0, msg_idx=0, block_idx=0,
-        role="user", type="text", ts="2026-01-01T00:00:00Z", content="hi",
+        session_id="s1",
+        seq=0,
+        msg_idx=0,
+        block_idx=0,
+        role="user",
+        type="text",
+        ts="2026-01-01T00:00:00Z",
+        content="hi",
     )
     s1.write_atomic(sr, [br], "2026-01-01T00:00:01Z")
     s1.close()
@@ -859,15 +888,13 @@ def test_agent_run_with_session_persists_tool_turn(
     import asyncio as asyncio_mod
     from unittest.mock import MagicMock
 
-    import any_llm
     from anthropic.types import TextBlock, ToolUseBlock
 
     from cothis.agent import Agent
 
     monkeypatch.setattr(
-        any_llm.AnyLLM,
-        "create",
-        staticmethod(lambda *a, **kw: MagicMock()),
+        "cothis.ai.get_provider",
+        lambda *a, **kw: MagicMock(),
     )
 
     agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
@@ -880,10 +907,9 @@ def test_agent_run_with_session_persists_tool_turn(
     state = {"turn": 0}
 
     async def fake_amessages(**kwargs: Any) -> Any:
-        from any_llm.types.messages import (
-            MessageResponse,
-            MessageUsage,
-        )
+        from anthropic.types import Message as MessageResponse
+        from anthropic.types import Usage as MessageUsage
+
         state["turn"] += 1
         if state["turn"] == 1:
             content: list[Any] = [
@@ -894,8 +920,12 @@ def test_agent_run_with_session_persists_tool_turn(
         else:
             content = [TextBlock(type="text", text="final")]
         return MessageResponse(
-            id="m1", model="x", role="assistant", type="message",
-            content=content, stop_reason="end_turn",
+            id="m1",
+            model="x",
+            role="assistant",
+            type="message",
+            content=content,
+            stop_reason="end_turn",
             usage=MessageUsage(input_tokens=1, output_tokens=1),
         )
 
@@ -945,15 +975,13 @@ def test_attach_session_seeds_agent_messages_from_loaded_history(
     import asyncio as asyncio_mod
     from unittest.mock import MagicMock
 
-    import any_llm
     from anthropic.types import TextBlock
 
     from cothis.agent import Agent
 
     monkeypatch.setattr(
-        any_llm.AnyLLM,
-        "create",
-        staticmethod(lambda *a, **kw: MagicMock()),
+        "cothis.ai.get_provider",
+        lambda *a, **kw: MagicMock(),
     )
 
     db_path = tmp_path / "sessions" / "session.db"
@@ -983,11 +1011,16 @@ def test_attach_session_seeds_agent_messages_from_loaded_history(
     seen_request_messages: list[Any] = []
 
     async def fake_amessages(**kwargs: Any) -> Any:
-        from any_llm.types.messages import MessageResponse, MessageUsage
+        from anthropic.types import Message as MessageResponse
+        from anthropic.types import Usage as MessageUsage
+
         # Capture what the Agent is about to send.
         seen_request_messages.extend(kwargs.get("messages", []))
         return MessageResponse(
-            id="m1", model="x", role="assistant", type="message",
+            id="m1",
+            model="x",
+            role="assistant",
+            type="message",
             content=[TextBlock(type="text", text="ok")],
             stop_reason="end_turn",
             usage=MessageUsage(input_tokens=1, output_tokens=1),
@@ -1003,7 +1036,8 @@ def test_attach_session_seeds_agent_messages_from_loaded_history(
     request_user_texts = [
         m["content"][0].get("text")
         for m in seen_request_messages
-        if m.get("role") == "user" and m.get("content")
+        if m.get("role") == "user"
+        and m.get("content")
         and isinstance(m["content"][0], dict)
         and m["content"][0].get("type") == "text"
     ]
@@ -1029,14 +1063,11 @@ def test_ensure_messages_merges_when_history_ends_with_user(
     """
     from unittest.mock import MagicMock
 
-    import any_llm
-
     from cothis.agent import Agent
 
     monkeypatch.setattr(
-        any_llm.AnyLLM,
-        "create",
-        staticmethod(lambda *a, **kw: MagicMock()),
+        "cothis.ai.get_provider",
+        lambda *a, **kw: MagicMock(),
     )
 
     db_path = tmp_path / "sessions" / "session.db"
@@ -1058,10 +1089,7 @@ def test_ensure_messages_merges_when_history_ends_with_user(
         f"Expected 1 user message (merged), got {len(user_msgs)}. "
         f"Consecutive user messages → Anthropic 400."
     )
-    text_blocks = [
-        b for b in user_msgs[0]["content"]
-        if b.get("type") == "text"
-    ]
+    text_blocks = [b for b in user_msgs[0]["content"] if b.get("type") == "text"]
     assert len(text_blocks) == 2
     assert text_blocks[0]["text"] == "first prompt"
     assert text_blocks[1]["text"] == "follow up"
@@ -1096,7 +1124,10 @@ def test_crud_roundtrip_real_consumer_thread(tmp_path: Path) -> None:
     try:
         # Ordering: roles must match enqueue order exactly.
         assert [m["role"] for m in s2.messages] == [
-            "user", "assistant", "user", "assistant",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
         ]
         # Data integrity: every enqueued block survived the async path.
         assert s2.messages[0]["content"] == [_user_text("turn 1")]
@@ -1530,14 +1561,18 @@ def test_close_storage_closed_even_when_consumer_stuck(
 
     storage_closed = {"called": False}
     release_called_after = {"ok": False}
+
     def tracking_close() -> None:
         storage_closed["called"] = True
+
     monkeypatch.setattr(s._storage, "close", tracking_close)
     real_release = s._release_lock
+
     def tracking_release() -> None:
         if storage_closed["called"]:
             release_called_after["ok"] = True
         real_release()
+
     monkeypatch.setattr(s, "_release_lock", tracking_release)
 
     # Fake consumer that's still "alive" after the join timeout —
@@ -1547,10 +1582,13 @@ def test_close_storage_closed_even_when_consumer_stuck(
     class _StuckConsumer(threading.Thread):
         def run(self) -> None:  # never started; never runs
             pass
+
         def is_alive(self) -> bool:
             return True
+
         def join(self, timeout: float | None = None) -> None:
             return  # returns immediately, still alive
+
     s._consumer = _StuckConsumer()
 
     # Squash the join timeouts so the test doesn't sleep.
@@ -1604,6 +1642,7 @@ def test_restrict_to_owner_logs_warning_windows_icacls_fails(
 
     def failing_run(*args, **kwargs):
         raise subprocess.CalledProcessError(1, ["icacls"], output=b"", stderr=b"denied")
+
     monkeypatch.setattr(storage_mod.subprocess, "run", failing_run)
 
     with caplog.at_level("WARNING", logger="cothis.session.storage"):
@@ -1626,6 +1665,7 @@ def test_restrict_to_owner_logs_warning_posix_chmod_fails(
 
     def chmod_fail(path: str, mode: int) -> None:
         raise OSError(1, "Operation not permitted", path)
+
     monkeypatch.setattr(storage_mod.os, "chmod", chmod_fail)
 
     with caplog.at_level("WARNING", logger="cothis.session.storage"):
@@ -1665,7 +1705,8 @@ def test_is_visible_matches_self_and_ancestor(tmp_path: Path) -> None:
 
 
 def test_list_sessions_in_cwd_tree_resolves_observer_cwd_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #331: ``list_sessions_in_cwd_tree`` hoists ``observer_cwd.resolve()`` out of the loop.
 
@@ -1713,13 +1754,13 @@ def test_list_sessions_in_cwd_tree_resolves_observer_cwd_once(
         return real_helper(session_cwd, observer_resolved)
 
     monkeypatch.setattr(
-        storage_mod, "_is_visible_with_resolved_observer", tracking_helper,
+        storage_mod,
+        "_is_visible_with_resolved_observer",
+        tracking_helper,
     )
 
     visible = storage.list_sessions_in_cwd_tree(tmp_path)
-    assert len(visible) == 5, (
-        f"expected 5 visible sessions; got {len(visible)}"
-    )
+    assert len(visible) == 5, f"expected 5 visible sessions; got {len(visible)}"
 
     # All 5 rows saw the SAME pre-resolved observer (one ``.resolve()``
     # call, shared across all rows). If the resolution were inside the

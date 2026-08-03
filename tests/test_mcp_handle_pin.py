@@ -36,12 +36,8 @@ def _make_server() -> FastMCP:
 
 
 def _mock_llm(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub ``AnyLLM.create`` so ``Agent(...)`` needs no provider/network."""
-    import any_llm
-
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    """Stub ``cothis.ai.get_provider`` so ``Agent(...)`` needs no provider/network."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
 
 
 def _patch_in_memory_transport(
@@ -101,9 +97,7 @@ async def test_mcp_handle_is_pinned_at_adopt_time(
         tool = agent._tool_map[add_keys[0]]
         cls = getattr(tool, "_handle_cls")
         slot = agent._handle_manager._slots[cls]
-        assert cls.pin is True, (
-            "MCPSessionHandle must be pinned at adopt time"
-        )
+        assert cls.pin is True, "MCPSessionHandle must be pinned at adopt time"
         assert slot.is_pinned, (
             "adopted slot must report is_pinned=True so the reaper skips it"
         )

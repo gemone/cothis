@@ -667,7 +667,7 @@ class _ShellTool(_HookableTool):
     executable path (shell mode only). Satisfies the ``Tool`` protocol by
     exposing ``__name__`` / ``__doc__`` / ``__signature__`` and a pre-built
     ``__cothis_schema__`` (so per-arg descriptions reach the LLM without
-    going through any-llm's lossy ``callable_to_tool``).
+    going through the cothis.ai schema path).
 
     Dispatch (type-driven, ADR-0001):
     - ``command`` is a list → argv mode: ``Popen(list, shell=False)``.
@@ -1131,7 +1131,7 @@ def _build_signature(arg_specs: list[dict[str, Any]]) -> inspect.Signature:
     """Build an ``inspect.Signature`` from YAML arg declarations.
 
     Each declared arg becomes a ``Parameter`` of the declared ``type``
-    (defaulting to ``str``), so any-llm's ``inspect.signature``-based
+    (defaulting to ``str``), so the cothis.ai ``inspect.signature``-based
     schema builder picks them up. All args are keyword-or-positional with
     no default; optional args (``required: false``) are a later slice.
     """
@@ -1151,10 +1151,10 @@ def _build_tool_schema(
 ) -> dict[str, Any]:
     """Build an Anthropic-format tool schema dict carrying per-arg descriptions.
 
-    any-llm's ``callable_to_tool`` drops per-parameter ``description``
+    The cothis.ai schema path drops per-parameter ``description``
     fields (it only reads type annotations), so YAML tools pre-build the
     full schema here in Anthropic shape (``{name, description, input_schema}``)
-    and Agent passes it straight through to ``any_llm.amessages`` via any-llm's
+    and Agent passes it straight through to ``amessages`` via the
     dict-passthrough (``prepare_tools`` leaves dicts alone). This is how the
     rich ``description:`` text a YAML author writes actually reaches the model.
     """

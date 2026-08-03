@@ -30,22 +30,22 @@ def _make_agent(
 ) -> tuple[Any, Any]:
     """Build an Agent + Session pair for testing.
 
-    Agent uses a mocked AnyLLM (no real provider calls). Session uses
+    Agent uses a mocked provider (no real LLM calls). Session uses
     a temp db under ``tmp_path``; ``flush_sync=True`` so writes are
     visible immediately.
     """
-    import any_llm
-
     from cothis.agent import Agent
     from cothis.session import Session
 
     monkeypatch.setattr(
-        any_llm.AnyLLM,
-        "create",
-        staticmethod(lambda *a, **kw: MagicMock()),
+        "cothis.ai.get_provider",
+        lambda *a, **kw: MagicMock(),
     )
     agent = Agent(
-        model="x", provider="openrouter", tools=[], max_iterations=5,
+        model="x",
+        provider="openrouter",
+        tools=[],
+        max_iterations=5,
     )
     db_path = tmp_path / "sessions" / "session.db"
     session = Session.new(db_path, cwd=tmp_path, model="x", flush_sync=True)
@@ -69,6 +69,7 @@ def _notify_rows(session: Any) -> list[dict[str, Any]]:
         return []
     rows = cur.fetchall()
     import json
+
     return [
         {
             "seq": r[0],
@@ -153,9 +154,7 @@ def test_execute_tool_emits_started_and_completed_on_success(
     assert "duration_ms" in rows[1]["meta"]
     assert rows[1]["meta"]["ok"] is True
     # payload_pointer references the session + tool call
-    assert rows[1]["payload_pointer"] == (
-        f"session:{session.session_id}:tool:tu_happy"
-    )
+    assert rows[1]["payload_pointer"] == (f"session:{session.session_id}:tool:tu_happy")
 
 
 # ---------------------------------------------------------------------
@@ -247,9 +246,7 @@ def test_execute_tool_payload_pointer_format(
     )
     rows = _notify_rows(session)
     completed = next(r for r in rows if r["event_type"] == "completed")
-    assert completed["payload_pointer"] == (
-        f"session:{session.session_id}:tool:tu_pp"
-    )
+    assert completed["payload_pointer"] == (f"session:{session.session_id}:tool:tu_pp")
 
 
 # ---------------------------------------------------------------------
