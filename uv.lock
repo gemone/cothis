@@ -7,6 +7,7 @@ members = [
     "cothis-ai",
     "cothis-core",
     "cothis-protocol",
+    "cothis-storage",
 ]
 
 [manifest.dependency-groups]
@@ -205,7 +206,7 @@ source = { editable = "packages/cothis-core" }
 dependencies = [
     { name = "anyio" },
     { name = "cothis-protocol" },
-    { name = "filelock" },
+    { name = "cothis-storage" },
     { name = "griffe" },
     { name = "mcp" },
     { name = "pathspec" },
@@ -222,7 +223,7 @@ dependencies = [
 requires-dist = [
     { name = "anyio", specifier = ">=4.0" },
     { name = "cothis-protocol", editable = "packages/cothis-protocol" },
-    { name = "filelock", specifier = ">=3.13" },
+    { name = "cothis-storage", editable = "packages/cothis-storage" },
     { name = "griffe", specifier = ">=2.1.0" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "pathspec", specifier = ">=0.12.1" },
@@ -251,6 +252,17 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "websockets", specifier = ">=13.0" },
 ]
+
+[[package]]
+name = "cothis-storage"
+version = "0.1.0"
+source = { editable = "packages/cothis-storage" }
+dependencies = [
+    { name = "filelock" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "filelock", specifier = ">=3.13" }]
 
 [[package]]
 name = "cryptography"

@@ -7,7 +7,7 @@ license = "Apache-2.0"
 dependencies = [
     "anyio>=4.0",
     "cothis-protocol",
-    "filelock>=3.13",
+    "cothis-storage",
     "griffe>=2.1.0",
     "mcp>=1.28.1",
     "pathspec>=0.12.1",
@@ -34,3 +34,4 @@ namespace = true
 [tool.uv.sources]
 cothis-ai = { workspace = true }
 cothis-protocol = { workspace = true }
+cothis-storage = { workspace = true }

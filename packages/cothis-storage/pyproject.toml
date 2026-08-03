@@ -1,0 +1,16 @@
+[project]
+name = "cothis-storage"
+version = "0.1.0"
+description = "cothis storage - durable SQLite session/conversation persistence (cothis.session)"
+requires-python = ">=3.14"
+license = "Apache-2.0"
+dependencies = [
+    "filelock>=3.13",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "cothis.session"
