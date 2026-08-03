@@ -142,6 +142,7 @@ def test_openrouter_defaults_to_openrouter_base_url() -> None:
 
 def test_openrouter_caller_base_url_overrides_default() -> None:
     provider = get_provider("openrouter", api_base="https://custom.test/v1")
+    assert isinstance(provider, OpenRouterProvider)
     assert provider._api_base == "https://custom.test/v1"
 
 

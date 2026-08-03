@@ -12,7 +12,7 @@ works without an API key or ``ANTHROPIC_API_KEY`` env var set.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -76,6 +76,10 @@ class AnthropicProvider:
             async for event in stream:
                 yield event
 
+    @overload
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False) -> MessageResponse: ...
+    @overload
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True]) -> AsyncIterator[MessageStreamEvent]: ...
     async def amessages(
         self,
         *,

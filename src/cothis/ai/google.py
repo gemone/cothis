@@ -13,7 +13,7 @@ The Google client is constructed lazily on first use so
 from __future__ import annotations
 
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from cothis.ai._translate import (
     anthropic_messages_to_google_contents,
@@ -72,6 +72,10 @@ class GoogleProvider:
         return types.GenerateContentConfig(**config_kwargs)
 
     # ================================================================ amessages
+    @overload
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False) -> MessageResponse: ...
+    @overload
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True]) -> AsyncIterator[MessageStreamEvent]: ...
     async def amessages(
         self,
         *,

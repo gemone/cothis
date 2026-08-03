@@ -261,10 +261,13 @@ def test_non_stream_translates_completion_to_message(
     # content blocks: one text + one tool_use with parsed input
     types_ = [type(b).__name__ for b in msg.content]
     assert types_ == ["TextBlock", "ToolUseBlock"]
-    assert msg.content[0].text == "hello"
-    assert msg.content[1].id == "tu_9"
-    assert msg.content[1].name == "fs.read"
-    assert msg.content[1].input == {"path": "/a"}
+    first_block, second_block = msg.content[0], msg.content[1]
+    assert isinstance(first_block, TextBlock)
+    assert isinstance(second_block, ToolUseBlock)
+    assert first_block.text == "hello"
+    assert second_block.id == "tu_9"
+    assert second_block.name == "fs.read"
+    assert second_block.input == {"path": "/a"}
 
     # The create kwargs carry the translated request shape.
     req = captured["create_kwargs"]

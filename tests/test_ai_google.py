@@ -100,13 +100,19 @@ def test_contents_translation_tool_result_becomes_function_response() -> None:
 
 
 def test_tool_schema_translation_to_function_declarations() -> None:
+    from google.genai import types
+
     tools = [
         {"name": "fs.read", "description": "read", "input_schema": {"type": "object"}}
     ]
     out = anthropic_tools_to_google(tools)
-    assert out == [
-        {"name": "fs.read", "description": "read", "parameters": {"type": "object"}}
-    ]
+    assert out is not None
+    assert len(out) == 1
+    decl = out[0]
+    assert isinstance(decl, types.FunctionDeclaration)
+    assert decl.name == "fs.read"
+    assert decl.description == "read"
+    assert decl.parameters is not None  # wrapped into a google Schema
 
 
 def test_map_google_finish_reason_accepts_enum_name_and_string() -> None:

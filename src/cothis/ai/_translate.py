@@ -14,13 +14,16 @@ the foreign SDK constructor, or built SDK model objects where labelled.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from anthropic.types import StopReason
 
 # ---------------------------------------------------------------------------
 # OpenAI finish-reason -> Anthropic stop_reason
 # ---------------------------------------------------------------------------
 
-_OPENAI_FINISH_MAP: dict[str | None, str] = {
+_OPENAI_FINISH_MAP: dict[str | None, StopReason] = {
     "stop": "end_turn",
     "tool_calls": "tool_use",
     "function_call": "tool_use",
@@ -30,7 +33,7 @@ _OPENAI_FINISH_MAP: dict[str | None, str] = {
 }
 
 
-def map_openai_finish_reason(finish_reason: str | None) -> str:
+def map_openai_finish_reason(finish_reason: str | None) -> StopReason:
     """Map an OpenAI ``finish_reason`` onto an Anthropic ``stop_reason``.
 
     Unknown reasons fall back to ``"end_turn"`` so an unexpected provider
@@ -44,7 +47,7 @@ def map_openai_finish_reason(finish_reason: str | None) -> str:
 # Google finish-reason -> Anthropic stop_reason
 # ---------------------------------------------------------------------------
 
-_GOOGLE_FINISH_MAP: dict[str, str] = {
+_GOOGLE_FINISH_MAP: dict[str, StopReason] = {
     "STOP": "end_turn",
     "MAX_TOKENS": "max_tokens",
     "SAFETY": "end_turn",
@@ -59,7 +62,7 @@ _GOOGLE_FINISH_MAP: dict[str, str] = {
 }
 
 
-def map_google_finish_reason(finish_reason: Any) -> str:
+def map_google_finish_reason(finish_reason: Any) -> StopReason:
     """Map a Google GenAI ``FinishReason`` (enum or name) onto Anthropic.
 
     Accepts either the ``google.genai.types.FinishReason`` enum or its
@@ -338,24 +341,26 @@ def _tool_result_payload(content: Any) -> dict[str, Any]:
 
 def anthropic_tools_to_google(
     tools: list[dict[str, Any]] | None,
-) -> list[dict[str, Any]] | None:
-    """Translate Anthropic tool schemas to Google ``function_declarations``.
+) -> list[Any] | None:
+    """Translate Anthropic tool schemas to Google ``FunctionDeclaration``s.
 
-    Returns a list of ``{"name", "description", "parameters"}`` dicts ready
-    to wrap in ``google.genai.types.Tool(function_declarations=[...])``.
+    Returns a list of ``google.genai.types.FunctionDeclaration`` objects
+    ready to wrap in ``google.genai.types.Tool(function_declarations=[...])``.
     """
     if not tools:
         return None
-    out: list[dict[str, Any]] = []
+    from google.genai import types
+
+    out: list[Any] = []
     for tool in tools:
-        decl: dict[str, Any] = {
+        fd_kwargs: dict[str, Any] = {
             "name": tool.get("name", ""),
             "parameters": tool.get("input_schema")
             or {"type": "object", "properties": {}},
         }
         if tool.get("description"):
-            decl["description"] = tool["description"]
-        out.append(decl)
+            fd_kwargs["description"] = tool["description"]
+        out.append(types.FunctionDeclaration(**fd_kwargs))
     return out
 
 

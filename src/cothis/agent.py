@@ -25,7 +25,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 # cothis: the Anthropic stream-event types (``RawMessageStartEvent`` etc.)
 # and ``TextDelta`` are imported lazily inside ``Agent.run_stream`` instead
@@ -909,18 +909,15 @@ class Agent(BaseModel):
         await self._ensure_handles()
 
         for _turn in range(self.max_iterations):
-            response = cast(
-                "MessageResponse",
-                await self._llm.amessages(
-                    model=self.model,
-                    messages=_request_messages(
-                        self._messages,
-                        active_skills=self._active_skills_for_request(),
-                    ),
-                    max_tokens=self._effective_max_tokens(),
-                    system=system_param,
-                    tools=self._tool_schemas(),
+            response = await self._llm.amessages(
+                model=self.model,
+                messages=_request_messages(
+                    self._messages,
+                    active_skills=self._active_skills_for_request(),
                 ),
+                max_tokens=self._effective_max_tokens(),
+                system=system_param,
+                tools=self._tool_schemas(),
             )
             msg = _assistant_msg_from_response(response)
             self._tag_skill_blocks(msg["content"])
@@ -1018,19 +1015,16 @@ class Agent(BaseModel):
         max_iterations = self.max_iterations
 
         for _turn in range(max_iterations):
-            stream = cast(
-                "AsyncIterator[MessageStreamEvent]",
-                await llm.amessages(
-                    model=model,
-                    messages=_request_messages(
-                        self._messages,
-                        active_skills=self._active_skills_for_request(),
-                    ),
-                    max_tokens=self._effective_max_tokens(),
-                    system=system_param,
-                    tools=tool_schemas,
-                    stream=True,
+            stream = await llm.amessages(
+                model=model,
+                messages=_request_messages(
+                    self._messages,
+                    active_skills=self._active_skills_for_request(),
                 ),
+                max_tokens=self._effective_max_tokens(),
+                system=system_param,
+                tools=tool_schemas,
+                stream=True,
             )
 
             blocks: dict[int, dict[str, Any]] = {}

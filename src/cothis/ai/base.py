@@ -9,7 +9,7 @@ factory that resolves a provider key to a concrete instance.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -48,6 +48,10 @@ class AIProvider(Protocol):
     over ``anthropic.types.RawMessageStreamEvent``.
     """
 
+    @overload
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False) -> MessageResponse: ...
+    @overload
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True]) -> AsyncIterator[MessageStreamEvent]: ...
     async def amessages(
         self,
         *,

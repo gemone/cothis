@@ -19,7 +19,7 @@ The SDK client is constructed lazily on first use.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from cothis.ai._translate import (
     anthropic_messages_to_openai,
@@ -73,6 +73,10 @@ class OpenAIProvider:
         }
 
     # ================================================================ amessages
+    @overload
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False) -> MessageResponse: ...
+    @overload
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True]) -> AsyncIterator[MessageStreamEvent]: ...
     async def amessages(
         self,
         *,
