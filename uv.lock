@@ -2,6 +2,22 @@ version = 1
 revision = 3
 requires-python = ">=3.14"
 
+[manifest]
+members = [
+    "cothis-ai",
+    "cothis-core",
+]
+
+[manifest.dependency-groups]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pytest-asyncio", specifier = ">=1.4.0" },
+    { name = "pytest-mock", specifier = ">=3.15.1" },
+    { name = "ruff", specifier = ">=0.15.18" },
+    { name = "time-machine", specifier = ">=3.2.0" },
+    { name = "ty", specifier = ">=0.0.51" },
+]
+
 [[package]]
 name = "annotated-doc"
 version = "0.0.4"
@@ -165,17 +181,31 @@ wheels = [
 ]
 
 [[package]]
-name = "cothis"
+name = "cothis-ai"
 version = "0.1.0"
-source = { editable = "." }
+source = { editable = "packages/cothis-ai" }
 dependencies = [
     { name = "anthropic" },
+    { name = "google-genai" },
+    { name = "openai" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anthropic", specifier = ">=0.40.0" },
+    { name = "google-genai", specifier = ">=0.3.0" },
+    { name = "openai", specifier = ">=1.50.0" },
+]
+
+[[package]]
+name = "cothis-core"
+version = "0.1.0"
+source = { editable = "packages/cothis-core" }
+dependencies = [
     { name = "anyio" },
     { name = "filelock" },
-    { name = "google-genai" },
     { name = "griffe" },
     { name = "mcp" },
-    { name = "openai" },
     { name = "pathspec" },
     { name = "prompt-toolkit" },
     { name = "pydantic" },
@@ -186,25 +216,12 @@ dependencies = [
     { name = "websockets" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-mock" },
-    { name = "ruff" },
-    { name = "time-machine" },
-    { name = "ty" },
-]
-
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=0.40.0" },
     { name = "anyio", specifier = ">=4.0" },
     { name = "filelock", specifier = ">=3.13" },
-    { name = "google-genai", specifier = ">=0.3.0" },
     { name = "griffe", specifier = ">=2.1.0" },
     { name = "mcp", specifier = ">=1.28.1" },
-    { name = "openai", specifier = ">=1.50.0" },
     { name = "pathspec", specifier = ">=0.12.1" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
     { name = "pydantic", specifier = ">=2.13.4" },
@@ -213,16 +230,6 @@ requires-dist = [
     { name = "textual", specifier = ">=0.47.0" },
     { name = "typer", specifier = ">=0.25.1" },
     { name = "websockets", specifier = ">=13.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "pytest-asyncio", specifier = ">=1.4.0" },
-    { name = "pytest-mock", specifier = ">=3.15.1" },
-    { name = "ruff", specifier = ">=0.15.18" },
-    { name = "time-machine", specifier = ">=3.2.0" },
-    { name = "ty", specifier = ">=0.0.51" },
 ]
 
 [[package]]

@@ -41,7 +41,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 _BOUNDARY_SITES = [
     {
         "id": "mcp.group.tools",
-        "file": "src/cothis/tools/mcp.py",
+        "file": "packages/cothis-core/src/cothis/tools/mcp.py",
         "kind": "shape_guard",
         "boundary": "group.tools",
         "shape_check_regex": r"isinstance\([^)]*tools[^)]*,\s*dict\)",
@@ -51,7 +51,7 @@ _BOUNDARY_SITES = [
     },
     {
         "id": "slash.register",
-        "file": "src/cothis/slash.py",
+        "file": "packages/cothis-core/src/cothis/slash.py",
         "kind": "registry_overwrite",
         "boundary": "_entries",
         "collision_check_regex": r"if\s+name\s+in\s+_entries",
@@ -60,7 +60,7 @@ _BOUNDARY_SITES = [
     },
     {
         "id": "agent._tool_map",
-        "file": "src/cothis/agent.py",
+        "file": "packages/cothis-core/src/cothis/agent.py",
         "kind": "registry_overwrite",
         "boundary": "self._tool_map",
         "collision_check_regex": r"if\s+key\s+in\s+self\._tool_map",

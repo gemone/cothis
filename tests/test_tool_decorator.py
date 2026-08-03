@@ -660,7 +660,7 @@ def test_load_python_tools_discovers_single_file(tmp_path: Any) -> None:
     from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "greet.py").write_text(
-        'from cothis import tool\n\n@tool("test.greet")\n'
+        'from cothis.tools import tool\n\n@tool("test.greet")\n'
         'def greet(name: str) -> str:\n    """Greet."""\n    return f"hi {name}"\n',
         encoding="utf-8",
     )
@@ -677,7 +677,7 @@ def test_load_python_tools_discovers_package(tmp_path: Any) -> None:
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text(
-        'from cothis import tool\n\n@tool("pkg.tool")\n'
+        'from cothis.tools import tool\n\n@tool("pkg.tool")\n'
         'def t(x: str) -> str:\n    """T."""\n    return x\n',
         encoding="utf-8",
     )
@@ -697,7 +697,7 @@ def test_load_python_tools_import_failure_doesnt_crash(
     (tmp_path / "broken.py").write_text("import nonexistent_module\n", encoding="utf-8")
     # A valid file alongside the broken one should still load.
     (tmp_path / "good.py").write_text(
-        'from cothis import tool\n\n@tool("good")\n'
+        'from cothis.tools import tool\n\n@tool("good")\n'
         'def g() -> str:\n    """G."""\n    return "ok"\n',
         encoding="utf-8",
     )
@@ -733,7 +733,7 @@ def test_load_python_tools_ignores_non_tooldef_attributes(
     from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "mixed.py").write_text(
-        "from cothis import tool\n\n"
+        "from cothis.tools import tool\n\n"
         "CONSTANT = 42\n"
         "def helper():\n    pass\n\n"
         '@tool("real.tool")\n'
@@ -760,7 +760,7 @@ def test_loader_discovers_tool_with_pre_load_hooks(tmp_path: Any) -> None:
     from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "t.py").write_text(
-        "from cothis import tool\n\n"
+        "from cothis.tools import tool\n\n"
         "calls = []\n\n"
         '@tool("t")\n'
         'def t() -> str:\n    """T."""\n    return "ok"\n\n'
@@ -889,7 +889,7 @@ def test_no_hooks_registered_loads_normally(tmp_path: Any) -> None:
     from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "t.py").write_text(
-        "from cothis import tool\n\n"
+        "from cothis.tools import tool\n\n"
         '@tool("plain")\n'
         'def t(x: str) -> str:\n    """Plain."""\n    return x\n',
         encoding="utf-8",
@@ -1196,12 +1196,12 @@ def test_python_duplicate_names_detected(tmp_path: Any) -> None:
     from cothis.tools.core import load_tools_from_layer
 
     (tmp_path / "a.py").write_text(
-        'from cothis import tool\n@tool("dup")\n'
+        'from cothis.tools import tool\n@tool("dup")\n'
         'def a() -> str:\n    """A."""\n    return "a"\n',
         encoding="utf-8",
     )
     (tmp_path / "b.py").write_text(
-        'from cothis import tool\n@tool("dup")\n'
+        'from cothis.tools import tool\n@tool("dup")\n'
         'def b() -> str:\n    """B."""\n    return "b"\n',
         encoding="utf-8",
     )
@@ -1225,7 +1225,7 @@ def test_cross_format_same_layer_duplicate_raises(tmp_path: Any) -> None:
         'name: dup\ncommand: ["echo", "yaml"]\n', encoding="utf-8"
     )
     (tmp_path / "p.py").write_text(
-        'from cothis import tool\n@tool("dup")\n'
+        'from cothis.tools import tool\n@tool("dup")\n'
         'def p() -> str:\n    """P."""\n    return "py"\n',
         encoding="utf-8",
     )

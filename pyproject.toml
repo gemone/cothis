@@ -1,38 +1,8 @@
-[project]
-name = "cothis"
-version = "0.1.0"
-description = "A complete coding agent."
-readme = "README.md"
-license = "Apache-2.0"
-license-files = ["LICENSE"]
-authors = [
-    { name = "gemo", email = "git@gemo.one" }
-]
-requires-python = ">=3.14"
-dependencies = [
-    "anthropic>=0.40.0",
-    "openai>=1.50.0",
-    "google-genai>=0.3.0",
-    "anyio>=4.0",  # direct dep: cothis.ws + cothis.worker use fail_after/Event (#248)
-    "filelock>=3.13",
-    "griffe>=2.1.0",
-    "mcp>=1.28.1",
-    "pathspec>=0.12.1",
-    "prompt-toolkit>=3.0",
-    "pydantic>=2.13.4",
-    "pyyaml>=6.0.3",
-    "rich>=15.0.0",
-    "textual>=0.47.0",
-    "typer>=0.25.1",
-    "websockets>=13.0",
-]
+[tool.uv.workspace]
+members = ["packages/*"]
 
-[project.scripts]
-cothis = "cothis.cli:main"
-
-[build-system]
-requires = ["uv_build>=0.11.7,<0.12.0"]
-build-backend = "uv_build"
+[tool.uv]
+package = false
 
 [dependency-groups]
 dev = [
@@ -46,6 +16,9 @@ dev = [
 
 [tool.ruff.lint]
 select = ["I", "TC", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cothis"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
