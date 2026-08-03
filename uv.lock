@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 members = [
     "cothis-ai",
     "cothis-core",
+    "cothis-protocol",
 ]
 
 [manifest.dependency-groups]
@@ -203,6 +204,7 @@ version = "0.1.0"
 source = { editable = "packages/cothis-core" }
 dependencies = [
     { name = "anyio" },
+    { name = "cothis-protocol" },
     { name = "filelock" },
     { name = "griffe" },
     { name = "mcp" },
@@ -219,6 +221,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.0" },
+    { name = "cothis-protocol", editable = "packages/cothis-protocol" },
     { name = "filelock", specifier = ">=3.13" },
     { name = "griffe", specifier = ">=2.1.0" },
     { name = "mcp", specifier = ">=1.28.1" },
@@ -229,6 +232,23 @@ requires-dist = [
     { name = "rich", specifier = ">=15.0.0" },
     { name = "textual", specifier = ">=0.47.0" },
     { name = "typer", specifier = ">=0.25.1" },
+    { name = "websockets", specifier = ">=13.0" },
+]
+
+[[package]]
+name = "cothis-protocol"
+version = "0.1.0"
+source = { editable = "packages/cothis-protocol" }
+dependencies = [
+    { name = "anyio" },
+    { name = "pydantic" },
+    { name = "websockets" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyio", specifier = ">=4.0" },
+    { name = "pydantic", specifier = ">=2.13.4" },
     { name = "websockets", specifier = ">=13.0" },
 ]
 

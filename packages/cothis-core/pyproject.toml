@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 license = "Apache-2.0"
 dependencies = [
     "anyio>=4.0",
+    "cothis-protocol",
     "filelock>=3.13",
     "griffe>=2.1.0",
     "mcp>=1.28.1",
@@ -32,3 +33,4 @@ namespace = true
 
 [tool.uv.sources]
 cothis-ai = { workspace = true }
+cothis-protocol = { workspace = true }
