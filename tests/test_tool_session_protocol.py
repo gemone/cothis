@@ -110,8 +110,6 @@ def test_session_handler_receives_session_result_args() -> None:
     """Handler gets (session, result, args) when called from _execute_tool."""
     from unittest.mock import MagicMock
 
-    import any_llm
-
     handler_calls: list[tuple[Any, str, dict[str, Any]]] = []
 
     @tool(inject_session=True)

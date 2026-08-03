@@ -4,7 +4,7 @@ The decorator is the schema-fidelity surface for Python tools: it parses a
 Google-style docstring (``griffe``) + ``inspect.signature`` and builds an
 OpenAI-format schema carrying per-arg descriptions. If the parsing or schema
 construction drifts, the LLM silently sees generic descriptions (the same
-lossy behaviour as ``any-llm``'s ``callable_to_tool``) — defeating the
+lossy behaviour as a naive ``callable_to_tool`` would) — defeating the
 decorator's reason for existing.
 
 Covers:
@@ -147,9 +147,7 @@ def test_multiline_description_collapsed() -> None:
         """
         return ""
 
-    desc = read.__cothis_schema__["input_schema"]["properties"]["path"][
-        "description"
-    ]
+    desc = read.__cothis_schema__["input_schema"]["properties"]["path"]["description"]
     assert "Relative paths are resolved" in desc
     # No stray newlines in the collapsed description.
     assert "\n" not in desc
@@ -911,13 +909,9 @@ async def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None
     """ "Multiple ``pre_execute`` callbacks form a pipeline (A's output feeds B)."""
     from unittest.mock import MagicMock
 
-    import any_llm
-
     from cothis.agent import Agent
 
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     agent = Agent(model="x", provider="openrouter", tools=[])
 
     @tool("pipe")
@@ -939,7 +933,10 @@ async def test_pre_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> None
     agent._tool_map["pipe"] = echo
     tu = {"name": "pipe", "input": {"x": "start"}}
     is_error, result = await agent._execute_tool(tu)
-    assert (is_error, result) == (False, "start-A-B")  # both pre_execute callbacks ran in order
+    assert (is_error, result) == (
+        False,
+        "start-A-B",
+    )  # both pre_execute callbacks ran in order
 
 
 @pytest.mark.asyncio
@@ -949,13 +946,9 @@ async def test_pre_execute_exception_short_circuits_and_returns_error(
     """ "``pre_execute`` raising short-circuits; error string returned to LLM."""
     from unittest.mock import MagicMock
 
-    import any_llm
-
     from cothis.agent import Agent
 
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     agent = Agent(model="x", provider="openrouter", tools=[])
 
     @tool("guarded")
@@ -979,13 +972,9 @@ async def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> No
     """ "Multiple ``after_execute`` callbacks form a pipeline on result."""
     from unittest.mock import MagicMock
 
-    import any_llm
-
     from cothis.agent import Agent
 
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     agent = Agent(model="x", provider="openrouter", tools=[])
 
     @tool("transform")
@@ -1005,7 +994,10 @@ async def test_after_execute_pipeline_multiple_callbacks(monkeypatch: Any) -> No
     agent._tool_map["transform"] = base
     tu = {"name": "transform", "input": {}}
     is_error, result = await agent._execute_tool(tu)
-    assert (is_error, result) == (False, "HELLO!")  # both after_execute callbacks ran in order
+    assert (is_error, result) == (
+        False,
+        "HELLO!",
+    )  # both after_execute callbacks ran in order
 
 
 @pytest.mark.asyncio
@@ -1013,13 +1005,9 @@ async def test_after_execute_exception_uses_original_result(monkeypatch: Any) ->
     """ "``after_execute`` raising uses the original result (don't hide output)."""
     from unittest.mock import MagicMock
 
-    import any_llm
-
     from cothis.agent import Agent
 
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     agent = Agent(model="x", provider="openrouter", tools=[])
 
     @tool("safe")
@@ -1043,13 +1031,9 @@ async def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
     """ "Tool body exception fires ``on_error`` with phase='tool'."""
     from unittest.mock import MagicMock
 
-    import any_llm
-
     from cothis.agent import Agent
 
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     agent = Agent(model="x", provider="openrouter", tools=[])
 
     errors = []
@@ -1076,13 +1060,9 @@ async def test_on_error_at_execute_phase_correct(monkeypatch: Any) -> None:
     """ "``on_error`` phase is 'pre_execute' when pre_execute raises."""
     from unittest.mock import MagicMock
 
-    import any_llm
-
     from cothis.agent import Agent
 
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     agent = Agent(model="x", provider="openrouter", tools=[])
 
     errors = []
@@ -1111,13 +1091,9 @@ async def test_no_hooks_execute_baseline_unchanged(monkeypatch: Any) -> None:
     """ "A tool with no execute hooks dispatches exactly as before."""
     from unittest.mock import MagicMock
 
-    import any_llm
-
     from cothis.agent import Agent
 
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     agent = Agent(model="x", provider="openrouter", tools=[])
 
     @tool("plain")
@@ -1282,6 +1258,7 @@ def test_no_duplicate_names_loads_normally(tmp_path: Any) -> None:
 def test_schema_union_two_types_emits_anyof() -> None:
     """A genuine multi-type union (``str | list[str]``) must reach the
     LLM schema as ``anyOf`` — not collapse to its first member."""
+
     @tool("multi")
     def multi(path: str | list[str]) -> str:
         """Multi.
@@ -1301,6 +1278,7 @@ def test_schema_union_two_types_emits_anyof() -> None:
 def test_schema_optional_unwrap_still_works() -> None:
     """``Optional[X]`` (one non-None member) still unwraps to ``X`` —
     regression check on the union-collapse fix."""
+
     @tool("opt")
     def opt(x: int | None = None) -> str:
         """Opt.
@@ -1317,6 +1295,7 @@ def test_schema_optional_unwrap_still_works() -> None:
 
 def test_schema_pep604_optional_unwrap_still_works() -> None:
     """``X | None`` (PEP 604 form) also unwraps to ``X``."""
+
     @tool("pep604")
     def pep604(name: str | None = None) -> str:
         """Pep604.

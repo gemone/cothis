@@ -9,7 +9,7 @@ model's own ``max_output_tokens``, which litellm publishes in
 runtime, no extra dependency.
 
 cothis: matching is exact-key only (``model``, then ``{provider}/{model}``).
-litellm provider names diverge from any-llm's (e.g. ``together_ai`` vs
+litellm provider names diverge from cothis's (e.g. ``together_ai`` vs
 ``together``), so we deliberately do NOT fuzzy-match on the
 ``litellm_provider`` field — a mismatch falls back to ``_FALLBACK_MAX_TOKENS``
 and the user overrides via ``--max-tokens`` / ``COTHIS_MAX_TOKENS``. Upgrade

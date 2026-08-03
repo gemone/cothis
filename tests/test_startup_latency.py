@@ -33,10 +33,21 @@ _SRC_ROOT = _REPO_ROOT / "src" / "cothis"
 
 # Third-party packages the project depends on (pyproject.toml + their
 # transitive module names). Stdlib imports are exempt.
-_THIRD_PARTY_MODULES = frozenset({
-    "any_llm", "anthropic", "click", "filelock", "griffe", "mcp",
-    "pathspec", "prompt_toolkit", "pydantic", "rich", "typer", "yaml",
-})
+_THIRD_PARTY_MODULES = frozenset(
+    {
+        "anthropic",
+        "click",
+        "filelock",
+        "griffe",
+        "mcp",
+        "pathspec",
+        "prompt_toolkit",
+        "pydantic",
+        "rich",
+        "typer",
+        "yaml",
+    }
+)
 
 _COST_MARKER = re.compile(r"#\s*cost:\s*~(\d+)\s*ms")
 
@@ -130,7 +141,10 @@ def test_cothis_help_under_startup_budget() -> None:
 
 
 def _full_lines(path: Path) -> dict[int, str]:
-    return {i + 1: line for i, line in enumerate(path.read_text(encoding="utf-8").splitlines())}
+    return {
+        i + 1: line
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines())
+    }
 
 
 def _is_deferred(tree: ast.Module, target_lineno: int) -> bool:
@@ -139,12 +153,8 @@ def _is_deferred(tree: ast.Module, target_lineno: int) -> bool:
         if isinstance(node, ast.If):
             test = node.test
             is_type_checking = (
-                (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING")
-                or (
-                    isinstance(test, ast.Constant)
-                    and test.value is False
-                )
-            )
+                isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"
+            ) or (isinstance(test, ast.Constant) and test.value is False)
             if not is_type_checking:
                 continue
             for child in ast.walk(node):
@@ -262,8 +272,11 @@ def test_prompt_toolkit_not_imported_at_cli_startup() -> None:
     order-dependent on whatever else the suite imported).
     """
     result = subprocess.run(
-        [sys.executable, "-c",
-         "import sys, cothis.cli; print('prompt_toolkit' in sys.modules)"],
+        [
+            sys.executable,
+            "-c",
+            "import sys, cothis.cli; print('prompt_toolkit' in sys.modules)",
+        ],
         capture_output=True,
         text=True,
         cwd=str(_REPO_ROOT),

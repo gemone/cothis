@@ -475,11 +475,7 @@ async def test_inflight_balanced_when_repr_raises(
     """
     from unittest.mock import MagicMock
 
-    import any_llm
-
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
 
     from cothis.agent import Agent
 

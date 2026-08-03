@@ -1,11 +1,14 @@
 # cothis
 
-A complete coding agent built on top of
-[`any-llm`](https://github.com/mozilla-ai/any-llm) — talk to any LLM
-provider through a single interface, with a small ReAct-style loop that
-call tools. Built-in tools are `fs.read`, `fs.list`, `fs.search`, `fs.create`, `fs.modify`, and `fs.delete`; you
+A complete coding agent that talks to LLM providers through their direct
+SDKs — Anthropic, OpenAI, Google (Gemini), and OpenRouter (via the OpenAI
+SDK) — with a small ReAct-style loop that calls tools. Built-in tools are `fs.read`, `fs.list`, `fs.search`, `fs.create`, `fs.modify`, and `fs.delete`; you
 can add more as YAML shell tools, Python `@tool` functions, or MCP servers
 under `.agents/tools/` (see [Custom tools](#custom-tools)).
+
+> **Architecturally inspired by [pi](https://github.com/earendil-works/pi).**
+> cothis reuses pi's separation of an AI provider layer from the agent
+> loop, translated to idiomatic Python and direct provider SDKs.
 
 - `cothis ask "..."` — one-shot prompt, plain-text output (pipe-friendly).
 - `cothis chat` — interactive multi-turn session in the Textual TUI (3-pane layout, worktree-aware sessions, `--legacy` for the old REPL).
@@ -252,7 +255,7 @@ Built-in tools (`fs.read`, `fs.list`, `fs.create`, `fs.modify`, `fs.delete`) are
 `@tool` decorator. It reads a Google-style docstring (summary → tool
 description, `Args:` → per-arg descriptions) and `inspect.signature`
 (types + defaults), then pre-builds an OpenAI schema so descriptions
-reach the LLM (bypassing any-llm's lossy `callable_to_tool`).
+reach the LLM (bypassing the cothis.ai schema path).
 
 ```python
 from cothis import tool
@@ -426,13 +429,13 @@ All hooks are optional. A tool with no hooks dispatches exactly as before.
 
 All configuration is via environment variables. The provider/model
 pair controls *which* LLM you hit; the matching `*_API_KEY` env var is
-read automatically by `any-llm` based on the chosen provider.
+read by cothis's provider layer based on the chosen provider.
 
 ### cothis
 
 | Variable                   | Purpose                                   | Default                |
 | -------------------------- | ----------------------------------------- | ---------------------- |
-| `COTHIS_PROVIDER`          | any-llm provider key (see table below).   | `openrouter`           |
+| `COTHIS_PROVIDER`          | provider key (see table below).   | `openrouter`           |
 | `COTHIS_MODEL`             | Model identifier for the chosen provider. | `openai/gpt-oss-120b`  |
 | `COTHIS_MAX_TOKENS`        | Override the output-token cap (otherwise resolved per-model from bundled litellm metadata). | *(unset)* |
 | `COTHIS_TOOL_OUTPUT_FORMAT`| How `dict`/`list` tool results are serialised: `json`, `csv`, `tsv`, `yaml`. `str` results bypass this. | `json` |
@@ -451,7 +454,7 @@ over env vars, which take precedence over defaults.
 
 ### API keys
 
-`any-llm` reads the API key for the active provider from a well-known
+cothis reads the API key for the active provider from a well-known
 env var. Set the one that matches your `COTHIS_PROVIDER`:
 
 ```bash
@@ -471,12 +474,19 @@ export COTHIS_MODEL=gpt-4.1-mini
 
 ## Supported providers
 
-cothis can talk to any provider supported by
-[`any-llm`](https://docs.mozilla.ai/providers) — OpenAI, Anthropic,
-Mistral, OpenRouter, Ollama, Gemini, Groq, and many more.
+cothis talks to four providers through their direct SDKs:
 
-For the full list and each provider's API key env var / capabilities,
-see the [any-llm providers page](https://docs.mozilla.ai/providers).
+| Provider key  | SDK              | API key env var        | Notes |
+| ------------- | ---------------- | ---------------------- | ----- |
+| `anthropic`   | `anthropic`      | `ANTHROPIC_API_KEY`    | Native Messages API — pass-through, no translation. |
+| `openai`      | `openai`         | `OPENAI_API_KEY`       | Chat Completions; messages + tool schemas translated to/from the Anthropic shape. |
+| `google`      | `google-genai`   | `GOOGLE_API_KEY`       | Gemini via the unified Google GenAI SDK. |
+| `openrouter`  | `openai` (base URL override) | `OPENROUTER_API_KEY` | Default provider; any OpenRouter model id (e.g. `openai/gpt-oss-120b`). |
+| `mistral`     | `openai` (base URL override) | `MISTRAL_API_KEY`    | OpenAI-compatible; routed through the OpenAI provider with Mistral's base URL. |
+
+Each provider normalises its stream into the Anthropic Messages event
+shape internally (see `src/cothis/ai/`), so the agent loop is
+provider-agnostic.
 
 
 ## Model metadata
@@ -503,7 +513,7 @@ the Actions tab). When litellm's source changes, the workflow opens a PR
 against `src/cothis/data/model_prices.json`; no PR when there's no diff.
 
 **Known ceiling**: litellm's `litellm_provider` field names diverge from
-any-llm's provider keys (e.g. `together_ai` vs `together`). cothis does
+cothis's provider keys (e.g. `together_ai` vs `together`). cothis does
 not fuzzy-match on provider, so a model whose only key in litellm is
 provider-prefixed under a *different* name resolves to the 8192
 fallback. Override with `--max-tokens` in that case.

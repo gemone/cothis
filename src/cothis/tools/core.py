@@ -199,8 +199,8 @@ def tool(
 
     Returns a ``ToolDef`` instance that wraps the function. ``ToolDef``
     satisfies the ``Tool`` Protocol (``__name__`` + ``__call__``) and carries
-    a pre-built Anthropic-shape tool schema on ``__cothis_schema__`` (bypassing any-llm's
-    lossy ``callable_to_tool``, which drops per-parameter ``description``
+    a pre-built Anthropic-shape tool schema on ``__cothis_schema__`` (bypassing the
+    cothis.ai schema path, which drops per-parameter ``description``
     fields). It also exposes the five lifecycle hook decorators
     (``.pre_load()`` / ``.after_load()`` / ``.pre_execute()`` /
     ``.after_execute()`` / ``.on_error()``) — see CONTEXT.md "Tool lifecycle".
@@ -512,7 +512,7 @@ class ToolDef(_HookableTool):
 
     Produced by the ``@tool`` decorator. Wraps a function with:
     - ``__name__`` / ``__doc__`` / ``__signature__`` / ``__cothis_schema__`` —
-      the surface the ``Tool`` protocol + any-llm expect.
+      the surface the ``Tool`` protocol + cothis.ai expect.
     - ``__call__(**args)`` — delegates to the wrapped function.
     - Five hook-decorator methods (inherited from ``_HookableTool``) — register
       callbacks into an ordered list per stage. Callbacks are stored here but
@@ -738,9 +738,9 @@ def schema_for(tool: Tool) -> dict[str, Any]:
     """Return ``tool``'s schema in Anthropic tool shape (``{name, description, input_schema}``).
 
     Tools carrying a pre-built Anthropic-shape schema on ``__cothis_schema__``
-    (so per-arg ``description:`` text reaches the model — any-llm's
-    ``callable_to_tool`` would strip it) return that dict; ``Agent`` passes it
-    straight to ``any_llm.amessages``. A bare callable without the attribute
+    (so per-arg ``description:`` text reaches the model — the cothis.ai
+    schema path would strip it) return that dict; ``Agent`` passes it
+    straight to ``amessages``. A bare callable without the attribute
     gets a schema built on the spot via ``_build_schema`` (same path
     ``@tool`` uses) — ``amessages`` validates ``tools: list[dict]``, so
     returning a raw callable would ``ValidationError`` at send time.

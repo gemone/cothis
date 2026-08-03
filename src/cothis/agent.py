@@ -1,4 +1,4 @@
-"""An agent loop built on top of any-llm.
+"""An agent loop built on the cothis.ai layer.
 
 The loop is the standard ReAct-style cycle:
 
@@ -30,13 +30,13 @@ from typing import TYPE_CHECKING, Any, cast
 # cothis: the Anthropic stream-event types (``RawMessageStartEvent`` etc.)
 # and ``TextDelta`` are imported lazily inside ``Agent.run_stream`` instead
 # of at module top. The ``anthropic`` SDK pulls in ``anthropic.lib.vertex``
-# and ``anthropic.lib.bedrock`` on first import (~1s); ``any_llm.types.messages``
+# and ``anthropic.lib.bedrock`` on first import (~1s); ``cothis.ai._types``
 # hard-imports ``anthropic.types`` at top level (~1.5s more). Deferring both
 # to the first real LLM call keeps ``cothis --help`` / non-LLM paths from
 # paying ~2.5s of SDK load. The ``isinstance`` dispatch in ``run_stream``
 # is how ty narrows the ``MessageStreamEvent`` union (it can't narrow by
 # string ``event.type`` comparison). The union is itself just these
-# anthropic SDK classes (any-llm re-exports them).
+# anthropic SDK classes (cothis.ai re-exports them).
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr  # cost: ~5ms
 
 # cothis: ``Tool`` must be runtime-imported (not TYPE_CHECKING-only) because
@@ -67,9 +67,8 @@ from cothis.tools.mcp import MCPSessionHandle
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from any_llm import AnyLLM
-    from any_llm.types.messages import MessageResponse, MessageStreamEvent
-
+    from cothis.ai import AIProvider
+    from cothis.ai._types import MessageResponse, MessageStreamEvent
     from cothis.session import Session
 
 
@@ -655,7 +654,7 @@ def _coalesce_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
     Reasoning-capable providers (e.g. ``gpt-oss-120b`` on openrouter) emit
     ``reasoning`` and ``content`` as **mutually exclusive** per chunk: while
     reasoning, ``delta.content == ""`` (explicit "no text right now"); while
-    answering, ``delta.reasoning`` is absent. any-llm's OpenAI→Messages
+    answering, ``delta.reasoning`` is absent. the AI layer's OpenAI→Messages
     stream converter, however, opens a text-block lifecycle on any chunk
     where ``delta.content is not None`` — so each reasoning chunk opens and
     closes an empty ``text`` block, and the resulting assistant message
@@ -674,9 +673,10 @@ def _coalesce_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
     cothis: ``thinking`` signatures are not preserved across merges — this
     slice does not pass the ``thinking`` param, so Anthropic doesn't validate
     them on the way back, and other providers' reasoning blocks never carry
-    a real signature anyway. The proper fix is upstream (any-llm should use
-    ``if delta.content:`` rather than ``if delta.content is not None:``);
-    this is cothis's defensive layer so the agent works regardless.
+    a real signature anyway. The empty-text-block root cause is already
+    fixed in ``cothis.ai`` (``openai.py`` uses a truthiness ``if
+    content_piece:`` check rather than ``is not None``); this defensive
+    layer remains for robustness so the agent works regardless of provider.
     """
     out: list[dict[str, Any]] = []
     for block in content:
@@ -707,14 +707,14 @@ def _coalesce_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class Agent(BaseModel):
-    """A minimal ReAct-style agent loop over any-llm.
+    """A minimal ReAct-style agent loop over the cothis.ai layer.
 
     Parameters
     ----------
     model:
         Model identifier, e.g. ``"mistral-small-latest"``.
     provider:
-        any-llm provider key, e.g. ``"mistral"``, ``"openai"``, ``"anthropic"``.
+        provider key, e.g. ``"mistral"``, ``"openai"``, ``"anthropic"``.
     tools:
         Python callables the agent can invoke. ``@tool``-decorated functions,
         YAML tools, and MCP tools carry a pre-built Anthropic-shape schema;
@@ -732,7 +732,7 @@ class Agent(BaseModel):
         ``amessages`` call (see ``cothis.model_metadata``); an explicit int
         wins. CLI users set this via ``--max-tokens`` / ``COTHIS_MAX_TOKENS``.
     api_key / api_base:
-        Forwarded to ``AnyLLM.create``. Default to the provider's env vars.
+        Forwarded to ``cothis.ai.get_provider``. Default to the provider's env vars.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -753,7 +753,7 @@ class Agent(BaseModel):
     preactivate_skills: list[str] = Field(default_factory=list)
 
     # Runtime-only state: not validated, not serialised.
-    _llm: AnyLLM = PrivateAttr()
+    _llm: AIProvider = PrivateAttr()
     _tool_map: dict[str, Tool] = PrivateAttr(default_factory=dict)
     # Anthropic-shaped message dicts (user/assistant only). Assistant dicts
     # carry response metadata (id/model/stop_reason/usage); ``_request_messages``
@@ -787,9 +787,9 @@ class Agent(BaseModel):
     _bus: NotifyBus | None = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
-        from any_llm import AnyLLM
+        from cothis.ai import get_provider
 
-        self._llm = AnyLLM.create(
+        self._llm = get_provider(
             self.provider,
             api_key=self.api_key,
             api_base=self.api_base,
@@ -979,8 +979,8 @@ class Agent(BaseModel):
                 "calling X" → X runs → "calling Y" → Y runs in order.
 
         The accumulator consumes the Anthropic stream-event union directly
-        (any-llm synthesises these events from OpenAI chunks for non-Anthropic
-        providers via ``messages_compat``): block state is seeded from
+        (cothis.ai synthesises these events from OpenAI chunks for non-Anthropic
+        providers): block state is seeded from
         ``ContentBlockStartEvent.content_block``, mutated by per-block deltas
         (``TextDelta``/``ThinkingDelta`` append, ``SignatureDelta`` overwrites,
         ``InputJSONDelta`` accumulates then parses at block stop). The turn
@@ -1009,8 +1009,8 @@ class Agent(BaseModel):
             RawMessageDeltaEvent,
             RawMessageStartEvent,
             RawMessageStopEvent,
+            TextDelta,
         )
-        from any_llm.types.messages import TextDelta
 
         tool_schemas = self._tool_schemas()
         model = self.model

@@ -26,6 +26,8 @@ from unittest.mock import MagicMock
 
 import pytest
 from anthropic.types import (
+    InputJSONDelta,
+    MessageDeltaUsage,
     RawContentBlockDeltaEvent,
     RawContentBlockStartEvent,
     RawContentBlockStopEvent,
@@ -33,21 +35,21 @@ from anthropic.types import (
     RawMessageStartEvent,
     RawMessageStopEvent,
     SignatureDelta,
-    ThinkingBlock,
-    ThinkingDelta,
-)
-from anthropic.types.message import Message
-from anthropic.types.raw_message_delta_event import Delta
-from any_llm.types.messages import (
-    InputJSONDelta,
-    MessageDeltaUsage,
-    MessageResponse,
-    MessageUsage,
     StopReason,
     TextBlock,
     TextDelta,
+    ThinkingBlock,
+    ThinkingDelta,
     ToolUseBlock,
 )
+from anthropic.types import (
+    Message as MessageResponse,
+)
+from anthropic.types import (
+    Usage as MessageUsage,
+)
+from anthropic.types.message import Message
+from anthropic.types.raw_message_delta_event import Delta
 from pydantic import ValidationError
 
 from cothis.agent import (
@@ -188,11 +190,6 @@ def test_init_warns_on_sanitised_key_collision(
 ) -> None:
     """Two names sanitising to the same wire key (``fs.read`` vs ``fs_read``)
     must log a WARNING; last-write-wins matches dict semantics."""
-    import any_llm
-
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
     class _ToolA:
         __name__ = "fs.read"
 
@@ -206,6 +203,7 @@ def test_init_warns_on_sanitised_key_collision(
             return "b"
 
     tool_a, tool_b = _ToolA(), _ToolB()
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     with caplog.at_level(logging.WARNING, logger="cothis.agent"):
         agent = Agent(model="x", provider="openrouter", tools=[tool_a, tool_b])
     assert agent._tool_map == {"fs_read": tool_b}  # last-write-wins
@@ -449,11 +447,7 @@ def test_finalized_blocks_match_naive_concat() -> None:
 
 
 def _patched_agent(monkeypatch: pytest.MonkeyPatch) -> Agent:
-    import any_llm
-
-    monkeypatch.setattr(
-        any_llm.AnyLLM, "create", staticmethod(lambda *a, **kw: MagicMock())
-    )
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
     return Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
 
 
@@ -735,7 +729,7 @@ def test_run_max_tokens_mid_tool_call_executes_tool_not_poisons_session(
 # --- run_stream -------------------------------------------------------------
 #
 # Stream fixtures use the real anthropic SDK ``Raw*Event`` pydantic models
-# (any-llm re-exports them as ``MessageStreamEvent``): ``run_stream`` narrows
+# (cothis.ai re-exports them as ``MessageStreamEvent``): ``run_stream`` narrows
 # the union by ``isinstance``, so SimpleNamespace envelopes would never match.
 
 
@@ -1115,7 +1109,7 @@ async def test_run_stream_coalesces_fragmented_assistant_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """REGRESSION: gpt-oss-120b interleaves reasoning/text per chunk, and
-    any-llm's OpenAI→Messages stream converter opens a NEW content block on
+    the AI layer's OpenAI→Messages stream converter opens a NEW content block on
     every reasoning→text transition. The result is an assistant message with
     dozens of tiny ``thinking`` fragments interleaved with empty ``text``
     blocks. When that malformed message is replayed on the next turn, some
