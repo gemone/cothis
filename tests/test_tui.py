@@ -245,10 +245,11 @@ async def test_append_delta_segmented_streaming_is_linear_not_quadratic() -> Non
     is bounded by ``deltas_per_segment × chunk_size``, so total work is
     linear in N × chunk_size.
 
-    Threshold 3.5× leaves headroom for CI runner variance + Textual's
-    per-widget layout overhead (which grows linearly with conversation
-    length). A pre-fix regression to true O(N²) gives ~4× on this
-    workload — the threshold catches that while not flaking on overhead.
+    A 4× workload (400 vs 1600 deltas) widens the gap between a healthy
+    linear implementation (~4-6×) and a true O(N²) regression (~16×), so
+    the threshold has wide headroom for CI runner variance + Textual's
+    per-widget layout overhead without flaking, while still catching
+    quadratic accumulation.
     """
     import time
 
@@ -267,14 +268,15 @@ async def test_append_delta_segmented_streaming_is_linear_not_quadratic() -> Non
             await pilot.pause()
             return time.perf_counter() - t0
 
-    # Two workloads: 200 deltas vs 400 deltas, flushing every 50.
-    # Larger flush interval → per-segment buffer cost dominates over
-    # per-widget mount overhead, isolating the regression we're guarding.
-    t_small = await _run(200, flush_every=50)
-    t_large = await _run(400, flush_every=50)
+    # Two workloads: 400 deltas vs 1600 deltas (4× workload), flushing
+    # every 50. A 4× workload separates linear (~4-6×) from O(N²) (~16×)
+    # far more clearly than 2×, so CI runner variance can't push a healthy
+    # linear impl over the threshold.
+    t_small = await _run(400, flush_every=50)
+    t_large = await _run(1600, flush_every=50)
     ratio = t_large / t_small if t_small > 0 else float("inf")
-    assert ratio <= 3.5, (
-        f"expected ≤3.5× slowdown on 2× workload (linear + overhead); "
+    assert ratio <= 8.0, (
+        f"expected ≤8.0× slowdown on 4× workload (linear + overhead); "
         f"got {ratio:.2f}× (small={t_small*1000:.1f}ms, large={t_large*1000:.1f}ms) — "
         f"buffer is accumulating O(N²) work somewhere"
     )
