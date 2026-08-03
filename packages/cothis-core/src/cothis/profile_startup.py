@@ -91,7 +91,7 @@ def _format_for_test(rows: list[tuple[int, int, str]]) -> str:
 
 
 def _main(argv: Any = None) -> None:
-    """CLI entry: ``python -m cothis._profile_startup``."""
+    """CLI entry: ``python -m cothis.profile_startup``."""
     rows = _measure()
     _print_top(rows)
 

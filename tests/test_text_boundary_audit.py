@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-_SRC_ROOT = Path(__file__).parent.parent / "src" / "cothis"
+_SRC_ROOT = Path(__file__).parent.parent / "packages"
 
 # Files exempted from rule 3 (not file-content mutation paths).
 # ``format.py`` legitimately emits ``"\\n"`` in output separators

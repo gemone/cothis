@@ -21,7 +21,7 @@ from pathlib import Path
 def _core_source() -> str:
     path = (
         Path(__file__).resolve().parent.parent
-        / "src" / "cothis" / "tools" / "core.py"
+        / "packages" / "cothis-core" / "src" / "cothis" / "tools" / "core.py"
     )
     return path.read_text(encoding="utf-8")
 

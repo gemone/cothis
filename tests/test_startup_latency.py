@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).parent.parent
-_SRC_ROOT = _REPO_ROOT / "src" / "cothis"
+_SRC_ROOT = _REPO_ROOT / "packages" / "cothis-core" / "src" / "cothis"
 
 # Third-party packages the project depends on (pyproject.toml + their
 # transitive module names). Stdlib imports are exempt.
@@ -55,7 +55,6 @@ _COST_MARKER = re.compile(r"#\s*cost:\s*~(\d+)\s*ms")
 # path. New files enter this list only when they're imported by one of
 # these three (transitively, during startup).
 _STARTUP_PATH_FILES = (
-    _SRC_ROOT / "__init__.py",
     _SRC_ROOT / "cli.py",
     _SRC_ROOT / "agent.py",
 )
@@ -94,7 +93,7 @@ def _run_subprocess_ms(code: str) -> float:
             # Ensure the subprocess imports THIS checkout, not an
             # installed copy. uv-run sets PYTHONPATH already, but be
             # explicit so a bare pytest invocation matches.
-            "PYTHONPATH": str(_REPO_ROOT / "src"),
+            "PYTHONPATH": os.pathsep.join([str(_REPO_ROOT / "packages" / "cothis-core" / "src"), str(_REPO_ROOT / "packages" / "cothis-ai" / "src")]),
         },
     )
     return (time.perf_counter() - t) * 1000

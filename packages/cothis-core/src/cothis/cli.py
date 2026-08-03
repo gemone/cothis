@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 # If COTHIS_PROFILE_STARTUP is set, re-exec under -X importtime and exit
 # before any third-party import runs. Imports only stdlib so the
 # measurement cost is negligible when the flag is unset.
-from cothis._profile_startup import maybe_profile
+from cothis.profile_startup import maybe_profile
 
 maybe_profile()
 

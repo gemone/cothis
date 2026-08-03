@@ -12,7 +12,7 @@ Run::
 
 from pathlib import Path
 
-from cothis import tool
+from cothis.tools import tool
 
 _CODE_LINES_DESCRIPTION = """Count lines of code in a file.
 

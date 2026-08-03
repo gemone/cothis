@@ -335,7 +335,7 @@ def test_pre_load_false_on_winner_empties_slot_no_fallback(
     project = tmp_path / "project"
     project.mkdir()
     (project / "blocked.py").write_text(
-        "from cothis import tool\n\n"
+        "from cothis.tools import tool\n\n"
         '@tool("shared.tool")\n'
         'def t() -> str:\n    """T."""\n    return "proj"\n\n'
         "@t.pre_load()\n"
@@ -392,7 +392,7 @@ def test_shadowed_tool_load_hooks_never_fire(tmp_path: Any, monkeypatch: Any) ->
     # If its hook fires, it touches the marker file.
     (user / "loser.py").write_text(
         "import os\n\n"
-        "from cothis import tool\n\n"
+        "from cothis.tools import tool\n\n"
         '@tool("shared.tool")\n'
         'def t() -> str:\n    """T."""\n    return "user"\n\n'
         "@t.after_load()\n"
