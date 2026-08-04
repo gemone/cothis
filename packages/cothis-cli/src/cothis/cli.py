@@ -41,6 +41,9 @@ from cothis.session.archive import (
 from cothis.session.storage import Storage, display_cwd, is_visible
 from cothis.tools import discover_tools
 
+if TYPE_CHECKING:
+    from cothis.protocol.acp import ACPServer
+
 app = typer.Typer()
 console = Console()
 
@@ -209,6 +212,96 @@ async def _run_and_close(agent: Agent, prompt: str) -> str:
         return await agent.run(prompt)
     finally:
         await agent.aclose()
+
+
+@app.command(name="acp")
+def acp(
+    token: str = typer.Option(
+        ...,
+        "--token",
+        envvar="COTHIS_ACP_TOKEN",
+        help="Bearer token ACP clients must present in their hello handshake.",
+    ),
+    provider: str = typer.Option(
+        "openrouter",
+        "--provider",
+        "-p",
+        envvar="COTHIS_PROVIDER",
+        help="provider key (e.g. openrouter, mistral, openai, anthropic).",
+    ),
+    model: str = typer.Option(
+        "openai/gpt-oss-120b",
+        "--model",
+        "-m",
+        envvar="COTHIS_MODEL",
+        help="Model identifier for the chosen provider.",
+    ),
+) -> None:
+    """Serve cothis over ACP on stdio (length-prefixed JSON frames).
+
+    An editor (or any ACP client) spawns ``cothis acp --token ...`` and speaks
+    the Agent Client Protocol over stdin/stdout: a ``hello`` handshake, then
+    ``create`` / ``prompt`` commands. Assistant text + tool calls stream back
+    as ``session_progress`` events. All diagnostics go to stderr; stdout
+    carries only protocol frames.
+    """
+    from cothis.acp_bridge import AgentSessionBackend
+    from cothis.protocol.acp import ACPServer
+
+    backend = AgentSessionBackend(
+        provider=provider,
+        model=model,
+        tools=discover_tools(_PROJECT_TOOLS_DIR, _user_tools_dir()),
+        system=DEFAULT_SYSTEM_PROMPT,
+    )
+    server = ACPServer(backend, token=token)
+    try:
+        asyncio.run(_acp_stdio(server))
+    except KeyboardInterrupt:
+        pass
+
+
+class _StdioByteConnection:
+    """A :class:`ByteConnection` over process stdin/stdout.
+
+    Reads inbound byte chunks off stdin in a thread (so the asyncio loop is
+    never blocked on a read) and writes framed replies to stdout. ``close``
+    is a no-op beyond marking the connection closed — the process owns these
+    streams; closing stdin/stdout mid-serve would truncate pending writes.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def send(self, chunk: bytes) -> None:
+        await asyncio.to_thread(self._write, chunk)
+
+    async def close(self, final_chunk: bytes | None = None) -> None:
+        if final_chunk is not None:
+            await asyncio.to_thread(self._write, final_chunk)
+        self.closed = True
+
+    def _write(self, chunk: bytes) -> None:
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+
+    def __aiter__(self) -> _StdioByteConnection:
+        return self
+
+    async def __anext__(self) -> bytes:
+        loop = asyncio.get_event_loop()
+        # ``os.read`` on the stdin fd returns whatever bytes are available
+        # (up to n), blocking only when nothing is pending, and b"" on EOF —
+        # read1-like semantics with a clean static type (no cast/ignore).
+        chunk = await loop.run_in_executor(None, os.read, sys.stdin.fileno(), 65536)
+        if not chunk:
+            raise StopAsyncIteration
+        return bytes(chunk)
+
+
+async def _acp_stdio(server: ACPServer) -> None:
+    """Drive one :class:`ACPServer` over a stdio connection until EOF."""
+    await server.serve_connection(_StdioByteConnection())
 
 
 @app.command()
