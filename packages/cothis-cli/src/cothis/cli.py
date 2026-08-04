@@ -1151,18 +1151,17 @@ def main() -> None:
 def install_cmd(
     specs: list[str] = typer.Argument(..., help="One or more PyPI package specs to install as extensions (e.g. 'rich', 'httpx>=0.27')."),
 ) -> None:
-    """Install one or more extensions into isolated uv venvs."""
+    """Install one or more extensions into the shared extensions venv."""
     from cothis.extensions import ExtensionError, ExtensionManager
 
-    home = _cothis_home()
-    for spec in specs:
-        try:
-            typer.echo(f"installing {spec}...")
-            ext = ExtensionManager(home).install(spec)
+    try:
+        typer.echo(f"installing {len(specs)} extension(s)...")
+        exts = ExtensionManager(_cothis_home()).install(specs)
+        for ext in exts:
             typer.echo(f"installed extension {ext.name} {ext.version or ''}")
-        except (ExtensionError, ValueError) as exc:
-            typer.echo(f"Error: {exc}", err=True)
-            raise typer.Exit(1)
+    except (ExtensionError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
 
 
 @app.command(name="extensions")

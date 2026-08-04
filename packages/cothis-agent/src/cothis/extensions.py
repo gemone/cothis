@@ -1,12 +1,9 @@
-"""Extensions system — install, discover, and (future) load per-extension isolated venvs.
+"""Extensions system — install and discover cothis extensions.
 
-Mirrors pi's discover→install→resolve flow on clean-room principles: each
-extension is a PyPI package installed into its own uv-built venv under
-``$COTHIS_HOME/extensions/<name>/``, tracked by an ``extension.json`` manifest.
-Loading extensions into the agent loop (out-of-process via MCP-stdio) is a
-follow-up iteration; this module provides install + discover now.
-
-No pi TypeScript is copied; the architecture is reimplemented in idiomatic Python.
+Extensions are PyPI packages installed into a single shared uv venv under
+``$COTHIS_HOME/extensions/venv/``. Loading extensions into the agent loop
+(out-of-process) is a follow-up iteration; this module provides install +
+discover now.
 """
 
 from __future__ import annotations
@@ -22,10 +19,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger("cothis.extensions")
-
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
 
 
 class ExtensionError(Exception):
@@ -46,38 +39,37 @@ def _extensions_dir(cothis_home: Path | None = None) -> Path:
     return (cothis_home or _cothis_home()) / "extensions"
 
 
-def _manifest_path(cothis_home: Path, name: str) -> Path:
-    return _extensions_dir(cothis_home) / name / "extension.json"
+def _venv_path(cothis_home: Path | None = None) -> Path:
+    return _extensions_dir(cothis_home) / "venv"
+
+
+def _manifest_path(cothis_home: Path | None = None) -> Path:
+    return _extensions_dir(cothis_home) / "extensions.json"
 
 
 # ---------------------------------------------------------------------------
 # Name sanitisation (PyPI-name extraction + path-traversal guard)
 # ---------------------------------------------------------------------------
 
-_PYPI_NAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
+def _extract_name(spec: str) -> str:
+    """Extract a display name from a PyPI spec or a git/HTTP URL.
 
-
-def _sanitize_name(spec: str) -> str:
-    """Extract the bare PyPI project name from a spec, rejecting non-PyPI sources.
-
-    ``"rich>=13"``, ``"httpx[http2]==0.27"``, ``"package-name>=1.0"`` → the bare
-    name.  Rejects git URLs, local paths, and anything with path separators
-    (defence-in-depth against traversal out of ``extensions/``).
+    ``"rich>=13"`` -> ``"rich"``; ``"git+https://github.com/x/mypkg.git"``
+    -> ``"mypkg"``. Used for the manifest + display only; the actual install
+    delegates to ``uv pip install <spec>`` which handles all source types.
     """
     stripped = spec.strip()
-    # Reject anything that looks like a path / URL / VCS spec (I8 = PyPI only).
-    if "/" in stripped or "\\" in stripped or stripped.startswith(("git+", "http://", "https://")):
-        raise ValueError(
-            f"non-PyPI source {spec!r} not supported yet (git/local-path extensions are a follow-up)"
-        )
-    # Strip version specifiers, extras, etc.: take the part before the first
-    # comparator/extras/semicolon.
+    if stripped.startswith(("git+", "http://", "https://")) or ".git" in stripped:
+        url = stripped.split("git+", 1)[-1]
+        url = url.split("@", 1)[-1]
+        url = url.split("?", 1)[0].split("#", 1)[0]
+        name = url.rstrip("/").split("/")[-1]
+        if name.endswith(".git"):
+            name = name[:-4]
+        return name.lower()
     for sep in ("[", "<", ">", "=", "!", ";", " @ "):
         stripped = stripped.split(sep, 1)[0]
-    name = stripped.strip().lower()
-    if not _PYPI_NAME_RE.match(name):
-        raise ValueError(f"invalid extension name {name!r} (must be a valid PyPI project name)")
-    return name
+    return stripped.strip().lower()
 
 
 # ---------------------------------------------------------------------------
@@ -107,89 +99,68 @@ class Extension:
     name: str
     spec: str
     version: str | None
-    venv_path: Path
-    manifest_path: Path
 
 
 # ---------------------------------------------------------------------------
-# Manager
+# Manager (single shared venv)
 # ---------------------------------------------------------------------------
 
 
 class ExtensionManager:
-    """Install and discover cothis extensions (per-extension isolated uv venvs)."""
+    """Install and discover cothis extensions in a single shared uv venv.
+
+    All extensions share one venv at ``$COTHIS_HOME/extensions/venv/``.
+    ``cothis install rich httpx`` installs both into that venv in one
+    ``uv pip install`` call; versions can be specified per-spec.
+    """
 
     def __init__(self, cothis_home: Path | None = None) -> None:
         self._home = cothis_home or _cothis_home()
 
     # ------------------------------------------------------------------ install
 
-    def install(self, spec: str) -> Extension:
-        """Install *spec* into a fresh/existing per-extension venv via ``uv``.
+    def install(self, specs: list[str]) -> list[Extension]:
+        """Install *specs* into the shared extensions venv (idempotent venv).
 
-        Idempotent: re-running ``uv venv`` on an existing path is a no-op.
-        Returns the :class:`Extension` (with the read-back version).
+        Returns one :class:`Extension` per spec (with read-back version).
         """
-        name = _sanitize_name(spec)
-        ext_dir = _extensions_dir(self._home) / name
-        venv_path = ext_dir / "venv"
-        ext_dir.mkdir(parents=True, exist_ok=True)
-
         uv = _find_uv()
+        venv = _venv_path(self._home)
+        venv.parent.mkdir(parents=True, exist_ok=True)
 
-        # 1. Create (or refresh) the venv.
-        self._run_uv(uv, ["venv", str(venv_path), "--python", "3.14"])
-        # 2. Install the package into the venv.
-        self._run_uv(uv, ["pip", "install", spec, "--python", str(venv_path)])
-        # 3. Read back the installed version.
-        version = self._read_version(uv, name, venv_path)
-
-        # 4. Write manifest atomically.
-        manifest = {
-            "name": name,
-            "spec": spec,
-            "version": version,
-            "installed_at": datetime.now(UTC).isoformat(),
-            "venv_path": str(venv_path),
-            "cothis_extension_api": 1,
-        }
-        mpath = ext_dir / "extension.json"
-        _write_atomic(mpath, json.dumps(manifest, indent=2) + "\n")
-
-        return Extension(
-            name=name,
-            spec=spec,
-            version=version,
-            venv_path=venv_path,
-            manifest_path=mpath,
-        )
+        # 1. Ensure the shared venv exists (uv venv is idempotent).
+        self._run_uv(uv, ["venv", str(venv), "--python", "3.14"])
+        # 2. Install all specs at once into the shared venv.
+        self._run_uv(uv, ["pip", "install", *specs, "--python", str(venv)])
+        # 3. Read back versions.
+        results = [
+            Extension(name=_extract_name(s), spec=s, version=self._read_version(uv, _extract_name(s), venv))
+            for s in specs
+        ]
+        # 4. Update manifest.
+        self._update_manifest(results)
+        return results
 
     # --------------------------------------------------------------- discover
 
     def discover(self) -> list[Extension]:
-        """List installed extensions (parsed from manifests; corrupt → skip)."""
-        ext_root = _extensions_dir(self._home)
-        if not ext_root.is_dir():
+        """List installed extensions (from the manifest)."""
+        mpath = _manifest_path(self._home)
+        if not mpath.is_file():
             return []
-        results: list[Extension] = []
-        for child in sorted(ext_root.iterdir()):
-            mpath = child / "extension.json"
-            if not mpath.is_file():
-                continue
-            try:
-                data = json.loads(mpath.read_text(encoding="utf-8"))
-                results.append(
-                    Extension(
-                        name=data["name"],
-                        spec=data.get("spec", data["name"]),
-                        version=data.get("version"),
-                        venv_path=Path(data.get("venv_path", child / "venv")),
-                        manifest_path=mpath,
-                    )
+        try:
+            data = json.loads(mpath.read_text(encoding="utf-8"))
+            return [
+                Extension(
+                    name=e["name"],
+                    spec=e.get("spec", e["name"]),
+                    version=e.get("version"),
                 )
-            except Exception:
-                logger.warning("skipping corrupt extension manifest: %s", mpath)
-        return results
+                for e in data.get("extensions", [])
+            ]
+        except Exception:
+            logger.warning("skipping corrupt extensions manifest: %s", mpath)
+            return []
 
     # --------------------------------------------------------------- internal
 
@@ -205,29 +176,46 @@ class ExtensionManager:
             )
         return proc
 
-    def _read_version(self, uv: str, name: str, venv_path: Path) -> str | None:
+    def _read_version(self, uv: str, name: str, venv: Path) -> str | None:
         """Read back the installed version of *name* from ``uv pip list``."""
-        proc = self._run_uv(uv, ["pip", "list", "--python", str(venv_path)])
+        proc = self._run_uv(uv, ["pip", "list", "--python", str(venv)])
         for line in proc.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 2 and parts[0].lower() == name:
                 return parts[1]
         return None
 
+    def _update_manifest(self, new_exts: list[Extension]) -> None:
+        """Merge *new_exts* into the manifest (dedup by name)."""
+        existing = {e.name: e for e in self.discover()}
+        for ext in new_exts:
+            existing[ext.name] = ext
+        all_exts = sorted(existing.values(), key=lambda e: e.name)
+        data = {
+            "extensions": [
+                {"name": e.name, "spec": e.spec, "version": e.version}
+                for e in all_exts
+            ],
+            "venv_path": str(_venv_path(self._home)),
+            "updated_at": datetime.now(UTC).isoformat(),
+            "cothis_extension_api": 1,
+        }
+        mpath = _manifest_path(self._home)
+        mpath.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomic(mpath, json.dumps(data, indent=2) + "\n")
+
 
 # ---------------------------------------------------------------------------
-# Future loading (I9+ stub — documented, NOT wired)
+# Future loading (stub — documented, NOT wired)
 # ---------------------------------------------------------------------------
 
 
 class ExtensionLoader:
-    """Loads an installed extension's tools into the agent (I9+).
+    """Loads an installed extension's tools into the agent (future).
 
-    Per-extension venvs forbid in-process import. The planned strategy: each
-    extension's package may expose a console-script entry point (or
-    ``python -m <pkg> --mcp-stdio``) that speaks MCP over stdio. cothis spawns
-    ``<venv>/bin/<entrypoint>`` and consumes it via the existing MCP-stdio tool
-    source (``cothis.tools.mcp``, type ``mcp.stdio``). No new IPC protocol.
+    Each extension's package may expose a console-script entry point that
+    speaks MCP over stdio. cothis spawns it from the extensions venv and
+    consumes it via the existing MCP-stdio tool source.
     """
 
     def __init__(self, ext: Extension) -> None:
@@ -235,8 +223,7 @@ class ExtensionLoader:
 
     def load(self) -> None:
         raise NotImplementedError(
-            "extension loading into the agent loop is a follow-up (I9+); "
-            "this stub is intentionally not wired."
+            "extension loading into the agent loop is a follow-up."
         )
 
 
