@@ -67,7 +67,7 @@ _STARTUP_PATH_FILES = (
 # Ceiling = baseline × 1.5 (conservative; issue's target is baseline+50ms
 # but CI variance needs more headroom until we have stable data).
 _CEILINGS_MS = {
-    "Linux": 600,
+    "Linux": 1100,  # was 600; the uv-workspace multi-package editable-namespace split (~5 members) added ~230ms of import-resolution overhead to cothis --help
     "Darwin": 1200,
     "Windows": 1300,
 }
