@@ -6,7 +6,7 @@ requires-python = ">=3.14"
 members = [
     "cothis-agent",
     "cothis-ai",
-    "cothis-core",
+    "cothis-cli",
     "cothis-protocol",
     "cothis-storage",
     "cothis-tui",
@@ -231,9 +231,9 @@ requires-dist = [
 ]
 
 [[package]]
-name = "cothis-core"
+name = "cothis-cli"
 version = "0.1.0"
-source = { editable = "packages/cothis-core" }
+source = { editable = "packages/cothis-cli" }
 dependencies = [
     { name = "cothis-agent" },
     { name = "cothis-protocol" },

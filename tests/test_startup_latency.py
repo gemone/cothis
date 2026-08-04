@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).parent.parent
-_SRC_ROOT = _REPO_ROOT / "packages" / "cothis-core" / "src" / "cothis"
+_SRC_ROOT = _REPO_ROOT / "packages" / "cothis-cli" / "src" / "cothis"
 _AGENT_SRC_ROOT = _REPO_ROOT / "packages" / "cothis-agent" / "src" / "cothis"
 _PKG_ROOT = _REPO_ROOT / "packages"
 
@@ -95,7 +95,7 @@ def _run_subprocess_ms(code: str) -> float:
             # Ensure the subprocess imports THIS checkout, not an
             # installed copy. uv-run sets PYTHONPATH already, but be
             # explicit so a bare pytest invocation matches.
-            "PYTHONPATH": os.pathsep.join([str(_REPO_ROOT / "packages" / m / "src") for m in ("cothis-core", "cothis-ai", "cothis-agent", "cothis-storage", "cothis-protocol")]),
+            "PYTHONPATH": os.pathsep.join([str(_REPO_ROOT / "packages" / m / "src") for m in ("cothis-cli", "cothis-ai", "cothis-agent", "cothis-storage", "cothis-protocol", "cothis-tui")]),
         },
     )
     return (time.perf_counter() - t) * 1000
@@ -281,7 +281,7 @@ def test_prompt_toolkit_not_imported_at_cli_startup() -> None:
         capture_output=True,
         text=True,
         cwd=str(_REPO_ROOT),
-        env={**os.environ, "PYTHONPATH": os.pathsep.join([str(_REPO_ROOT / "packages" / m / "src") for m in ("cothis-core", "cothis-ai", "cothis-agent", "cothis-storage", "cothis-protocol")])},
+        env={**os.environ, "PYTHONPATH": os.pathsep.join([str(_REPO_ROOT / "packages" / m / "src") for m in ("cothis-cli", "cothis-ai", "cothis-agent", "cothis-storage", "cothis-protocol", "cothis-tui")])},
     )
     assert result.returncode == 0, (
         f"cothis.cli import failed in subprocess:\n{result.stderr}"
