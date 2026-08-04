@@ -69,7 +69,7 @@ _STARTUP_PATH_FILES = (
 _CEILINGS_MS = {
     "Linux": 1100,  # was 600; the uv-workspace multi-package editable-namespace split (~5 members) added ~230ms of import-resolution overhead to cothis --help
     "Darwin": 1200,
-    "Windows": 1300,
+    "Windows": 1600,  # was 1300; uv-workspace multi-package editable-namespace overhead (~1500ms cothis --help on Windows)
 }
 
 
