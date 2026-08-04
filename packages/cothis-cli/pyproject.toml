@@ -1,7 +1,7 @@
 [project]
-name = "cothis-core"
+name = "cothis-cli"
 version = "0.1.0"
-description = "cothis core (transitional) - agent loop, tools, session, tui, cli; awaiting extraction into dedicated packages"
+description = "cothis CLI - typer/rich command-line interface + startup profiler (cothis.cli, cothis.profile_startup)"
 requires-python = ">=3.14"
 license = "Apache-2.0"
 dependencies = [
@@ -26,7 +26,6 @@ module-name = "cothis"
 namespace = true
 
 [tool.uv.sources]
-cothis-ai = { workspace = true }
 cothis-agent = { workspace = true }
 cothis-protocol = { workspace = true }
 cothis-storage = { workspace = true }
