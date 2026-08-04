@@ -42,7 +42,7 @@ def _metadata() -> dict[str, dict[str, Any]]:
     in one process share one parse — the file is ~1.6 MB and parsing is the
     only non-trivial work here.
     """
-    path = files("cothis.data") / "model_prices.json"
+    path = files("cothis.ai.data") / "model_prices.json"
     return json.loads(path.read_text())
 
 

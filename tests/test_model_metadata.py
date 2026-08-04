@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cothis.agent import Agent
-from cothis.model_metadata import _FALLBACK_MAX_TOKENS, resolve_max_tokens
+from cothis.ai.model_metadata import _FALLBACK_MAX_TOKENS, resolve_max_tokens
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -85,7 +85,7 @@ def test_resolve_legacy_max_tokens_field_used_when_max_output_absent(
 ) -> None:
     # Inject a fake entry that has ONLY the legacy ``max_tokens`` field.
     # ``_metadata`` is cached, so clear the cache before + after.
-    from cothis import model_metadata
+    from cothis.ai import model_metadata
 
     fake = {"fake-legacy-model": {"max_tokens": 9999}}  # no max_output_tokens
     monkeypatch.setattr(model_metadata, "_metadata", lambda: fake)
@@ -103,7 +103,7 @@ def test_legacy_max_tokens_skipped_when_max_input_tokens_present(
     it as the output cap — falling through to the conservative fallback
     instead.
     """
-    from cothis import model_metadata
+    from cothis.ai import model_metadata
 
     fake = {
         "fake-input-cap-model": {
