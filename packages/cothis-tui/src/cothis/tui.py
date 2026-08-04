@@ -8,7 +8,8 @@
 
 Stream routing per the design-review sign-off (#228, 2026-07-24):
 ``ContentDelta(kind="text")`` renders as normal assistant content;
-``ContentDelta(kind="thinking")`` renders dimmed. Tool calls render
+``ContentDelta(kind="thinking")`` renders as a collapsed, dimmed
+``Collapsible`` (expand to read the model's reasoning). Tool calls render
 as inline cards with a status badge.
 
 WS attach (``attach_ws`` / ``attach_session_ws``) + ``run_turn``
@@ -32,6 +33,7 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Collapsible,
     Header,
     Label,
     ListItem,
@@ -150,6 +152,12 @@ class ConversationView(VerticalScroll):
         border: round $accent;
         padding: 0 1;
     }
+    ConversationView > Collapsible.thinking-block {
+        margin: 0 0 0 2;
+        padding: 0 1;
+        border-left: thick $primary-darken-2;
+        color: $text-disabled;
+    }
     """
 
     def __init__(self) -> None:
@@ -158,6 +166,12 @@ class ConversationView(VerticalScroll):
         # so the per-delta append path stays linear. ``renderable_str`` joins
         # lazily — only the final Markdown parse needs the joined string.
         self._text_buf: list[str] = []
+        # Thinking-segment accumulator (#I11). Kept separate from
+        # ``_text_buf`` so ``renderable_str`` (the text-segment source, read
+        # by tests + inspection) stays free of reasoning content. Finalised
+        # into a collapsed, dimmed ``Collapsible`` so the model's reasoning is
+        # available but doesn't clutter the conversation.
+        self._thinking_buf: list[str] = []
         # Plain-text widget shown WHILE a segment streams (#407). Mounting it
         # avoids re-parsing Markdown on every delta; it is swapped for a
         # ``Markdown`` widget (one parse) at finalisation.
@@ -190,10 +204,16 @@ class ConversationView(VerticalScroll):
         ``kind="text"`` → accumulate (O(1)) + cheap plain-text refresh; the
         segment is parsed into Markdown ONCE at finalisation, not per delta
         (#407 — per-delta Markdown re-parse was O(S²) in segment size).
-        ``kind="thinking"`` → logged but not rendered (collapsible block
-        lands when the toggle UX is designed).
+        ``kind="thinking"`` → accumulate into ``_thinking_buf`` (separate
+        from the text buffer) and finalise into a collapsed, dimmed
+        ``Collapsible`` so the model's reasoning is available without
+        cluttering the conversation. A kind switch (thinking → text or vice
+        versa) finalises the active segment first, so each kind renders as
+        its own block in event order.
         """
         if kind == "text":
+            # Close any streaming thinking segment so text is its own block.
+            self._finalize_thinking()
             # If the previous segment already finalised (idle timer fired, or
             # a user/tool boundary), start a fresh segment below it — the old
             # Markdown widget stays mounted; the buffer + handles reset.
@@ -204,7 +224,10 @@ class ConversationView(VerticalScroll):
             self._refresh_stream()
             self._arm_finalize()
         elif kind == "thinking":
-            logger.debug("dropping thinking delta (%d chars)", len(text))
+            # Close any streaming text segment so thinking is its own block.
+            self._finalize_segment()
+            self._thinking_buf.append(text)
+            self._arm_finalize()
 
     def append_user_message(self, text: str) -> None:
         """Render a user prompt with a distinct prefix.
@@ -216,7 +239,7 @@ class ConversationView(VerticalScroll):
         injected links or markup can't activate inside the widget.
         """
         safe = text.replace("[", "\\[").replace("]", "\\]")
-        self._finalize_segment()
+        self._finalize_active()
         self._text_buf = []
         self._finalized = False
         self._text_buf.append(f"\n> **you**: {safe}\n\n")
@@ -238,7 +261,7 @@ class ConversationView(VerticalScroll):
         item 4). ``None`` keeps the legacy un-indexed behaviour (no
         status update will land for this card).
         """
-        self._finalize_segment()
+        self._finalize_active()
         self._text_buf = []
         self._finalized = False
         card = ToolCallCard(name=name, status=status, call_id=call_id)
@@ -287,12 +310,45 @@ class ConversationView(VerticalScroll):
             self._follow(at_bottom)
 
     def _arm_finalize(self) -> None:
-        """(Re)arm the idle-finalise debounce — parse Markdown once after streaming settles."""
+        """(Re)arm the idle-finalise debounce — flush both segments once streaming settles."""
         if self._finalize_timer is not None:
             self._finalize_timer.stop()
         self._finalize_timer = self.set_timer(
-            _STREAM_FINALIZE_S, self._finalize_segment,
+            _STREAM_FINALIZE_S, self._finalize_active,
         )
+
+    def _finalize_active(self) -> None:
+        """Flush whichever segment(s) are streaming — text and/or thinking.
+
+        The idle-finalise timer's callback, and the boundary flush called by
+        ``append_tool_call`` / ``append_user_message``. Order matters only in
+        that text mounts before thinking when both are pending (the model
+        streams text then a trailing thinking block rarely); DOM order is
+        otherwise driven by the kind-switch finalisation in ``append_delta``.
+        """
+        self._finalize_segment()
+        self._finalize_thinking()
+
+    def _finalize_thinking(self) -> None:
+        """Mount the accumulated thinking as a collapsed, dimmed ``Collapsible``.
+
+        Idempotent: a no-op when ``_thinking_buf`` is empty. The buffer is
+        cleared on mount so a subsequent thinking segment starts fresh.
+        Collapsed by default (``Collapsible`` ctor) so reasoning stays out of
+        the way until the user expands it — the "dimmed/collapsed, toggle to
+        expand" contract documented on ``ContentDelta``.
+        """
+        if not self._thinking_buf:
+            return
+        source = "".join(self._thinking_buf)
+        self._thinking_buf = []
+        at_bottom = self._at_bottom()
+        self.mount(
+            Collapsible(
+                Markdown(source), title="reasoning", classes="thinking-block",
+            )
+        )
+        self._follow(at_bottom)
 
     def _finalize_segment(self) -> None:
         """Swap the streaming ``Static`` for a ``Markdown`` widget (one parse).
