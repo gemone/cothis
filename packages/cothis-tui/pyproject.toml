@@ -1,0 +1,24 @@
+[project]
+name = "cothis-tui"
+version = "0.1.0"
+description = "cothis TUI - textual 3-pane app shell (cothis.tui)"
+requires-python = ">=3.14"
+license = "Apache-2.0"
+dependencies = [
+    "cothis-agent",
+    "cothis-storage",
+    "textual>=0.47.0",
+    "websockets>=13.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "cothis"
+namespace = true
+
+[tool.uv.sources]
+cothis-agent = { workspace = true }
+cothis-storage = { workspace = true }

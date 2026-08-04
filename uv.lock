@@ -9,6 +9,7 @@ members = [
     "cothis-core",
     "cothis-protocol",
     "cothis-storage",
+    "cothis-tui",
 ]
 
 [manifest.dependency-groups]
@@ -237,11 +238,10 @@ dependencies = [
     { name = "cothis-agent" },
     { name = "cothis-protocol" },
     { name = "cothis-storage" },
+    { name = "cothis-tui" },
     { name = "prompt-toolkit" },
     { name = "rich" },
-    { name = "textual" },
     { name = "typer" },
-    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -249,11 +249,10 @@ requires-dist = [
     { name = "cothis-agent", editable = "packages/cothis-agent" },
     { name = "cothis-protocol", editable = "packages/cothis-protocol" },
     { name = "cothis-storage", editable = "packages/cothis-storage" },
+    { name = "cothis-tui", editable = "packages/cothis-tui" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
     { name = "rich", specifier = ">=15.0.0" },
-    { name = "textual", specifier = ">=0.47.0" },
     { name = "typer", specifier = ">=0.25.1" },
-    { name = "websockets", specifier = ">=13.0" },
 ]
 
 [[package]]
@@ -286,6 +285,25 @@ dependencies = [
 requires-dist = [
     { name = "cothis-agent", editable = "packages/cothis-agent" },
     { name = "filelock", specifier = ">=3.13" },
+]
+
+[[package]]
+name = "cothis-tui"
+version = "0.1.0"
+source = { editable = "packages/cothis-tui" }
+dependencies = [
+    { name = "cothis-agent" },
+    { name = "cothis-storage" },
+    { name = "textual" },
+    { name = "websockets" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cothis-agent", editable = "packages/cothis-agent" },
+    { name = "cothis-storage", editable = "packages/cothis-storage" },
+    { name = "textual", specifier = ">=0.47.0" },
+    { name = "websockets", specifier = ">=13.0" },
 ]
 
 [[package]]
