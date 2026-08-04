@@ -2325,3 +2325,171 @@ async def test_config_menu_seeds_from_saved_selection(
         assert isinstance(modal, ConfigMenuModal)
         # Seeded with saved ∩ available — the unavailable 'ghost' is dropped.
         assert modal._selected == {"alpha"}
+
+
+# ---------------------------------------------------------------------
+# Thinking-block rendering (#I11) — ``append_delta("thinking", ...)``
+# accumulates into ``_thinking_buf`` (separate from ``_text_buf``) and
+# finalises into a collapsed, dimmed ``Collapsible(Markdown(source),
+# title="reasoning", classes="thinking-block")``. Thinking stays OUT of
+# ``renderable_str`` (which reads ``_text_buf`` only).
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thinking_delta_renders_as_collapsible_after_finalise() -> None:
+    """#I11: thinking deltas mount a collapsed Collapsible on finalise.
+
+    ``append_delta("thinking", ...)`` accumulates into ``_thinking_buf``;
+    ``_finalize_active()`` flushes it as ``Collapsible(Markdown(source),
+    title="reasoning")``. Exactly one Collapsible mounts and the reasoning
+    source is preserved inside its Markdown widget (collapsed by default
+    so it stays out of the way until the user expands it).
+    """
+    from textual.widgets import Collapsible, Markdown
+
+    from cothis.tui import ConversationView, CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        view.append_delta("thinking", "I should consider the options.")
+        await pilot.pause()
+        view._finalize_active()
+        await pilot.pause()
+
+        collapsibles = list(view.query(Collapsible))
+        assert len(collapsibles) == 1, (
+            f"expected one thinking Collapsible; got {len(collapsibles)}"
+        )
+        col = collapsibles[0]
+        assert str(col.title) == "reasoning", (
+            f"expected Collapsible title 'reasoning'; got {col.title!r}"
+        )
+        # The reasoning source is preserved inside the Collapsible's
+        # Markdown widget. ``_markdown`` holds the source after mount.
+        md = col.query_one(Markdown)
+        assert "consider the options" in md._markdown, (
+            f"reasoning not in Collapsible Markdown; got {md._markdown!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_thinking_stays_out_of_renderable_str_while_collapsible_mounted() -> None:
+    """#I11: a mounted thinking Collapsible coexists with a ``renderable_str``
+    that EXCLUDES the reasoning.
+
+    ``renderable_str`` reads ``_text_buf`` only; thinking lives in
+    ``_thinking_buf`` and finalises into a sibling widget. So the
+    reasoning is present in the DOM (as a Collapsible) yet absent from
+    the text-segment source — guards against a regression that folds
+    thinking back into the text buffer (which would clutter the answer).
+    """
+    from textual.widgets import Collapsible
+
+    from cothis.tui import ConversationView, CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        view.append_delta("thinking", "secret reasoning here")
+        await pilot.pause()
+        view._finalize_active()
+        await pilot.pause()
+
+        # The Collapsible IS mounted in the DOM...
+        assert len(list(view.query(Collapsible))) == 1, (
+            "expected the thinking Collapsible to be mounted"
+        )
+        # ...yet renderable_str (the text-segment source) excludes it.
+        assert "secret reasoning" not in view.renderable_str, (
+            f"thinking leaked into renderable_str: {view.renderable_str!r}"
+        )
+        assert view.renderable_str == ""
+
+
+@pytest.mark.asyncio
+async def test_thinking_then_text_mounts_collapsible_before_markdown() -> None:
+    """#I11: a kind switch (thinking → text) finalises thinking first, so
+    the Collapsible mounts BEFORE the text Markdown in DOM order.
+
+    Event order must match DOM order: the model's reasoning block
+    precedes its answer. The kind-switch in ``append_delta`` flushes the
+    thinking buffer before accumulating text, so the Collapsible is
+    already mounted when the text segment finalises below it.
+    """
+    from textual.widgets import Collapsible, Markdown
+
+    from cothis.tui import ConversationView, CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        view.append_delta("thinking", "let me think...")
+        await pilot.pause()
+        view.append_delta("text", "here is my answer.")
+        await pilot.pause()
+        view._finalize_active()
+        await pilot.pause()
+
+        # Direct children of ConversationView, in mount order. The
+        # Markdown nested inside the Collapsible is NOT a direct child,
+        # so positions_md captures only the text-segment Markdown.
+        children = list(view.children)
+        positions_col = [i for i, c in enumerate(children) if isinstance(c, Collapsible)]
+        positions_md = [i for i, c in enumerate(children) if isinstance(c, Markdown)]
+        assert len(positions_col) == 1, (
+            f"expected one Collapsible direct child; got {positions_col}"
+        )
+        assert len(positions_md) == 1, (
+            f"expected one text Markdown direct child; got {positions_md}"
+        )
+        assert positions_col[0] < positions_md[0], (
+            f"thinking Collapsible (idx {positions_col[0]}) must precede the "
+            f"text Markdown (idx {positions_md[0]})"
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_call_after_thinking_flushes_collapsible_above_card() -> None:
+    """#I11: a tool call after streaming thinking flushes the thinking
+    block so the Collapsible mounts ABOVE the ToolCallCard.
+
+    ``append_tool_call`` calls ``_finalize_active()`` (the boundary
+    flush), which mounts the pending thinking Collapsible before the
+    card itself is mounted — DOM order matches event order: reasoning →
+    tool dispatch.
+    """
+    from textual.widgets import Collapsible
+
+    from cothis.tui import ConversationView, CothisApp, ToolCallCard
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        view.append_delta("thinking", "planning the tool call.")
+        await pilot.pause()
+        view.append_tool_call("fs.read")
+        await pilot.pause()
+        # ``append_tool_call`` already flushes at the boundary; the explicit
+        # call is idempotent and mirrors the idle-timer finalise path.
+        view._finalize_active()
+        await pilot.pause()
+
+        children = list(view.children)
+        positions_col = [i for i, c in enumerate(children) if isinstance(c, Collapsible)]
+        positions_card = [i for i, c in enumerate(children) if isinstance(c, ToolCallCard)]
+        assert len(positions_col) == 1, (
+            f"expected one thinking Collapsible above the card; got {positions_col}"
+        )
+        assert len(positions_card) == 1, (
+            f"expected one ToolCallCard; got {positions_card}"
+        )
+        assert positions_col[0] < positions_card[0], (
+            f"thinking Collapsible (idx {positions_col[0]}) must precede the "
+            f"ToolCallCard (idx {positions_card[0]})"
+        )
