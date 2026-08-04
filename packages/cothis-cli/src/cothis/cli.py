@@ -1146,5 +1146,41 @@ def main() -> None:
         sys.exit(1)
 
 
+
+@app.command(name="install")
+def install_cmd(
+    specs: list[str] = typer.Argument(..., help="One or more PyPI package specs to install as extensions (e.g. 'rich', 'httpx>=0.27')."),
+) -> None:
+    """Install one or more extensions into the shared extensions venv."""
+    from cothis.extensions import ExtensionError, ExtensionManager
+
+    try:
+        typer.echo(f"installing {len(specs)} extension(s)...")
+        exts = ExtensionManager(_cothis_home()).install(specs)
+        for ext in exts:
+            typer.echo(f"installed extension {ext.name} {ext.version or ''}")
+    except (ExtensionError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command(name="extensions")
+def extensions_cmd(
+    action: str = typer.Argument("list", help="'list' (default) — list installed extensions."),
+) -> None:
+    """List installed extensions."""
+    from cothis.extensions import ExtensionManager
+
+    if action != "list":
+        typer.echo(f"unknown action {action!r}; use 'list'", err=True)
+        raise typer.Exit(1)
+    exts = ExtensionManager(_cothis_home()).discover()
+    if not exts:
+        typer.echo("no extensions installed")
+        return
+    for ext in exts:
+        typer.echo(f"{ext.name}\t{ext.version or '?'}\t{ext.spec}")
+
+
 if __name__ == "__main__":
     main()
