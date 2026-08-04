@@ -1275,5 +1275,42 @@ def extensions_cmd(
         typer.echo(f"{ext.name}\t{ext.version or '?'}\t{ext.spec}")
 
 
+@app.command(name="skills")
+def skills_cmd(
+    action: str = typer.Argument("list", help="'list' (default) — list discovered Agent Skills."),
+) -> None:
+    """List discovered Agent Skills (project > user-cothis > user-agents layers)."""
+    from cothis.skills import discover_skills
+
+    if action != "list":
+        typer.echo(f"unknown action {action!r}; use 'list'", err=True)
+        raise typer.Exit(1)
+    skills = discover_skills(Path.cwd())
+    if not skills:
+        typer.echo("no skills found")
+        return
+    # Layer roots match ``discover_skills``'s own resolution (skills.py):
+    # project cwd/.agents/skills, user-cothis $COTHIS_HOME/skills (via the
+    # shared ``_cothis_home`` helper), user-agents ~/.agents/skills. Labels
+    # are derived by path-prefix matching the equally-unresolved ``source``
+    # (discover_skills stores ``skill_dir / SKILL.md`` without ``.resolve()``),
+    # not by re-running env logic.
+    project = Path.cwd() / ".agents" / "skills"
+    user_cothis = _cothis_home() / "skills"
+    user_agents = Path.home() / ".agents" / "skills"
+
+    def _layer(src: Path) -> str:
+        if src.is_relative_to(project):
+            return "project"
+        if src.is_relative_to(user_cothis):
+            return "user-cothis"
+        if src.is_relative_to(user_agents):
+            return "user-agents"
+        return "?"
+
+    for s in skills:
+        typer.echo(f"{s.name}\t{_layer(s.source)}\t{s.description[:80]}")
+
+
 if __name__ == "__main__":
     main()
