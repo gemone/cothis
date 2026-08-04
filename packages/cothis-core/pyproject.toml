@@ -8,11 +8,10 @@ dependencies = [
     "cothis-agent",
     "cothis-protocol",
     "cothis-storage",
+    "cothis-tui",
     "prompt-toolkit>=3.0",
     "rich>=15.0.0",
-    "textual>=0.47.0",
     "typer>=0.25.1",
-    "websockets>=13.0",
 ]
 
 [project.scripts]
@@ -31,3 +30,4 @@ cothis-ai = { workspace = true }
 cothis-agent = { workspace = true }
 cothis-protocol = { workspace = true }
 cothis-storage = { workspace = true }
+cothis-tui = { workspace = true }
