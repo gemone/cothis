@@ -1,22 +1,20 @@
 [project]
-name = "cothis-core"
+name = "cothis-agent"
 version = "0.1.0"
-description = "cothis core (transitional) - agent loop, tools, session, tui, cli; awaiting extraction into dedicated packages"
+description = "cothis agent loop, tools, skills, worker, supervisor (cothis.agent / cothis.tools / cothis.skills / ...)"
 requires-python = ">=3.14"
 license = "Apache-2.0"
 dependencies = [
-    "cothis-agent",
+    "anyio>=4.0",
+    "cothis-ai",
     "cothis-protocol",
     "cothis-storage",
-    "prompt-toolkit>=3.0",
-    "rich>=15.0.0",
-    "textual>=0.47.0",
-    "typer>=0.25.1",
-    "websockets>=13.0",
+    "griffe>=2.1.0",
+    "mcp>=1.28.1",
+    "pathspec>=0.12.1",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
 ]
-
-[project.scripts]
-cothis = "cothis.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12.0"]
@@ -28,6 +26,5 @@ namespace = true
 
 [tool.uv.sources]
 cothis-ai = { workspace = true }
-cothis-agent = { workspace = true }
 cothis-protocol = { workspace = true }
 cothis-storage = { workspace = true }

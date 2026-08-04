@@ -46,7 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr  # cost: ~5ms
 # ruff's TC001 rule can't see the runtime use and wants it moved under
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
-from cothis.model_metadata import resolve_max_tokens
+from cothis.ai.model_metadata import resolve_max_tokens
 from cothis.notify import NotifyBus
 from cothis.skills import discover_skills, format_catalog
 from cothis.tools import (

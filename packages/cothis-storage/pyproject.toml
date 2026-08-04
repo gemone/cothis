@@ -5,6 +5,7 @@ description = "cothis storage - durable SQLite session/conversation persistence 
 requires-python = ">=3.14"
 license = "Apache-2.0"
 dependencies = [
+    "cothis-agent",
     "filelock>=3.13",
 ]
 
@@ -14,3 +15,6 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "cothis.session"
+
+[tool.uv.sources]
+cothis-agent = { workspace = true }

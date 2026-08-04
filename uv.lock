@@ -4,6 +4,7 @@ requires-python = ">=3.14"
 
 [manifest]
 members = [
+    "cothis-agent",
     "cothis-ai",
     "cothis-core",
     "cothis-protocol",
@@ -183,6 +184,35 @@ wheels = [
 ]
 
 [[package]]
+name = "cothis-agent"
+version = "0.1.0"
+source = { editable = "packages/cothis-agent" }
+dependencies = [
+    { name = "anyio" },
+    { name = "cothis-ai" },
+    { name = "cothis-protocol" },
+    { name = "cothis-storage" },
+    { name = "griffe" },
+    { name = "mcp" },
+    { name = "pathspec" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyio", specifier = ">=4.0" },
+    { name = "cothis-ai", editable = "packages/cothis-ai" },
+    { name = "cothis-protocol", editable = "packages/cothis-protocol" },
+    { name = "cothis-storage", editable = "packages/cothis-storage" },
+    { name = "griffe", specifier = ">=2.1.0" },
+    { name = "mcp", specifier = ">=1.28.1" },
+    { name = "pathspec", specifier = ">=0.12.1" },
+    { name = "pydantic", specifier = ">=2.13.4" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
+]
+
+[[package]]
 name = "cothis-ai"
 version = "0.1.0"
 source = { editable = "packages/cothis-ai" }
@@ -204,15 +234,10 @@ name = "cothis-core"
 version = "0.1.0"
 source = { editable = "packages/cothis-core" }
 dependencies = [
-    { name = "anyio" },
+    { name = "cothis-agent" },
     { name = "cothis-protocol" },
     { name = "cothis-storage" },
-    { name = "griffe" },
-    { name = "mcp" },
-    { name = "pathspec" },
     { name = "prompt-toolkit" },
-    { name = "pydantic" },
-    { name = "pyyaml" },
     { name = "rich" },
     { name = "textual" },
     { name = "typer" },
@@ -221,15 +246,10 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anyio", specifier = ">=4.0" },
+    { name = "cothis-agent", editable = "packages/cothis-agent" },
     { name = "cothis-protocol", editable = "packages/cothis-protocol" },
     { name = "cothis-storage", editable = "packages/cothis-storage" },
-    { name = "griffe", specifier = ">=2.1.0" },
-    { name = "mcp", specifier = ">=1.28.1" },
-    { name = "pathspec", specifier = ">=0.12.1" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
-    { name = "pydantic", specifier = ">=2.13.4" },
-    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "textual", specifier = ">=0.47.0" },
     { name = "typer", specifier = ">=0.25.1" },
@@ -258,11 +278,15 @@ name = "cothis-storage"
 version = "0.1.0"
 source = { editable = "packages/cothis-storage" }
 dependencies = [
+    { name = "cothis-agent" },
     { name = "filelock" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "filelock", specifier = ">=3.13" }]
+requires-dist = [
+    { name = "cothis-agent", editable = "packages/cothis-agent" },
+    { name = "filelock", specifier = ">=3.13" },
+]
 
 [[package]]
 name = "cryptography"
