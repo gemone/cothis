@@ -24,7 +24,6 @@ it's a layer input, not a public API.
 
 from __future__ import annotations
 
-from cothis.tools.builtins import read
 from cothis.tools.core import (
     AfterExecuteError,
     HandleManager,
@@ -42,6 +41,7 @@ from cothis.tools.core import (
     tool,
 )
 from cothis.tools.format import format_tool_output
+from cothis.tools.fs.read import read
 from cothis.tools.mcp import (
     MCPClientTool,
     MCPServer,

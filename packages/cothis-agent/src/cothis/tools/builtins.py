@@ -1,9 +1,10 @@
-"""Built-in filesystem tools shipped with cothis."""
+"""Built-in tools shipped with cothis — filesystem operations and Agent-skill management."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from cothis.skills import deactivate_skill, load_skill
 from cothis.tools.fs.create import _create
 from cothis.tools.fs.delete import _delete
 from cothis.tools.fs.list import _list
@@ -14,4 +15,13 @@ from cothis.tools.fs.search import _search
 if TYPE_CHECKING:
     from cothis.tools.core import Tool
 
-TOOLS: list[Tool] = [read, _list, _search, _create, _modify, _delete]
+TOOLS: list[Tool] = [
+    read,
+    _list,
+    _search,
+    _create,
+    _modify,
+    _delete,
+    load_skill,
+    deactivate_skill,
+]
