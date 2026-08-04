@@ -133,6 +133,12 @@ _MAX_PATHS = 64
 # saturating the agent's context budget. Larger files should be read
 # in slices (``start_line`` / ``end_line``) or written in chunks.
 _MAX_BYTES = 1024 * 1024
+# 2000 — bounds the LLM-context cost of a single unbounded ``fs.read``.
+# The byte cap alone misses files that are ≤ _MAX_BYTES yet carry tens of
+# thousands of short lines (minified JS, CSVs, generated code, lockfiles):
+# one read used to emit every line. 2000 fits a typical source file; larger
+# reads continue with ``start_line=`` (the truncation notice points there).
+_MAX_LINES = 2000
 
 
 def _load_gitignore(root: Path) -> pathspec.PathSpec | None:

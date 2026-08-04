@@ -19,6 +19,7 @@ from typing import Any
 from cothis.tools.core import tool
 from cothis.tools.fs._hygiene import (
     _MAX_BYTES,
+    _MAX_LINES,
     _MAX_PATHS,
     WORKDIR,
     PathBoundaryError,
@@ -33,7 +34,10 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
     Path resolution failures bubble up as :class:`PathBoundaryError`.
     Per-file byte cap ``_MAX_BYTES`` is enforced here: bodies past the
     cap are truncated with a trailing ``… (truncated, N more bytes)``
-    line (#95).
+    line (#95). Files under the byte cap stream once and are capped at
+    ``_MAX_LINES`` lines per call (bounds the context cost of files with
+    tens of thousands of short lines); a trailing notice names the
+    resume ``start_line`` when the cap bites.
     """
     cwd = WORKDIR.get() or Path.cwd()
     resolved = _resolve_under(path, cwd)
@@ -56,17 +60,69 @@ def _read_one(path: str, start_line: int | None, end_line: int | None) -> str:
         head = decoder.decode(truncated, final=True)
         dropped = size - (_MAX_BYTES - len(decoder.buffer))
         return head + f"\n… (truncated, {dropped} more bytes)"
-    text = resolved.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    total = len(lines)
+    # Line-range path: stream the file once and collect at most _MAX_LINES
+    # lines from ``start``. Streaming (vs ``read_text().splitlines()`` on the
+    # whole file) bounds peak memory by the requested window, not the file:
+    # asking for lines 5–10 of a 50k-line file now reads ~10 lines, not 50k.
+    # The line cap catches files that are ≤ _MAX_BYTES yet carry tens of
+    # thousands of short lines (minified JS, CSVs) — one read can't dump an
+    # unbounded line count into the conversation.
+    #
+    # File iteration uses universal newlines (``\n`` / ``\r\n`` / ``\r``) —
+    # the same line boundaries an editor counts. ``str.splitlines()`` also
+    # splits on exotic separators (``\v`` / ``\f`` / `` `` …); those are
+    # not line separators in source files, so iterating matches how the model
+    # references lines across calls.
     start = max(1, start_line or 1)
-    end = min(total, end_line or total)
-    if start > total:
-        return f"Error: start_line {start} is beyond EOF (file has {total} lines)"
-    width = len(str(end))
-    return "\n".join(
-        f"{i:>{width}}\t{lines[i - 1]}" for i in range(start, end + 1)
+    collected: list[str] = []
+    total = 0  # 1-based count of lines read; equals file length if read to EOF
+    reached_window = False
+    more_after_cap = False
+    with resolved.open("r", encoding="utf-8") as fh:
+        for raw in fh:
+            total += 1
+            if total < start:
+                continue
+            reached_window = True
+            if end_line is not None and total > end_line:
+                break  # the model's requested window ended on the prior line
+            if len(collected) < _MAX_LINES:
+                collected.append(raw.rstrip("\n"))
+            else:
+                # Already emitted the cap's worth; this line proves a tail
+                # exists. Stop without materialising the rest of the file —
+                # ``more_after_cap`` drives the continuation notice below.
+                more_after_cap = True
+                break
+
+    if not reached_window:
+        # The file ended before ``start`` — ``total`` is the true line count.
+        return (
+            f"Error: start_line {start} is beyond EOF "
+            f"(file has {total} lines)"
+        )
+
+    last_shown = start + len(collected) - 1
+    width = len(str(last_shown))
+    out = "\n".join(
+        f"{i:>{width}}\t{collected[i - start]}" for i in range(start, last_shown + 1)
     )
+    if more_after_cap:
+        # Actionable continuation: tell the model where it left off and the
+        # exact resume offset (the model's ``end_line`` lets us count the
+        # remaining in-range lines; a full read just signals "more").
+        if end_line is not None:
+            remaining = end_line - last_shown
+            out += (
+                f"\n… ({remaining} more line(s) in range; "
+                f"use start_line={last_shown + 1} to continue)"
+            )
+        else:
+            out += (
+                f"\n… (more lines in file; "
+                f"use start_line={last_shown + 1} to continue)"
+            )
+    return out
 
 
 _READ_DESCRIPTION = """Read UTF-8 text files with 1-based line numbers (tab-separated).
