@@ -18,9 +18,17 @@ if TYPE_CHECKING:
 
 
 def _make_file(tmp_path: Path, name: str, content: str) -> Path:
-    """Create a file with the given text content for testing."""
+    """Create a file with the given text content for testing.
+
+    Writes via ``write_bytes`` (binary) rather than ``write_text`` so the
+    file's line endings are exactly the LF bytes in ``content`` on EVERY
+    platform — ``write_text`` is text-mode and translates ``\\n`` to
+    ``\\r\\n`` on Windows, which would make any multi-line ``old_string``
+    fail the byte-exact substring match. ``fs.edit`` itself is line-ending-
+    preserving; only the test fixture needs to be platform-stable.
+    """
     f = tmp_path / name
-    f.write_text(content)
+    f.write_bytes(content.encode("utf-8"))
     return f
 
 
