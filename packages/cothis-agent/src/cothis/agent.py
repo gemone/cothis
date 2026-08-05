@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr  # cost: ~5ms
 # ruff's TC001 rule can't see the runtime use and wants it moved under
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
+from cothis.ai._retry import call_with_retry, retrying_stream
 from cothis.ai.model_metadata import resolve_max_tokens
 from cothis.notify import NotifyBus
 from cothis.skills import discover_skills, format_catalog
@@ -909,7 +910,8 @@ class Agent(BaseModel):
         await self._ensure_handles()
 
         for _turn in range(self.max_iterations):
-            response = await self._llm.amessages(
+            response = await call_with_retry(
+                self._llm.amessages,
                 model=self.model,
                 messages=_request_messages(
                     self._messages,
@@ -1015,7 +1017,8 @@ class Agent(BaseModel):
         max_iterations = self.max_iterations
 
         for _turn in range(max_iterations):
-            stream = await llm.amessages(
+            stream = retrying_stream(
+                llm.amessages,
                 model=model,
                 messages=_request_messages(
                     self._messages,
