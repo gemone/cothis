@@ -70,6 +70,54 @@ def _entry_max_tokens(entry: dict[str, Any]) -> int | None:
     return None
 
 
+def _entry_context_window(entry: dict[str, Any]) -> int | None:
+    """Pick the context-window size (input cap) from one litellm entry.
+
+    ``max_input_tokens`` is the modern field; the legacy ``max_tokens``
+    duplicates it when both are present (litellm schema). When only the
+    legacy field exists it is the input cap. Both absent -> ``None``.
+    """
+    inp = entry.get("max_input_tokens")
+    if isinstance(inp, (int, float)) and inp > 0:
+        return int(inp)
+    # Only fall back to legacy when there is no modern input field at all;
+    # otherwise the legacy value is the output cap (see _entry_max_tokens).
+    if "max_input_tokens" not in entry:
+        legacy = entry.get("max_tokens")
+        if isinstance(legacy, (int, float)) and legacy > 0:
+            return int(legacy)
+    return None
+
+
+def model_info(model: str, provider: str) -> dict[str, Any]:
+    """Return the structured limits advertised for one model.
+
+    A sibling to :func:`resolve_max_tokens` that returns both limits as a
+    dict (``maxOutputTokens``, ``contextWindow``) instead of a single int.
+    Reuses the same cached :func:`_metadata` and the same
+    ``(model, f'{provider}/{model}')`` key walk, picking the first matching
+    entry so the advertised pair is consistent with the resolver's
+    precedence. Unknown fields are ``None`` — no invented numbers, no crash.
+    Callers that need a concrete output cap should still use
+    :func:`resolve_max_tokens` (which falls back to ``_FALLBACK_MAX_TOKENS``
+    for unknown models); this function is for honest *advertisement*, where
+    ``None`` is the truthful "we don't know".
+    """
+    data = _metadata()
+    entry: dict[str, Any] | None = None
+    for key in (model, f"{provider}/{model}"):
+        candidate = data.get(key)
+        if isinstance(candidate, dict):
+            entry = candidate
+            break
+    if entry is None:
+        return {"maxOutputTokens": None, "contextWindow": None}
+    return {
+        "maxOutputTokens": _entry_max_tokens(entry),
+        "contextWindow": _entry_context_window(entry),
+    }
+
+
 def resolve_max_tokens(
     model: str,
     provider: str,

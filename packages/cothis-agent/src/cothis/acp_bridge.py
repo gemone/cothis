@@ -34,6 +34,7 @@ from cothis.protocol.messages import (
     BackendError,
     ItemFinished,
     ItemStarted,
+    ModelDescriptor,
     ModelRef,
     ProtocolError,
     SessionSnapshot,
@@ -176,6 +177,21 @@ class AgentSessionBackend:
         return sess
 
     # ------------------------------------------------------------------ backend
+
+    async def models(self) -> list[ModelDescriptor]:
+        # The honest advertisement: the single model this server is
+        # configured to serve, enriched with the limits bundled litellm
+        # metadata can resolve for it (``None`` where unknown — never
+        # invented). A multi-model registry is a follow-up.
+        from cothis.ai.model_metadata import model_info
+
+        return [
+            ModelDescriptor(
+                provider=self._provider,
+                id=self._model,
+                **model_info(self._model, self._provider),
+            )
+        ]
 
     async def list_sessions(self) -> list[SessionSummary]:
         return [s.summary() for s in self._sessions.values()]

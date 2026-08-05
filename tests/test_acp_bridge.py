@@ -161,3 +161,36 @@ async def test_tool_error_marks_item_error() -> None:
 
     tool_finished = next(p for p in emitted if p.type == "item_finished" and p.item.role == "tool")
     assert tool_finished.item.status == "error" and tool_finished.item.isError
+
+
+@pytest.mark.asyncio
+async def test_models_advertises_configured_model_with_limits() -> None:
+    # A backend configured for the default cothis model advertises exactly
+    # that (provider, id), enriched with the limits bundled metadata resolves.
+    backend = AgentSessionBackend(
+        provider="openrouter",
+        model="openai/gpt-oss-120b",
+        make_agent=lambda **_kw: _FakeAgent([]),
+    )
+    [advertised] = await backend.models()
+    assert advertised.provider == "openrouter"
+    assert advertised.id == "openai/gpt-oss-120b"
+    # litellm knows this model; both limits are populated.
+    assert advertised.maxOutputTokens == 32768
+    assert advertised.contextWindow == 131072
+
+
+@pytest.mark.asyncio
+async def test_models_unknown_model_advertises_none_limits() -> None:
+    # An unknown configured model is still advertised by id; the limits are
+    # honestly None rather than invented.
+    backend = AgentSessionBackend(
+        provider="p",
+        model="no-such-model",
+        make_agent=lambda **_kw: _FakeAgent([]),
+    )
+    [advertised] = await backend.models()
+    assert advertised.provider == "p"
+    assert advertised.id == "no-such-model"
+    assert advertised.maxOutputTokens is None
+    assert advertised.contextWindow is None

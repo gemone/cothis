@@ -34,6 +34,7 @@ from cothis.protocol.messages import (
     PROTOCOL_VERSION,
     BackendError,
     ClientHello,
+    ModelDescriptor,
     ModelRef,
     PromptCommand,
     ProtocolError,
@@ -95,6 +96,14 @@ class SessionBackend(Protocol):
     async def prompt(
         self, session_id: str, text: str, emit: ProgressEmitter
     ) -> SessionSnapshot: ...
+    async def models(self) -> list[ModelDescriptor]:
+        """Models this server advertises in the handshake snapshot.
+
+        Implementations return the model(s) they are configured to serve,
+        enriched with the limits they can resolve. ``[]`` is honest for a
+        backend that advertises nothing.
+        """
+        ...
 
 
 class ACPServer:
@@ -106,7 +115,6 @@ class ACPServer:
         *,
         token: str,
         server_id: str = "cothis",
-        models: list[Any] | None = None,
         max_frame_length: int | None = None,
     ) -> None:
         if not token:
@@ -114,7 +122,6 @@ class ACPServer:
         self._backend = backend
         self._token_digest = hashlib.sha256(token.encode("utf-8")).digest()
         self.id = server_id
-        self._models = list(models or [])
         self._max_frame = max_frame_length
         # revision is fixed at 0 in I9 (no broadcast machinery yet).
         self._revision = 0
@@ -123,12 +130,13 @@ class ACPServer:
 
     async def _server_snapshot(self) -> dict[str, Any]:
         sessions = await self._backend.list_sessions()
+        models = await self._backend.models()
         return {
             "serverId": self.id,
             "protocolVersion": PROTOCOL_VERSION,
             "revision": self._revision,
             "sessions": [s.model_dump(mode="json") for s in sessions],
-            "models": self._models,
+            "models": [m.model_dump(mode="json") for m in models],
         }
 
     # ------------------------------------------------------------------ serving

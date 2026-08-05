@@ -94,6 +94,24 @@ class ModelRef(BaseModel):
     id: str = Field(min_length=1)
 
 
+class ModelDescriptor(BaseModel):
+    """A model advertised in :class:`ServerSnapshot.models`.
+
+    The ``(provider, id)`` pair identifies the model; the two optional limits
+    are populated when cothis's bundled metadata resolves them for that model
+    (``None`` means "unknown" — never invented). Only the model the server is
+    configured to serve is advertised today; a multi-model registry is a
+    follow-up.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(min_length=1)
+    id: str = Field(min_length=1)
+    maxOutputTokens: int | None = None
+    contextWindow: int | None = None
+
+
 # ---------------------------------------------------------------------------
 # Content + transcript items
 # ---------------------------------------------------------------------------
@@ -266,8 +284,8 @@ class ServerSnapshot(BaseModel):
     protocolVersion: int
     revision: int = Field(ge=0)
     sessions: list[SessionSummary]
-    # Models advertised to clients (populated in a follow-up).
-    models: list[JsonValue] = Field(default_factory=list)
+    # Models advertised to clients (the configured model + its resolved limits).
+    models: list[ModelDescriptor] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +565,7 @@ __all__ = [
     "SessionPhase",
     "AssistantStopReason",
     "ModelRef",
+    "ModelDescriptor",
     # content + transcript
     "TextContent",
     "ToolCallContent",
