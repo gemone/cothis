@@ -36,6 +36,7 @@ from cothis.tools.mcp import (
     _build_mcp_http_server,
     _build_mcp_stdio_server,
     _flatten_exc,
+    _normalize_input_schema,
     _normalize_mcp_result,
 )
 from cothis.tools.yaml import _ShellTool, load_yaml_tools
@@ -500,6 +501,216 @@ def test_normalize_mixed_text_and_image_keeps_both() -> None:
     assert "7 bytes base64" in lines[1]
 
 
+# --- input-schema normalization (pure) ---------------------------------
+#
+# ``_normalize_input_schema`` is the single chokepoint that stops a
+# non-conformant MCP server from corrupting the tool-call contract for every
+# provider. These cover every case in the I16 plan's test section.
+#
+# CRITIC FIX: assert ``$ref``/``$defs`` ABSENCE via a RECURSIVE dict-key walk
+# (``_schema_has_key`` below), NOT a ``json.dumps`` substring check — a
+# property literally named with those characters would false-red a substring
+# check. The walk is the correct, robust assertion.
+
+
+def _schema_has_key(node: Any, key: str) -> bool:
+    """Recursive dict-key walk — True if ``key`` appears anywhere in the tree.
+
+    The robust way to assert a key is absent from a normalised schema: a
+    ``json.dumps(node)`` substring check would false-red on a property
+    literally named ``"$ref"`` or ``"$defs"``. Walks dicts + lists.
+    """
+    if isinstance(node, dict):
+        if key in node:
+            return True
+        return any(_schema_has_key(v, key) for v in node.values())
+    if isinstance(node, list):
+        return any(_schema_has_key(v, key) for v in node)
+    return False
+
+
+def test_normalize_schema_passthrough_conformant() -> None:
+    """A conformant schema returns an equal dict — no spurious mutation."""
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}},
+        "required": ["a"],
+    }
+    assert _normalize_input_schema(schema, tool_name="t") == {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}},
+        "required": ["a"],
+    }
+
+
+def test_normalize_schema_defaults_missing_top_level_type() -> None:
+    """A schema missing ``type`` gets ``type:object`` + empty properties injected."""
+    assert _normalize_input_schema({}, tool_name="t") == {
+        "type": "object",
+        "properties": {},
+    }
+    assert _normalize_input_schema({"properties": {"x": {}}}, tool_name="t") == {
+        "type": "object",
+        "properties": {"x": {}},
+    }
+
+
+def test_normalize_schema_inlines_local_ref() -> None:
+    """A local ``$ref`` against ``$defs`` is inlined into the property; ``$defs`` stripped."""
+    schema = {
+        "$defs": {"X": {"type": "string"}},
+        "properties": {"a": {"$ref": "#/$defs/X"}},
+    }
+    out = _normalize_input_schema(schema, tool_name="t")
+    assert out["type"] == "object"
+    assert out["properties"]["a"] == {"type": "string"}
+    assert not _schema_has_key(out, "$ref")
+    assert not _schema_has_key(out, "$defs")
+    assert not _schema_has_key(out, "definitions")
+
+
+def test_normalize_schema_inlines_transitive_ref() -> None:
+    """Transitive ``$ref`` (X -> Y -> leaf) inlines to the leaf schema."""
+    schema = {
+        "$defs": {
+            "X": {"$ref": "#/$defs/Y"},
+            "Y": {"type": "string"},
+        },
+        "properties": {"a": {"$ref": "#/$defs/X"}},
+    }
+    out = _normalize_input_schema(schema, tool_name="t")
+    assert out["properties"]["a"] == {"type": "string"}
+    assert not _schema_has_key(out, "$ref")
+
+
+def test_normalize_schema_drops_unresolvable_ref_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unresolvable ``$ref`` is replaced with ``{}`` and logged at WARNING."""
+    schema = {"properties": {"a": {"$ref": "#/$defs/Missing"}}}
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        out = _normalize_input_schema(schema, tool_name="mytool")
+    assert out["properties"]["a"] == {}
+    assert "mytool" in caplog.text
+    assert "#/$defs/Missing" in caplog.text
+    assert not _schema_has_key(out, "$ref")
+
+
+def test_normalize_schema_rejects_remote_ref() -> None:
+    """A remote/http ``$ref`` is dropped — never resolved (security: no network)."""
+    schema = {"properties": {"a": {"$ref": "https://example.com/schema.json"}}}
+    out = _normalize_input_schema(schema, tool_name="t")
+    assert out["properties"]["a"] == {}
+    assert not _schema_has_key(out, "$ref")
+
+
+def test_normalize_schema_strips_provider_specific_keys() -> None:
+    """``$schema``/``$id`` stripped; ``additionalProperties``/``description`` preserved."""
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://example.com/schema.json",
+        "type": "object",
+        "description": "a tool",
+        "additionalProperties": False,
+        "properties": {"a": {"type": "string"}},
+    }
+    out = _normalize_input_schema(schema, tool_name="t")
+    assert not _schema_has_key(out, "$schema")
+    assert not _schema_has_key(out, "$id")
+    assert out["description"] == "a tool"
+    assert out["additionalProperties"] is False
+
+
+def test_normalize_schema_coerces_malformed_required(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``required`` coerced to a unique string list; non-strings dropped with WARNING."""
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        out_bare = _normalize_input_schema(
+            {"type": "object", "required": "a", "properties": {"a": {}}},
+            tool_name="t",
+        )
+        out_dedupe = _normalize_input_schema(
+            {"type": "object", "required": ["a", "a", "b"]},
+            tool_name="t",
+        )
+        out_drop = _normalize_input_schema(
+            {"type": "object", "required": ["a", 1, True]},
+            tool_name="t",
+        )
+    assert out_bare["required"] == ["a"]
+    assert out_dedupe["required"] == ["a", "b"]
+    assert out_drop["required"] == ["a"]
+    # The non-string entries (1, True) triggered a WARNING naming the field.
+    assert "required" in caplog.text
+    assert "non-string" in caplog.text
+
+
+def test_normalize_schema_oversized_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A schema whose JSON form exceeds ``_MAX_SCHEMA_BYTES`` is replaced."""
+    from cothis.tools.mcp import _MAX_SCHEMA_BYTES
+
+    # A small dict whose serialised form exceeds the byte ceiling (a single
+    # huge description string is enough — the schema tree itself is shallow).
+    big_value = "x" * (_MAX_SCHEMA_BYTES + 1000)
+    schema = {"type": "object", "properties": {"big": {"description": big_value}}}
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        out = _normalize_input_schema(schema, tool_name="bigtool")
+    assert out == {"type": "object", "properties": {}}
+    assert "bigtool" in caplog.text
+
+
+def test_normalize_schema_deep_nesting_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hand-built nesting deeper than ``_MAX_SCHEMA_DEPTH`` falls back without RecursionError."""
+    from cothis.tools.mcp import _MAX_SCHEMA_DEPTH
+
+    leaf: dict[str, Any] = {"type": "string"}
+    for _ in range(_MAX_SCHEMA_DEPTH + 5):
+        leaf = {"type": "object", "properties": {"a": leaf}}
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        out = _normalize_input_schema(leaf, tool_name="deeptool")
+    assert out == {"type": "object", "properties": {}}
+    assert "deeptool" in caplog.text
+
+
+def test_normalize_schema_self_referential_ref_safe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A self-referential ``$defs`` entry terminates at the depth ceiling — no RecursionError."""
+    schema = {
+        "$defs": {"X": {"$ref": "#/$defs/X"}},
+        "properties": {"a": {"$ref": "#/$defs/X"}},
+    }
+    with caplog.at_level(logging.WARNING, logger="cothis.tools"):
+        out = _normalize_input_schema(schema, tool_name="cycletool")
+    # The depth counter fires before the cycle escapes; whole schema replaced.
+    assert out == {"type": "object", "properties": {}}
+    assert "cycletool" in caplog.text
+
+
+def test_normalize_schema_deepcopy_contract() -> None:
+    """The server's dict is never mutated — mutate it after the call, result is unchanged."""
+    schema = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "required": ["a"],
+    }
+    result = _normalize_input_schema(schema, tool_name="t")
+    # Mutate the original after the call in every way a buggy caller might.
+    schema["properties"]["a"] = {"type": "integer"}
+    schema["properties"]["new"] = {"type": "boolean"}
+    schema["required"].append("b")
+    assert result == {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "required": ["a"],
+    }
+
+
 # --- connect_into + dispatch -------------------------------------------
 
 
@@ -523,6 +734,62 @@ async def test_connect_into_discovers_tools_with_schema() -> None:
         assert add.__cothis_schema__["name"] == "test-server.add"
         assert "a" in params["properties"]
         assert "b" in params["properties"]
+
+
+@pytest.mark.asyncio
+async def test_connect_into_normalises_non_conformant_input_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``connect_into`` wraps a non-conformant server tool into a normalised schema.
+
+    Constructs an ``mcp.types.Tool`` whose ``inputSchema`` is missing a
+    top-level ``type`` and carries a ``$ref`` (exactly the shape a
+    non-conformant server ships), then routes it through the real
+    ``MCPServer.connect_into`` snapshot+wrap path by injecting it into the
+    group's tool store from a monkeypatched ``connect_to_server``. The
+    wrapped ``MCPClientTool``'s ``input_schema`` has ``type == "object"``,
+    the ``$ref`` inlined, and no ``$ref``/``$defs`` keys anywhere in the tree.
+    The raw server form is preserved on ``_raw_input_schema``.
+    """
+    from mcp.types import Tool as McpTool
+
+    odd = McpTool(
+        name="odd",
+        description="odd tool",
+        inputSchema={
+            "properties": {"a": {"$ref": "#/$defs/X"}},
+            "$defs": {"X": {"type": "string"}},
+        },
+    )
+
+    async def _inject(
+        self: ClientSessionGroup, params: Any, session_params: Any = None
+    ) -> Any:
+        # Inject the non-conformant tool directly into the group's tool store
+        # under a prefixed name (matching what ``component_name_hook`` would
+        # do). ``connect_into`` snapshotted ``before`` prior to this call, so
+        # the tool appears as "new" and gets wrapped in an ``MCPClientTool``.
+        self._tools[  # noqa: SLF001 — exercise the real snapshot+wrap path
+            "odd-server.odd"
+        ] = odd
+        return None
+
+    monkeypatch.setattr(ClientSessionGroup, "connect_to_server", _inject)
+    server = MCPServer(name="mcp:odd-server", params=None)
+    async with ClientSessionGroup() as group:
+        tools = (await server.connect_into(group))[0]
+    by_name = {t.__name__: t for t in tools}
+    assert "odd-server.odd" in by_name
+    wrapped = by_name["odd-server.odd"]
+    assert isinstance(wrapped, MCPClientTool)
+
+    schema = wrapped.__cothis_schema__["input_schema"]
+    assert schema["type"] == "object"
+    assert schema["properties"]["a"] == {"type": "string"}
+    assert not _schema_has_key(schema, "$ref")
+    assert not _schema_has_key(schema, "$defs")
+    # Raw server form preserved for diagnostic, never sent to the model.
+    assert wrapped._raw_input_schema == odd.inputSchema
 
 
 @pytest.mark.asyncio

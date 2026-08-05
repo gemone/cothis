@@ -19,6 +19,8 @@ lifecycle hooks. See ADR-0005 §2 (deferred connect) and §4 (name prefix).
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import re
 import shutil
 from pathlib import Path
@@ -107,6 +109,209 @@ def _normalize_mcp_result(result: CallToolResult) -> str:
     return body
 
 
+# Resource caps for the input-schema normaliser. Sibling-in-spirit to
+# ``_MAX_BYTES`` in ``fs/_hygiene``: schema-specific (only one consumer
+# today, ``_normalize_input_schema``), so they live here rather than in the
+# shared caps module. Module-const (not config) to match the ``_MAX_BYTES``
+# precedent — operator tuning via env is out of scope for this hardening pass.
+# 64 KiB — bounds a pathological server schema's serialised size before it
+# reaches the model context. A focused tool schema is a few hundred bytes;
+# anything this large is almost always a server bug.
+_MAX_SCHEMA_BYTES = 64 * 1024
+# 32 — bounds nesting / self-referential ``$ref`` cycles. Real tool schemas
+# rarely exceed 4-5 levels; this is a generous safety margin that keeps a
+# cyclical ``$defs`` entry from looping forever.
+_MAX_SCHEMA_DEPTH = 32
+
+
+class _SchemaTooDeep(Exception):
+    """Raised when an ``inputSchema``'s nesting exceeds ``_MAX_SCHEMA_DEPTH``.
+
+    Caught at the ``_normalize_input_schema`` entry point so the recursion
+    terminates with a single minimal-schema fallback rather than propagating
+    ``RecursionError`` (a cyclical ``$defs`` entry would otherwise loop).
+    """
+
+
+def _normalize_input_schema(schema: dict[str, Any], *, tool_name: str) -> dict[str, Any]:
+    """Normalise an MCP server's ``inputSchema`` into a clean Anthropic ``input_schema``.
+
+    The MCP spec lets any server ship a JSON Schema as ``inputSchema``; that
+    dict flows verbatim into ``__cothis_schema__["input_schema"]`` and out to
+    every provider (Anthropic via ``schema_for``; OpenAI/Google via
+    ``anthropic_tools_to_openai``/``anthropic_tools_to_google`` which pass
+    ``input_schema`` straight through as ``parameters``). A non-conformant
+    server — missing top-level ``type:object``, carrying ``$ref``/``$defs``
+    the Anthropic tool shape rejects, malformed ``required``, oversized or
+    self-referential — would corrupt the tool-call contract for every model.
+    This is the single chokepoint that stops that.
+
+    Contract (run inside ``MCPClientTool.__init__`` before assigning
+    ``__cothis_schema__``):
+
+    1. ``deepcopy`` the input so the server's dict (held by the SDK) is never
+       mutated — there is a dedicated deepcopy-contract test.
+    2. Default top-level ``type`` to ``"object"`` (synthesise
+       ``{type:object, properties:{}}`` when missing/empty/non-object).
+    3. Inline local ``$ref`` against ``$defs``/``definitions`` (recursing,
+       bounded by ``_MAX_SCHEMA_DEPTH``), then strip
+       ``$defs``/``definitions``/``$ref``/``$schema``/``$id`` (keys the
+       Anthropic tool shape rejects). Remote/http refs are NEVER resolved —
+       only ``#/...`` local fragments; anything else is dropped with a
+       WARNING (security: no network ref resolution).
+    4. Replace-with-``{}`` any unresolvable ``$ref`` and log at ``WARNING``
+       naming the tool + the offending ref.
+    5. Coerce ``required`` to a unique list of strings, dropping non-string
+       entries with a ``WARNING``.
+    6. If the serialised result exceeds ``_MAX_SCHEMA_BYTES`` or nesting
+       exceeds ``_MAX_SCHEMA_DEPTH``, replace with ``{"type":"object",
+       "properties":{}}`` + ``WARNING``.
+
+    Pure: stdlib-only (``json`` + ``copy.deepcopy`` + the module ``logger``).
+    """
+    # Deepcopy first so the server's dict is never mutated in place — defense
+    # against future changes and a documented contract (deepcopy-contract test).
+    work = copy.deepcopy(schema)
+
+    # Harvest ``$defs``/``definitions`` from the root once — all local
+    # ``$ref`` fragments resolve against this map (the JSON Schema document
+    # model: refs are root-relative).
+    defs: dict[str, Any] = {}
+    for defkey in ("$defs", "definitions"):
+        block = work.get(defkey)
+        if isinstance(block, dict):
+            for name, sub in block.items():
+                defs[str(name)] = sub
+
+    def resolve_ref(ref: str, depth: int) -> Any:
+        if not ref.startswith("#/"):
+            logger.warning(
+                "MCP tool %r: inputSchema $ref %r is not a local fragment; "
+                "dropped (remote refs are never resolved)",
+                tool_name,
+                ref,
+            )
+            return {}
+        # ``#/$defs/X`` or ``#/definitions/X`` — take the trailing segment
+        # as the def key (matches the harvest loop above).
+        name = ref[2:].split("/", 1)[-1]
+        target = defs.get(name)
+        if target is None:
+            logger.warning(
+                "MCP tool %r: inputSchema $ref %r not found in "
+                "$defs/definitions; replaced with {}",
+                tool_name,
+                ref,
+            )
+            return {}
+        # ``walk`` (and thus the ``_MAX_SCHEMA_DEPTH`` counter) is the sole
+        # bound for transitive / self-referential refs — a cyclical def
+        # terminates there instead of looping forever.
+        return walk(target, depth + 1)
+
+    def coerce_required(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if not isinstance(value, list):
+            logger.warning(
+                "MCP tool %r: inputSchema 'required' is %s, expected a list "
+                "of strings; dropped",
+                tool_name,
+                type(value).__name__,
+            )
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        dropped = False
+        for item in value:
+            # ``isinstance(True, str)`` is False — bools are dropped here
+            # alongside ints/None/dicts (only real strings survive).
+            if isinstance(item, str):
+                if item not in seen:
+                    seen.add(item)
+                    out.append(item)
+            else:
+                dropped = True
+        if dropped:
+            logger.warning(
+                "MCP tool %r: inputSchema 'required' had non-string entries; "
+                "dropped",
+                tool_name,
+            )
+        return out
+
+    def walk(node: Any, depth: int) -> Any:
+        # Explicit depth counter (never raw recursion) — bounds transitive
+        # / self-referential refs and satisfies ty. The raised exception is
+        # caught once at the entry point.
+        if depth > _MAX_SCHEMA_DEPTH:
+            raise _SchemaTooDeep()
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str):
+                # A ``$ref`` node replaces the entire node (JSON Schema
+                # semantics: sibling keys are ignored under draft-07 ref).
+                return resolve_ref(ref, depth)
+            out: dict[str, Any] = {}
+            for key, value in node.items():
+                if key in ("$defs", "definitions", "$ref", "$schema", "$id"):
+                    # Provider-rejecting / inline-definition keys: dropped
+                    # after their refs were harvested at the root.
+                    continue
+                if key == "required":
+                    coerced = coerce_required(value)
+                    if coerced:
+                        out[key] = coerced
+                    continue
+                out[key] = walk(value, depth + 1)
+            return out
+        if isinstance(node, list):
+            return [walk(item, depth + 1) for item in node]
+        return node
+
+    try:
+        normalised = walk(work, 0)
+    except _SchemaTooDeep:
+        logger.warning(
+            "MCP tool %r: inputSchema nesting exceeded depth ceiling %d; "
+            "replaced with a minimal object schema",
+            tool_name,
+            _MAX_SCHEMA_DEPTH,
+        )
+        return {"type": "object", "properties": {}}
+    if not isinstance(normalised, dict):
+        # ``$ref`` at the root resolved to a non-object leaf; default to an
+        # empty object so the top-level is always a function-shaped schema.
+        normalised = {"type": "object", "properties": {}}
+    if not normalised.get("type"):
+        normalised["type"] = "object"
+    if normalised.get("type") != "object":
+        # The root must be an object schema; force it so providers don't
+        # reject the tool definition outright.
+        normalised = {"type": "object", "properties": {}}
+    normalised.setdefault("properties", {})
+    # Final byte-size ceiling on the serialised form.
+    try:
+        encoded = json.dumps(normalised).encode("utf-8")
+    except (TypeError, ValueError):
+        logger.warning(
+            "MCP tool %r: inputSchema is not JSON-serialisable; replaced "
+            "with a minimal object schema",
+            tool_name,
+        )
+        return {"type": "object", "properties": {}}
+    if len(encoded) > _MAX_SCHEMA_BYTES:
+        logger.warning(
+            "MCP tool %r: inputSchema serialised to %d bytes (ceiling %d); "
+            "replaced with a minimal object schema",
+            tool_name,
+            len(encoded),
+            _MAX_SCHEMA_BYTES,
+        )
+        return {"type": "object", "properties": {}}
+    return normalised
+
+
 class MCPSessionHandle(ResourceHandle):
     """A ``ResourceHandle`` backed by one MCP server's session.
 
@@ -172,22 +377,25 @@ class MCPClientTool(_HookableTool):
         self.__name__ = mcp_tool.name
         self.__doc__ = mcp_tool.description or f"MCP tool: {mcp_tool.name}"
         self._remote_name = mcp_tool.name
-        # cothis: ceiling — the server's ``inputSchema`` is passed through
-        # verbatim as the ``input_schema`` field (Anthropic tool shape). The
-        # MCP spec defines ``inputSchema`` as a JSON Schema, which is
-        # structurally what Anthropic's ``input_schema`` expects — but a
-        # non-conformant server may ship a schema missing ``type: "object"``,
-        # carrying ``$ref``/``$defs``, or with provider-specific quirks, and
-        # those leak straight to the model. cothis does no normalisation
-        # today. Upgrade path: run the schema through a normaliser (drop
-        # ``$defs`` by inlining, default missing ``type`` to ``object``,
-        # validate it's a function-shaped schema) so an odd server can't
-        # corrupt the tool-call contract.
+        # cothis: the server's ``inputSchema`` is a JSON Schema, which is
+        # structurally what Anthropic's ``input_schema`` expects — but the
+        # MCP spec lets any server ship one, and a non-conformant schema
+        # (missing ``type:object``, carrying ``$ref``/``$defs``, malformed
+        # ``required``, oversized or self-referential) would leak straight to
+        # every provider and corrupt the tool-call contract. Normalise once
+        # here at the single chokepoint; see ``_normalize_input_schema`` for
+        # the contract (deepcopy → default type → inline ``$ref`` → strip
+        # provider-rejecting keys → coerce ``required`` → size/depth caps).
+        # The raw server form is kept on ``_raw_input_schema`` for diagnostic
+        # (so a WARNING can name what diverged) and is NEVER sent to the model.
+        self._raw_input_schema = mcp_tool.inputSchema
         self.__cothis_schema__ = {
             "name": mcp_tool.name,
             "description": self.__doc__,
-            "input_schema": mcp_tool.inputSchema
-            or {"type": "object", "properties": {}},
+            "input_schema": _normalize_input_schema(
+                mcp_tool.inputSchema or {"type": "object", "properties": {}},
+                tool_name=mcp_tool.name,
+            ),
         }
 
     async def __call__(self, **kwargs: Any) -> str:
