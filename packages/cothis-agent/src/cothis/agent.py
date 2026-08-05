@@ -47,7 +47,13 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr  # cost: ~5ms
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
 from cothis.ai._retry import call_with_retry, retrying_stream
-from cothis.ai.model_metadata import resolve_max_tokens
+from cothis.ai.context_budget import (
+    ContextBudget,
+    build_context_budget,
+    estimate_input_tokens,
+    total_input_tokens_from_usage,
+)
+from cothis.ai.model_metadata import model_info, resolve_max_tokens
 from cothis.notify import NotifyBus
 from cothis.skills import discover_skills, format_catalog
 from cothis.tools import (
@@ -251,6 +257,30 @@ def _assistant_msg_from_response(response: MessageResponse) -> dict[str, Any]:
         if response.usage
         else None,
     }
+
+
+def _last_observed_input_tokens(messages: list[dict[str, Any]]) -> int | None:
+    """Return the most recent observed context size from stored assistant ``usage``.
+
+    Walks ``messages`` backwards to the most recent assistant message whose
+    ``usage`` dict yields a non-``None`` total via
+    :func:`total_input_tokens_from_usage`. Stays here (not in the
+    ``context_budget`` primitive) because it knows the stored-with-metadata
+    ``_messages`` shape — assistant dicts carry ``usage`` alongside
+    ``role``/``content``, while the primitive only knows the provider
+    ``usage`` block shape.
+
+    Returns ``None`` when no assistant message has a usable ``usage`` block
+    (pre-first-turn, or every response lacked usage) — the caller
+    (``Agent.context_budget``) then falls back to the heuristic estimate.
+    """
+    for m in reversed(messages):
+        if m.get("role") != "assistant":
+            continue
+        total = total_input_tokens_from_usage(m.get("usage"))
+        if total is not None:
+            return total
+    return None
 
 
 def _request_messages(
@@ -872,6 +902,42 @@ class Agent(BaseModel):
                 self.model, self.provider, self.max_tokens
             )
         return self._resolved_max_tokens
+
+    def context_budget(self) -> ContextBudget:
+        """Assemble a read-only :class:`~cothis.ai.ContextBudget` signal.
+
+        Combines the model's advertised ``contextWindow`` (via
+        :func:`model_info`) with the most recently observed provider
+        ``usage`` block to produce a pure-data pressure snapshot. The
+        deferred auto-compaction epic consumes this; nothing in the loop
+        reacts to it yet — no compaction, eviction, or summarisation is
+        wired here.
+
+        The signal degrades gracefully when the model's context window is
+        unknown (``contextWindow is None`` for models missing from the
+        bundled metadata): every derived field (``available_tokens``,
+        ``ratio``, ``pressure``) becomes ``None`` rather than fabricating
+        a number. ``used_tokens`` is still populated.
+
+        Token accounting priority:
+
+        1. **Observed** (authoritative): the most recent assistant
+           ``usage.input_tokens`` (+ Anthropic cache fields). Exact, free,
+           the provider's own count.
+        2. **Heuristic fallback** (pre-first-turn / no usage yet): a
+           char/4 estimate over the ``{role, content}`` projection. Bounded
+           error (~±20%), zero-dependency, covers messages only.
+
+        O(messages) and cheap: one ``model_info`` lookup against the
+        already-cached metadata, plus one backwards walk to the last
+        assistant ``usage`` (or, in the fallback path, one forward walk
+        to estimate the projection).
+        """
+        capacity = model_info(self.model, self.provider)["contextWindow"]
+        used = _last_observed_input_tokens(self._messages)
+        if used is None:
+            used = estimate_input_tokens(_request_messages(self._messages))
+        return build_context_budget(used=used, capacity=capacity)
 
     async def run(self, user_input: str) -> str:
         """Run the agent loop to completion and return the final answer.

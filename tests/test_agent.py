@@ -65,6 +65,7 @@ from cothis.agent import (
     _concat_text,
     _finalize_stream_block,
     _init_stream_block,
+    _last_observed_input_tokens,
     _load_agents_md,
     _read_first_matching,
     _read_text,
@@ -73,6 +74,7 @@ from cothis.agent import (
     _system_param,
     _tool_result_block,
 )
+from cothis.ai import ContextBudget, PressureLevel
 
 if TYPE_CHECKING:
     from cothis.tools import Tool
@@ -1743,3 +1745,232 @@ def test_resolve_ask_unknown_id_is_noop(
     """AC #229: ``resolve_ask`` with unknown ask_id → silent no-op."""
     agent = _patched_agent(monkeypatch)
     agent.resolve_ask("nonexistent", "value")
+
+
+# --- context_budget() wiring ------------------------------------------------
+#
+# ``Agent.context_budget()`` assembles the pressure signal from already-
+# stored state: the model's advertised ``contextWindow`` (via
+# ``model_info``) and the most recent assistant ``usage`` block, with a
+# char/4 heuristic fallback for the pre-first-turn case. These tests use
+# the MagicMock-provider pattern (no network): the metadata-only signal
+# doesn't need the LLM, and ``usage`` dicts are planted directly into
+# ``_messages``.
+
+
+def _make_budget_agent(
+    monkeypatch: pytest.MonkeyPatch, **overrides: Any
+) -> Agent:
+    """Build an Agent without any LLM call (mirrors ``test_model_metadata``).
+
+    ``cothis.ai.get_provider`` is patched to a MagicMock so no provider is
+    contacted and no API key is required. ``model`` / ``provider`` default
+    to the real ``openai/gpt-oss-120b`` on ``openrouter`` so ``model_info``
+    returns a known, non-``None`` ``contextWindow`` (131072).
+    """
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    return Agent(
+        model=overrides.get("model", "openai/gpt-oss-120b"),
+        provider=overrides.get("provider", "openrouter"),
+        tools=[],
+        max_iterations=5,
+        max_tokens=overrides.get("max_tokens", None),
+    )
+
+
+def _plant_assistant_with_usage(
+    agent: Agent, usage: dict[str, Any] | None
+) -> None:
+    """Append an assistant message carrying ``usage`` to ``_messages``.
+
+    Mirrors the stored-with-metadata shape ``_assistant_msg_from_response``
+    produces (the dict ``_last_observed_input_tokens`` walks). ``content``
+    is minimal — the budget signal reads ``role`` + ``usage``, not content.
+    """
+    agent._messages.append(
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "id": "msg_test",
+            "model": agent.model,
+            "stop_reason": "end_turn",
+            "usage": usage,
+        }
+    )
+
+
+def test_context_budget_known_model_observed_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real model + planted usage → exact ratio + MEDIUM pressure boundary.
+
+    ``openai/gpt-oss-120b`` on ``openrouter`` advertises a 131072-token
+    window. With ``input_tokens=98304`` planted on the last assistant
+    message, the ratio is exactly 0.75 — the MEDIUM bucket's lower edge.
+    """
+    agent = _make_budget_agent(monkeypatch)
+    _plant_assistant_with_usage(agent, {"input_tokens": 98304, "output_tokens": 100})
+    budget = agent.context_budget()
+    assert isinstance(budget, ContextBudget)
+    assert budget.capacity_tokens == 131072
+    assert budget.used_tokens == 98304
+    assert budget.ratio == pytest.approx(0.75)
+    assert budget.pressure == PressureLevel.MEDIUM
+    assert budget.available_tokens == 32768
+    assert budget.is_known
+
+
+def test_context_budget_anthropic_cache_breakdown_summed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic splits cached tokens out — the signal must sum them.
+
+    ``input_tokens`` is the non-cached portion; ``cache_creation_*`` +
+    ``cache_read_*`` are the cached portions. The true context size for
+    the turn is the sum (100000), not just ``input_tokens`` (1000).
+    """
+    agent = _make_budget_agent(monkeypatch)
+    _plant_assistant_with_usage(
+        agent,
+        {
+            "input_tokens": 1000,
+            "cache_creation_input_tokens": 5000,
+            "cache_read_input_tokens": 94000,
+            "output_tokens": 200,
+        },
+    )
+    budget = agent.context_budget()
+    assert budget.used_tokens == 100000
+    assert budget.capacity_tokens == 131072
+    assert budget.ratio == pytest.approx(100000 / 131072)
+
+
+def test_context_budget_unknown_model_capacity_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown model → ``capacity is None``; derived fields None, no crash.
+
+    ``model_info`` reports honestly for models missing from the bundled
+    metadata: ``contextWindow`` is ``None``, never invented. The signal
+    must tolerate this without raising and without fabricating a ratio.
+    ``used_tokens`` is still populated from the planted usage.
+    """
+    agent = _make_budget_agent(monkeypatch, model="no-such-model-xyz", provider="openai")
+    _plant_assistant_with_usage(agent, {"input_tokens": 500})
+    budget = agent.context_budget()
+    assert budget.capacity_tokens is None
+    assert budget.used_tokens == 500
+    assert budget.available_tokens is None
+    assert budget.ratio is None
+    assert budget.pressure is None
+    assert not budget.is_known
+
+
+def test_context_budget_no_turns_empty_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-first-turn, ``_messages == []``: heuristic returns 0, no crash.
+
+    No observed usage → fallback to ``estimate_input_tokens``; empty
+    messages → 0. With known capacity, ratio is 0.0 (NONE pressure),
+    not None — the capacity is known, only the usage path was absent.
+    """
+    agent = _make_budget_agent(monkeypatch)
+    assert agent._messages == []
+    budget = agent.context_budget()
+    assert budget.used_tokens == 0
+    assert budget.capacity_tokens == 131072
+    assert budget.available_tokens == 131072
+    assert budget.ratio == pytest.approx(0.0)
+    assert budget.pressure == PressureLevel.NONE
+    assert budget.is_known
+
+
+def test_context_budget_pre_first_turn_with_user_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-first-turn with a user message: heuristic estimate kicks in.
+
+    No assistant message yet → no observed usage → ``estimate_input_tokens``
+    produces a positive estimate from the user message's {role, content}
+    projection. With known capacity, ratio is a float in [0, 1).
+    """
+    agent = _make_budget_agent(monkeypatch)
+    agent._messages.append({"role": "user", "content": "hello, please help me"})
+    budget = agent.context_budget()
+    assert budget.used_tokens is not None
+    assert budget.used_tokens > 0
+    assert budget.capacity_tokens == 131072
+    assert budget.ratio is not None
+    assert 0.0 <= budget.ratio < 1.0
+    assert budget.is_known
+
+
+def test_context_budget_picks_most_recent_observed_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple assistant turns: the most recent ``usage`` wins.
+
+    ``_last_observed_input_tokens`` walks backwards; the latest assistant
+    message's usage is the authoritative "how full was the window on the
+    last call" measurement, not the earliest.
+    """
+    agent = _make_budget_agent(monkeypatch)
+    _plant_assistant_with_usage(agent, {"input_tokens": 1000, "output_tokens": 10})
+    # Interleave a user tool-result-style message (role user) — must be
+    # skipped by the assistant-only walk.
+    agent._messages.append({"role": "user", "content": "ok"})
+    _plant_assistant_with_usage(agent, {"input_tokens": 50000, "output_tokens": 10})
+    budget = agent.context_budget()
+    assert budget.used_tokens == 50000  # the most recent, not 1000
+
+
+def test_context_budget_is_read_only_and_cheap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calling ``context_budget()`` must not mutate ``_messages``.
+
+    The signal is instrumentation only — it reads state, never writes.
+    Regression guard against a future compaction pass wiring eviction
+    into the wrong layer.
+    """
+    agent = _make_budget_agent(monkeypatch)
+    _plant_assistant_with_usage(agent, {"input_tokens": 1000, "output_tokens": 10})
+    snapshot_before = [dict(m) for m in agent._messages]
+    _ = agent.context_budget()
+    _ = agent.context_budget()
+    assert agent._messages == snapshot_before
+    assert len(agent._messages) == 1
+
+
+# --- _last_observed_input_tokens unit tests ---------------------------------
+
+
+def test_last_observed_input_tokens_none_when_no_assistant() -> None:
+    # Pure helper: only assistant messages carry usage. A user-only list
+    # yields None — caller falls back to the heuristic.
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "hi"},
+    ]
+    assert _last_observed_input_tokens(messages) is None
+
+
+def test_last_observed_input_tokens_none_when_usage_is_none() -> None:
+    # An assistant message stored with ``usage=None`` (a response that
+    # lacked a usage block) is skipped, not crashed on.
+    messages: list[dict[str, Any]] = [
+        {"role": "assistant", "content": [], "usage": None},
+    ]
+    assert _last_observed_input_tokens(messages) is None
+
+
+def test_last_observed_input_tokens_walks_backwards() -> None:
+    # Two assistant turns: the most recent non-None usage wins.
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [], "usage": {"input_tokens": 100}},
+        {"role": "user", "content": "again"},
+        {"role": "assistant", "content": [], "usage": {"input_tokens": 200}},
+    ]
+    assert _last_observed_input_tokens(messages) == 200
+
