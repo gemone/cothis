@@ -24,6 +24,7 @@ _AUDITED_MODULES = (
     "cothis.tools.fs.search",
     "cothis.tools.fs.create",
     "cothis.tools.fs.modify",
+    "cothis.tools.fs.edit",
     "cothis.tools.fs.delete",
     "cothis.skills",
 )

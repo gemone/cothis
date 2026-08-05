@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from cothis.skills import deactivate_skill, load_skill
 from cothis.tools.fs.create import _create
 from cothis.tools.fs.delete import _delete
+from cothis.tools.fs.edit import _edit
 from cothis.tools.fs.list import _list
 from cothis.tools.fs.modify import _modify
 from cothis.tools.fs.read import read
@@ -21,6 +22,7 @@ TOOLS: list[Tool] = [
     _search,
     _create,
     _modify,
+    _edit,
     _delete,
     load_skill,
     deactivate_skill,
