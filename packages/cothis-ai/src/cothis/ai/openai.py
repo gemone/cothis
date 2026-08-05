@@ -174,11 +174,17 @@ async def _synthesise_stream(
 ) -> AsyncIterator[MessageStreamEvent]:
     """Yield ``RawMessageStreamEvent``s synthesised from OpenAI chunks.
 
-    Lifecycle emitted (one text block per turn; one tool_use block per
-    tool call; ``message_stop`` exactly once — duplicate finishes tolerated):
+    Lifecycle emitted (one thinking block when the model streams a reasoning
+    trace; one text block per turn; one tool_use block per tool call;
+    ``message_stop`` exactly once — duplicate finishes tolerated):
     ``message_start``; for each block ``content_block_start`` ->
     ``content_block_delta``* -> ``content_block_stop``; ``message_delta``
     (carrying the mapped ``stop_reason``); ``message_stop``.
+
+    Reasoning models (o-series, gpt-5-codex) and OpenAI-compatible backends
+    stream a reasoning trace as an undocumented ``reasoning_content`` /
+    ``reasoning`` extra on the chunk delta; it is captured here as a
+    ``ThinkingBlock`` lifecycle so the event stream is provider-agnostic.
     """
     # SDK types are imported lazily so this module is import-safe without
     # the anthropic package installed at import time.
@@ -193,15 +199,37 @@ async def _synthesise_stream(
         RawMessageStopEvent,
         TextBlock,
         TextDelta,
+        ThinkingBlock,
+        ThinkingDelta,
         ToolUseBlock,
         Usage,
     )
     from anthropic.types.message import Message
 
+    def _reasoning_piece(delta: Any) -> str:
+        """Return the reasoning delta text for ``delta`` (empty if none).
+
+        OpenAI-compatible backends stream the reasoning trace as an
+        undocumented extra on ``ChoiceDelta`` — the installed openai SDK
+        (2.43.0) does not type it, so it lands in pydantic's ``model_extra``
+        and is exposed as a plain attribute. Wire-name conventions differ
+        across the backends routed through this provider: DeepSeek / OpenRouter
+        send ``reasoning_content``; other OpenAI-compatible backends send
+        ``reasoning``. Read both defensively via ``getattr`` (the file's
+        universal style for upstream fields) and return the first non-empty
+        hit so a single synthesiser covers every backend.
+        """
+        for _name in ("reasoning_content", "reasoning"):
+            _piece = getattr(delta, _name, None)
+            if _piece:
+                return _piece
+        return ""
+
     message_id: str | None = None
     started = False
     next_index = 0
     text_block_index: int | None = None  # open text block, if any
+    thinking_block_index: int | None = None  # open thinking block, if any
     # Maps OpenAI tool_call.index -> our content_block index.
     tool_block_for: dict[int, int] = {}
     stopped = False  # message_stop latch (OpenRouter can duplicate finishes)
@@ -230,11 +258,56 @@ async def _synthesise_stream(
             continue
         delta = getattr(choice, "delta", None)
 
-        # ---- text content ---------------------------------------------------
+        # ---- reasoning (thinking) ------------------------------------------
+        # OpenAI reasoning-family models (o-series, gpt-5-codex) and the
+        # OpenAI-compatible backends routed through this provider stream a
+        # reasoning trace alongside the answer. Capture it as a
+        # ``ThinkingBlock`` lifecycle so the AI-layer event stream stays
+        # provider-agnostic — the accumulator and TUI thinking-render then
+        # apply unchanged. No ``signature``/``SignatureDelta`` path: the
+        # Anthropic signature is provider-specific encryption this synthesis
+        # has no source for, and ``_translate`` drops thinking blocks before
+        # any OpenAI round-trip, so a blank signature is never validated.
         if delta is not None:
+            reasoning_piece = _reasoning_piece(delta)
+            if reasoning_piece:
+                if thinking_block_index is None:
+                    # Close any open text block before opening a thinking
+                    # block — one content_block lifecycle per block.
+                    if text_block_index is not None:
+                        yield RawContentBlockStopEvent(
+                            type="content_block_stop", index=text_block_index
+                        )
+                        text_block_index = None
+                    thinking_block_index = next_index
+                    next_index += 1
+                    yield RawContentBlockStartEvent(
+                        type="content_block_start",
+                        index=thinking_block_index,
+                        content_block=ThinkingBlock(
+                            type="thinking", thinking="", signature=""
+                        ),
+                    )
+                yield RawContentBlockDeltaEvent(
+                    type="content_block_delta",
+                    index=thinking_block_index,
+                    delta=ThinkingDelta(
+                        type="thinking_delta", thinking=reasoning_piece
+                    ),
+                )
+
+            # ---- text content ----------------------------------------------
             content_piece = getattr(delta, "content", None)
             if content_piece:
                 if text_block_index is None:
+                    # Close any open thinking block before opening a text
+                    # block — reasoning typically streams before the answer,
+                    # but defend against interleaving.
+                    if thinking_block_index is not None:
+                        yield RawContentBlockStopEvent(
+                            type="content_block_stop", index=thinking_block_index
+                        )
+                        thinking_block_index = None
                     text_block_index = next_index
                     next_index += 1
                     yield RawContentBlockStartEvent(
@@ -253,13 +326,19 @@ async def _synthesise_stream(
             for tc in tool_calls:
                 tc_index = getattr(tc, "index", 0)
                 if tc_index not in tool_block_for:
-                    # Close any open text block before opening a tool block —
-                    # we keep one text block per turn; tool calls come after.
+                    # Close any open text/thinking block before opening a tool
+                    # block — we keep one text block per turn; tool calls
+                    # come after.
                     if text_block_index is not None:
                         yield RawContentBlockStopEvent(
                             type="content_block_stop", index=text_block_index
                         )
                         text_block_index = None
+                    if thinking_block_index is not None:
+                        yield RawContentBlockStopEvent(
+                            type="content_block_stop", index=thinking_block_index
+                        )
+                        thinking_block_index = None
                     block_index = next_index
                     next_index += 1
                     tool_block_for[tc_index] = block_index
@@ -289,7 +368,12 @@ async def _synthesise_stream(
         finish = getattr(choice, "finish_reason", None)
         if finish is not None and not stopped:
             stopped = True
-            # Close whatever blocks are still open (text + tool_use blocks).
+            # Close whatever blocks are still open (thinking + text + tool_use).
+            if thinking_block_index is not None:
+                yield RawContentBlockStopEvent(
+                    type="content_block_stop", index=thinking_block_index
+                )
+                thinking_block_index = None
             if text_block_index is not None:
                 yield RawContentBlockStopEvent(
                     type="content_block_stop", index=text_block_index
@@ -317,6 +401,10 @@ async def _synthesise_stream(
     # backends truncate), close any dangling blocks and emit the stop pair so
     # the agent's message_stop latch fires exactly once.
     if started and not stopped:
+        if thinking_block_index is not None:
+            yield RawContentBlockStopEvent(
+                type="content_block_stop", index=thinking_block_index
+            )
         if text_block_index is not None:
             yield RawContentBlockStopEvent(
                 type="content_block_stop", index=text_block_index
