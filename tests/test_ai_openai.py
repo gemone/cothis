@@ -33,6 +33,8 @@ from anthropic.types import (
     RawMessageStopEvent,
     TextBlock,
     TextDelta,
+    ThinkingBlock,
+    ThinkingDelta,
     ToolUseBlock,
 )
 
@@ -306,8 +308,15 @@ def _chunk(
     chunk_id: str = "chatcmpl-1",
     model: str = "gpt-test",
     usage: dict[str, int] | None = None,
+    reasoning: str | None = None,
+    reasoning_field: str = "reasoning_content",
 ) -> SimpleNamespace:
     delta = SimpleNamespace(content=content, tool_calls=None, function_call=None)
+    # Reasoning-model trace arrives as an undocumented extra on the wire
+    # (the openai SDK does not type it). Attach it under the requested wire
+    # name so the synthesiser's check-both-names path is exercised.
+    if reasoning is not None:
+        setattr(delta, reasoning_field, reasoning)
     if tool_calls is not None:
         tc_objs = []
         for tc in tool_calls:
@@ -561,3 +570,246 @@ def test_stream_no_explicit_finish_still_emits_message_stop(
     assert len([e for e in events if isinstance(e, RawMessageStopEvent)]) == 1
     msg_deltas = [e for e in events if isinstance(e, RawMessageDeltaEvent)]
     assert msg_deltas[-1].delta.stop_reason == "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# Stream: reasoning-model reasoning trace -> ThinkingBlock lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_stream_reasoning_only_emits_one_thinking_block_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reasoning turn emits one ThinkingBlock start, ThinkingDelta deltas on
+    that index (joined text == full trace), one content_block_stop, then the
+    text-block lifecycle for the answer, then exactly one message_stop."""
+    captured: dict[str, Any] = {}
+    chunks = [
+        _chunk(reasoning="think"),
+        _chunk(reasoning="ing"),
+        _chunk(content="hi"),
+        _chunk(finish="stop"),
+    ]
+    _install_streaming_fake(monkeypatch, chunks, captured)
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    events = _run_stream(provider, model="gpt-test", messages=[], max_tokens=10)
+
+    assert isinstance(events[0], RawMessageStartEvent)
+
+    block_starts = [e for e in events if isinstance(e, RawContentBlockStartEvent)]
+    thinking_starts = [e for e in block_starts if isinstance(e.content_block, ThinkingBlock)]
+    text_starts = [e for e in block_starts if isinstance(e.content_block, TextBlock)]
+    assert len(thinking_starts) == 1
+    assert len(text_starts) == 1
+    thinking_idx = thinking_starts[0].index
+    text_idx = text_starts[0].index
+    assert thinking_idx != text_idx
+
+    deltas = [e for e in events if isinstance(e, RawContentBlockDeltaEvent)]
+    thinking_deltas = [d for d in deltas if isinstance(d.delta, ThinkingDelta)]
+    assert len(thinking_deltas) == 2
+    assert all(d.index == thinking_idx for d in thinking_deltas)
+    assert "".join(d.delta.thinking for d in thinking_deltas) == "thinking"
+
+    # Exactly one content_block_stop on the thinking index.
+    thinking_stops = [
+        e
+        for e in events
+        if isinstance(e, RawContentBlockStopEvent) and e.index == thinking_idx
+    ]
+    assert len(thinking_stops) == 1
+
+    # The answer's text-block lifecycle follows.
+    text_deltas = [d for d in deltas if isinstance(d.delta, TextDelta)]
+    assert "".join(d.delta.text for d in text_deltas) == "hi"
+
+    stops = [e for e in events if isinstance(e, RawMessageStopEvent)]
+    assert len(stops) == 1
+
+
+def test_stream_reasoning_via_reasoning_field_name_matches_reasoning_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The synthesiser reads both wire names — populating ``reasoning`` instead
+    of ``reasoning_content`` still emits the ThinkingBlock lifecycle (the
+    check-both-names defence is the unit under test)."""
+    captured: dict[str, Any] = {}
+    chunks = [
+        _chunk(reasoning="plan", reasoning_field="reasoning"),
+        _chunk(content="answer"),
+        _chunk(finish="stop"),
+    ]
+    _install_streaming_fake(monkeypatch, chunks, captured)
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    events = _run_stream(provider, model="m", messages=[], max_tokens=10)
+
+    block_starts = [e for e in events if isinstance(e, RawContentBlockStartEvent)]
+    thinking_starts = [e for e in block_starts if isinstance(e.content_block, ThinkingBlock)]
+    assert len(thinking_starts) == 1
+    thinking_deltas = [
+        d
+        for d in events
+        if isinstance(d, RawContentBlockDeltaEvent) and isinstance(d.delta, ThinkingDelta)
+    ]
+    assert "".join(d.delta.thinking for d in thinking_deltas) == "plan"
+
+
+def test_stream_non_reasoning_model_emits_no_thinking_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: when the backend sends no reasoning, the new branch
+    must not fire — no ThinkingBlock start, no ThinkingDelta."""
+    captured: dict[str, Any] = {}
+    chunks = [
+        _chunk(content="Hel"),
+        _chunk(content="lo"),
+        _chunk(finish="stop"),
+    ]
+    _install_streaming_fake(monkeypatch, chunks, captured)
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    events = _run_stream(provider, model="gpt-test", messages=[], max_tokens=10)
+
+    block_starts = [e for e in events if isinstance(e, RawContentBlockStartEvent)]
+    assert not any(isinstance(e.content_block, ThinkingBlock) for e in block_starts)
+    deltas = [e for e in events if isinstance(e, RawContentBlockDeltaEvent)]
+    assert not any(isinstance(d.delta, ThinkingDelta) for d in deltas)
+    # The existing contract still holds.
+    assert len([e for e in events if isinstance(e, RawMessageStopEvent)]) == 1
+
+
+def test_stream_reasoning_then_text_closes_thinking_before_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The thinking content_block_stop is emitted BEFORE the text
+    content_block_start; both blocks present on distinct indices."""
+    captured: dict[str, Any] = {}
+    chunks = [
+        _chunk(reasoning="plan"),
+        _chunk(content="answer"),
+        _chunk(finish="stop"),
+    ]
+    _install_streaming_fake(monkeypatch, chunks, captured)
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    events = _run_stream(provider, model="m", messages=[], max_tokens=10)
+
+    thinking_idx = next(
+        e.index
+        for e in events
+        if isinstance(e, RawContentBlockStartEvent)
+        and isinstance(e.content_block, ThinkingBlock)
+    )
+    text_idx = next(
+        e.index
+        for e in events
+        if isinstance(e, RawContentBlockStartEvent) and isinstance(e.content_block, TextBlock)
+    )
+    thinking_stop_pos = next(
+        i
+        for i, e in enumerate(events)
+        if isinstance(e, RawContentBlockStopEvent) and e.index == thinking_idx
+    )
+    text_start_pos = next(
+        i
+        for i, e in enumerate(events)
+        if isinstance(e, RawContentBlockStartEvent) and e.index == text_idx
+    )
+    assert thinking_stop_pos < text_start_pos
+    assert thinking_idx != text_idx
+    assert len([e for e in events if isinstance(e, RawMessageStopEvent)]) == 1
+
+
+def test_stream_reasoning_then_tool_call_closes_thinking_before_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The thinking block is closed before the tool_use content_block_start."""
+    captured: dict[str, Any] = {}
+    chunks = [
+        _chunk(reasoning="plan"),
+        _chunk(tool_calls=[{"index": 0, "id": "tu_1", "name": "t", "arguments": "{}"}]),
+        _chunk(finish="tool_calls"),
+    ]
+    _install_streaming_fake(monkeypatch, chunks, captured)
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    events = _run_stream(provider, model="m", messages=[], max_tokens=10)
+
+    thinking_idx = next(
+        e.index
+        for e in events
+        if isinstance(e, RawContentBlockStartEvent)
+        and isinstance(e.content_block, ThinkingBlock)
+    )
+    tool_idx = next(
+        e.index
+        for e in events
+        if isinstance(e, RawContentBlockStartEvent)
+        and isinstance(e.content_block, ToolUseBlock)
+    )
+    thinking_stop_pos = next(
+        i
+        for i, e in enumerate(events)
+        if isinstance(e, RawContentBlockStopEvent) and e.index == thinking_idx
+    )
+    tool_start_pos = next(
+        i
+        for i, e in enumerate(events)
+        if isinstance(e, RawContentBlockStartEvent) and e.index == tool_idx
+    )
+    assert thinking_stop_pos < tool_start_pos
+    assert len([e for e in events if isinstance(e, RawMessageStopEvent)]) == 1
+
+
+def test_stream_reasoning_no_explicit_finish_closes_thinking_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reasoning stream that ends without finish_reason still closes the
+    open thinking block and emits exactly one message_stop with
+    stop_reason='end_turn' (extends the no-finish contract to thinking)."""
+    captured: dict[str, Any] = {}
+    _install_streaming_fake(monkeypatch, [_chunk(reasoning="plan")], captured)
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    events = _run_stream(provider, model="m", messages=[], max_tokens=10)
+
+    thinking_idx = next(
+        e.index
+        for e in events
+        if isinstance(e, RawContentBlockStartEvent)
+        and isinstance(e.content_block, ThinkingBlock)
+    )
+    # The fallback tail emits content_block_stop for the thinking block.
+    assert any(
+        isinstance(e, RawContentBlockStopEvent) and e.index == thinking_idx
+        for e in events
+    )
+    assert len([e for e in events if isinstance(e, RawMessageStopEvent)]) == 1
+    msg_deltas = [e for e in events if isinstance(e, RawMessageDeltaEvent)]
+    assert msg_deltas[-1].delta.stop_reason == "end_turn"
+
+
+def test_synthesised_thinking_block_round_trips_through_agent_accumulator() -> None:
+    """The synthesised ThinkingBlock start + ThinkingDelta deltas + stop match
+    what the agent accumulator's thinking branch expects: block
+    type=='thinking' and the ``thinking`` field joins to the full string.
+    Guards against a shape mismatch that would silently drop the block."""
+    from cothis.agent import (
+        _apply_stream_delta,
+        _finalize_stream_block,
+        _init_stream_block,
+    )
+
+    start_block = ThinkingBlock(type="thinking", thinking="", signature="")
+    block = _init_stream_block(
+        RawContentBlockStartEvent(
+            type="content_block_start", index=0, content_block=start_block
+        ).content_block
+    )
+    assert block["type"] == "thinking"
+
+    for piece in ("think", "ing"):
+        _apply_stream_delta(
+            block,
+            ThinkingDelta(type="thinking_delta", thinking=piece),
+        )
+    _finalize_stream_block(block)
+
+    assert block["type"] == "thinking"
+    assert block["thinking"] == "thinking"
