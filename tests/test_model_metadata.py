@@ -19,7 +19,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from cothis.agent import Agent
-from cothis.ai.model_metadata import _FALLBACK_MAX_TOKENS, resolve_max_tokens
+from cothis.ai.model_metadata import (
+    _FALLBACK_MAX_TOKENS,
+    model_info,
+    resolve_max_tokens,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -129,6 +133,30 @@ def test_real_sonar_entry_does_not_inflate_output_cap() -> None:
     assert (
         resolve_max_tokens("sonar", "perplexity") == _FALLBACK_MAX_TOKENS
     )
+
+
+# --- model_info (structured advertisement) ----------------------------------
+
+
+def test_model_info_known_model_returns_both_limits() -> None:
+    # claude-sonnet-4-5 is a bare litellm key with both modern fields set.
+    info = model_info("claude-sonnet-4-5", "anthropic")
+    assert info == {"maxOutputTokens": 64000, "contextWindow": 200000}
+
+
+def test_model_info_prefixed_provider_model_key() -> None:
+    # openai/gpt-oss-120b resolves via the {provider}/{model} key.
+    info = model_info("openai/gpt-oss-120b", "openrouter")
+    assert info == {"maxOutputTokens": 32768, "contextWindow": 131072}
+
+
+def test_model_info_unknown_model_returns_none_limits() -> None:
+    # Unknown model: no crash, no invented numbers — both honestly None.
+    assert model_info("no-such-model-xyz", "openai") == {
+        "maxOutputTokens": None,
+        "contextWindow": None,
+    }
+
 
 
 # --- Agent wiring -----------------------------------------------------------

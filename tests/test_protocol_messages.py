@@ -18,6 +18,7 @@ from cothis.protocol import (
     Command,
     CommandResult,
     EventEnvelope,
+    ModelDescriptor,
     PromptCommand,
     ProtocolError,
     RequestEnvelope,
@@ -47,6 +48,54 @@ def _snapshot() -> dict:
 def test_protocol_version_supported() -> None:
     assert is_supported_protocol_version(PROTOCOL_VERSION)
     assert not is_supported_protocol_version(PROTOCOL_VERSION + 1)
+
+
+def test_model_descriptor_roundtrip_and_forbid() -> None:
+    # Minimal descriptor round-trips; optional limits default to None.
+    md = ModelDescriptor.model_validate({"provider": "p", "id": "m"})
+    assert md.provider == "p" and md.id == "m"
+    assert md.maxOutputTokens is None and md.contextWindow is None
+    roundtrip = ModelDescriptor.model_validate(md.model_dump(mode="json"))
+    assert roundtrip == md
+    # Limits populate when provided.
+    full = ModelDescriptor.model_validate(
+        {"provider": "p", "id": "m", "maxOutputTokens": 8192, "contextWindow": 200000}
+    )
+    assert full.maxOutputTokens == 8192 and full.contextWindow == 200000
+    with pytest.raises(ValidationError):  # extra field
+        ModelDescriptor.model_validate(
+            {"provider": "p", "id": "m", "bogus": 1}
+        )
+    with pytest.raises(ValidationError):  # empty provider
+        ModelDescriptor.model_validate({"provider": "", "id": "m"})
+
+
+def test_server_snapshot_models_typed_as_model_descriptor() -> None:
+    # ServerSnapshot.models is a closed list[ModelDescriptor], not loose JSON.
+    from cothis.protocol import ServerSnapshot
+
+    snap = ServerSnapshot.model_validate(
+        {
+            "serverId": "srv",
+            "protocolVersion": PROTOCOL_VERSION,
+            "revision": 0,
+            "sessions": [],
+            "models": [{"provider": "openrouter", "id": "openai/gpt-oss-120b"}],
+        }
+    )
+    assert len(snap.models) == 1
+    assert isinstance(snap.models[0], ModelDescriptor)
+    assert snap.models[0].provider == "openrouter"
+    with pytest.raises(ValidationError):  # a loose JsonValue element is rejected
+        ServerSnapshot.model_validate(
+            {
+                "serverId": "srv",
+                "protocolVersion": PROTOCOL_VERSION,
+                "revision": 0,
+                "sessions": [],
+                "models": ["not-a-model-descriptor"],
+            }
+        )
 
 
 def test_client_hello_roundtrip_and_validation() -> None:

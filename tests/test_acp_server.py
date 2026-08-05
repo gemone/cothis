@@ -17,6 +17,7 @@ from cothis.protocol.messages import (
     PROTOCOL_VERSION,
     AssistantDelta,
     BackendError,
+    ModelDescriptor,
     ModelRef,
     ProtocolError,
     SessionSnapshot,
@@ -57,6 +58,18 @@ class FakeBackend:
     def __init__(self) -> None:
         self.created: list[SessionSnapshot] = []
         self.prompt_calls: list[tuple[str, str]] = []
+
+    async def models(self) -> list[ModelDescriptor]:
+        # The honest advertisement: a single configured model with limits
+        # the bundled metadata can resolve for it.
+        return [
+            ModelDescriptor(
+                provider="openrouter",
+                id="openai/gpt-oss-120b",
+                maxOutputTokens=32768,
+                contextWindow=131072,
+            )
+        ]
 
     async def list_sessions(self) -> list[SessionSummary]:
         return [
@@ -132,12 +145,15 @@ def _hello(token: str = "secret", version: int = PROTOCOL_VERSION) -> bytes:
 
 @pytest.mark.asyncio
 async def test_handshake_success_sends_server_hello_with_snapshot() -> None:
-    server = ACPServer(FakeBackend(), token="secret")
+    backend = FakeBackend()
+    server = ACPServer(backend, token="secret")
     [msg] = await _serve(server, [_hello()])
     assert msg.type == "hello"
     assert msg.version == PROTOCOL_VERSION
     assert msg.snapshot.serverId == "cothis"
     assert msg.snapshot.sessions == []
+    # The handshake snapshot advertises the backend's configured model.
+    assert msg.snapshot.models == await backend.models()
 
 
 @pytest.mark.asyncio
