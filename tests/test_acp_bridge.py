@@ -8,18 +8,31 @@ and the in-memory session/snapshot bookkeeping.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
 from cothis.acp_bridge import AgentSessionBackend
 from cothis.agent import ContentDelta, ToolCallEvent, ToolResultEvent
-from cothis.protocol.messages import BackendError
+from cothis.protocol.messages import BackendError, ModelRef, SessionSnapshot
 
 
 class _FakeAgent:
-    def __init__(self, events: list[Any]) -> None:
-        self._events = list(events)
+    """A stand-in agent whose ``run_stream`` yields canned events.
+
+    Exposes settable ``provider`` / ``model`` / ``_llm`` / ``_resolved_max_tokens``
+    / ``api_key`` / ``api_base`` so ``set_model`` can mutate it in place.
+    """
+
+    def __init__(self, events: list[Any] | None = None) -> None:
+        self._events = list(events or [])
+        self.provider = "p"
+        self.model = "m"
+        self.api_key: str | None = None
+        self.api_base: str | None = None
+        self._llm: Any = "original-llm"
+        self._resolved_max_tokens = 100
 
     async def run_stream(self, _text: str):  # type: ignore[no-untyped-def]
         for event in self._events:
@@ -194,3 +207,140 @@ async def test_models_unknown_model_advertises_none_limits() -> None:
     assert advertised.id == "no-such-model"
     assert advertised.maxOutputTokens is None
     assert advertised.contextWindow is None
+
+
+# ---------------------------------------------------------------------------
+# I19: abort / set_model / set_thinking + cancellation finalisation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_abort_unknown_session_raises_not_found() -> None:
+    backend = _backend([])
+    with pytest.raises(BackendError) as exc:
+        await backend.abort("nope")
+    assert exc.value.error.code == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_abort_known_session_no_active_turn_returns_snapshot() -> None:
+    backend = _backend([])
+    snap = await backend.create_session("/", None, None, None)
+    after = await backend.abort(snap.id)
+    # Pure snapshot read: nothing changes.
+    assert after.id == snap.id
+    assert after.transcript == []
+    assert after.revision == 0
+
+
+@pytest.mark.asyncio
+async def test_set_thinking_updates_snapshot_thinking_level() -> None:
+    backend = _backend([])
+    snap = await backend.create_session("/", None, None, None)
+    assert snap.thinkingLevel == "off"
+    after = await backend.set_thinking(snap.id, "high")
+    assert after.thinkingLevel == "high"
+
+
+@pytest.mark.asyncio
+async def test_set_thinking_unknown_session_raises_not_found() -> None:
+    backend = _backend([])
+    with pytest.raises(BackendError) as exc:
+        await backend.set_thinking("nope", "high")
+    assert exc.value.error.code == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_set_model_updates_snapshot_and_rewires_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _FakeAgent([])
+    backend = AgentSessionBackend(
+        provider="p",
+        model="m",
+        make_agent=lambda **_kw: agent,
+    )
+    snap = await backend.create_session("/", None, None, None)
+
+    import cothis.ai
+
+    calls: list[tuple[str, Any, Any]] = []
+
+    def fake_get_provider(
+        provider: str, *, api_key: Any = None, api_base: Any = None
+    ) -> str:
+        calls.append((provider, api_key, api_base))
+        return f"llm-{provider}"
+
+    monkeypatch.setattr(cothis.ai, "get_provider", fake_get_provider)
+
+    new_model = ModelRef(provider="newprov", id="newmodel")
+    after = await backend.set_model(snap.id, new_model)
+
+    # Snapshot reflects the new model.
+    assert after.model == new_model
+    # The live agent was rewired in place.
+    assert agent.provider == "newprov"
+    assert agent.model == "newmodel"
+    assert agent._llm == "llm-newprov"
+    assert agent._resolved_max_tokens == -1
+    assert calls == [("newprov", None, None)]
+
+
+@pytest.mark.asyncio
+async def test_set_model_unknown_session_raises_not_found() -> None:
+    backend = _backend([])
+    with pytest.raises(BackendError) as exc:
+        await backend.set_model("nope", ModelRef(provider="x", id="y"))
+    assert exc.value.error.code == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_prompt_cancelled_mid_stream_finalises_as_aborted() -> None:
+    # A fake agent that yields one delta then blocks until cancelled.
+    class _BlockingAgent:
+        def __init__(self, block: asyncio.Event) -> None:
+            self._block = block
+            self.provider = "p"
+            self.model = "m"
+            self.api_key: str | None = None
+            self.api_base: str | None = None
+            self._llm: Any = "llm"
+            self._resolved_max_tokens = 100
+
+        async def run_stream(self, _text: str):  # type: ignore[no-untyped-def]
+            yield ContentDelta(kind="text", text="partial ")
+            await self._block.wait()
+
+    block = asyncio.Event()
+    backend = AgentSessionBackend(
+        provider="p",
+        model="m",
+        make_agent=lambda **_kw: _BlockingAgent(block),
+    )
+    snap = await backend.create_session("/", None, None, None)
+    emitted: list = []
+
+    async def run_prompt() -> SessionSnapshot:
+        return await backend.prompt(snap.id, "hi", _collector(emitted))
+
+    task = asyncio.create_task(run_prompt())
+    # Wait for the assistant item to start streaming (item_started + delta).
+    while len(emitted) < 2:
+        await asyncio.sleep(0.001)
+        if task.done():
+            break
+    task.cancel()
+    # The bridge catches CancelledError, finalises the assistant item as
+    # aborted, and returns the snapshot (does not re-raise).
+    result = await task
+
+    # The emitted item_finished has stopReason="aborted", status="aborted".
+    finished = next(p for p in emitted if p.type == "item_finished")
+    assert finished.item.stopReason == "aborted"
+    assert finished.item.status == "aborted"
+    # The snapshot transcript contains the aborted assistant item.
+    assert result.transcript[-1].role == "assistant"
+    assistant = result.transcript[-1]
+    assert assistant.status == "aborted"
+    assert assistant.stopReason == "aborted"
