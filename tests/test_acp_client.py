@@ -31,6 +31,7 @@ from cothis.protocol.messages import (
     ProtocolError,
     SessionSnapshot,
     SessionSummary,
+    ThinkingLevel,
 )
 
 # A sentinel the loopback uses to signal EOF on a peer's inbound queue. Kept
@@ -152,6 +153,37 @@ class _FakeBackend:
         )
         snap = next(s for s in self.created if s.id == session_id)
         return snap.model_copy(update={"revision": 1})
+
+    async def abort(self, session_id: str) -> SessionSnapshot:
+        if not any(s.id == session_id for s in self.created):
+            raise BackendError(
+                ProtocolError(
+                    code="not_found", message=f"session {session_id!r} not found"
+                )
+            )
+        return next(s for s in self.created if s.id == session_id)
+
+    async def set_model(self, session_id: str, model: ModelRef) -> SessionSnapshot:
+        if not any(s.id == session_id for s in self.created):
+            raise BackendError(
+                ProtocolError(
+                    code="not_found", message=f"session {session_id!r} not found"
+                )
+            )
+        snap = next(s for s in self.created if s.id == session_id)
+        return snap.model_copy(update={"model": model})
+
+    async def set_thinking(
+        self, session_id: str, level: ThinkingLevel
+    ) -> SessionSnapshot:
+        if not any(s.id == session_id for s in self.created):
+            raise BackendError(
+                ProtocolError(
+                    code="not_found", message=f"session {session_id!r} not found"
+                )
+            )
+        snap = next(s for s in self.created if s.id == session_id)
+        return snap.model_copy(update={"thinkingLevel": level})
 
 
 async def _serve_in_background(server: ACPServer, loop: _Loopback) -> asyncio.Task:

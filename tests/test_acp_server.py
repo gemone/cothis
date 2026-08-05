@@ -7,6 +7,7 @@ sockets, no network, no real agent.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -22,6 +23,7 @@ from cothis.protocol.messages import (
     ProtocolError,
     SessionSnapshot,
     SessionSummary,
+    ThinkingLevel,
 )
 from cothis.protocol.wire import (
     ServerMessageDecoder,
@@ -54,10 +56,58 @@ class FakeConnection:
         return self._chunks.pop(0)
 
 
-class FakeBackend:
+class _QueueConn:
+    """A connection backed by an asyncio.Queue for async chunk delivery.
+
+    Lets a test feed frames dynamically (after the previous frame has been
+    processed) and await server output mid-turn — needed for the abort
+    mid-turn scenario where a blocking prompt must start before the abort
+    arrives.
+    """
+
     def __init__(self) -> None:
+        self._q: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.sent = bytearray()
+        self.closed = False
+
+    async def send(self, chunk: bytes) -> None:
+        self.sent += chunk
+
+    async def close(self, final_chunk: bytes | None = None) -> None:
+        if final_chunk is not None:
+            self.sent += final_chunk
+        self.closed = True
+
+    def __aiter__(self) -> _QueueConn:
+        return self
+
+    async def __anext__(self) -> bytes:
+        item = await self._q.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    def feed(self, chunk: bytes) -> None:
+        self._q.put_nowait(chunk)
+
+    def feed_eof(self) -> None:
+        self._q.put_nowait(None)
+
+
+class FakeBackend:
+    def __init__(
+        self,
+        *,
+        block: asyncio.Event | None = None,
+        started: asyncio.Event | None = None,
+    ) -> None:
         self.created: list[SessionSnapshot] = []
         self.prompt_calls: list[tuple[str, str]] = []
+        self.abort_calls: list[str] = []
+        self.set_model_calls: list[tuple[str, ModelRef]] = []
+        self.set_thinking_calls: list[tuple[str, ThinkingLevel]] = []
+        self._block = block
+        self._started = started
 
     async def models(self) -> list[ModelDescriptor]:
         # The honest advertisement: a single configured model with limits
@@ -121,15 +171,51 @@ class FakeBackend:
                 delta="Hi",
             )
         )
+        if self._started is not None:
+            self._started.set()
+        if self._block is not None:
+            try:
+                await self._block.wait()
+            except asyncio.CancelledError:
+                snap = next(s for s in self.created if s.id == session_id)
+                return snap.model_copy(update={"revision": 42})
         snap = next(s for s in self.created if s.id == session_id)
         return snap.model_copy(update={"revision": 1})
+
+    async def abort(self, session_id: str) -> SessionSnapshot:
+        self.abort_calls.append(session_id)
+        if not any(s.id == session_id for s in self.created):
+            raise BackendError(
+                ProtocolError(code="not_found", message=f"session {session_id!r} not found")
+            )
+        return next(s for s in self.created if s.id == session_id)
+
+    async def set_model(self, session_id: str, model: ModelRef) -> SessionSnapshot:
+        self.set_model_calls.append((session_id, model))
+        if not any(s.id == session_id for s in self.created):
+            raise BackendError(
+                ProtocolError(code="not_found", message=f"session {session_id!r} not found")
+            )
+        snap = next(s for s in self.created if s.id == session_id)
+        return snap.model_copy(update={"model": model})
+
+    async def set_thinking(
+        self, session_id: str, level: ThinkingLevel
+    ) -> SessionSnapshot:
+        self.set_thinking_calls.append((session_id, level))
+        if not any(s.id == session_id for s in self.created):
+            raise BackendError(
+                ProtocolError(code="not_found", message=f"session {session_id!r} not found")
+            )
+        snap = next(s for s in self.created if s.id == session_id)
+        return snap.model_copy(update={"thinkingLevel": level})
 
 
 def _enc(d: dict) -> bytes:
     return encode_client_message(d)
 
 
-def _decode(conn: FakeConnection) -> list:
+def _decode(conn: FakeConnection | _QueueConn) -> list:
     return ServerMessageDecoder().push(bytes(conn.sent))
 
 
@@ -244,10 +330,11 @@ async def test_prompt_streams_progress_then_response() -> None:
 
 @pytest.mark.asyncio
 async def test_unsupported_command_returns_invalid_request() -> None:
+    # ``steer`` is defined in the schema but still unsupported (deferred).
     server = ACPServer(FakeBackend(), token="secret")
     out = await _serve(
         server,
-        [_hello(), _enc({"type": "request", "id": "r", "request": {"command": "abort", "sessionId": "s"}})],
+        [_hello(), _enc({"type": "request", "id": "r", "request": {"command": "steer", "sessionId": "s", "text": "x"}})],
     )
     reply = out[1]
     assert reply.type == "response" and not reply.ok
@@ -291,3 +378,187 @@ async def test_batched_hello_and_request_in_one_chunk() -> None:
 async def test_server_rejects_empty_token() -> None:
     with pytest.raises(ValueError):
         ACPServer(FakeBackend(), token="")
+
+
+# ---------------------------------------------------------------------------
+# I19: abort / set_model / set_thinking dispatch
+# ---------------------------------------------------------------------------
+
+
+async def _create_session(backend: FakeBackend) -> str:
+    """Create a session via the server and return its id."""
+    created = await _serve(
+        ACPServer(backend, token="secret"),
+        [_hello(), _enc({"type": "request", "id": "c", "request": {"command": "create", "cwd": "/"}})],
+    )
+    return created[1].result.session.id
+
+
+@pytest.mark.asyncio
+async def test_abort_with_no_active_turn_returns_snapshot() -> None:
+    # REQUIRED no-op-safe: aborting a session with NO active turn returns
+    # ok + the current snapshot (not an error).
+    backend = FakeBackend()
+    sid = await _create_session(backend)
+
+    out = await _serve(
+        ACPServer(backend, token="secret"),
+        [_hello(), _enc({"type": "request", "id": "a", "request": {"command": "abort", "sessionId": sid}})],
+    )
+    reply = out[1]
+    assert reply.type == "response" and reply.ok
+    assert reply.result.command == "abort"
+    assert reply.result.session.id == sid
+    assert backend.abort_calls == [sid]
+
+
+@pytest.mark.asyncio
+async def test_abort_unknown_session_returns_not_found() -> None:
+    server = ACPServer(FakeBackend(), token="secret")
+    out = await _serve(
+        server,
+        [_hello(), _enc({"type": "request", "id": "a", "request": {"command": "abort", "sessionId": "nope"}})],
+    )
+    reply = next(m for m in out if m.type == "response")
+    assert not reply.ok
+    assert reply.error.code == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_abort_mid_turn_cancels_active_prompt() -> None:
+    # The blocking prompt must start before the abort arrives, so use a
+    # queue-backed connection that feeds frames dynamically.
+    started = asyncio.Event()
+    block = asyncio.Event()
+    backend = FakeBackend(block=block, started=started)
+    sid = await _create_session(backend)
+
+    server = ACPServer(backend, token="secret")
+    conn = _QueueConn()
+    serve_task = asyncio.create_task(server.serve_connection(conn))
+    conn.feed(_hello())
+    conn.feed(
+        _enc(
+            {
+                "type": "request",
+                "id": "p",
+                "request": {"command": "prompt", "sessionId": sid, "text": "hi"},
+            }
+        )
+    )
+    # Wait until the backend has emitted progress and is now blocking.
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    # Now send the abort — the prompt task is mid-turn.
+    conn.feed(
+        _enc({"type": "request", "id": "a", "request": {"command": "abort", "sessionId": sid}})
+    )
+    conn.feed_eof()
+    await serve_task
+
+    msgs = _decode(conn)
+    responses = [m for m in msgs if m.type == "response"]
+    prompt_resp = next(r for r in responses if r.id == "p")
+    abort_resp = next(r for r in responses if r.id == "a")
+    # Both land as ok=True.
+    assert prompt_resp.ok and prompt_resp.result.command == "prompt"
+    assert abort_resp.ok and abort_resp.result.command == "abort"
+    # The prompt response is sent before the abort response (abort awaits
+    # the prompt task before sending its own response).
+    assert msgs.index(prompt_resp) < msgs.index(abort_resp)
+    assert backend.abort_calls == [sid]
+
+
+@pytest.mark.asyncio
+async def test_second_prompt_while_turn_active_returns_busy() -> None:
+    started = asyncio.Event()
+    block = asyncio.Event()
+    backend = FakeBackend(block=block, started=started)
+    sid = await _create_session(backend)
+
+    server = ACPServer(backend, token="secret")
+    conn = _QueueConn()
+    serve_task = asyncio.create_task(server.serve_connection(conn))
+    conn.feed(_hello())
+    conn.feed(
+        _enc(
+            {
+                "type": "request",
+                "id": "p1",
+                "request": {"command": "prompt", "sessionId": sid, "text": "hi"},
+            }
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    # A second prompt for the same session while the first is active → busy.
+    conn.feed(
+        _enc(
+            {
+                "type": "request",
+                "id": "p2",
+                "request": {"command": "prompt", "sessionId": sid, "text": "hi2"},
+            }
+        )
+    )
+    conn.feed_eof()
+    await serve_task
+
+    msgs = _decode(conn)
+    busy = next(m for m in msgs if m.type == "response" and m.id == "p2")
+    assert not busy.ok
+    assert busy.error.code == "busy"
+
+
+@pytest.mark.asyncio
+async def test_set_model_dispatch() -> None:
+    backend = FakeBackend()
+    sid = await _create_session(backend)
+
+    out = await _serve(
+        ACPServer(backend, token="secret"),
+        [
+            _hello(),
+            _enc(
+                {
+                    "type": "request",
+                    "id": "m",
+                    "request": {
+                        "command": "set_model",
+                        "sessionId": sid,
+                        "model": {"provider": "x", "id": "y"},
+                    },
+                }
+            ),
+        ],
+    )
+    reply = out[1]
+    assert reply.ok and reply.result.command == "set_model"
+    assert reply.result.session.model == ModelRef(provider="x", id="y")
+    assert backend.set_model_calls == [(sid, ModelRef(provider="x", id="y"))]
+
+
+@pytest.mark.asyncio
+async def test_set_thinking_dispatch() -> None:
+    backend = FakeBackend()
+    sid = await _create_session(backend)
+
+    out = await _serve(
+        ACPServer(backend, token="secret"),
+        [
+            _hello(),
+            _enc(
+                {
+                    "type": "request",
+                    "id": "t",
+                    "request": {
+                        "command": "set_thinking",
+                        "sessionId": sid,
+                        "thinkingLevel": "high",
+                    },
+                }
+            ),
+        ],
+    )
+    reply = out[1]
+    assert reply.ok and reply.result.command == "set_thinking"
+    assert reply.result.session.thinkingLevel == "high"
+    assert backend.set_thinking_calls == [(sid, "high")]

@@ -20,12 +20,13 @@ starts, matching the streaming lifecycle clients expect.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from cothis.protocol.messages import (
     AssistantDelta,
@@ -232,9 +233,69 @@ class AgentSessionBackend:
         sess.transcript.append(user_item)
 
         translator = _StreamTranslator(model=sess.model, emit=emit)
-        await translator.run(sess.agent.run_stream(text))
+        try:
+            await translator.run(sess.agent.run_stream(text))
+        except asyncio.CancelledError:
+            # The server's abort cancels its prompt task; the CancelledError
+            # lands in translator.run's ``async for``. Finalise the in-flight
+            # assistant item as ``aborted`` (bounded emits) and return the
+            # aborted snapshot — the prompt task sends it as ``ok=True``.
+            await translator.finalize_aborted()
         sess.transcript.extend(translator.finished_items)
         sess.updated_at = _now_ms()
+        return sess.snapshot()
+
+    async def abort(self, session_id: str) -> SessionSnapshot:
+        """Return the current snapshot for a session (no-op-safe).
+
+        The server cancels any active prompt task before calling this; the
+        backend just reports the authoritative post-abort state. Raises
+        ``not_found`` (via ``_get``) for an unknown session — never for a
+        missing turn.
+        """
+        return self._get(session_id).snapshot()
+
+    async def set_thinking(
+        self, session_id: str, level: ThinkingLevel
+    ) -> SessionSnapshot:
+        """Update the session's thinking level (metadata-only in this iteration).
+
+        Takes effect on the next ``prompt``. Wiring ``thinking`` into the LLM
+        call is a follow-up; this changes the snapshot but not yet model
+        behaviour.
+        """
+        sess = self._get(session_id)
+        sess.thinking = level
+        return sess.snapshot()
+
+    async def set_model(
+        self, session_id: str, model: ModelRef
+    ) -> SessionSnapshot:
+        """Re-target the session's live agent at a new model, in place.
+
+        Mutates the agent's ``provider`` / ``model`` / ``_llm`` and invalidates
+        the cached ``_resolved_max_tokens`` so it re-resolves for the new
+        model. Preserves ``_messages`` / ``_tool_map`` / handles / MCP state.
+        Cross-provider message-format compatibility is an existing cothis
+        concern, not introduced here.
+
+        The mutation is synchronous and not guarded by the per-session busy
+        check (only ``prompt`` is): a ``set_model`` arriving while a turn is in
+        flight may be observed by that turn's later LLM calls (e.g. a tool
+        loop). For this iteration the expectation is best-effort, next-turn
+        semantics; robust mid-turn handling is deferred.
+        """
+        from cothis.ai import get_provider
+
+        sess = self._get(session_id)
+        agent = sess.agent
+        agent.provider = model.provider
+        agent.model = model.id
+        agent._llm = get_provider(
+            model.provider, api_key=agent.api_key, api_base=agent.api_base
+        )
+        agent._resolved_max_tokens = -1
+        sess.model = model
         return sess.snapshot()
 
 
@@ -268,6 +329,17 @@ class _StreamTranslator:
                 await self._on_tool_result(event)
             # AskUserRequestEvent is not surfaced over ACP in I9.
         await self._finish_assistant(stop_reason="stop")
+
+    async def finalize_aborted(self) -> None:
+        """Finalise an in-flight assistant message as ``aborted``.
+
+        Called from the backend's ``CancelledError`` path when the server
+        aborts a turn mid-stream. Emits ``item_finished`` with
+        ``stopReason="aborted"`` and appends the item (status ``"aborted"``)
+        to ``finished_items``. No-op if nothing streamed before the
+        cancellation.
+        """
+        await self._finish_assistant(stop_reason="aborted", status="aborted")
 
     # -- assistant message lifecycle ----------------------------------------
 
@@ -313,7 +385,12 @@ class _StreamTranslator:
             timestamp=_now_ms(),
         )
 
-    async def _finish_assistant(self, *, stop_reason: AssistantStopReason) -> None:
+    async def _finish_assistant(
+        self,
+        *,
+        stop_reason: AssistantStopReason,
+        status: Literal["complete", "aborted"] = "complete",
+    ) -> None:
         if not self._assistant_started or self._msg_id is None:
             return
         item = AssistantTranscriptItem(
@@ -321,7 +398,7 @@ class _StreamTranslator:
             id=self._msg_id,
             content=list(self._content),
             model=self._model,
-            status="complete",
+            status=status,
             stopReason=stop_reason,
             timestamp=_now_ms(),
         )
