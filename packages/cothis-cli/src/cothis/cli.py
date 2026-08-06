@@ -953,9 +953,15 @@ class _DrivenCothisApp:
 
                 # ``attach_session_ws`` is async; ``create_task`` keeps the
                 # sync callback (Textual modal dismiss) unblocked.
+                # #I24: seed the footer's model + session cells from the
+                # spawn handle's sid + the CLI's known model so the status
+                # bar shows correct values BEFORE the first turn_finished
+                # frame lands (the worker emits no per-spawn frame).
                 asyncio.create_task(
                     self.attach_session_ws(sid, handle.ws_url, handle.token),
                 )
+                self.footer_session = sid
+                self.footer_model = model
 
             async def on_mount(self) -> None:
                 # Run the base on_mount (focus SessionList) so the bare `n`
@@ -990,6 +996,10 @@ class _DrivenCothisApp:
                 await self.attach_session_ws(
                     resume_session_id, handle.ws_url, handle.token,
                 )
+                # #I24: seed footer model/session so the status bar is
+                # populated before the first turn_finished frame.
+                self.footer_session = resume_session_id
+                self.footer_model = model
 
             async def on_unmount(self) -> None:
                 # cothis: cancel the crash-monitor loop on app exit (#398

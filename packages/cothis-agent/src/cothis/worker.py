@@ -2,9 +2,18 @@
 
 Owns one ``Agent`` + drives a WebSocket transport (``cothis.ws``) that accepts
 control messages (``run_turn`` / ``attach_input`` / ``detach_input`` /
-``shutdown`` / ``ping`` / ``resolve_ask``) and emits stream messages
-(``assistant_delta`` / ``tool_call_started`` / ``tool_call_result_pointer`` /
-``ask_user_request`` / ``pong`` / ``error``).
+``shutdown`` / ``ping`` / ``resolve_ask`` / ``interrupt_turn``) and emits
+stream messages (``assistant_delta`` / ``tool_call_started`` /
+``tool_call_result_pointer`` / ``ask_user_request`` / ``pong`` / ``error`` /
+``turn_started`` / ``turn_finished``).
+
+``turn_started`` opens a turn; ``turn_finished`` (carrying the post-turn
+model / session_id / context pressure / active_skills snapshot) closes it
+on every exit path (normal end, timeout, error, interrupt). The TUI relies
+on ``turn_finished`` to reconcile its run-state to idle and refresh the
+status footer. ``interrupt_turn`` cancels ``_active_turn`` — the same
+abort primitive already used by run_turn-supersede (#316) and disconnect
+(#396) — exposed behind a control message rather than a parallel path.
 
 Handshake requires a valid bearer token on the ``Authorization`` header.
 Missing or wrong token → HTTP 401, connection rejected. The token is generated
@@ -90,6 +99,14 @@ class SessionWorker:
         # below reads this so the agent (which knows nothing about the WS
         # surface) can emit the event.
         self._active_conn: Connection | None = None
+        # #I24: interrupt-vs-timeout tie-breaker. ``interrupt_turn`` flips
+        # this to ``True`` BEFORE cancelling ``_active_turn``; ``_stream_turn``
+        # resets it to ``False`` at turn start. A ``CancelledError`` reaching
+        # ``_stream_turn`` with the flag set is an intentional interrupt (no
+        # error frame); without it, the cancel is treated as a turn timeout.
+        # See ``_stream_turn`` for why the flag is needed (cancel-scope
+        # cancellation and ``interrupt_turn`` surface as the same type).
+        self._interrupting: bool = False
         # Sync callback the agent calls from _ask_user. Reads _active_conn at
         # call time (a fresh closure per worker would also work; method ref
         # is simpler and lets tests monkeypatch if needed). ``setattr`` keeps
@@ -241,7 +258,37 @@ class SessionWorker:
             await conn.close()
             self._transport.request_shutdown()
         elif typ == "run_turn":
+            # Emit ``turn_started`` before the stream begins so the TUI can
+            # flip its run-state to "running" + render the footer's state
+            # cell. The matching ``turn_finished`` is emitted from
+            # ``_stream_turn``'s finally (covers normal end, timeout,
+            # error, AND interrupt) — the TUI uses that frame to return
+            # to idle + refresh the footer's data cells.
+            await conn.send(json.dumps({"type": "turn_started"}))
             await self._stream_turn(conn, msg.get("prompt", ""))
+        elif typ == "interrupt_turn":
+            # Reuse the existing abort primitive (the same cancel used by
+            # run_turn-supersede at #316 and disconnect in ``_handle_conn``'s
+            # finally at #396) so there's no parallel abort path. The
+            # ``_stream_turn`` finally emits ``turn_finished`` once the
+            # cancelled task unwinds, which is the frame the TUI awaits to
+            # return to idle. Guarded for the no-active-turn case: an Esc
+            # when idle is a benign no-op, not an error.
+            #
+            # Set ``_interrupting`` BEFORE cancelling so ``_stream_turn``'s
+            # ``except asyncio.CancelledError`` can tell this intentional
+            # cancel apart from a turn-timeout cancel (both arrive as the
+            # same type). The interrupt path emits ``turn_finished`` only —
+            # no ``error`` frame — because interrupt is a user action, not
+            # a fault.
+            if self._active_turn is not None and not self._active_turn.done():
+                self._interrupting = True
+                self._active_turn.cancel()
+                try:
+                    await self._active_turn
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._active_turn = None
         elif typ in ("attach_input", "detach_input"):
             # Real terminal attach lands with #230; accept + ignore for now.
             logger.debug("SessionWorker got %r (terminal attach deferred)", typ)
@@ -267,7 +314,33 @@ class SessionWorker:
         the connection indefinitely. Errors are logged server-side + a generic
         ``"internal error"`` goes to the client (loopback-only is not a license
         to leak exception details).
+
+        Exit paths + the frames each emits (the TUI reconciles run-state to
+        idle off the terminal ``turn_finished`` from ``finally``):
+
+        - normal end        → stream events + ``turn_finished``
+        - timeout           → ``error: turn timeout`` + ``turn_finished``
+        - run_stream raises → ``error: internal error`` + ``turn_finished``
+        - interrupt_turn    → ``turn_finished`` only (no error — intentional)
+
+        Timeout vs. interrupt disambiguation: ``anyio.fail_after``'s deadline
+        normally surfaces as ``TimeoutError`` (the ``except TimeoutError``
+        branch below — the common path). On some Python / async-generator
+        setups the cancel-scope cancellation can leak as a raw
+        ``asyncio.CancelledError`` instead; ``interrupt_turn`` cancels the
+        same task, so the two are indistinguishable by type alone. The
+        ``_interrupting`` flag (set by the interrupt dispatch before
+        cancelling, reset at the top of this method on each turn) is the
+        tie-breaker: a ``CancelledError`` with the flag set is an intentional
+        interrupt (no error frame); without it, the cancellation is treated
+        as a timeout leak and ``error: turn timeout`` is emitted. The
+        handler does not re-raise — falling through to ``finally`` keeps the
+        terminal-frame send off the cancellation path so the TUI footer
+        reliably reconciles to idle.
         """
+        # Reset at turn start: a CancelledError during this turn is a
+        # timeout unless ``interrupt_turn`` flips ``_interrupting`` first.
+        self._interrupting = False
         try:
             with anyio.fail_after(_TURN_TIMEOUT_S):
                 async for event in self._agent.run_stream(prompt):
@@ -308,9 +381,155 @@ class SessionWorker:
         except TimeoutError:
             logger.warning("SessionWorker turn timed out after %ds", _TURN_TIMEOUT_S)
             await conn.send(json.dumps({"type": "error", "message": "turn timeout"}))
+        except asyncio.CancelledError:
+            # ``CancelledError`` is a ``BaseException`` — it bypasses the
+            # ``except Exception`` handler below. Reach here when
+            # ``anyio.fail_after``'s cancellation surfaces unconverted (the
+            # ``TimeoutError`` branch above is the common path) OR when
+            # ``interrupt_turn`` / run_turn-supersede / disconnect cancels
+            # the task. The ``_interrupting`` flag distinguishes intentional
+            # interrupt (no error frame — interrupt is a user action, not a
+            # fault) from a timeout leak (emit the ``error: turn timeout``
+            # frame). Either way, fall through to ``finally`` rather than
+            # re-raising: re-raise would subject the terminal-frame send to
+            # cancellation re-delivery on some Python versions and risk
+            # losing the ``turn_finished`` frame the TUI footer reconciles
+            # on. Swallowing ends the task cleanly; callers
+            # (``_handle_conn`` finally, interrupt dispatch, run_turn
+            # supersede) await + absorb both ``CancelledError`` and normal
+            # completion, so the task's cancelled-vs-done state is unused.
+            if not self._interrupting:
+                logger.warning(
+                    "SessionWorker turn cancelled (treated as timeout) "
+                    "after %ds",
+                    _TURN_TIMEOUT_S,
+                )
+                await conn.send(
+                    json.dumps({"type": "error", "message": "turn timeout"})
+                )
         except Exception:  # noqa: BLE001
             logger.exception("Agent.run_stream failed")
             await conn.send(json.dumps({"type": "error", "message": "internal error"}))
+        finally:
+            # Terminal frame on every exit path. The TUI reconciles its
+            # run-state to idle off this frame and re-reads the post-turn
+            # context pressure + active_skills (which may have mutated
+            # during the turn via load_skill/deactivate_skill tool calls).
+            # ``pressure`` carries the ``PressureLevel`` value string
+            # (cleanly JSON-serialisable — ``PressureLevel`` is a ``str``
+            # Enum) or ``None`` when the budget is unknown.
+            await self._emit_turn_finished(conn)
+
+    async def _emit_turn_finished(self, conn: Connection) -> None:
+        """Send the terminal ``turn_finished`` frame, guarded against a closing conn.
+
+        Reads model / session_id / context pressure / active_skills from
+        ``self._agent`` (and ``self._agent.session`` / ``_session``). Every
+        field is validated for JSON-safety (``str`` / ``None`` / ``list[str]``)
+        and falls back to a safe default rather than raising — the snapshot
+        is best-effort, and a non-serialisable value on any agent shape must
+        not break the terminal-frame guarantee the TUI relies on.
+
+        The send is shielded (``asyncio.shield``) and wrapped in try/except:
+        a ``CancelledError`` reaching ``_stream_turn``'s ``finally`` (timeout
+        or interrupt) can be re-delivered at the await point on some Python
+        versions, which would abort the send mid-flight and lose the terminal
+        frame. ``shield`` runs the send in an inner task that survives outer
+        cancellation, so the frame reaches the client even as the task
+        unwinds; the outer ``CancelledError`` is swallowed (the frame is the
+        point — the task's cancel state is settled by the caller).
+        """
+        agent = self._agent
+        # ``session`` is exposed as ``_session`` (PrivateAttr) on real
+        # agents; try both spellings defensively so test stubs + future
+        # surfaces both work.
+        session = getattr(agent, "session", None) or getattr(agent, "_session", None)
+        session_id = self._safe_session_id(session)
+        active_skills = self._safe_active_skills(session)
+        pressure = self._safe_pressure(agent)
+        model = self._safe_model(agent)
+        payload = json.dumps(
+            {
+                "type": "turn_finished",
+                "model": model,
+                "session_id": session_id,
+                "pressure": pressure,
+                "active_skills": active_skills,
+            }
+        )
+        try:
+            # ``shield`` so task-cancellation re-delivery at this await
+            # doesn't abort the send; the inner task completes + delivers
+            # the frame, the outer ``CancelledError`` is caught below.
+            await asyncio.shield(conn.send(payload))
+        except asyncio.CancelledError:
+            # Outer task unwinding (timeout / interrupt / disconnect); the
+            # shielded send completes in the background. Don't mask the
+            # cancel as a fresh error — the TUI reconciles on this frame
+            # (or on the next turn's ``turn_started`` if the conn was
+            # already tearing down).
+            pass
+        except Exception:  # noqa: BLE001 — conn mid-close, best-effort send
+            # The conn may be mid-close after cancellation (the interrupt
+            # handler cancels ``_active_turn`` which raises out of the
+            # ``run_stream`` loop into the finally above). Swallow so a
+            # closing conn doesn't mask the cancel as a fresh error.
+            pass
+
+    @staticmethod
+    def _safe_session_id(session: Any) -> str | None:
+        """Read ``session.session_id`` if it's a real string, else ``None``."""
+        if session is None:
+            return None
+        try:
+            sid = session.session_id
+        except Exception:  # noqa: BLE001 — best-effort snapshot read
+            return None
+        return sid if isinstance(sid, str) else None
+
+    @staticmethod
+    def _safe_active_skills(session: Any) -> list[str]:
+        """Read ``session.active_skills`` as a sorted ``list[str]``; ``[]`` on any failure."""
+        if session is None:
+            return []
+        try:
+            skills = session.active_skills
+        except Exception:  # noqa: BLE001 — best-effort snapshot read
+            return []
+        try:
+            return sorted(str(s) for s in skills)
+        except Exception:  # noqa: BLE001 — non-iterable / malformed
+            return []
+
+    @staticmethod
+    def _safe_pressure(agent: Any) -> str | None:
+        """Read ``agent.context_budget().pressure.value``; ``None`` on any failure."""
+        try:
+            budget = agent.context_budget()
+        except Exception:  # noqa: BLE001 — best-effort snapshot read
+            return None
+        if budget is None:
+            return None
+        try:
+            pressure = budget.pressure
+        except Exception:  # noqa: BLE001 — best-effort snapshot read
+            return None
+        if pressure is None:
+            return None
+        try:
+            value = pressure.value
+        except Exception:  # noqa: BLE001 — best-effort snapshot read
+            return None
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _safe_model(agent: Any) -> str | None:
+        """Read ``agent.model`` if it's a real string, else ``None``."""
+        try:
+            model = agent.model
+        except Exception:  # noqa: BLE001 — best-effort snapshot read
+            return None
+        return model if isinstance(model, str) else None
 
     async def serve_forever(self) -> None:
         """Run the accept loop until ``shutdown`` arrives or ``stop()``."""
