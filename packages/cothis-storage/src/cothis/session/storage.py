@@ -46,7 +46,10 @@ logger = logging.getLogger(__name__)
 # the first real migration (#30 adds blocks.skill/blocks.state, or later).
 # Bump this constant when a migration actually ships; the writer below pins
 # it on every sessions row so future per-row dispatch has the data.
-SCHEMA_VERSION = 2
+# v3 (#I21): adds the ``blocks_fts`` FTS5 index over ``blocks.content`` and
+# AFTER-row triggers keeping it in sync; the v2→v3 migration backfills the
+# index once from existing rows.
+SCHEMA_VERSION = 3
 
 _DDL = (
     """
@@ -89,6 +92,45 @@ _DDL = (
     "CREATE INDEX IF NOT EXISTS idx_blocks_tool ON blocks(session_id, tool_name)",
     "CREATE INDEX IF NOT EXISTS idx_blocks_pair ON blocks(session_id, tool_use_id)",
     "CREATE TABLE IF NOT EXISTS archive_state(key TEXT PRIMARY KEY, value TEXT)",
+)
+
+# cothis (#I21): FTS5 full-text index over ``blocks.content``. External-content
+# table (``content='blocks'``, ``content_rowid='rowid'``) — the index holds only
+# tokens; the searchable text is read back from ``blocks`` at query time, so the
+# index stays small and never drifts from the source row. AFTER-row triggers keep
+# it in sync on every write path (``write_atomic`` appends, ``delete_session``,
+# ``delete_blocks_from_msg_idx``, ``archive_skill_blocks`` UPDATEs, and the
+# cold→hot ``promote_session`` INSERT) with zero app-code write-path changes.
+# Indexed column is ``content`` only — it holds the searchable text for ``text``
+# and ``thinking`` blocks (and the unknown-type JSON fallback); structured
+# ``tool_input`` / ``tool_output`` are deferred with ranking tuning.
+#
+# These statements are run separately from ``_DDL`` so a sqlite build without
+# the FTS5 extension can degrade gracefully (search disabled, every other
+# command unaffected) instead of failing every ``Storage`` construction.
+_FTS_DDL = (
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(
+        content, content='blocks', content_rowid='rowid')
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS blocks_fts_ai AFTER INSERT ON blocks BEGIN
+        INSERT INTO blocks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS blocks_fts_ad AFTER DELETE ON blocks BEGIN
+        INSERT INTO blocks_fts(blocks_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS blocks_fts_au AFTER UPDATE ON blocks BEGIN
+        INSERT INTO blocks_fts(blocks_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+        INSERT INTO blocks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END
+    """,
 )
 
 
@@ -138,6 +180,25 @@ class BlockRow(NamedTuple):
     summarized_seq: str | None = None
     skill: str | None = None
     state: str | None = None
+
+
+class SearchHit(NamedTuple):
+    """One ``Storage.search`` result row — a ranked hit on ``blocks_fts``.
+
+    Storage-shaped, like :class:`SessionRow` / :class:`BlockRow`.
+    ``snippet`` is a FTS5 ``snippet()`` fragment around the match (terms
+    wrapped in markers); ``rank`` is BM25 (lower = more relevant). The
+    ``content`` itself is not returned — the snippet is the caller-facing
+    preview (avoids dumping full tool output into a one-line listing).
+    """
+
+    session_id: str
+    seq: int
+    msg_idx: int
+    role: str
+    type: str
+    snippet: str
+    rank: float
 
 
 def _restrict_to_owner(path: str) -> None:
@@ -287,6 +348,29 @@ class Storage:
         self._conn.execute("PRAGMA foreign_keys=ON")
         for stmt in _DDL:
             self._conn.execute(stmt)
+        # cothis (#I21): FTS5 index + sync triggers. Run separately from the
+        # core ``_DDL`` so a sqlite build without the FTS5 extension degrades
+        # gracefully: the core schema is already in place, so every non-search
+        # command keeps working; ``Storage.search`` raises a clear error and
+        # the v3 backfill is skipped. ``IF NOT EXISTS`` makes re-open a no-op.
+        self._fts5_available = True
+        for stmt in _FTS_DDL:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError as exc:
+                # Only a missing FTS5 extension disables search. An
+                # unrelated OperationalError (disk full / locked) on the
+                # trigger creates must NOT be swallowed as "FTS5
+                # unavailable" — re-raise so the real cause surfaces. The
+                # module-missing error reads ``no such module: fts5``.
+                msg = str(exc).lower()
+                if "no such module" not in msg and "fts5" not in msg:
+                    raise
+                logger.warning(
+                    "FTS5 unavailable; session search disabled: %s", exc,
+                )
+                self._fts5_available = False
+                break
         # cothis: v1→v2 migration (#69). Add ``skill`` and ``state`` columns
         # to existing v1 databases. New DBs already have them from DDL.
         # Safe: PRAGMA table_info + set-membership guard means re-open is
@@ -299,7 +383,21 @@ class Storage:
                 self._conn.execute("ALTER TABLE blocks ADD COLUMN skill TEXT")
             if "state" not in cols:
                 self._conn.execute("ALTER TABLE blocks ADD COLUMN state TEXT")
-        self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        # cothis (#I21): v2→v3 migration. The one-time ``'rebuild'`` repopulates
+        # ``blocks_fts`` from ``blocks`` so a DB that predates the index is
+        # searchable the moment it's reopened. Guarded by ``user_version`` so
+        # it runs exactly once per upgrading DB; skipped when FTS5 is absent.
+        if current_version < 3 and self._fts5_available:
+            self._conn.execute("INSERT INTO blocks_fts(blocks_fts) VALUES ('rebuild')")
+        # Advance ``user_version`` to v3 only when the FTS backfill actually
+        # ran. A DB first opened on a no-FTS5 build has an empty index; pinning
+        # it to 3 anyway would make a later FTS5-enabled open see
+        # ``current_version < 3`` as False and skip the backfill — leaving every
+        # pre-existing row unsearchable. Staying at 2 makes the next FTS5-enabled
+        # open re-run the one-time backfill. The v1→v2 column migration above is
+        # idempotent, so remaining at 2 is a no-op there.
+        pinned_version = SCHEMA_VERSION if self._fts5_available else 2
+        self._conn.execute(f"PRAGMA user_version={pinned_version}")
         self._conn.commit()
         # Tighten db + WAL/SHM sidecars to owner-only. SQLite creates all
         # three via open() under the umask; sidecars do NOT inherit the
@@ -560,3 +658,45 @@ class Storage:
         """Close the connection. Idempotent — safe to call twice."""
         if self._conn is not None:
             self._conn.close()
+
+    def search(self, query: str, *, limit: int = 50) -> list[SearchHit]:
+        """Full-text search over ``blocks.content`` across every session.
+
+        ``query`` is a raw FTS5 MATCH expression — pass-through, no rewriting.
+        Users get the full FTS5 grammar: bare terms, ``"quoted phrases"``,
+        ``prefix*`` globbing, and ``AND`` / ``OR`` / ``NOT`` boolean ops.
+
+        ``snippet`` is a FTS5 ``snippet()`` fragment around the match (matched
+        terms wrapped in ``«»``, ellipsis ``…`` for elided text); ``rank`` is
+        BM25, so lower is more relevant and ``ORDER BY rank`` returns the best
+        hits first. ``content`` itself is not returned — the snippet is the
+        listing-friendly preview.
+
+        Default ``limit=50`` caps the result set; pagination is deferred. A
+        query with no matches returns ``[]`` (not an error).
+
+        Requires the FTS5 extension. CPython's bundled sqlite ships with it
+        on every standard distribution build (the CI runners included); if a
+        custom-compiled sqlite lacks it, :meth:`__init__` detected that at
+        open time and this method raises ``sqlite3.OperationalError`` with a
+        clear message instead of running a doomed query.
+        """
+        if not self._fts5_available:
+            raise sqlite3.OperationalError(
+                "FTS5 is not available in this SQLite build; "
+                "session search is disabled"
+            )
+        cur = self._conn.execute(
+            """
+            SELECT b.session_id, b.seq, b.msg_idx, b.role, b.type,
+                   snippet(blocks_fts, 0, '«', '»', '…', 16) AS snippet,
+                   rank
+            FROM blocks_fts f
+            JOIN blocks b ON b.rowid = f.rowid
+            WHERE blocks_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+            """,
+            (query, limit),
+        )
+        return [SearchHit(*row) for row in cur.fetchall()]
