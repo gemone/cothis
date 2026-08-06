@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,7 +39,7 @@ from cothis.session.archive import (
     promote_session,
     run_archival_pass,
 )
-from cothis.session.storage import Storage, display_cwd, is_visible
+from cothis.session.storage import SearchHit, Storage, display_cwd, is_visible
 from cothis.tools import discover_tools
 
 if TYPE_CHECKING:
@@ -694,6 +695,53 @@ def delete_cmd(
     except KeyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"deleted session [cyan]{session_id}[/cyan]")
+
+
+@app.command(name="search")
+def search_cmd(
+    query: str = typer.Argument(
+        ..., help="FTS5 query (terms, \"phrases\", prefix*)."
+    ),
+    limit: int = typer.Option(
+        50, "--limit", "-n", help="Max hits to print."
+    ),
+) -> None:
+    """Search stored message text across all sessions in this DB.
+
+    Runs a full-text (FTS5) MATCH over the searchable text of every stored
+    block in the resolved DB and prints ranked hits, newest-relevant first.
+    DB-wide by design (no cwd scoping yet) — recall over every session in
+    this DB, including forked and promoted ones. ``query`` is a raw FTS5
+    expression, so quote phrases (``\"deploy script\"``), use ``prefix*``,
+    and combine with ``AND``/``OR``/``NOT``.
+
+    Each line: ``<session_id>  <seq>  [<role>/<type>]  <snippet>``.
+    """
+    db_path = _resolve_db_path()
+    if not db_path.exists():
+        console.print("[dim]no sessions database yet[/dim]")
+        return
+    storage = Storage(db_path)
+    try:
+        try:
+            hits: list[SearchHit] = storage.search(query, limit=limit)
+        except sqlite3.OperationalError as exc:
+            # A malformed FTS5 MATCH expression (unterminated quote, bad
+            # syntax) surfaces as OperationalError. The CLI is the
+            # user-facing surface, so print a clean line instead of a
+            # traceback + exit 1 — mirrors the ``no matches`` handling.
+            console.print(f"[dim]invalid query: {exc}[/dim]")
+            return
+        if not hits:
+            console.print("[dim]no matches[/dim]")
+            return
+        for hit in hits:
+            typer.echo(
+                f"{hit.session_id}  {hit.seq}  "
+                f"[{hit.role}/{hit.type}]  {hit.snippet}"
+            )
+    finally:
+        storage.close()
 
 
 @app.command(name="archive")
