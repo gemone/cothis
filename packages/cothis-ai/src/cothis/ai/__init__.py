@@ -12,6 +12,8 @@ Public surface (frozen — other modules depend on these names):
 * the canonical type aliases from :mod:`cothis.ai._types`
   (``MessageResponse``, ``MessageStreamEvent``, ``Usage``, ``TextDelta``,
   ``InputJSONDelta``, ...).
+* :class:`ContextBudget` / :class:`PressureLevel` — the context-window
+  pressure signal from :mod:`cothis.ai.context_budget`.
 """
 
 from __future__ import annotations
@@ -30,12 +32,15 @@ from cothis.ai._types import (
     Usage,
 )
 from cothis.ai.base import AIProvider, get_provider
+from cothis.ai.context_budget import ContextBudget, PressureLevel
 
 __all__ = [
     "AIProvider",
+    "ContextBudget",
     "InputJSONDelta",
     "MessageResponse",
     "MessageStreamEvent",
+    "PressureLevel",
     "SignatureDelta",
     "StopReason",
     "TextBlock",
