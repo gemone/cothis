@@ -73,9 +73,9 @@ class GoogleProvider:
 
     # ================================================================ amessages
     @overload
-    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False) -> MessageResponse: ...
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False, session_id: str | None = None) -> MessageResponse: ...
     @overload
-    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True]) -> AsyncIterator[MessageStreamEvent]: ...
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True], session_id: str | None = None) -> AsyncIterator[MessageStreamEvent]: ...
     async def amessages(
         self,
         *,
@@ -85,7 +85,12 @@ class GoogleProvider:
         system: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
+        session_id: str | None = None,
     ) -> MessageResponse | AsyncIterator[MessageStreamEvent]:
+        # ``session_id`` is accepted for Protocol parity but ignored: Google
+        # prompt caching is out of scope this iteration. Keeping the param
+        # uniform lets call sites always pass ``session_id`` without branching
+        # on the concrete provider.
         contents = anthropic_messages_to_google_contents(messages)
         config = self._build_config(max_tokens=max_tokens, system=system, tools=tools)
         client = self._get_client()

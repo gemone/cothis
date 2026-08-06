@@ -19,6 +19,7 @@ The SDK client is constructed lazily on first use.
 
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from cothis.ai._translate import (
@@ -64,19 +65,30 @@ class OpenAIProvider:
         max_tokens: int,
         system: list[dict[str, Any]] | None,
         tools: list[dict[str, Any]] | None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        request: dict[str, Any] = {
             "model": model,
             "messages": anthropic_messages_to_openai(messages, system),
             "max_tokens": max_tokens,
             "tools": anthropic_tools_to_openai(tools),
         }
+        # Route OpenAI's automatic prefix caching to this conversation via a
+        # per-session key. Gated to real OpenAI only (``api_base is None``):
+        # OpenAI-compatible backends (OpenRouter, DeepSeek, Groq, Mistral) 400
+        # on unknown top-level params, and the ``OpenAIProvider`` subclasses
+        # used for them always set ``api_base``. When no session is attached
+        # (the ephemeral ``ask`` path) the key is omitted — OpenAI still
+        # auto-caches by prefix.
+        if session_id is not None and self._api_base is None:
+            request["prompt_cache_key"] = _derive_prompt_cache_key(session_id)
+        return request
 
     # ================================================================ amessages
     @overload
-    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False) -> MessageResponse: ...
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False, session_id: str | None = None) -> MessageResponse: ...
     @overload
-    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True]) -> AsyncIterator[MessageStreamEvent]: ...
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True], session_id: str | None = None) -> AsyncIterator[MessageStreamEvent]: ...
     async def amessages(
         self,
         *,
@@ -86,6 +98,7 @@ class OpenAIProvider:
         system: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
+        session_id: str | None = None,
     ) -> MessageResponse | AsyncIterator[MessageStreamEvent]:
         request = self._build_request(
             model=model,
@@ -93,6 +106,7 @@ class OpenAIProvider:
             max_tokens=max_tokens,
             system=system,
             tools=tools,
+            session_id=session_id,
         )
         client = self._get_client()
         if stream:
@@ -102,6 +116,20 @@ class OpenAIProvider:
             return _synthesise_stream(chunk_stream, model=model)
         completion = await client.chat.completions.create(**request)
         return _completion_to_message(completion, model=model)
+
+
+def _derive_prompt_cache_key(session_id: str) -> str:
+    """Derive a stable, length-bounded ``prompt_cache_key`` from a session id.
+
+    ``sha256(session_id).hexdigest()[:32]`` — 32 hex chars, well within
+    OpenAI's key length bound, deterministic across process restarts (the
+    session id is durable in SQLite, so a hash of it is stable too). The
+    hash decouples the cache key from any future session-id format change
+    and guarantees the length bound unconditionally, even if a future
+    session id is longer than today's ``uuid4().hex`` (32 url-safe chars
+    that would also fit raw).
+    """
+    return hashlib.sha256(session_id.encode()).hexdigest()[:32]
 
 
 # ===========================================================================

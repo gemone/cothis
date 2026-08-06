@@ -43,7 +43,7 @@ from cothis.ai._translate import (
     anthropic_tools_to_openai,
     map_openai_finish_reason,
 )
-from cothis.ai.openai import OpenAIProvider
+from cothis.ai.openai import OpenAIProvider, _derive_prompt_cache_key
 
 # ---------------------------------------------------------------------------
 # Translation unit tests (pure helpers)
@@ -813,3 +813,130 @@ def test_synthesised_thinking_block_round_trips_through_agent_accumulator() -> N
 
     assert block["type"] == "thinking"
     assert block["thinking"] == "thinking"
+
+
+# ---------------------------------------------------------------------------
+# Prompt-cache hints: per-session ``prompt_cache_key`` (I22).
+# ---------------------------------------------------------------------------
+
+
+def test_derive_prompt_cache_key_is_deterministic_and_length_bounded() -> None:
+    """``_derive_prompt_cache_key`` is stable for one input and ≤64 chars."""
+    key = _derive_prompt_cache_key("abc")
+    again = _derive_prompt_cache_key("abc")
+    assert key == again  # deterministic
+    assert len(key) <= 64  # within OpenAI's bound
+    assert len(key) == 32  # sha256 prefix[:32]
+
+
+def test_derive_prompt_cache_key_distinct_for_distinct_sessions() -> None:
+    assert _derive_prompt_cache_key("session-one") != _derive_prompt_cache_key(
+        "session-two"
+    )
+
+
+def test_non_stream_sets_prompt_cache_key_for_real_openai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_fake_client(
+        monkeypatch, create_return=_make_completion(text="hi"), captured=captured
+    )
+    provider = OpenAIProvider(api_key="sk", api_base=None)  # real OpenAI
+    asyncio.run(
+        provider.amessages(
+            model="gpt-test",
+            messages=[],
+            max_tokens=1,
+            session_id="abc",
+        )
+    )
+    req = captured["create_kwargs"]
+    assert req["prompt_cache_key"] == _derive_prompt_cache_key("abc")
+
+
+def test_prompt_cache_key_stable_across_calls_within_one_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_fake_client(
+        monkeypatch, create_return=_make_completion(text="hi"), captured=captured
+    )
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    asyncio.run(
+        provider.amessages(model="m", messages=[], max_tokens=1, session_id="same")
+    )
+    first = captured["create_kwargs"]["prompt_cache_key"]
+    captured["create_kwargs"] = {}
+    asyncio.run(
+        provider.amessages(model="m", messages=[], max_tokens=1, session_id="same")
+    )
+    second = captured["create_kwargs"]["prompt_cache_key"]
+    assert first == second  # stable across turns within one session
+
+
+def test_prompt_cache_key_distinct_across_two_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_fake_client(
+        monkeypatch, create_return=_make_completion(text="hi"), captured=captured
+    )
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    asyncio.run(
+        provider.amessages(model="m", messages=[], max_tokens=1, session_id="sess-a")
+    )
+    first = captured["create_kwargs"]["prompt_cache_key"]
+    captured["create_kwargs"] = {}
+    asyncio.run(
+        provider.amessages(model="m", messages=[], max_tokens=1, session_id="sess-b")
+    )
+    second = captured["create_kwargs"]["prompt_cache_key"]
+    assert first != second  # distinct across sessions
+
+
+def test_prompt_cache_key_absent_when_no_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ephemeral ``ask`` path (no session attached) omits the key — OpenAI
+    still auto-caches by prefix, so this degrades gracefully, not a crash."""
+    captured: dict[str, Any] = {}
+    _install_fake_client(
+        monkeypatch, create_return=_make_completion(text="hi"), captured=captured
+    )
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    asyncio.run(provider.amessages(model="m", messages=[], max_tokens=1))
+    assert "prompt_cache_key" not in captured["create_kwargs"]
+
+
+def test_prompt_cache_key_absent_for_openai_compat_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenAI-compatible backends (OpenRouter / DeepSeek / Groq / Mistral) 400
+    on unknown top-level params, so the key is gated off when ``api_base`` is
+    set — covers the ``api_base is None`` gate pin."""
+    captured: dict[str, Any] = {}
+    _install_fake_client(
+        monkeypatch, create_return=_make_completion(text="hi"), captured=captured
+    )
+    provider = OpenAIProvider(
+        api_key="sk", api_base="https://api.openrouter.ai/api/v1"
+    )
+    asyncio.run(
+        provider.amessages(
+            model="m", messages=[], max_tokens=1, session_id="abc"
+        )
+    )
+    assert "prompt_cache_key" not in captured["create_kwargs"]
+
+
+def test_stream_sets_prompt_cache_key_for_real_openai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_streaming_fake(monkeypatch, [_chunk(finish="stop")], captured)
+    provider = OpenAIProvider(api_key="sk", api_base=None)
+    _run_stream(provider, model="m", messages=[], max_tokens=1, session_id="abc")
+    assert captured["create_kwargs"]["prompt_cache_key"] == _derive_prompt_cache_key(
+        "abc"
+    )

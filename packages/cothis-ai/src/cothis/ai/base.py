@@ -49,9 +49,9 @@ class AIProvider(Protocol):
     """
 
     @overload
-    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False) -> MessageResponse: ...
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[False] = False, session_id: str | None = None) -> MessageResponse: ...
     @overload
-    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True]) -> AsyncIterator[MessageStreamEvent]: ...
+    async def amessages(self, *, model: str, messages: list[dict[str, Any]], max_tokens: int, system: list[dict[str, Any]] | None = None, tools: list[dict[str, Any]] | None = None, stream: Literal[True], session_id: str | None = None) -> AsyncIterator[MessageStreamEvent]: ...
     async def amessages(
         self,
         *,
@@ -61,6 +61,7 @@ class AIProvider(Protocol):
         system: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
+        session_id: str | None = None,
     ) -> MessageResponse | AsyncIterator[MessageStreamEvent]: ...
 
 

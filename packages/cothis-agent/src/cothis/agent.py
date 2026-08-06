@@ -986,6 +986,9 @@ class Agent(BaseModel):
                 max_tokens=self._effective_max_tokens(),
                 system=system_param,
                 tools=self._tool_schemas(),
+                session_id=self._session.session_id
+                if self._session is not None
+                else None,
             )
             msg = _assistant_msg_from_response(response)
             self._tag_skill_blocks(msg["content"])
@@ -1094,6 +1097,9 @@ class Agent(BaseModel):
                 system=system_param,
                 tools=tool_schemas,
                 stream=True,
+                session_id=self._session.session_id
+                if self._session is not None
+                else None,
             )
 
             blocks: dict[int, dict[str, Any]] = {}
