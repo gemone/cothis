@@ -132,7 +132,7 @@ def test_workdir_context_resets_on_exception(tmp_path: Path) -> None:
 def test_agent_has_cwd_field() -> None:
     """Agent's Pydantic model declares a ``cwd`` field (Path | None).
 
-    Avoids Agent construction (which triggers any-llm's API-key check);
+    Avoids Agent construction (which triggers the provider SDK's API-key check);
     field introspection is enough to pin the contract.
     """
     from cothis.agent import Agent
@@ -145,7 +145,7 @@ def test_agent_run_body_wraps_workdir_context() -> None:
     """Agent.run delegates to ``_run_inner`` inside ``workdir_context``.
 
     Verified by source inspection — Agent.run is a thin wrapper, not a
-    duplicate of the loop. (Construction-time check would need any-llm
+    duplicate of the loop. (Construction-time check would need the provider facade
     mocked; this stays offline.)
     """
     import inspect

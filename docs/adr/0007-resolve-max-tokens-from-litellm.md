@@ -8,7 +8,7 @@ hardcoded `_DEFAULT_MAX_TOKENS = 8192` constant landed in #31 is removed.
 
 ## Context
 
-`Agent` calls `any_llm.amessages(..., max_tokens=...)` on every turn.
+`Agent` calls the facade's `amessages(..., max_tokens=...)` on every turn.
 #31 hardcoded `8192` for every model. Wrong-sized caps silently hurt:
 
 - Too small → a generation can be cut off mid-tool-call. The PR #37
@@ -71,7 +71,7 @@ proxies).
 
 ### 3. Known ceiling — provider-name divergence
 
-litellm's `litellm_provider` field names diverge from any-llm's provider
+litellm's `litellm_provider` field names diverge from the facade's provider
 keys (e.g. `together_ai` vs `together`, `fireworks_ai` vs `fireworks`).
 The resolver does **not** fuzzy-match on the provider field — doing so
 would require a hand-maintained name map that drifts as either side

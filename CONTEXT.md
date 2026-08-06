@@ -1,6 +1,6 @@
 # cothis
 
-A complete coding agent built on `any-llm`. The agent loop is a
+A complete coding agent that talks to LLM providers through their direct SDKs. The agent loop is a
 ReAct cycle; its capability is extended through tools discovered at
 startup — from Python callables, YAML declarations, and MCP servers
 (issue #1).
@@ -37,7 +37,7 @@ base class, issue #1 stories 1–10). Three forms: `@tool`, `@tool("name")`,
 (summary → tool description, `Args:` → per-arg descriptions) and
 `inspect.signature` (types + required/optional), pre-builds an
 Anthropic-shape tool schema (`{name, description, input_schema}`) that
-`Agent` passes straight to `any_llm.amessages`. `fs.read`, `fs.create`,
+`Agent` passes straight to `amessages`. `fs.read`, `fs.create`,
 `fs.modify`, `fs.delete`, `fs.list`, `fs.search` all use it.
 _Avoid_: tool factory, tool wrapper, tool class.
 
@@ -200,7 +200,7 @@ namespace (implies a hierarchy cothis doesn't have).
 A tool produced from a YAML declaration under `.agents/tools/`. The
 YAML-source `Tool` — carries `__name__`, `__doc__`, `__signature__`, and
 a pre-built Anthropic-shape tool schema (`{name, description, input_schema}`,
-so per-arg descriptions reach the LLM without going through `any-llm`'s
+so per-arg descriptions reach the LLM without going through a multi-provider facade's
 lossy `callable_to_tool`). `_compile` produces a `CommandBlock` from the
 YAML; `load_yaml_tools` gates the executable and wraps it in a
 `_ShellTool` instance.

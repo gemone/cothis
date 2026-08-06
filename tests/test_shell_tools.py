@@ -515,7 +515,7 @@ command: "echo hi"
 def test_arg_description_reaches_schema() -> None:
     """A YAML arg's ``description:`` is carried into ``__cothis_schema__``.
 
-    This is the core PRD promise: bypassing any-llm's lossy
+    This is the core PRD promise: bypassing a multi-provider facade's lossy
     ``callable_to_tool`` so per-arg descriptions survive.
     """
     yaml_text = """

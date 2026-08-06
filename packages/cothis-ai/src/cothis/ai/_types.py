@@ -14,7 +14,7 @@ from __future__ import annotations
 import anthropic.types as _ant
 
 # Non-stream response. ``anthropic.types.Message`` exposes the identical
-# shape any-llm's ``MessageResponse`` exposed (``id``, ``model``, ``role``,
+# shape the upstream facade library's ``MessageResponse`` exposed (``id``, ``model``, ``role``,
 # ``type``, ``content``, ``stop_reason``, ``usage``).
 type MessageResponse = _ant.Message
 
@@ -35,7 +35,7 @@ type SignatureDelta = _ant.SignatureDelta
 type InputJSONDelta = _ant.InputJSONDelta
 
 # The stream-event union the agent narrows by ``isinstance``. This is what
-# any-llm re-exported as ``MessageStreamEvent``; we alias the anthropic
+# a prior provider-abstraction library re-exported this as ``MessageStreamEvent``; we alias the anthropic
 # union directly.
 type MessageStreamEvent = _ant.RawMessageStreamEvent
 

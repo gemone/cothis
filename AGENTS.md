@@ -313,4 +313,4 @@ Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/do
 
 ## Attribution
 
-cothis is architecturally inspired by [pi](https://github.com/earendil-works/pi) (TypeScript). We mirror pi's provider-abstraction pattern in `src/cothis/ai/` on clean-room principles; no pi source is copied.
+cothis's AI provider layer (`src/cothis/ai/`) is implemented on clean-room principles; no third-party project source is copied. Architectural attribution lives in README.

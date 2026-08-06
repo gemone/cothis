@@ -8,7 +8,7 @@ otherwise left in force.
 
 ## Context
 
-cothis's agent loop was built on `any_llm.acompletion` — the OpenAI
+cothis's agent loop was built on the prior multi-provider facade's `acompletion` — the OpenAI
 Chat Completions wire format. `system` was a `{role: "system"}` message;
 assistant turns carried OpenAI `tool_calls`; tool results were
 `{role: "tool", tool_call_id, content}` messages; streamed tool
@@ -26,7 +26,7 @@ model.
 
 ## Decision
 
-**Migrate the internal wire format to `any_llm.amessages` (the Anthropic
+**Migrate the internal wire format to the facade's `amessages` (the Anthropic
 Messages API), end-to-end.** `system` becomes a top-level parameter (a
 list of content blocks); `messages` hold only user/assistant turns as
 Anthropic block lists; tool schemas are Anthropic-shaped throughout.
@@ -37,13 +37,13 @@ validated in research but implemented in later slices are indexed under
 
 ### 1. `amessages` as the internal wire format
 
-The agent calls `any_llm.amessages(model, messages, max_tokens, *,
+The agent calls the facade's `amessages(model, messages, max_tokens, *,
 system, tools, stream, …)`. `system` is a top-level list of content
 blocks (not a `{role: system}` message); each block carries
 `cache_control: {type: ephemeral}`. For #31 the list is just the persona
 block; #33 adds the AGENTS.md block; #30 reserves a catalog slot.
 
-any-llm's default `_amessages` auto-converts Messages↔Completions for
+The prior multi-provider facade's default `_amessages` auto-converts Messages↔Completions for
 non-Anthropic providers (validated end-to-end on openrouter). The
 Anthropic provider passes `system`/`messages` through verbatim to
 `client.messages.create` (`MessagesParams.model_dump(exclude_none=True)`),
@@ -54,7 +54,7 @@ from the bundled litellm JSON.
 
 **Considered: the Responses API.** Rejected: not provider-portable
 (Anthropic-only). The Messages API is portable across providers via
-any-llm's converter, and clearer than Completion (`system` first-class,
+the facade's converter, and clearer than Completion (`system` first-class,
 content blocks native). Completion is deprecated.
 
 ### 2. Anthropic tool shape, end-to-end (supersedes ADR-0005 §schema)
@@ -69,7 +69,7 @@ ADR-0005's schema mentions assumed OpenAI shape (`function.parameters`,
 `__cothis_schema__` as an OpenAI schema); those assumptions are
 superseded here. ADR-0005 is not edited.
 
-The round-trip (Anthropic → OpenAI via any-llm's
+The round-trip (Anthropic → OpenAI via the facade's
 `_convert_tools_to_openai`) is lossless for every shipped tool;
 MCP schemas (with `$schema`/`$defs`/`$ref`/`enum`) pass through
 verbatim as `input_schema`.
@@ -93,7 +93,7 @@ deleted — `tool_use.input` arrives already-parsed.
 ### 4. `run_stream` on `MessageStreamEvent`; turn decision by `stop_reason`
 
 `run_stream` consumes the Anthropic stream-event union directly
-(any-llm synthesises these events from OpenAI chunks for non-Anthropic
+(The facade synthesises these events from OpenAI chunks for non-Anthropic
 providers via `messages_compat`). Block state is seeded from
 `ContentBlockStartEvent.content_block`; deltas accumulate per block
 (`TextDelta`/`ThinkingDelta` append, `SignatureDelta` overwrites the
@@ -217,5 +217,5 @@ in its own slice and may extend this ADR.
   attention (synthetic `MessageStreamEvent` flows via the real
   anthropic SDK `Raw*Event` constructors).
 - `run_stream`'s accumulator depends on the anthropic SDK event types
-  at runtime (the `isinstance` narrowing). any-llm re-exports these as
+  at runtime (the `isinstance` narrowing). The facade re-exports these as
   `MessageStreamEvent`, so the dependency is already transitive.
