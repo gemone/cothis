@@ -239,17 +239,139 @@ async def test_worker_run_turn_emits_assistant_delta_and_tool_call() -> None:
         ) as ws:
             await ws.send(json.dumps({"type": "run_turn", "prompt": "hi"}))
             received: list[dict[str, Any]] = []
-            # Loop until the turn ends (mock_agent yields exactly 3 events).
-            while len(received) < 3:
+            # Drain the full turn (#I24): turn_started + 3 stream events +
+            # turn_finished = 5 frames. Filter the new turn_* bookend frames
+            # so the assertions below still target the 3 stream events.
+            while len(received) < 5:
                 raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 received.append(json.loads(raw))
-            assert received[0] == {"type": "assistant_delta", "kind": "text", "text": "hello "}
-            assert received[1] == {"type": "assistant_delta", "kind": "text", "text": "world"}
-            assert received[2] == {
+            stream = [
+                m for m in received
+                if m["type"] not in ("turn_started", "turn_finished")
+            ]
+            assert stream[0] == {"type": "assistant_delta", "kind": "text", "text": "hello "}
+            assert stream[1] == {"type": "assistant_delta", "kind": "text", "text": "world"}
+            assert stream[2] == {
                 "type": "tool_call_started",
                 "tool": "fs.read",
                 "arguments": {"path": "a.py"},
                 "call_id": "tu_test",
             }
     finally:
+        await worker.stop()
+
+
+# ---------------------------------------------------------------------
+# Turn-lifecycle frames + interrupt (#I24)
+# ---------------------------------------------------------------------
+
+
+def _rich_mock_agent() -> Any:
+    """Agent stub carrying model / session / budget / skills signals.
+
+    Used by the #I24 turn-frame tests so ``turn_finished``'s payload
+    (model / session_id / pressure / active_skills) carries non-default
+    values that the assertions can pin down. Yields one text delta + ends.
+    """
+    from cothis.agent import ContentDelta
+    from cothis.ai.context_budget import ContextBudget, PressureLevel
+
+    async def _run_stream(prompt: str):
+        yield ContentDelta(kind="text", text="ok")
+
+    session = MagicMock()
+    session.session_id = "abcdef0123456789abcdef0123456789"
+    session.active_skills = frozenset({"git-commit", "reviewer"})
+
+    agent = MagicMock()
+    agent.run_stream = _run_stream
+    agent.model = "m1"
+    agent._session = session
+    agent.session = session
+    agent.context_budget = MagicMock(
+        return_value=ContextBudget(
+            used_tokens=100,
+            capacity_tokens=1000,
+            available_tokens=900,
+            ratio=0.1,
+            pressure=PressureLevel.NONE,
+        ),
+    )
+    agent.aclose = MagicMock(return_value=asyncio.sleep(0))
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_run_turn_emits_turn_started_and_turn_finished_frames() -> None:
+    """``run_turn`` yields ``turn_started`` then a terminal ``turn_finished`` (#I24).
+
+    The ``turn_finished`` payload carries the post-turn model / session_id /
+    pressure / active_skills snapshot read from the agent. This is the
+    authoritative refresh the TUI uses to repaint the footer + reconcile
+    run-state to idle.
+    """
+    from cothis.worker import SessionWorker
+
+    worker = SessionWorker(_rich_mock_agent())
+    uri = await worker.start()
+    try:
+        async with websockets.connect(
+            uri, additional_headers={"Authorization": f"Bearer {worker.token}"}
+        ) as ws:
+            await ws.send(json.dumps({"type": "run_turn", "prompt": "hi"}))
+            received: list[dict[str, Any]] = []
+            while len(received) < 3:
+                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                received.append(json.loads(raw))
+            assert received[0]["type"] == "turn_started"
+            finished = received[-1]
+            assert finished["type"] == "turn_finished"
+            assert finished["model"] == "m1"
+            assert finished["session_id"] == "abcdef0123456789abcdef0123456789"
+            assert finished["pressure"] == "none"
+            assert finished["active_skills"] == ["git-commit", "reviewer"]
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_turn_cancels_active_turn_and_emits_turn_finished() -> None:
+    """``interrupt_turn`` cancels ``_active_turn`` + still yields ``turn_finished`` (#I24).
+
+    The finally fires despite cancellation — that terminal-frame guarantee
+    is what the TUI relies on to return to idle. Reuses the same cancel
+    primitive as run_turn-supersede + disconnect.
+    """
+    from cothis.worker import SessionWorker
+
+    blocker = asyncio.Event()
+
+    async def _blocking_run_stream(prompt: str):
+        # Block until interrupted (or the test's safety timeout). The
+        # unreachable ``yield`` makes this an async generator.
+        await blocker.wait()
+        yield  # pragma: no cover
+
+    agent = _rich_mock_agent()
+    agent.run_stream = _blocking_run_stream
+    worker = SessionWorker(agent)
+    uri = await worker.start()
+    try:
+        async with websockets.connect(
+            uri, additional_headers={"Authorization": f"Bearer {worker.token}"}
+        ) as ws:
+            await ws.send(json.dumps({"type": "run_turn", "prompt": "hi"}))
+            # Wait for turn_started so we know the turn task is in flight
+            # before interrupting.
+            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            assert json.loads(raw)["type"] == "turn_started"
+            await ws.send(json.dumps({"type": "interrupt_turn"}))
+            # The interrupt handler cancels + awaits the task; the finally
+            # then emits turn_finished.
+            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            assert json.loads(raw)["type"] == "turn_finished"
+            # The interrupt handler clears ``_active_turn``.
+            assert worker._active_turn is None or worker._active_turn.done()
+    finally:
+        blocker.set()
         await worker.stop()

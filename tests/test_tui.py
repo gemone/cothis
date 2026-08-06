@@ -2493,3 +2493,259 @@ async def test_tool_call_after_thinking_flushes_collapsible_above_card() -> None
             f"thinking Collapsible (idx {positions_col[0]}) must precede the "
             f"ToolCallCard (idx {positions_card[0]})"
         )
+
+
+# ---------------------------------------------------------------------
+# Footer + Esc-to-interrupt (#I24)
+#
+# Headless coverage for the status bar + run-state lifecycle. Drives
+# run-state via ``_dispatch_ws_message`` / ``action_interrupt_turn`` directly
+# (NOT via scroll positioning) so the known-flaky scroll race (#450) is
+# not perturbed.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_footer_is_mounted_and_renders_idle_state() -> None:
+    """Footer mounts on launch + its initial render shows the 5 cells (#I24)."""
+    from cothis.tui import CothisApp, CothisFooter
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        footer = app.query_one(CothisFooter)
+        rendered = str(footer.content)
+        assert "state:idle" in rendered
+        assert "session:" in rendered
+        assert "ctx:" in rendered
+        assert "skills:" in rendered
+
+
+@pytest.mark.asyncio
+async def test_turn_started_sets_run_state_running() -> None:
+    """``turn_started`` WS frame flips ``run_state`` to ``running`` (#I24)."""
+    from cothis.tui import CothisApp, CothisFooter
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._dispatch_ws_message({"type": "turn_started"})
+        await pilot.pause()
+        assert app.run_state == "running"
+        footer_render = str(app.query_one(CothisFooter).content)
+        assert "state:running" in footer_render
+
+
+@pytest.mark.asyncio
+async def test_turn_finished_updates_footer_fields_and_run_state() -> None:
+    """``turn_finished`` payload updates footer cells + reconciles to idle (#I24)."""
+    from cothis.tui import CothisApp, CothisFooter
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._dispatch_ws_message({"type": "turn_started"})
+        await pilot.pause()
+        assert app.run_state == "running"
+        app._dispatch_ws_message(
+            {
+                "type": "turn_finished",
+                "model": "m1",
+                "session_id": "abcdef0123",
+                "pressure": "medium",
+                "active_skills": ["git-commit"],
+            }
+        )
+        await pilot.pause()
+        assert app.run_state == "idle"
+        assert app.footer_model == "m1"
+        assert app.footer_session == "abcdef0123"
+        assert app.footer_pressure == "medium"
+        assert app.footer_skills == ["git-commit"]
+        footer_render = str(app.query_one(CothisFooter).content)
+        assert "m1" in footer_render
+        assert "session:abcdef01" in footer_render
+        assert "ctx:medium" in footer_render
+        assert "skills:git-commit" in footer_render
+        assert "state:idle" in footer_render
+
+
+@pytest.mark.asyncio
+async def test_action_interrupt_turn_sends_interrupt_and_sets_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While ``running``, ``action_interrupt_turn`` sends one ``interrupt_turn`` frame (#I24)."""
+    import json as _json
+
+    from cothis.tui import CothisApp
+
+    fake = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        await pilot.pause()
+        app.run_state = "running"
+        await pilot.pause()
+        await app.action_interrupt_turn()
+        await pilot.pause()
+        assert app.run_state == "interrupted"
+        assert len(fake.sent) == 1
+        assert _json.loads(fake.sent[0]) == {"type": "interrupt_turn"}
+        await app.detach_ws()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_action_interrupt_turn_is_noop_when_idle() -> None:
+    """When idle (default), ``action_interrupt_turn`` sends nothing + state unchanged (#I24)."""
+    from cothis.tui import CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.run_state == "idle"
+        await app.action_interrupt_turn()
+        await pilot.pause()
+        assert app.run_state == "idle"
+
+
+@pytest.mark.asyncio
+async def test_action_interrupt_turn_noop_when_running_but_no_ws() -> None:
+    """Running + no WS attached → interrupt is a safe no-op (no crash, no state corruption) (#I24)."""
+    from cothis.tui import CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.run_state = "running"
+        await pilot.pause()
+        # No WS attached — must not raise and must not flip to interrupted.
+        await app.action_interrupt_turn()
+        await pilot.pause()
+        assert app.run_state == "running"
+
+
+@pytest.mark.asyncio
+async def test_turn_finished_after_interrupt_reconciles_to_idle() -> None:
+    """Optimistic ``interrupted`` reconciles to ``idle`` on the terminal frame (#I24)."""
+    from cothis.tui import CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.run_state = "running"
+        await pilot.pause()
+        app.run_state = "interrupted"
+        await pilot.pause()
+        app._dispatch_ws_message(
+            {
+                "type": "turn_finished",
+                "model": "m1",
+                "session_id": "abcdef0123",
+                "pressure": "low",
+                "active_skills": [],
+            }
+        )
+        await pilot.pause()
+        assert app.run_state == "idle"
+
+
+@pytest.mark.asyncio
+async def test_escape_keypress_routes_to_interrupt_when_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``pilot.press('escape')`` while running triggers the interrupt action (#I24).
+
+    Also covers the priority-binding + TextArea-focus interaction: with the
+    input focused, Esc must still route to the app-level binding (not be
+    swallowed by the TextArea).
+    """
+    import json as _json
+
+    from cothis.tui import CothisApp
+
+    fake = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        await pilot.pause()
+        # Focus the input so the priority binding is the only path Esc can
+        # take — without priority a focused TextArea would consume it.
+        app.query_one("#input").focus()
+        await pilot.pause()
+        app.run_state = "running"
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.run_state == "interrupted"
+        assert any(
+            _json.loads(s) == {"type": "interrupt_turn"} for s in fake.sent
+        ), f"expected an interrupt_turn frame; sent={fake.sent}"
+        await app.detach_ws()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_escape_dismisses_modal_not_interrupts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a modal is pushed, Esc dismisses the modal — app interrupt does NOT fire (#I24).
+
+    Regression guard for the Esc-binding-collision risk: the app-level
+    non-priority ``Binding('escape')`` routes through the focused-widget
+    layer, so a pushed modal's own Esc binding wins while it's open and the
+    app interrupt action does not fire.
+    """
+    import json as _json
+
+    from cothis.tui import AskUserModal, CothisApp
+
+    fake = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_ws("ws://fake/agent", "tok")
+        await pilot.pause()
+        app.run_state = "running"
+        await pilot.pause()
+        # Capture the screen-stack depth so we can assert the modal was
+        # actually pushed + then dismissed by Esc.
+        base_depth = len(app.screen_stack)
+        # Push a modal that has its own Esc binding (dismiss_modal).
+        app.push_screen(AskUserModal("pick one", ["a", "b"]))
+        await pilot.pause()
+        assert len(app.screen_stack) == base_depth + 1
+        await pilot.press("escape")
+        await pilot.pause()
+        # Modal dismissed — stack depth back to baseline…
+        assert len(app.screen_stack) == base_depth
+        # …and the app never sent an interrupt_turn frame.
+        assert not any(
+            _json.loads(s).get("type") == "interrupt_turn" for s in fake.sent
+        ), (
+            f"Esc should have dismissed the modal, not interrupted; sent={fake.sent}"
+        )
+        # run_state is unchanged — the interrupt action did not fire.
+        assert app.run_state == "running"
+        await app.detach_ws()
+        await pilot.pause()

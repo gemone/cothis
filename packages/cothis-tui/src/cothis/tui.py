@@ -5,6 +5,8 @@
 - ``SessionList`` (left): sessions from the session table.
 - ``ConversationView`` (center): scrollable Markdown + tool-call cards.
 - ``TextArea`` input (bottom, ``id="input"``): multiline input with Ctrl+Enter to send.
+- ``CothisFooter`` (very bottom, ``id="footer"``): one-line status bar —
+  model / session short-id / context pressure / active skills / run-state (#I24).
 
 Stream routing per the design-review sign-off (#228, 2026-07-24):
 ``ContentDelta(kind="text")`` renders as normal assistant content;
@@ -16,6 +18,14 @@ WS attach (``attach_ws`` / ``attach_session_ws``) + ``run_turn``
 forwarding (``send_run_turn``) landed with #252/#319. Multi-session
 dispatch + the worktree picker (#234) are wired up; ``on_worktree_pick``
 (slice D) is the spawn contract for production CLI wiring.
+
+Esc-to-interrupt (#I24): ``Binding('escape','interrupt_turn')``
+cancels the in-flight turn via the worker's ``interrupt_turn`` control
+message (the same task-cancel primitive used for run_turn-supersede and
+disconnect). The worker emits ``turn_started`` / ``turn_finished`` frames
+that drive the footer's run-state cell + post-turn refresh; ``action_interrupt_turn``
+is a no-op unless a turn is running. The TUI does not speak ACP — the WS
+bridge is the minimal, correct interrupt path.
 """
 
 from __future__ import annotations
@@ -30,6 +40,7 @@ from typing import TYPE_CHECKING
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
+from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -558,6 +569,35 @@ class WorktreePickerModal(ModalScreen[str | None]):
             self.dismiss(str(self._worktrees[idx].path))
 
 
+class CothisFooter(Static):
+    """One-line status bar — surfaces run-state + key signals at a glance (#I24).
+
+    Renders five cells left-to-right:
+
+    ``model | session:<short-id> | ctx:<pressure> | skills:[a,b] | state:<run_state>``
+
+    * ``<short-id>`` — first 8 chars of the active session id.
+    * ``<pressure>`` — the ``PressureLevel`` value string (``none`` / ``low`` /
+      ``medium`` / ``high`` / ``critical``) or ``?`` when unknown.
+    * ``skills`` — comma-joined sorted active-skills set, or ``-`` when empty.
+    * ``run_state`` — ``idle`` / ``running`` / ``interrupted``.
+
+    The widget itself holds no state; it is repainted by ``CothisApp``'s
+    combined ``_refresh_footer`` watcher whenever one of the footer
+    reactives flips. No polling, no per-second timer.
+    """
+
+    DEFAULT_CSS = """
+    CothisFooter#footer {
+        height: 1;
+        dock: bottom;
+        background: $boost;
+        color: $text-disabled;
+        padding: 0 1;
+    }
+    """
+
+
 # ---------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------
@@ -597,7 +637,30 @@ class CothisApp(App):
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("n", "new_session", "New session", show=True),
         Binding("ctrl+m", "menu", "Menu", show=True),
+        # Esc → interrupt a running turn (#I24). No ``priority=True``: an
+        # app-level priority binding would steal Esc from pushed modal
+        # screens (modals install their own non-priority Esc binding to
+        # dismiss). Textual resolves bindings top-screen-first for non-
+        # priority bindings, so a modal's Esc wins while it's open and the
+        # app binding fires only when no modal is pushed. Esc is not a text
+        # character, so a focused TextArea does not consume it — the
+        # binding routes to the app the same way ctrl+enter does.
+        Binding("escape", "interrupt_turn", "Interrupt", show=False),
     ]
+
+    # -----------------------------------------------------------------
+    # Run-state + footer reactives (#I24) — the app's first reactives.
+    # Plain attrs would work, but reactives let a single combined watcher
+    # (``_refresh_footer``) re-render the footer widget on any change with
+    # no ad-hoc call sites. ``run_state`` is a constrained literal set
+    # (idle|running|interrupted) so the Esc guard ``run_state != "running"``
+    # stays narrow + ty-friendly.
+    # -----------------------------------------------------------------
+    run_state: reactive[str] = reactive("idle")
+    footer_model: reactive[str] = reactive("")
+    footer_session: reactive[str] = reactive("")
+    footer_pressure: reactive[str] = reactive("")
+    footer_skills: reactive[list[str]] = reactive[list[str]](list)
 
     def action_new_session(self) -> None:
         """Trigger the new-session flow (#234).
@@ -743,6 +806,11 @@ class CothisApp(App):
             )
             yield ConversationView()
         yield TextArea(id="input")
+        # Footer (#I24): docked at the very bottom, beneath the input. Both
+        # widgets use ``dock: bottom``; Textual stacks docked siblings in DOM
+        # order with the LAST mounted closest to the screen edge, so mounting
+        # the footer after the input places it below the input.
+        yield CothisFooter("", id="footer")
 
     async def on_mount(self) -> None:
         """Focus the session list on launch — preserve the pre-#375 target.
@@ -757,6 +825,64 @@ class CothisApp(App):
         dropped by the old wrapper.
         """
         self.query_one(SessionList).focus()
+        # Seed the footer with the initial idle render so the status bar
+        # shows the documented cells (``state:idle`` etc.) before any WS
+        # frame arrives. The watcher paths refresh it thereafter.
+        self._refresh_footer()
+
+    # -----------------------------------------------------------------
+    # Footer reactives → re-render (#I24). One ``watch_*`` per reactive
+    # delegates to a single combined callback so a turn_finished payload
+    # (which updates all four data cells at once) re-paints the footer
+    # once per changed field rather than four times.
+    # -----------------------------------------------------------------
+
+    def watch_run_state(self, _value: str) -> None:
+        self._refresh_footer()
+
+    def watch_footer_model(self, _value: str) -> None:
+        self._refresh_footer()
+
+    def watch_footer_session(self, _value: str) -> None:
+        self._refresh_footer()
+
+    def watch_footer_pressure(self, _value: str) -> None:
+        self._refresh_footer()
+
+    def watch_footer_skills(self, _value: list[str]) -> None:
+        self._refresh_footer()
+
+    def _render_footer_str(self) -> str:
+        """Compose the one-line footer render from the current reactives.
+
+        Cells: ``model | session:<short-id> | ctx:<pressure> | skills:[..] |
+        state:<run_state>``. ``<short-id>`` is the first 8 chars of
+        ``footer_session`` (the full id is stored; only the render is
+        shortened). ``<pressure>`` falls back to ``?`` when unknown (the
+        TUI never carries the raw ``None`` to the user-facing string).
+        """
+        short_sid = self.footer_session[:8]
+        pressure = self.footer_pressure or "?"
+        skills = ",".join(self.footer_skills) if self.footer_skills else "-"
+        model = self.footer_model or "-"
+        return (
+            f"{model} | session:{short_sid} | "
+            f"ctx:{pressure} | skills:{skills} | state:{self.run_state}"
+        )
+
+    def _refresh_footer(self) -> None:
+        """Re-render the footer widget from the current reactives.
+
+        Safe to call before ``compose`` finishes (the watcher fires during
+        reactive init); the ``try``/``except NoMatches`` guards the
+        not-yet-mounted case the same way ``on_active_session_changed``
+        does. ``Static.update`` is the cheap text-relayout path — no
+        Markdown parse, no DOM remount.
+        """
+        try:
+            self.query_one(CothisFooter).update(self._render_footer_str())
+        except Exception:  # noqa: BLE001 — footer not yet mounted
+            pass
 
     async def action_send_prompt(self) -> None:
         """Read input text → render locally → forward to worker if attached.
@@ -968,6 +1094,11 @@ class CothisApp(App):
         self._ws_pump_task = None
         ws = self._ws
         self._ws = None
+        # A dropped worker mid-turn leaves run_state stale ("running"); if
+        # the active session has no other reachable WS, return to idle so
+        # the footer + the Esc guard don't reference a dead connection (#I24).
+        if self._ws_by_session.get(self._active_session_id or "") is None:
+            self.run_state = "idle"
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -1007,6 +1138,11 @@ class CothisApp(App):
         """Close + remove one session's WS connection (multi-session #230)."""
         task = self._ws_pump_tasks_by_session.pop(session_id, None)
         ws = self._ws_by_session.pop(session_id, None)
+        # If the detached session was active, its worker is going away —
+        # clear a stale "running" so the footer + Esc guard don't reference
+        # a dead connection (#I24).
+        if session_id == self._active_session_id:
+            self.run_state = "idle"
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -1027,6 +1163,49 @@ class CothisApp(App):
         if ws is None:
             return
         await ws.send(json.dumps({"type": "run_turn", "prompt": prompt}))
+
+    async def send_interrupt_turn(self) -> None:
+        """Forward an ``interrupt_turn`` control message to the active worker (#I24).
+
+        Mirrors ``send_run_turn``'s WS routing (active-session WS with a
+        single-session ``_ws`` fallback). No-op when no WS is attached —
+        ``action_interrupt_turn`` already guards on run-state AND active-WS
+        presence before calling this, but the no-op keeps the helper safe
+        to call directly from tests / subclasses.
+        """
+        ws = self._ws_by_session.get(self._active_session_id or "") or self._ws
+        if ws is None:
+            return
+        # Guard the send: the WS may be mid-close when Esc is pressed (a
+        # worker crash mid-turn is exactly when the user reaches for the
+        # escape hatch). Swallow the send error so run_state — already
+        # optimistically "interrupted" — stays "interrupted" until the next
+        # turn / re-attach, mirroring worker._emit_turn_finished's guard.
+        try:
+            await ws.send(json.dumps({"type": "interrupt_turn"}))
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+
+    async def action_interrupt_turn(self) -> None:
+        """Esc-key action — interrupt the in-flight turn (#I24).
+
+        Guarded on run-state: only interrupts when ``run_state == "running"``.
+        When idle (or already interrupted) Esc is a harmless no-op — it sends
+        nothing and leaves state untouched. Also no-ops when no WS is
+        attached for the active session (cannot reach the worker).
+
+        Sets ``run_state="interrupted"`` optimistically so the footer
+        reflects the in-flight cancel AND a second Esc press is a no-op
+        (``interrupted != "running"``). Reconciled to ``"idle"`` when the
+        worker's terminal ``turn_finished`` frame lands.
+        """
+        if self.run_state != "running":
+            return
+        ws = self._ws_by_session.get(self._active_session_id or "") or self._ws
+        if ws is None:
+            return
+        self.run_state = "interrupted"
+        await self.send_interrupt_turn()
 
     async def _pump_ws(self) -> None:
         """Read inbound WS frames from ``self._ws`` (single-session path)."""
@@ -1098,6 +1277,23 @@ class CothisApp(App):
                 prompt=msg.get("prompt", ""),
                 choices=msg.get("choices", []),
             )
+        elif typ == "turn_started":
+            # #I24: worker opened a turn — flip run-state so the footer's
+            # state cell reads "running" and Esc becomes an armed interrupt.
+            self.run_state = "running"
+        elif typ == "turn_finished":
+            # #I24: terminal frame on every turn exit path (normal end,
+            # timeout, error, interrupt). This is the authoritative refresh
+            # — it carries the post-turn context pressure + any skill
+            # load/deactivate that happened during the turn. Reconciles
+            # run_state to "idle" (an optimistic "interrupted" set by
+            # ``action_interrupt_turn`` lands here too).
+            self.footer_model = msg.get("model") or ""
+            sid = msg.get("session_id") or ""
+            self.footer_session = sid
+            self.footer_pressure = msg.get("pressure") or ""
+            self.footer_skills = list(msg.get("active_skills") or [])
+            self.run_state = "idle"
         elif typ == "error":
             logger.warning("tui: worker error: %s", msg.get("message", ""))
         else:

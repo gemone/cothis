@@ -80,9 +80,11 @@ class FakeConnection:
         while len(self.sent) < count:
             fut: asyncio.Future[None] = asyncio.get_event_loop().create_future()
             self._recv_waiters.append(fut)
-            if self.sent:  # already enough
-                break
             try:
+                # Each ``conn.send`` resolves every queued waiter; the
+                # ``while`` re-checks the live frame count on wake, so we
+                # only return once ``count`` frames are actually present
+                # (or the per-wait timeout elapses with no new frame).
                 await asyncio.wait_for(fut, timeout)
             except TimeoutError:
                 break
@@ -301,8 +303,12 @@ async def test_run_turn_streams_deltas_via_fake_transport() -> None:
     conn = await transport.accept()
     try:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
-        await conn.wait_for_send(3)
-        got = [json.loads(f) for f in conn.sent[:3]]
+        await conn.wait_for_send(5, timeout=5.0)  # turn_started + 3 events + turn_finished (#I24)
+        got = [
+            m
+            for m in (json.loads(f) for f in conn.sent)
+            if m.get("type") not in ("turn_started", "turn_finished")
+        ]
         assert got[0] == {
             "type": "assistant_delta",
             "kind": "text",
@@ -381,8 +387,12 @@ async def test_run_turn_forwards_tool_result_pointer_via_fake_transport() -> Non
     conn = await transport.accept()
     try:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
-        await conn.wait_for_send(2)
-        got = [json.loads(f) for f in conn.sent[:2]]
+        await conn.wait_for_send(4, timeout=5.0)  # turn_started + 2 events + turn_finished (#I24)
+        got = [
+            m
+            for m in (json.loads(f) for f in conn.sent)
+            if m.get("type") not in ("turn_started", "turn_finished")
+        ]
         assert got[0] == {
             "type": "tool_call_started",
             "tool": "fs.read",
@@ -575,9 +585,13 @@ async def test_turn_timeout_emits_error(monkeypatch) -> None:
     conn = await transport.accept()
     try:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
-        await conn.wait_for_send(1, timeout=2.0)
-        msg = json.loads(conn.sent[0])
-        assert msg == {"type": "error", "message": "turn timeout"}
+        await conn.wait_for_send(2, timeout=2.0)  # turn_started + error (#I24)
+        got = [
+            m
+            for m in (json.loads(f) for f in conn.sent)
+            if m.get("type") not in ("turn_started", "turn_finished")
+        ]
+        assert got[0] == {"type": "error", "message": "turn timeout"}
     finally:
         await conn.feed(None)
 
@@ -608,9 +622,13 @@ async def test_run_stream_exception_emits_internal_error() -> None:
     conn = await transport.accept()
     try:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
-        await conn.wait_for_send(1, timeout=2.0)
-        msg = json.loads(conn.sent[0])
-        assert msg == {"type": "error", "message": "internal error"}
+        await conn.wait_for_send(2, timeout=2.0)  # turn_started + error (#I24)
+        got = [
+            m
+            for m in (json.loads(f) for f in conn.sent)
+            if m.get("type") not in ("turn_started", "turn_finished")
+        ]
+        assert got[0] == {"type": "error", "message": "internal error"}
     finally:
         await conn.feed(None)
 
