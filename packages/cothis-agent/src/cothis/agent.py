@@ -1174,10 +1174,16 @@ class Agent(BaseModel):
 
             tool_uses = _tool_uses_in(msg["content"])
             if tool_uses:
-                for block in tool_uses:
-                    skill = self._skill_for_block(block)
-                    is_error, output = await self._execute_tool(block)
-                    self._merge_tool_result(block["id"], output, is_error, skill=skill)
+                # Dispatch independent tool_use blocks concurrently; merge
+                # results in ORIGINAL block order (not completion order)
+                # so ``_messages`` and Session stay block-stable.
+                outcomes = await self._dispatch_tool_uses(tool_uses)
+                for block, (is_error, output, skill, _duration) in zip(
+                    tool_uses, outcomes, strict=True,
+                ):
+                    self._merge_tool_result(
+                        block["id"], output, is_error, skill=skill,
+                    )
                 continue
 
             # Non-tool turn: final answer (text concat; empty → "").
@@ -1218,9 +1224,12 @@ class Agent(BaseModel):
             ``str``: a ``TextDelta`` fragment of the model's final answer, as
                 soon as it arrives. The CLI accumulates these into a
                 Live-rendered Markdown view.
-            ``ToolCallEvent``: emitted immediately before each individual
-                tool dispatch (not batched), so multi-tool turns surface
-                "calling X" → X runs → "calling Y" → Y runs in order.
+            ``ToolCallEvent``: emitted for every ``tool_use`` block up-front
+                in original order before any dispatch, so multi-tool turns
+                surface "calling X" → "calling Y" → (concurrent dispatch) →
+                results. Independent blocks dispatch concurrently via
+                ``_dispatch_tool_uses`` (#316); consumers pair each call with
+                its ``ToolResultEvent`` by ``call_id``, not by adjacency.
 
         The accumulator consumes the Anthropic stream-event union directly
         (cothis.ai synthesises these events from OpenAI chunks for non-Anthropic
@@ -1354,12 +1363,20 @@ class Agent(BaseModel):
             if self._session is not None:
                 self._session.append_message("assistant", content)
 
-            if _tool_uses_in(content):
-                for block in content:
-                    if block.get("type") != "tool_use":
-                        continue
-                    # cothis: restore the original (pre-sanitisation) name for
-                    # human-facing output; the model emits the wire name.
+            tool_uses = _tool_uses_in(content)
+            if tool_uses:
+                # Emit every ``ToolCallEvent`` up-front in original block
+                # order so the consumer can render all "calling X / Y / Z"
+                # badges before any dispatch blocks the stream. Previously
+                # each call→result pair was emitted inline (serial
+                # dispatch); concurrent dispatch (#316) batches the calls
+                # first, then streams results as they resolve in original
+                # order. Consumers pair start+result by ``call_id`` (see
+                # ``ToolResultEvent``), not by adjacency.
+                for block in tool_uses:
+                    # cothis: restore the original (pre-sanitisation) name
+                    # for human-facing output; the model emits the wire
+                    # name.
                     display_name = getattr(
                         self._tool_map.get(block["name"]),
                         "__name__",
@@ -1370,10 +1387,18 @@ class Agent(BaseModel):
                         arguments=block["input"],
                         call_id=block["id"],
                     )
-                    skill = self._skill_for_block(block)
-                    started_at = time.monotonic()
-                    is_error, output = await self._execute_tool(block)
-                    duration_ms = int((time.monotonic() - started_at) * 1000)
+                # Dispatch independent blocks concurrently; per-call
+                # ``duration_ms`` is captured inside the gather (around
+                # ``_execute_tool``), not around the batch.
+                outcomes = await self._dispatch_tool_uses(tool_uses)
+                for block, (is_error, output, skill, duration_ms) in zip(
+                    tool_uses, outcomes, strict=True,
+                ):
+                    display_name = getattr(
+                        self._tool_map.get(block["name"]),
+                        "__name__",
+                        block["name"],
+                    )
                     pointer = (
                         f"session:{self._session.session_id}:tool:{block['id']}"
                         if self._session is not None else None
@@ -1385,7 +1410,9 @@ class Agent(BaseModel):
                         result_pointer=pointer,
                         call_id=block["id"],
                     )
-                    self._merge_tool_result(block["id"], output, is_error, skill=skill)
+                    self._merge_tool_result(
+                        block["id"], output, is_error, skill=skill,
+                    )
                 continue
 
             # Non-tool turn: final answer streamed already; just end the loop.
@@ -1785,6 +1812,102 @@ class Agent(BaseModel):
         fut = asks.pop(ask_id, None)
         if fut is not None and not fut.done():
             fut.set_result(value or "")
+
+    async def _dispatch_tool_uses(
+        self, tool_uses: list[dict[str, Any]],
+    ) -> list[tuple[bool, str, str | None, int]]:
+        """Dispatch ``tool_use`` blocks concurrently, preserving original order.
+
+        Returns one ``(is_error, output, skill, duration_ms)`` tuple per
+        input block, in the SAME order as ``tool_uses`` (NOT completion
+        order) so callers can merge results / stream events by original
+        block position. Shared by ``_run_inner`` (batch) and
+        ``_run_stream_inner`` (streaming) — the two serial dispatch loops
+        are now one ordered-concurrency site.
+
+        Concurrency model (the single biggest agent-latency lever):
+        * Non-skill-marker blocks run concurrently via
+          ``asyncio.gather(..., return_exceptions=True)`` — N independent
+          tools cost roughly the MAX of their wall-clocks instead of the
+          SUM (MCP round-trips, shell, fs.search all overlap).
+        * Skill-marker blocks (``load_skill`` / ``deactivate_skill``)
+          share an ``asyncio.Lock`` so they execute strictly one at a
+          time: ``Session._active_skills`` is a ``set[str]`` mutated
+          inside each tool body via check-then-add / check-then-discard
+          sequences, and overlapping dispatches would race. They still
+          overlap in time with non-skill blocks (different state).
+
+        Non-skill-marker tools run UNLOCKED, so any tool that injects the
+        session (``inject_session=True``) or mutates shared state from its
+        body MUST be concurrency-safe — only skill-marker dispatch is
+        serialised today. ``Session.append_block`` is safe (it is called
+        serially in ``_merge_tool_result`` after the gather completes), but
+        a future tool mutating other session state from its body would race
+        with its siblings.
+
+        Per-call ``duration_ms`` is captured INSIDE each gathered
+        coroutine (around ``_execute_tool``), not around the batch, so
+        streamed ``ToolResultEvent`` durations reflect each tool's own
+        wall-clock rather than the gather's total span.
+
+        ``_execute_tool`` already maps tool-body exceptions to
+        ``(True, "Error calling ...")``; ``return_exceptions=True`` plus
+        the inner ``except`` is belt-and-braces so one failing tool never
+        cancels its siblings — the gather always completes and every
+        result lands at its original index.
+        """
+        skill_lock = asyncio.Lock()
+
+        async def _run_one(
+            block: dict[str, Any],
+        ) -> tuple[bool, str, str | None, int]:
+            skill = self._skill_for_block(block)
+            started = time.monotonic()
+            try:
+                if skill is not None:
+                    # Serialise skill-marker dispatches so the
+                    # ``Session._active_skills`` mutation inside the tool
+                    # body can't race with a sibling load/deactivate.
+                    async with skill_lock:
+                        is_error, output = await self._execute_tool(block)
+                else:
+                    is_error, output = await self._execute_tool(block)
+            except Exception as exc:  # noqa: BLE001 — defense in depth
+                wire_name = block.get("name")
+                name = getattr(
+                    self._tool_map.get(wire_name), "__name__", wire_name,
+                )
+                return (
+                    True,
+                    f"Error calling {name}: {exc}",
+                    skill,
+                    int((time.monotonic() - started) * 1000),
+                )
+            return is_error, output, skill, int((time.monotonic() - started) * 1000)
+
+        raw = await asyncio.gather(
+            *(_run_one(b) for b in tool_uses),
+            return_exceptions=True,
+        )
+        # ``return_exceptions=True`` preserves submission order, so
+        # ``raw[i]`` aligns with ``tool_uses[i]``. ``_run_one`` swallows
+        # ``Exception``; a non-tuple entry here is a stray ``BaseException``
+        # (e.g. ``CancelledError``) — map it to an error result at its
+        # original index rather than crashing the whole turn.
+        outcomes: list[tuple[bool, str, str | None, int]] = []
+        for block, item in zip(tool_uses, raw, strict=True):
+            if isinstance(item, tuple):
+                outcomes.append(item)
+            else:
+                skill = self._skill_for_block(block)
+                wire_name = block.get("name")
+                name = getattr(
+                    self._tool_map.get(wire_name), "__name__", wire_name,
+                )
+                outcomes.append(
+                    (True, f"Error calling {name}: {item}", skill, 0)
+                )
+        return outcomes
 
     async def _execute_tool(self, tool_use: dict[str, Any]) -> tuple[bool, str]:
         """Dispatch a single ``tool_use`` block; return ``(is_error, output)``.

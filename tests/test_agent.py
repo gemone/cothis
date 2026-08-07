@@ -886,9 +886,12 @@ async def test_run_stream_yields_tool_result_event_with_metadata(
 
     The event carries the tool's display name, ``is_error`` flag,
     a non-negative ``duration_ms``, and ``result_pointer=None`` when no
-    Session is attached (the ephemeral ``ask`` path). Ordered immediately
-    after the matching ``ToolCallEvent`` so consumers can pair them by
-    adjacency.
+    Session is attached (the ephemeral ``ask`` path).
+
+    Concurrent dispatch (#316) emits every ``ToolCallEvent`` first (in
+    original block order), runs all blocks, then emits the
+    ``ToolResultEvent``s in original order. Consumers pair start+result
+    by ``call_id`` (see ``ToolResultEvent``), not by adjacency.
     """
 
     def boom(**kw: Any) -> str:
@@ -935,27 +938,41 @@ async def test_run_stream_yields_tool_result_event_with_metadata(
     monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
     out = await _drain(agent.run_stream("hi"))
 
+    calls = [e for e in out if isinstance(e, ToolCallEvent)]
     results = [e for e in out if isinstance(e, ToolResultEvent)]
+    assert len(calls) == 2
     assert len(results) == 2, f"expected 2 ToolResultEvents; got {results}"
 
-    # Each ToolResultEvent follows its ToolCallEvent (adjacency pairing).
-    calls = [i for i, e in enumerate(out) if isinstance(e, ToolCallEvent)]
-    assert len(calls) == 2
-    for call_idx, result in zip(calls, results, strict=True):
-        assert isinstance(out[call_idx + 1], ToolResultEvent)
-        assert out[call_idx + 1] is result
+    # Concurrent dispatch: all ToolCallEvents land BEFORE any
+    # ToolResultEvent (calls batched first, then results stream in
+    # original block order as the gather resolves).
+    last_call_idx = max(i for i, e in enumerate(out) if isinstance(e, ToolCallEvent))
+    first_result_idx = min(i for i, e in enumerate(out) if isinstance(e, ToolResultEvent))
+    assert last_call_idx < first_result_idx
+
+    # Calls preserve original block order (add then boom).
+    assert calls[0].name == "add"
+    assert calls[0].call_id == "tu1"
+    assert calls[1].name == "boom"
+    assert calls[1].call_id == "tu2"
+
+    # Results pair with calls by ``call_id`` (NOT adjacency), in original
+    # block order.
+    by_id = {r.call_id: r for r in results}
+    assert set(by_id) == {"tu1", "tu2"}
+    assert [r.call_id for r in results] == ["tu1", "tu2"]
 
     # First tool (``add``) — success.
-    assert results[0].tool == "add"
-    assert results[0].is_error is False
-    assert results[0].duration_ms >= 0
-    assert results[0].result_pointer is None  # no Session attached
+    assert by_id["tu1"].tool == "add"
+    assert by_id["tu1"].is_error is False
+    assert by_id["tu1"].duration_ms >= 0
+    assert by_id["tu1"].result_pointer is None  # no Session attached
 
     # Second tool (``boom``) — error captured, not raised.
-    assert results[1].tool == "boom"
-    assert results[1].is_error is True
-    assert results[1].duration_ms >= 0
-    assert results[1].result_pointer is None
+    assert by_id["tu2"].tool == "boom"
+    assert by_id["tu2"].is_error is True
+    assert by_id["tu2"].duration_ms >= 0
+    assert by_id["tu2"].result_pointer is None
 
 
 @pytest.mark.asyncio
