@@ -47,6 +47,11 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr  # cost: ~5ms
 # TYPE_CHECKING — which would crash pydantic. This noqa is the honest
 # representation of that constraint.
 from cothis.ai._retry import call_with_retry, retrying_stream
+from cothis.ai.compaction import (
+    build_summarisation_request,
+    plan_eviction,
+    resolve_summary_model,
+)
 from cothis.ai.context_budget import (
     ContextBudget,
     build_context_budget,
@@ -76,6 +81,7 @@ if TYPE_CHECKING:
 
     from cothis.ai import AIProvider
     from cothis.ai._types import MessageResponse, MessageStreamEvent
+    from cothis.protocol.messages import SessionPhase
     from cothis.session import Session
 
 
@@ -816,6 +822,20 @@ class Agent(BaseModel):
     # ``_execute_tool`` emits ``started`` + (``completed`` | ``failed``)
     # rows into ``notify_events`` via the session storage connection.
     _bus: NotifyBus | None = PrivateAttr(default=None)
+    # cothis: compaction slice C1 — in-memory observability phase. Flips to
+    # ``"compaction"`` around the summarisation call in ``_maybe_compact``
+    # and is restored to ``"idle"`` in the ``finally``. Observability-only
+    # in C1: the ACP bridge (``acp_bridge._Session.snapshot``) still
+    # hardcodes ``phase="idle"`` for clients; wiring this field into the
+    # snapshot is C2. Tracked here (not derived) so a later slice can emit
+    # ``"turn"`` during the loop body without re-deriving state.
+    _phase: SessionPhase = PrivateAttr(default="idle")
+    # Once-per-run compaction guard: bounds total summarisation calls to 1
+    # per ``run`` / ``run_stream`` invocation, guaranteeing termination and
+    # avoiding pathological repeated summarisation. Reset in ``_react_setup``
+    # so each user turn gets a fresh budget. Marked BEFORE the network call
+    # so a summariser failure does not retry within the same run.
+    _compaction_attempted_this_run: bool = PrivateAttr(default=False)
 
     def model_post_init(self, __context: Any) -> None:
         from cothis.ai import get_provider
@@ -939,6 +959,142 @@ class Agent(BaseModel):
             used = estimate_input_tokens(_request_messages(self._messages))
         return build_context_budget(used=used, capacity=capacity)
 
+    async def _maybe_compact(self) -> None:
+        """Compact the conversation in-memory when context pressure is HIGH+.
+
+        The single entry point slice C wires into the turn loop (called at
+        the TOP of each iteration in both ``_run_inner`` and
+        ``_run_stream_inner``, before ``_request_messages`` / ``amessages``).
+        On the common path (pressure below HIGH, or already attempted this
+        run) it returns immediately and the normal turn is byte-for-byte
+        unchanged.
+
+        One compaction attempt:
+
+        1. Guard on ``_compaction_attempted_this_run`` (once-per-run cap,
+           reset in ``_react_setup``) — bounds total summarisation calls per
+           run to 1, guaranteeing termination.
+        2. ``context_budget()`` + ``plan_eviction`` — pure decision. A no-op
+           decision (low/unknown pressure, below-floor, no-safe-cut) returns
+           without touching ``_messages``.
+        3. Mark attempted + flip ``_phase="compaction"`` BEFORE the network
+           call so a failure does not retry within the same run.
+        4. ``build_summarisation_request`` + ``resolve_summary_model`` select
+           the payload and the ``(provider, model)`` pair.
+        5. One non-stream ``amessages`` via ``call_with_retry`` (same
+           transient-error backoff the normal turn enjoys; ``tools=None``
+           because the summary carries no tool schemas).
+        6. Extract the summary text (concatenate every ``text`` block in the
+           response content). Empty summary -> treat as failure.
+        7. ATOMIC substitute: build ``[summary_user_msg] + retained`` as a
+           NEW list and assign ``self._messages`` only after the summary is
+           in hand. The old list is discarded whole; the retained tail
+           entries are the same dict objects (slice B does not copy).
+        8. Recompute ``context_budget()`` and log at INFO (decision reason,
+           evicted token estimate, new pressure). No loop — a still-HIGH
+           post-summary budget is handled by the next user turn (or C2's
+           auto-recompaction).
+        9. ``finally`` restores ``_phase="idle"``.
+
+        Failure path: ANY exception from steps 4-6 is caught, logged at
+        WARNING, and ``_maybe_compact`` returns WITHOUT mutating
+        ``_messages`` (the substitute in step 7 has not run). ``_phase`` is
+        restored in ``finally``. The normal turn then proceeds — the next
+        ``amessages`` may overflow, but state is never corrupted.
+
+        C1 scope: purely in-memory. NO session-store writes (so a resumed
+        session re-compacts in-memory; durable persistence of the summary
+        block is C2). No ``CompactionEvent`` is yielded on the stream path
+        (C2). ``_phase`` is observability-only — the ACP bridge still
+        reports ``"idle"`` to clients until C2 wires it in.
+        """
+        if self._compaction_attempted_this_run:
+            return
+        budget = self.context_budget()
+        decision = plan_eviction(messages=self._messages, budget=budget)
+        if not decision.window:
+            # Common path: low/unknown pressure, below-floor, or no safe
+            # cut. ``_messages`` untouched; the normal turn proceeds.
+            return
+        # Mark BEFORE the network call so a summariser failure does not
+        # retry within the same run.
+        self._compaction_attempted_this_run = True
+        self._phase = "compaction"
+        try:
+            req = build_summarisation_request(
+                window=decision.window,
+                max_tokens=self._effective_max_tokens(),
+            )
+            target = resolve_summary_model(
+                session_model=self.model, session_provider=self.provider
+            )
+            # Reuse the session's lazy client when the target provider
+            # matches (the common case + the testable seam); otherwise
+            # construct a fresh client for a different provider. Lazy import
+            # of ``get_provider`` mirrors ``model_post_init`` so the
+            # compaction code path never eagerly constructs a client at
+            # import or construction time.
+            if target.provider == self.provider:
+                provider = self._llm
+            else:
+                from cothis.ai import get_provider
+
+                provider = get_provider(
+                    target.provider,
+                    api_key=self.api_key,
+                    api_base=self.api_base,
+                )
+            response = await call_with_retry(
+                provider.amessages,
+                model=target.model,
+                messages=req.messages,
+                max_tokens=req.max_tokens,
+                system=req.system,
+                tools=None,
+                session_id=self._session.session_id
+                if self._session is not None
+                else None,
+            )
+            # Extract summary text by concatenating every ``text`` block in
+            # the response content. Reuses ``_concat_text`` over the
+            # model-dumped blocks (the stored-shape the helper expects).
+            summary_text = _concat_text(
+                [b.model_dump(exclude_none=True) for b in response.content]
+            )
+            if not summary_text.strip():
+                logger.warning(
+                    "compaction: summariser returned empty text "
+                    "(reason=%s, evicted_est=%d); leaving _messages unchanged",
+                    decision.reason,
+                    decision.evicted_token_estimate,
+                )
+                return
+            summary_msg = {
+                "role": "user",
+                "content": [{"type": "text", "text": summary_text}],
+            }
+            # Atomic substitute: build the new list speculatively and
+            # assign only after the summary is in hand. The retained tail
+            # entries are the same dict objects (slice B does not copy),
+            # preserving identity of the retained turns.
+            self._messages = [summary_msg, *list(decision.retained)]
+            new_budget = self.context_budget()
+            logger.info(
+                "compaction: %s; evicted_est=%d tokens; pressure %s -> %s",
+                decision.reason,
+                decision.evicted_token_estimate,
+                decision.pressure,
+                new_budget.pressure,
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully, never crash the turn
+            logger.warning(
+                "compaction failed (%s); leaving _messages unchanged: %s",
+                decision.reason,
+                exc,
+            )
+        finally:
+            self._phase = "idle"
+
     async def run(self, user_input: str) -> str:
         """Run the agent loop to completion and return the final answer.
 
@@ -976,6 +1132,7 @@ class Agent(BaseModel):
         await self._ensure_handles()
 
         for _turn in range(self.max_iterations):
+            await self._maybe_compact()
             response = await call_with_retry(
                 self._llm.amessages,
                 model=self.model,
@@ -1086,6 +1243,7 @@ class Agent(BaseModel):
         max_iterations = self.max_iterations
 
         for _turn in range(max_iterations):
+            await self._maybe_compact()
             stream = retrying_stream(
                 llm.amessages,
                 model=model,
@@ -1228,6 +1386,9 @@ class Agent(BaseModel):
         """
         self._ensure_messages(user_input)
         self._run_preactivation()
+        # Reset the once-per-run compaction guard so each user turn gets a
+        # fresh chance to compact (the cap is per-run, not per-Agent).
+        self._compaction_attempted_this_run = False
         return _system_param(self.system)
 
     def _merge_tool_result(
