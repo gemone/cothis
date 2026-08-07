@@ -1404,3 +1404,153 @@ async def test_worker_session_preactivation_filters_unavailable_skills(
         f"unavailable persisted skill 'ghost' should be filtered out; got "
         f"{captured.get('preactivate_skills')}"
     )
+
+
+# --- compaction CLI flags (slice C2: --summary-model / --min-retained-turns) -
+#
+# These pin the two operator knobs added in slice C2. They mirror the
+# ``--max-tokens`` / ``COTHIS_MAX_TOKENS`` idiom. ``--min-retained-turns``
+# carries ``envvar=COTHIS_MIN_RETAINED_TURNS`` (typer reads it); ``--summary-model``
+# deliberately has NO envvar= so the env read stays inside the agent's
+# ``resolve_summary_model`` (slice A behaviour preserved byte-for-byte).
+
+
+def _ask_capture_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[dict, Any]:
+    """Invoke ``cothis ask`` capturing the ``Agent(...)`` build kwargs.
+
+    ``Agent`` is replaced by a spy; ``asyncio.run`` is short-circuited (the
+    coro is closed) so the mock agent never actually runs. Returns
+    ``(captured_kwargs, runner_result)``.
+    """
+    import cothis.cli as cli_mod
+
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+
+    captured: dict = {}
+    mock_agent = MagicMock()
+    monkeypatch.setattr(
+        cli_mod, "Agent", lambda **kw: (captured.update(kw), mock_agent)[1],
+    )
+
+    def fake_run(coro: Any) -> None:
+        coro.close()
+
+    monkeypatch.setattr(asyncio, "run", fake_run)
+
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["ask", *argv])
+    return captured, result
+
+
+def test_ask_threads_compaction_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``ask --summary-model X --min-retained-turns 7`` reaches the Agent ctor."""
+    captured, result = _ask_capture_agent(
+        monkeypatch, ["--summary-model", "X", "--min-retained-turns", "7", "hi"]
+    )
+    assert result.exit_code == 0, f"ask failed: {result.output}"
+    assert captured["summary_model"] == "X"
+    assert captured["min_retained_turns"] == 7
+
+
+def test_ask_min_retained_turns_envvar_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``COTHIS_MIN_RETAINED_TURNS`` feeds ``--min-retained-turns`` via typer envvar."""
+    captured, result = _ask_capture_agent(
+        monkeypatch, ["hi"], env={"COTHIS_MIN_RETAINED_TURNS": "9"}
+    )
+    assert result.exit_code == 0, f"ask failed: {result.output}"
+    assert captured["min_retained_turns"] == 9
+
+
+def test_ask_min_retained_turns_flag_overrides_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag > env precedence for ``--min-retained-turns`` (mirrors --max-tokens)."""
+    captured, result = _ask_capture_agent(
+        monkeypatch,
+        ["--min-retained-turns", "8", "hi"],
+        env={"COTHIS_MIN_RETAINED_TURNS": "5"},
+    )
+    assert result.exit_code == 0, f"ask failed: {result.output}"
+    assert captured["min_retained_turns"] == 8
+
+
+def test_ask_summary_model_env_not_read_by_typer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--summary-model`` has NO ``envvar=`` on purpose.
+
+    With ``COTHIS_SUMMARY_MODEL`` set and no ``--summary-model`` flag, the
+    Agent ctor receives ``summary_model=None`` so the env read is delegated
+    to ``resolve_summary_model`` inside the agent (slice A behaviour
+    preserved byte-for-byte). This pins the no-envvar= design.
+    """
+    captured, result = _ask_capture_agent(
+        monkeypatch, ["hi"], env={"COTHIS_SUMMARY_MODEL": "openai/gpt-4o"}
+    )
+    assert result.exit_code == 0, f"ask failed: {result.output}"
+    assert captured["summary_model"] is None
+
+
+@pytest.mark.asyncio
+async def test_chat_session_threads_compaction_flags_to_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_chat_session`` (chat's ``--legacy`` REPL path) forwards the C2 flags
+    into the in-process ``Agent(...)`` ctor.
+
+    The TUI default path is intentionally NOT asserted here — it spawns a
+    worker subprocess that does not yet carry the flags (deferred C2 item).
+    """
+    from unittest.mock import AsyncMock
+
+    import cothis.cli as cli_mod
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    # Session.new: no real DB; a closeable MagicMock is enough.
+    mock_session = MagicMock()
+    mock_session.close = MagicMock()
+    monkeypatch.setattr(cli_mod.Session, "new", lambda *a, **k: mock_session)
+
+    captured: dict = {}
+    mock_agent = MagicMock()
+    mock_agent.attach_session = MagicMock()
+    mock_agent.aclose = AsyncMock()
+    monkeypatch.setattr(
+        cli_mod, "Agent", lambda **kw: (captured.update(kw), mock_agent)[1],
+    )
+
+    # PromptSession.prompt_async -> EOFError on first call so the REPL loop
+    # breaks immediately without reading stdin (Python 3.14 parses the
+    # ``except EOFError, KeyboardInterrupt:`` tuple form, so EOFError is
+    # caught and the loop breaks).
+    class _EOFSession:
+        async def prompt_async(self, *_a: object, **_k: object) -> str:
+            raise EOFError
+
+    monkeypatch.setattr(
+        "prompt_toolkit.shortcuts.PromptSession",
+        lambda *a, **k: _EOFSession(),
+    )
+
+    await cli_mod._chat_session(
+        model="m",
+        provider="p",
+        max_iterations=1,
+        max_tokens=None,
+        summary_model="openai/gpt-4o",
+        min_retained_turns=3,
+    )
+
+    assert captured["summary_model"] == "openai/gpt-4o"
+    assert captured["min_retained_turns"] == 3
+

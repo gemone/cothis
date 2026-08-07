@@ -186,6 +186,22 @@ def ask(
         envvar="COTHIS_MAX_TOKENS",
         help="Output-token cap. Default: resolved from bundled litellm metadata for the model.",
     ),
+    summary_model: str | None = typer.Option(
+        None,
+        "--summary-model",
+        help=(
+            "Summariser model (provider/model or bare model) used when "
+            "compacting the conversation. Overrides COTHIS_SUMMARY_MODEL; "
+            "when unset the env var is read inside the agent's "
+            "resolve_summary_model, then the session pair."
+        ),
+    ),
+    min_retained_turns: int = typer.Option(
+        4,
+        "--min-retained-turns",
+        envvar="COTHIS_MIN_RETAINED_TURNS",
+        help="Min turn-groups retained after compaction (default 4).",
+    ),
 ) -> None:
     """Run the agent once and print its final answer."""
     with console.status("loading...", spinner="dots"):
@@ -197,6 +213,8 @@ def ask(
             max_iterations=max_iterations,
             max_tokens=max_tokens,
             cwd=Path.cwd(),
+            summary_model=summary_model,
+            min_retained_turns=min_retained_turns,
         )
     with console.status("thinking...", spinner="dots"):
         answer = asyncio.run(_run_and_close(agent, prompt))
@@ -330,6 +348,22 @@ def chat(
         envvar="COTHIS_MAX_TOKENS",
         help="Output-token cap. Default: resolved from bundled litellm metadata for the model.",
     ),
+    summary_model: str | None = typer.Option(
+        None,
+        "--summary-model",
+        help=(
+            "Summariser model (provider/model or bare model) used when "
+            "compacting the conversation. Overrides COTHIS_SUMMARY_MODEL; "
+            "when unset the env var is read inside the agent's "
+            "resolve_summary_model, then the session pair."
+        ),
+    ),
+    min_retained_turns: int = typer.Option(
+        4,
+        "--min-retained-turns",
+        envvar="COTHIS_MIN_RETAINED_TURNS",
+        help="Min turn-groups retained after compaction (default 4).",
+    ),
     resume: str | None = typer.Option(
         None,
         "--resume",
@@ -366,6 +400,11 @@ def chat(
     TUI supports ``--model`` / ``--provider``. Flags not yet supported
     by the TUI (``--resume``, ``--skill``) fall back to the legacy REPL
     with a notice. Pass ``--legacy`` to force the REPL.
+
+    ``--summary-model`` / ``--min-retained-turns`` apply to the legacy
+    REPL path only (and to ``ask``): the TUI default spawns a worker
+    subprocess that does not yet carry them, so they are a silent no-op
+    on the default path until the worker is threaded (tracked as C2).
     """
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
@@ -390,6 +429,8 @@ def chat(
             max_tokens=max_tokens,
             resume=resume,
             preactivate_skills=list(skill),
+            summary_model=summary_model,
+            min_retained_turns=min_retained_turns,
         )
     )
 
@@ -402,6 +443,8 @@ async def _chat_session(
     max_tokens: int | None,
     resume: str | None = None,
     preactivate_skills: list[str] | None = None,
+    summary_model: str | None = None,
+    min_retained_turns: int = 4,
 ) -> None:
     # ``chat`` is the only command that persists. ``Session.new`` takes the
     # cross-process lock eagerly; the sessions row + title are written
@@ -435,6 +478,8 @@ async def _chat_session(
                 max_tokens=max_tokens,
                 cwd=Path.cwd(),
                 preactivate_skills=preactivate_skills or [],
+                summary_model=summary_model,
+                min_retained_turns=min_retained_turns,
             )
             agent.attach_session(session)
 
