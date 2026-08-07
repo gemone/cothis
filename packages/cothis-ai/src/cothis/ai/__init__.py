@@ -19,6 +19,9 @@ Public surface (frozen — other modules depend on these names):
   compaction summariser selector + prompt builder from
   :mod:`cothis.ai.compaction` (slice A; pure building blocks, not yet wired
   into the run loop).
+* :class:`EvictionDecision` / :func:`plan_eviction` — the compaction
+  eviction policy from :mod:`cothis.ai.compaction` (slice B; decides which
+  older turns to compact vs retain, driven by :class:`ContextBudget`).
 """
 
 from __future__ import annotations
@@ -38,9 +41,11 @@ from cothis.ai._types import (
 )
 from cothis.ai.base import AIProvider, get_provider
 from cothis.ai.compaction import (
+    EvictionDecision,
     SummarisationRequest,
     SummaryTarget,
     build_summarisation_request,
+    plan_eviction,
     resolve_summary_model,
 )
 from cothis.ai.context_budget import ContextBudget, PressureLevel
@@ -48,6 +53,7 @@ from cothis.ai.context_budget import ContextBudget, PressureLevel
 __all__ = [
     "AIProvider",
     "ContextBudget",
+    "EvictionDecision",
     "InputJSONDelta",
     "MessageResponse",
     "MessageStreamEvent",
@@ -64,5 +70,6 @@ __all__ = [
     "Usage",
     "build_summarisation_request",
     "get_provider",
+    "plan_eviction",
     "resolve_summary_model",
 ]
