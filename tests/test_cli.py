@@ -651,7 +651,7 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     # Stub ``attach_session_ws`` so the scheduled task doesn't try to use
     # real WS infrastructure. It's enough that ``on_worktree_pick`` schedules it.
     attach_calls: list = []
-    setattr(app, "attach_session_ws", lambda sid, ws_url, token: attach_calls.append((sid, ws_url, token)))
+    setattr(app, "attach_session_ws", lambda sid, ws_url, token, db_path=None: attach_calls.append((sid, ws_url, token, db_path)))
 
     cwd = tmp_path / "worktree-feat"
     cwd.mkdir()
@@ -674,6 +674,11 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     # attach_session_ws scheduled (create_task was stubbed; verify the coro
     # is what ``on_worktree_pick`` would have scheduled).
     assert len(scheduled) == 1
+
+    # attach_session_ws carried the worktree DB path so replay-on-attach
+    # fires (I29).
+    assert len(attach_calls) == 1
+    assert attach_calls[0][3] is not None
 
 
 @pytest.mark.asyncio

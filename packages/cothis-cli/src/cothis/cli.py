@@ -1002,8 +1002,14 @@ class _DrivenCothisApp:
                 # spawn handle's sid + the CLI's known model so the status
                 # bar shows correct values BEFORE the first turn_finished
                 # frame lands (the worker emits no per-spawn frame).
+                # #I29: pass ``wt_db`` so attach replays this session's
+                # stored history into ConversationView before the pump
+                # starts. The freshly-created session only has its seed
+                # user message, so this renders that opening turn.
                 asyncio.create_task(
-                    self.attach_session_ws(sid, handle.ws_url, handle.token),
+                    self.attach_session_ws(
+                        sid, handle.ws_url, handle.token, db_path=wt_db,
+                    ),
                 )
                 self.footer_session = sid
                 self.footer_model = model
@@ -1038,8 +1044,14 @@ class _DrivenCothisApp:
                 logging.getLogger(__name__).info(
                     "tui: resumed session %s", resume_session_id[:8],
                 )
+                # #I29: replay the resumed session's stored history on
+                # attach. ``_resolve_db_path()`` (no cwd) resolves the same
+                # db the worker reads — the worker runs at Path.cwd()
+                # (the TUI's launch cwd), matching launch-cwd resolution
+                # in all three ``_resolve_db_path`` modes.
                 await self.attach_session_ws(
                     resume_session_id, handle.ws_url, handle.token,
+                    db_path=_resolve_db_path(),
                 )
                 # #I24: seed footer model/session so the status bar is
                 # populated before the first turn_finished frame.
@@ -1068,6 +1080,10 @@ class _DrivenCothisApp:
                 # fresh port (re-crash, slow bind, port collision — the
                 # exact failures the recovery path must survive) is logged
                 # instead of swallowed as an un-retrieved task exception.
+                # #I29: no ``db_path`` is passed (replay is skipped) — the
+                # view is already populated from the original attach, so
+                # replaying would duplicate the history. ``db_path``
+                # defaults to ``None`` → no replay.
                 logging.getLogger(__name__).info(
                     "tui: re-attaching %s to restarted worker (ws=%s)",
                     sid[:8], ws_url,

@@ -298,6 +298,61 @@ class ConversationView(VerticalScroll):
         card.set_status("failed" if is_error else "done")
         return card
 
+    def render_replayed_message(self, msg: dict) -> None:
+        """Render one rebuilt ``{role, content: [blocks]}`` message (#I29).
+
+        Replay-on-attach reuses the existing primitives — there is no
+        parallel renderer. A user text block routes through
+        ``append_user_message`` (multiple text blocks in one message are
+        concatenated into one call; ``tool_result`` blocks are skipped
+        because the matching ``tool_use`` card already renders on the
+        assistant side). An assistant text block mounts one Markdown
+        widget via ``_finalize_segment`` (the buffer is seeded directly
+        so the streaming-throttle path is bypassed). A ``tool_use`` block
+        mounts a ``done``-status card (historical calls are already
+        finished). ``thinking`` / ``image`` blocks are silently skipped
+        (slice A deferral).
+
+        Leaves the view state clean (``_finalized=True``,
+        ``_stream_static=None``) after each assistant text block, so the
+        next live ``append_delta`` starts a fresh segment — the existing
+        streaming path stays behaviour-identical.
+        """
+        role = msg.get("role")
+        blocks = msg.get("content", []) or []
+        if role == "user":
+            # Concatenate text blocks into one user-echo call; skip
+            # tool_result (the tool_use card already shows on the
+            # assistant side).
+            text_parts = [
+                b.get("text", "")
+                for b in blocks
+                if b.get("type") == "text"
+            ]
+            if text_parts:
+                self.append_user_message("\n".join(text_parts))
+            return
+        if role == "assistant":
+            for b in blocks:
+                btype = b.get("type")
+                if btype == "text" and b.get("text"):
+                    # Seed the buffer + mark unfinalised so ``_finalize_segment``
+                    # mounts one Markdown widget for this block (bypassing the
+                    # streaming Static + throttle path). ``_finalize_segment``
+                    # removes any mounted Static itself (idempotent), so we do
+                    # NOT pre-null ``_stream_static`` — that would skip its
+                    # cleanup and orphan a mounted Static.
+                    self._text_buf = [b["text"]]
+                    self._finalized = False
+                    self._finalize_segment()
+                elif btype == "tool_use":
+                    self.append_tool_call(
+                        b.get("name", "?"),
+                        status="done",
+                        call_id=b.get("id"),
+                    )
+                # thinking / image / tool_result: deferred (slice A).
+
     def _refresh_stream(self) -> None:
         """Mount/refresh the plain-text streaming widget, throttled.
 
@@ -1112,8 +1167,42 @@ class CothisApp(App):
     # Multi-session WS attach (#230 slice B)
     # -----------------------------------------------------------------
 
+    def replay_session_history(self, session_id: str, db_path: Path) -> None:
+        """Replay a session's stored history into ``ConversationView`` (#I29).
+
+        Reads the rebuilt messages via ``Session.peek_messages`` — the
+        lock-free, read-only storage surface already used by
+        ``cothis history <id>``. Lock-free is essential here: the worker
+        subprocess holds the cross-process file lock on the session, so
+        a locking read from the TUI would contend with it. Each rebuilt
+        ``{role, content: [blocks]}`` message routes through
+        ``ConversationView.render_replayed_message``, which reuses the
+        existing rendering primitives (no parallel renderer).
+
+        Best-effort: a missing DB / corrupt schema / unknown id logs a
+        warning + returns so the TUI stays usable — mirrors
+        ``refresh_session_list``'s failure contract. A missing/empty
+        session (``peek_messages`` returns ``[]``) renders nothing, so a
+        fresh session's view stays correctly blank.
+        """
+        from cothis.session import Session
+
+        try:
+            messages = Session.peek_messages(db_path, session_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort replay
+            logger.warning(
+                "tui: cannot replay history for %s from %s: %s",
+                session_id[:8], db_path, exc,
+            )
+            return
+        view = self.query_one(ConversationView)
+        for msg in messages:
+            view.render_replayed_message(msg)
+
     async def attach_session_ws(
         self, session_id: str, uri: str, token: str,
+        *,
+        db_path: Path | None = None,
     ) -> None:
         """Open a WS client for a specific session (multi-session #230).
 
@@ -1121,6 +1210,14 @@ class CothisApp(App):
         ``session_id`` + starts a dedicated pump task. Marks the
         session as active via ``set_active_session``. Idempotent:
         re-attaching replaces the previous connection for that session.
+
+        Replay-on-attach (#I29): when ``db_path`` is supplied, the
+        session's stored history is replayed into ``ConversationView``
+        AFTER the WS connects + is stored but BEFORE the pump task
+        starts — so the rendered history is visible immediately on
+        attach and a fast worker frame can't race the history render.
+        Defaults ``None`` (no replay) so every existing 3-positional-arg
+        caller (tests, crash-restart re-attach) stays behaviour-identical.
         """
         import websockets
 
@@ -1129,6 +1226,8 @@ class CothisApp(App):
             uri, additional_headers={"Authorization": f"Bearer {token}"},
         )
         self._ws_by_session[session_id] = ws
+        if db_path is not None:
+            self.replay_session_history(session_id, db_path)
         self._ws_pump_tasks_by_session[session_id] = asyncio.create_task(
             self._pump_ws_connection(ws)
         )

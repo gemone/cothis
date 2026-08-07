@@ -2749,3 +2749,263 @@ async def test_escape_dismisses_modal_not_interrupts(
         assert app.run_state == "running"
         await app.detach_ws()
         await pilot.pause()
+
+
+# ---------------------------------------------------------------------
+# Replay-on-attach (#I29, slice A): on attach the TUI reads the session
+# store, rebuilds the Anthropic-shape messages, and renders them into
+# ConversationView reusing the existing primitives. The live-streaming
+# attach path stays behaviour-identical (db_path defaults None). Tests
+# seed a real temp DB via the Session API (the existing idiom), drive
+# replay, and assert widget presence / count + DOM order — never scroll
+# position (the #450 scroll-race neighbour).
+# ---------------------------------------------------------------------
+
+
+def _seed_history_session(
+    db: Path, cwd: Path,
+) -> tuple[str, Path]:
+    """Seed a session with user text + assistant [text + tool_use] + tool_result.
+
+    Mirrors the test_session.py seed idiom (flush_sync for determinism).
+    Returns ``(session_id, db_path)``.
+    """
+    from cothis.session import Session
+
+    s = Session.new(db, cwd=cwd, model="m", flush_sync=True)
+    sid = s.session_id
+    s.append_message("user", [{"type": "text", "text": "hello there"}])
+    s.append_message(
+        "assistant",
+        [
+            {"type": "text", "text": "I will read the file."},
+            {
+                "type": "tool_use",
+                "id": "tu1",
+                "name": "fs.read",
+                "input": {"path": "/x"},
+            },
+        ],
+    )
+    s.append_block(
+        "user",
+        {
+            "type": "tool_result",
+            "tool_use_id": "tu1",
+            "content": "file contents",
+        },
+    )
+    s.close()
+    return sid, db
+
+
+@pytest.mark.asyncio
+async def test_replay_renders_seeded_history(tmp_path: Path) -> None:
+    """Replay renders stored text + a done tool card into ConversationView (#I29)."""
+    from textual.widgets import Markdown
+
+    from cothis.tui import ConversationView, CothisApp, ToolCallCard
+
+    db = tmp_path / "sessions" / "session.db"
+    sid, db = _seed_history_session(db, tmp_path)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.replay_session_history(sid, db)
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+
+        # Two Markdown segments: the user echo + the assistant text.
+        markdowns = list(view.query(Markdown))
+        assert len(markdowns) == 2
+        sources = [getattr(md, "_markdown", "") or "" for md in markdowns]
+        assert any("hello there" in src for src in sources)
+        assert any("I will read the file" in src for src in sources)
+
+        # One tool_use card, status='done' (historical).
+        cards = list(view.query(ToolCallCard))
+        assert len(cards) == 1
+        assert cards[0]._status == "done"
+        assert cards[0]._call_id == "tu1"
+
+
+@pytest.mark.asyncio
+async def test_replay_empty_session_leaves_view_blank(tmp_path: Path) -> None:
+    """An empty session (peek_messages returns []) renders nothing (#I29)."""
+    from textual.widgets import Markdown
+
+    from cothis.session import Session
+    from cothis.tui import ConversationView, CothisApp, ToolCallCard
+
+    db = tmp_path / "sessions" / "session.db"
+    s = Session.new(db, cwd=tmp_path, model="m", flush_sync=True)
+    sid = s.session_id
+    s.close()
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.replay_session_history(sid, db)
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        assert list(view.query(Markdown)) == []
+        assert list(view.query(ToolCallCard)) == []
+
+
+@pytest.mark.asyncio
+async def test_replay_missing_db_is_best_effort_no_crash(tmp_path: Path) -> None:
+    """A missing/corrupt DB logs a warning and leaves the view blank (#I29).
+
+    Mirrors ``refresh_session_list``'s missing-DB contract: the TUI
+    stays usable when the storage layer is unavailable.
+    """
+    from textual.widgets import Markdown
+
+    from cothis.tui import ConversationView, CothisApp, ToolCallCard
+
+    bogus_db = tmp_path / "does-not-exist.db"
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Must not raise.
+        app.replay_session_history("0" * 32, bogus_db)
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        assert list(view.query(Markdown)) == []
+        assert list(view.query(ToolCallCard)) == []
+
+
+@pytest.mark.asyncio
+async def test_attach_session_ws_replay_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``db_path=`` triggers replay on attach; omitting it leaves the view blank (#I29).
+
+    Pins the opt-in contract: every existing 3-positional-arg caller
+    (production crash-restart + tests) stays behaviour-identical because
+    ``db_path`` defaults ``None``.
+    """
+    from textual.widgets import Markdown
+
+    from cothis.tui import ConversationView, CothisApp, ToolCallCard
+
+    db = tmp_path / "sessions" / "session.db"
+    sid, db = _seed_history_session(db, tmp_path)
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return _FakeWS([])
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    # WITH db_path → replay populates the view.
+    app_with = CothisApp()
+    async with app_with.run_test() as pilot:
+        await pilot.pause()
+        await app_with.attach_session_ws(
+            sid, "ws://fake/agent", "tok", db_path=db,
+        )
+        await pilot.pause()
+        view = app_with.query_one(ConversationView)
+        assert len(list(view.query(Markdown))) >= 1
+        assert len(list(view.query(ToolCallCard))) == 1
+        await app_with.detach_session_ws(sid)
+        await pilot.pause()
+
+    # WITHOUT db_path → view stays blank (no replay).
+    app_without = CothisApp()
+    async with app_without.run_test() as pilot:
+        await pilot.pause()
+        await app_without.attach_session_ws(sid, "ws://fake/agent", "tok")
+        await pilot.pause()
+        view = app_without.query_one(ConversationView)
+        assert list(view.query(Markdown)) == []
+        assert list(view.query(ToolCallCard)) == []
+        await app_without.detach_session_ws(sid)
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_replay_leaves_view_state_clean_for_live_stream(tmp_path: Path) -> None:
+    """After replay, a live ``append_delta`` still renders a fresh segment (#I29).
+
+    Regression guard for the streaming path: replay must not leave
+    ``_finalized`` / ``_stream_static`` stuck, or the next live delta
+    would append to a retained buffer instead of starting a fresh
+    Markdown segment.
+    """
+    from textual.widgets import Markdown
+
+    from cothis.tui import ConversationView, CothisApp
+
+    db = tmp_path / "sessions" / "session.db"
+    sid, db = _seed_history_session(db, tmp_path)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.replay_session_history(sid, db)
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        replayed_markdowns = len(list(view.query(Markdown)))
+
+        # A live assistant delta after replay starts a fresh segment.
+        app.append_assistant_delta("text", "live token")
+        view._finalize_segment()  # idle-timer proxy
+        await pilot.pause()
+
+        markdowns = list(view.query(Markdown))
+        # One new Markdown mounted for the live delta.
+        assert len(markdowns) == replayed_markdowns + 1
+        live_sources = [
+            getattr(md, "_markdown", "") or "" for md in markdowns
+        ]
+        assert any("live token" in src for src in live_sources)
+
+
+@pytest.mark.asyncio
+async def test_replay_multi_turn_history_preserves_dom_order(tmp_path: Path) -> None:
+    """A multi-turn history (user/assistant/user/assistant) renders in message order (#I29)."""
+    from textual.widgets import Markdown
+
+    from cothis.session import Session
+    from cothis.tui import ConversationView, CothisApp
+
+    db = tmp_path / "sessions" / "session.db"
+    s = Session.new(db, cwd=tmp_path, model="m", flush_sync=True)
+    sid = s.session_id
+    s.append_message("user", [{"type": "text", "text": "first question"}])
+    s.append_message(
+        "assistant", [{"type": "text", "text": "first answer"}],
+    )
+    s.append_message("user", [{"type": "text", "text": "second question"}])
+    s.append_message(
+        "assistant", [{"type": "text", "text": "second answer"}],
+    )
+    s.close()
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.replay_session_history(sid, db)
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+
+        # Four Markdown segments in DOM order: u1, a1, u2, a2.
+        markdowns = list(view.query(Markdown))
+        assert len(markdowns) == 4
+        sources = [
+            getattr(md, "_markdown", "") or "" for md in markdowns
+        ]
+        assert "first question" in sources[0]
+        assert "first answer" in sources[1]
+        assert "second question" in sources[2]
+        assert "second answer" in sources[3]
+
+        # DOM order of immediate children matches message order.
+        children = list(view.children)
+        positions = [
+            i for i, c in enumerate(children) if isinstance(c, Markdown)
+        ]
+        assert positions == sorted(positions)
