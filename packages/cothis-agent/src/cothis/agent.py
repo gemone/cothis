@@ -788,6 +788,19 @@ class Agent(BaseModel):
     # appended after the first user message; resume rebuild (#71)
     # treats the pair as a normal model-invoked load.
     preactivate_skills: list[str] = Field(default_factory=list)
+    # cothis: compaction slice C2 — operator knobs exposed via the
+    # ``--summary-model`` / ``--min-retained-turns`` CLI flags (ask/chat).
+    # ``summary_model`` is a pure override-or-None: when ``None`` (the
+    # worker / acp_bridge construction sites, or ``ask`` with no flag),
+    # ``resolve_summary_model`` reads ``COTHIS_SUMMARY_MODEL`` itself,
+    # preserving slice A's env-var behaviour byte-for-byte. The literal
+    # ``4`` mirrors ``cothis.ai.compaction._DEFAULT_MIN_RETAINED_TURNS``
+    # (kept as a literal rather than imported because it is a private
+    # name; the three literals are noted as a drift risk in C2). The
+    # ``gt=0`` constraint rejects a non-positive floor at construction
+    # (a clear error rather than plan_eviction's silent clamp to 1).
+    summary_model: str | None = None
+    min_retained_turns: int = Field(default=4, gt=0)
 
     # Runtime-only state: not validated, not serialised.
     _llm: AIProvider = PrivateAttr()
@@ -1011,7 +1024,11 @@ class Agent(BaseModel):
         if self._compaction_attempted_this_run:
             return
         budget = self.context_budget()
-        decision = plan_eviction(messages=self._messages, budget=budget)
+        decision = plan_eviction(
+            messages=self._messages,
+            budget=budget,
+            min_retained_turns=self.min_retained_turns,
+        )
         if not decision.window:
             # Common path: low/unknown pressure, below-floor, or no safe
             # cut. ``_messages`` untouched; the normal turn proceeds.
@@ -1026,7 +1043,9 @@ class Agent(BaseModel):
                 max_tokens=self._effective_max_tokens(),
             )
             target = resolve_summary_model(
-                session_model=self.model, session_provider=self.provider
+                session_model=self.model,
+                session_provider=self.provider,
+                override=self.summary_model,
             )
             # Reuse the session's lazy client when the target provider
             # matches (the common case + the testable seam); otherwise

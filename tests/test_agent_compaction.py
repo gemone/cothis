@@ -191,6 +191,8 @@ def _make_agent(
         tools=[],
         max_iterations=overrides.get("max_iterations", 5),
         max_tokens=overrides.get("max_tokens", None),
+        summary_model=overrides.get("summary_model", None),
+        min_retained_turns=overrides.get("min_retained_turns", 4),
     )
 
 
@@ -609,3 +611,112 @@ def test_maybe_compact_critical_pressure_fires(
     assert fake.phases == ["compaction"]
     assert agent._phase == "idle"
     assert agent._messages[0]["content"][0]["text"] == "critical summary"
+
+
+# --- (13) slice C2: CLI knobs thread into _maybe_compact --------------------
+#
+# These pin the wiring added in slice C2: ``Agent.summary_model`` forwards as
+# ``override=`` into ``resolve_summary_model`` and ``Agent.min_retained_turns``
+# forwards into ``plan_eviction``. The spies patch the RE-BOUND names in
+# ``cothis.agent``'s namespace (``agent.py`` does ``from cothis.ai.compaction
+# import resolve_summary_model, plan_eviction``); patching
+# ``cothis.ai.compaction.*`` would NOT intercept them.
+
+
+def test_maybe_compact_threads_summary_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Agent.summary_model`` forwards as ``override=`` to
+    ``resolve_summary_model`` (slice C2)."""
+    from cothis.ai.compaction import SummaryTarget
+
+    agent = _make_agent(monkeypatch, summary_model="openai/gpt-4o")
+    agent._messages = _seed_simple_groups(6, last_usage=_HIGH_USAGE)
+    fake = _FakeProvider(_fake_response(["override summary"]), agent=agent)
+    agent._llm = fake
+
+    captured: dict[str, Any] = {}
+
+    def spy(**kwargs: Any) -> SummaryTarget:
+        captured.update(kwargs)
+        # Return a target on the SESSION provider so the code reuses
+        # ``self._llm`` (the fake) without a get_provider call.
+        return SummaryTarget(model="summary-driven", provider=_PROVIDER)
+
+    monkeypatch.setattr("cothis.agent.resolve_summary_model", spy)
+
+    asyncio.run(agent._maybe_compact())
+
+    # override kwarg propagated from Agent.summary_model.
+    assert captured["override"] == "openai/gpt-4o"
+    assert captured["session_model"] == _MODEL
+    assert captured["session_provider"] == _PROVIDER
+    # The returned target drove the amessages model.
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["model"] == "summary-driven"
+    assert agent._messages[0]["content"][0]["text"] == "override summary"
+
+
+def test_maybe_compact_threads_min_retained_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Agent.min_retained_turns`` forwards into ``plan_eviction`` (slice C2)."""
+    agent = _make_agent(monkeypatch, min_retained_turns=6)
+    # Seed MORE groups than the floor (6) so a non-empty eviction window can
+    # form above it; with only 6 groups the floor would retain everything.
+    agent._messages = _seed_simple_groups(10, last_usage=_HIGH_USAGE)
+    fake = _FakeProvider(_fake_response(["floor summary"]), agent=agent)
+    agent._llm = fake
+
+    captured: dict[str, Any] = {}
+    real_plan = plan_eviction  # captured before patching; the genuine fn.
+
+    def spy(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_plan(**kwargs)
+
+    monkeypatch.setattr("cothis.agent.plan_eviction", spy)
+
+    asyncio.run(agent._maybe_compact())
+
+    assert captured["min_retained_turns"] == 6
+    # Compaction still completed end-to-end via the delegated planner.
+    assert len(fake.calls) == 1
+    assert agent._messages[0]["content"][0]["text"] == "floor summary"
+
+
+def test_maybe_compact_defaults_match_pre_c2_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: a default Agent (no new params) forwards
+    ``override=None`` and ``min_retained_turns=4`` — byte-identical to the
+    worker / acp_bridge construction sites that pass neither new param."""
+    from cothis.ai.compaction import resolve_summary_model as real_rsm
+
+    agent = _make_agent(monkeypatch)  # no overrides -> C2 defaults
+    assert agent.summary_model is None
+    assert agent.min_retained_turns == 4
+    agent._messages = _seed_simple_groups(6, last_usage=_HIGH_USAGE)
+    fake = _FakeProvider(_fake_response(["default summary"]), agent=agent)
+    agent._llm = fake
+
+    rsm_captured: dict[str, Any] = {}
+    pe_captured: dict[str, Any] = {}
+    real_plan = plan_eviction
+
+    def rsm_spy(**kwargs: Any) -> Any:
+        rsm_captured.update(kwargs)
+        return real_rsm(**kwargs)
+
+    def pe_spy(**kwargs: Any) -> Any:
+        pe_captured.update(kwargs)
+        return real_plan(**kwargs)
+
+    monkeypatch.setattr("cothis.agent.resolve_summary_model", rsm_spy)
+    monkeypatch.setattr("cothis.agent.plan_eviction", pe_spy)
+
+    asyncio.run(agent._maybe_compact())
+
+    assert rsm_captured["override"] is None
+    assert pe_captured["min_retained_turns"] == 4
+
