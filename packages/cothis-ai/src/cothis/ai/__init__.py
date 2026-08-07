@@ -14,6 +14,11 @@ Public surface (frozen — other modules depend on these names):
   ``InputJSONDelta``, ...).
 * :class:`ContextBudget` / :class:`PressureLevel` — the context-window
   pressure signal from :mod:`cothis.ai.context_budget`.
+* :class:`SummaryTarget` / :class:`SummarisationRequest` /
+  :func:`resolve_summary_model` / :func:`build_summarisation_request` — the
+  compaction summariser selector + prompt builder from
+  :mod:`cothis.ai.compaction` (slice A; pure building blocks, not yet wired
+  into the run loop).
 """
 
 from __future__ import annotations
@@ -32,6 +37,12 @@ from cothis.ai._types import (
     Usage,
 )
 from cothis.ai.base import AIProvider, get_provider
+from cothis.ai.compaction import (
+    SummarisationRequest,
+    SummaryTarget,
+    build_summarisation_request,
+    resolve_summary_model,
+)
 from cothis.ai.context_budget import ContextBudget, PressureLevel
 
 __all__ = [
@@ -43,11 +54,15 @@ __all__ = [
     "PressureLevel",
     "SignatureDelta",
     "StopReason",
+    "SummarisationRequest",
+    "SummaryTarget",
     "TextBlock",
     "TextDelta",
     "ThinkingBlock",
     "ThinkingDelta",
     "ToolUseBlock",
     "Usage",
+    "build_summarisation_request",
     "get_provider",
+    "resolve_summary_model",
 ]
