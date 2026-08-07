@@ -690,3 +690,111 @@ async def test_adopt_seeds_live_instance() -> None:
     assert calls == []  # still no acquire (already live)
     await mgr.release_all()
     assert calls == ["release"]
+
+
+# --- concurrent cold-acquire (I31) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ensure_acquired_acquires_once() -> None:
+    """Two tools sharing a handle class acquire exactly once under concurrent
+    dispatch (I31).
+
+    Before the per-class acquire lock, ``ensure_acquired``'s check-then-acquire
+    was a race: two tool_uses sharing a class (every MCP tool on one server
+    shares one ``MCPSessionHandle``) both observed ``is_live == False``, both
+    awaited ``acquire()``, double-connecting. Here ``acquire`` yields
+    (``asyncio.sleep``) to force the overlap window deterministically — no
+    wall-clock timing assertion. With the lock, acquire is invoked exactly
+    once; the second sibling sees ``is_live`` inside the lock and skips.
+    """
+    acquire_count = [0]
+
+    @resource(keepalive=600)
+    class H(ResourceHandle):
+        async def acquire(self) -> None:
+            acquire_count[0] += 1
+            # Yield to force the overlap window: without the per-class lock
+            # the sibling coroutine runs while this await is pending and also
+            # enters acquire (double-connect).
+            await asyncio.sleep(0.01)
+
+        async def release(self) -> None:
+            pass
+
+    @tool("a", handle=H)
+    def a() -> str:
+        return "ok"
+
+    @tool("b", handle=H)
+    def b() -> str:
+        return "ok"
+
+    mgr = HandleManager()
+    mgr.bind(a)
+    mgr.bind(b)
+
+    # Concurrent dispatch — mimics ``_dispatch_tool_uses`` running both
+    # tool_uses via ``asyncio.gather`` (I30).
+    await asyncio.gather(ensure_handle_ready(a), ensure_handle_ready(b))
+
+    assert acquire_count[0] == 1  # would be 2 without the per-class lock
+    assert a.handle is b.handle  # both point at the one shared instance
+    assert mgr._slots[H].is_live
+    assert mgr._slots[H].live_at is not None
+    await mgr.release_all()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_acquire_independent_classes_parallel() -> None:
+    """Distinct handle classes acquire in parallel, not serialised (I31).
+
+    The lock is per-class, not manager-wide: two tools binding DIFFERENT
+    handle classes must still have their ``acquire()`` calls overlap. This
+    guards against an accidental manager-wide lock regression (which would
+    serialise all cold-acquires and kill the I30 concurrency win).
+    Deterministic overlap probe — each acquire increments a shared
+    ``in_flight`` counter and records the high-water mark before yielding.
+    """
+    state = {"in_flight": 0, "max_in_flight": 0}
+
+    def make_handle(name: str) -> type[ResourceHandle]:
+        @resource(keepalive=600)
+        class H(ResourceHandle):
+            async def acquire(self) -> None:
+                state["in_flight"] += 1
+                state["max_in_flight"] = max(
+                    state["max_in_flight"], state["in_flight"]
+                )
+                await asyncio.sleep(0.02)  # force an overlap window
+                state["in_flight"] -= 1
+
+            async def release(self) -> None:
+                pass
+
+        return H
+
+    H1 = make_handle("h1")
+    H2 = make_handle("h2")
+
+    @tool("a", handle=H1)
+    def a() -> str:
+        return "ok"
+
+    @tool("b", handle=H2)
+    def b() -> str:
+        return "ok"
+
+    mgr = HandleManager()
+    mgr.bind(a)
+    mgr.bind(b)
+
+    await asyncio.gather(ensure_handle_ready(a), ensure_handle_ready(b))
+
+    # Distinct classes acquired concurrently — not serialised.
+    assert state["max_in_flight"] == 2, (
+        f"distinct handle classes should acquire in parallel "
+        f"(max_in_flight=2), got {state['max_in_flight']} — a manager-wide "
+        f"lock would serialise them"
+    )
+    await mgr.release_all()
