@@ -1025,7 +1025,30 @@ class HandleManager:
         # — the injected callable MUST be monotonic.
         self._clock = now if now is not None else time.monotonic
         self._slots: dict[type[ResourceHandle], _HandleSlot] = {}
+        # Per-class acquire locks guard the cold-acquire critical section in
+        # ``ensure_acquired`` against the check-then-acquire race exposed by
+        # concurrent dispatch (I30: ``_dispatch_tool_uses`` runs independent
+        # tool_uses via ``asyncio.gather``). One lock per handle class so
+        # siblings sharing a class (notably all MCP tools on one server share
+        # one ``MCPSessionHandle``) serialise their cold-acquire, while
+        # distinct classes still acquire in parallel.
+        self._acquire_locks: dict[type[ResourceHandle], asyncio.Lock] = {}
         self._reaper_task: asyncio.Task[None] | None = None
+
+    def _acquire_lock_for(self, cls: type[ResourceHandle]) -> asyncio.Lock:
+        """Return the per-class cold-acquire lock, creating it on first use.
+
+        Lazily created because ``ensure_acquired`` auto-registers a slot for
+        an unbound class (``bind`` may not have seen every class yet), so the
+        lock must spring into existence on the same path. One lock per class
+        — never a manager-wide lock, which would serialise unrelated classes
+        and kill the I30 concurrency win.
+        """
+        lock = self._acquire_locks.get(cls)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._acquire_locks[cls] = lock
+        return lock
 
     def _start_reaper(self) -> None:
         """Start the background idle-reaper if not already running.
@@ -1089,6 +1112,15 @@ class HandleManager:
         pinned handles still admits a new one. If every non-pinned live
         handle is in-flight, the pool temporarily exceeds ``max_handles``
         — a tool call must never fail because the pool is busy.
+
+        Concurrency-safe under I30's ``_dispatch_tool_uses`` (independent
+        tool_uses run via ``asyncio.gather``): the already-live fast path is
+        lock-free; the cold-acquire critical section (budget check → evict →
+        ``acquire()`` → set ``live_at``) is guarded by a per-class lock with
+        an ``is_live`` re-check inside, so two tools sharing a class (every
+        MCP tool on one server shares one ``MCPSessionHandle``) never
+        double-acquire. The lock is per-class, not manager-wide, so distinct
+        classes still acquire in parallel.
         """
         cls = getattr(tool, "_handle_cls", None)
         if cls is None:
@@ -1098,14 +1130,25 @@ class HandleManager:
             slot = _HandleSlot(instance=cls())
             self._slots[cls] = slot
         if not slot.is_live:
-            unpinned_live = sum(
-                1 for s in self._slots.values() if s.is_live and not s.is_pinned
-            )
-            if unpinned_live >= self._max_handles:
-                await self._evict_coldest()
-            await slot.instance.acquire()
-            slot.live_at = self._clock()
-            self._start_reaper()
+            # Cold path. Before I31 the check-then-acquire was a race: two
+            # tool_uses sharing this class (I30 dispatches independent blocks
+            # concurrently via ``asyncio.gather``) both observed
+            # ``is_live == False``, both awaited ``acquire()``, double-
+            # connecting (orphaned MCP sessions). The per-class lock makes
+            # the budget-check → evict → acquire → mark-live section atomic,
+            # and the inner ``is_live`` re-check lets a sibling that acquired
+            # first while we waited on the lock short-circuit.
+            async with self._acquire_lock_for(cls):
+                if not slot.is_live:
+                    unpinned_live = sum(
+                        1 for s in self._slots.values()
+                        if s.is_live and not s.is_pinned
+                    )
+                    if unpinned_live >= self._max_handles:
+                        await self._evict_coldest()
+                    await slot.instance.acquire()
+                    slot.live_at = self._clock()
+                    self._start_reaper()
         slot.last_used = self._clock()
         tool.handle = slot.instance
 
@@ -1235,3 +1278,4 @@ class HandleManager:
         for slot in list(self._slots.values()):
             await self._release(slot)
         self._slots.clear()  # permanent teardown — stale entries can't re-acquire
+        self._acquire_locks.clear()  # drop per-class locks too (stateless; symmetry)
