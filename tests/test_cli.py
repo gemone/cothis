@@ -681,6 +681,118 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     assert attach_calls[0][3] is not None
 
 
+def test_worker_tuning_env_forwards_non_none_only() -> None:
+    """The env-building helper maps resolved tuning values to the ``COTHIS_*``
+    vars the worker's Agent / ``resolve_summary_model`` read, forwarding only
+    non-None values. The all-None case (the ``cothis tui`` call site, which
+    passes nothing) must yield an empty dict so the worker inherits its shell
+    env exactly as before — this is the tui no-regression guarantee.
+    """
+    from cothis.cli import _worker_tuning_env
+
+    env = _worker_tuning_env(
+        max_concurrent_tools=16,
+        max_tool_result_chars=5000,
+        tool_timeout=12.5,
+        summary_model="openai/gpt-4o-mini",
+        min_retained_turns=9,
+    )
+    assert env == {
+        "COTHIS_MAX_CONCURRENT_TOOLS": "16",
+        "COTHIS_MAX_TOOL_RESULT_CHARS": "5000",
+        "COTHIS_TOOL_TIMEOUT": "12.5",
+        "COTHIS_SUMMARY_MODEL": "openai/gpt-4o-mini",
+        "COTHIS_MIN_RETAINED_TURNS": "9",
+    }
+
+    # `cothis tui` passes nothing -> nothing forwarded -> worker inherits
+    # shell env exactly as today (the tui no-regression guarantee).
+    assert _worker_tuning_env() == {}
+
+    # Partial: None fields omitted, non-None still mapped.
+    assert _worker_tuning_env(max_concurrent_tools=4) == {
+        "COTHIS_MAX_CONCURRENT_TOOLS": "4",
+    }
+
+
+def test_on_worktree_pick_forwards_tuning_env_to_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The merged {API keys | COTHIS_* tuning} dict that ``_launch_tui_app``
+    builds reaches ``spawn_worker``'s ``extra_env`` verbatim through both
+    spawn closures (verified here via ``on_worktree_pick``), without changes
+    to ``.build`` or ``spawn_worker``.
+    """
+    from typing import cast
+
+    import cothis.cli as cli_mod
+
+    # Stub Session.new to avoid touching the filesystem.
+    class _FakeSession:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+
+        def append_message(self, role, content):  # noqa: ANN001
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_session_new(db_path, *, cwd, model, flush_sync):  # noqa: ANN001
+        return _FakeSession(session_id="deadbeef" * 4)
+
+    monkeypatch.setattr("cothis.session.Session.new", fake_session_new)
+
+    # Fake Supervisor that records spawn_worker args + returns a handle-like obj.
+    spawn_calls: list[dict] = []
+
+    class _FakeHandle:
+        ws_url = "ws://127.0.0.1:9999/agent"
+        token = "fake-bearer-token"
+
+    class _FakeSupervisor:
+        def spawn_worker(self, sid, *, model, provider, cwd, sessions_dir=None, extra_env=None):  # noqa: ANN001
+            spawn_calls.append({
+                "sid": sid,
+                "extra_env": extra_env,
+            })
+            return _FakeHandle()
+
+    # Stub ``asyncio.create_task`` so the scheduled attach doesn't run.
+    scheduled: list = []
+    monkeypatch.setattr(
+        "asyncio.create_task", lambda coro: scheduled.append(coro),
+    )
+
+    sup = _FakeSupervisor()
+    merged_env = {
+        "TEST_API_KEY": "val",
+        "COTHIS_MAX_CONCURRENT_TOOLS": "16",
+        "COTHIS_MAX_TOOL_RESULT_CHARS": "5000",
+        "COTHIS_TOOL_TIMEOUT": "12.5",
+        "COTHIS_SUMMARY_MODEL": "openai/gpt-4o-mini",
+        "COTHIS_MIN_RETAINED_TURNS": "9",
+    }
+    app = cli_mod._DrivenCothisApp.build(
+        supervisor=cast("Supervisor", sup),
+        model="test-model",
+        provider="test-provider",
+        provider_env=merged_env,
+    )
+
+    # Stub ``attach_session_ws`` so the scheduled task doesn't use real WS.
+    setattr(app, "attach_session_ws", lambda *a, **k: None)
+
+    cwd = tmp_path / "worktree-feat"
+    cwd.mkdir()
+    app.on_worktree_pick(str(cwd))
+
+    # The merged dict (API keys + tuning) reaches spawn_worker.extra_env unchanged.
+    assert len(spawn_calls) == 1
+    assert spawn_calls[0]["extra_env"] == merged_env
+
+
 @pytest.mark.asyncio
 async def test_reattach_on_restart_swallows_and_logs_attach_failure(
     caplog: pytest.LogCaptureFixture,
@@ -1189,8 +1301,27 @@ def test_chat_defaults_to_tui(
 
     captured: list[dict] = []
 
-    def fake_launch(model: str, provider: str, resume: str | None = None) -> None:
-        captured.append({"model": model, "provider": provider, "resume": resume})
+    def fake_launch(
+        model: str,
+        provider: str,
+        resume: str | None = None,
+        *,
+        max_concurrent_tools: int | None = None,
+        max_tool_result_chars: int | None = None,
+        tool_timeout: float | None = None,
+        summary_model: str | None = None,
+        min_retained_turns: int | None = None,
+    ) -> None:
+        captured.append({
+            "model": model,
+            "provider": provider,
+            "resume": resume,
+            "max_concurrent_tools": max_concurrent_tools,
+            "max_tool_result_chars": max_tool_result_chars,
+            "tool_timeout": tool_timeout,
+            "summary_model": summary_model,
+            "min_retained_turns": min_retained_turns,
+        })
 
     monkeypatch.setattr(cli_mod, "_launch_tui_app", fake_launch)
 
@@ -1202,6 +1333,14 @@ def test_chat_defaults_to_tui(
         f"expected _launch_tui_app called once; got {captured}"
     )
     assert captured[0]["resume"] is None
+    # The five tuning flags are forwarded from the chat call site to
+    # _launch_tui_app (resolved typer defaults here: 8 / 20000 / None /
+    # None / 4). Pinning the wiring end-to-end at the call site.
+    assert captured[0]["max_concurrent_tools"] == 8
+    assert captured[0]["max_tool_result_chars"] == 20_000
+    assert captured[0]["tool_timeout"] is None
+    assert captured[0]["summary_model"] is None
+    assert captured[0]["min_retained_turns"] == 4
 
 
 def test_chat_legacy_runs_repl(
