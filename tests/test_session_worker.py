@@ -239,7 +239,7 @@ async def test_worker_run_turn_emits_assistant_delta_and_tool_call() -> None:
         ) as ws:
             await ws.send(json.dumps({"type": "run_turn", "prompt": "hi"}))
             received: list[dict[str, Any]] = []
-            # Drain the full turn (#I24): turn_started + 3 stream events +
+            # Drain the full turn: turn_started + 3 stream events +
             # turn_finished = 5 frames. Filter the new turn_* bookend frames
             # so the assertions below still target the 3 stream events.
             while len(received) < 5:
@@ -262,14 +262,14 @@ async def test_worker_run_turn_emits_assistant_delta_and_tool_call() -> None:
 
 
 # ---------------------------------------------------------------------
-# Turn-lifecycle frames + interrupt (#I24)
+# Turn-lifecycle frames + interrupt
 # ---------------------------------------------------------------------
 
 
 def _rich_mock_agent() -> Any:
     """Agent stub carrying model / session / budget / skills signals.
 
-    Used by the #I24 turn-frame tests so ``turn_finished``'s payload
+    Used by the turn-frame tests so ``turn_finished``'s payload
     (model / session_id / pressure / active_skills) carries non-default
     values that the assertions can pin down. Yields one text delta + ends.
     """
@@ -303,7 +303,7 @@ def _rich_mock_agent() -> Any:
 
 @pytest.mark.asyncio
 async def test_run_turn_emits_turn_started_and_turn_finished_frames() -> None:
-    """``run_turn`` yields ``turn_started`` then a terminal ``turn_finished`` (#I24).
+    """``run_turn`` yields ``turn_started`` then a terminal ``turn_finished``.
 
     The ``turn_finished`` payload carries the post-turn model / session_id /
     pressure / active_skills snapshot read from the agent. This is the
@@ -336,7 +336,7 @@ async def test_run_turn_emits_turn_started_and_turn_finished_frames() -> None:
 
 @pytest.mark.asyncio
 async def test_interrupt_turn_cancels_active_turn_and_emits_turn_finished() -> None:
-    """``interrupt_turn`` cancels ``_active_turn`` + still yields ``turn_finished`` (#I24).
+    """``interrupt_turn`` cancels ``_active_turn`` + still yields ``turn_finished``.
 
     The finally fires despite cancellation — that terminal-frame guarantee
     is what the TUI relies on to return to idle. Reuses the same cancel

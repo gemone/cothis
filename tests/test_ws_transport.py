@@ -180,7 +180,7 @@ async def test_ping_pong_via_fake_transport() -> None:
 async def test_resolve_ask_calls_agent_resolve_ask() -> None:
     """AC #229 B+D-3: ``resolve_ask`` WS handler routes to ``agent.resolve_ask``.
 
-    Replaces the slice A stub (which only logged receipt of the message).
+    Replaces the earlier stub (which only logged receipt of the message).
     Now the handler resolves the agent's pending Future, unblocking the
     tool that called ``_ask_user``. Still emits no WS frame of its own —
     the answer flows back through the agent's tool return + subsequent
@@ -303,7 +303,7 @@ async def test_run_turn_streams_deltas_via_fake_transport() -> None:
     conn = await transport.accept()
     try:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
-        await conn.wait_for_send(5, timeout=5.0)  # turn_started + 3 events + turn_finished (#I24)
+        await conn.wait_for_send(5, timeout=5.0)  # turn_started + 3 events + turn_finished
         got = [
             m
             for m in (json.loads(f) for f in conn.sent)
@@ -387,7 +387,7 @@ async def test_run_turn_forwards_tool_result_pointer_via_fake_transport() -> Non
     conn = await transport.accept()
     try:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
-        await conn.wait_for_send(4, timeout=5.0)  # turn_started + 2 events + turn_finished (#I24)
+        await conn.wait_for_send(4, timeout=5.0)  # turn_started + 2 events + turn_finished
         got = [
             m
             for m in (json.loads(f) for f in conn.sent)
@@ -585,7 +585,7 @@ async def test_turn_timeout_emits_error(monkeypatch) -> None:
     conn = await transport.accept()
     try:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
-        await conn.wait_for_send(2, timeout=2.0)  # turn_started + error (#I24)
+        await conn.wait_for_send(2, timeout=2.0)  # turn_started + error
         got = [
             m
             for m in (json.loads(f) for f in conn.sent)
@@ -622,7 +622,7 @@ async def test_run_stream_exception_emits_internal_error() -> None:
     conn = await transport.accept()
     try:
         await conn.feed(json.dumps({"type": "run_turn", "prompt": "hi"}))
-        await conn.wait_for_send(2, timeout=2.0)  # turn_started + error (#I24)
+        await conn.wait_for_send(2, timeout=2.0)  # turn_started + error
         got = [
             m
             for m in (json.loads(f) for f in conn.sent)

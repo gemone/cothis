@@ -816,7 +816,7 @@ def test_synthesised_thinking_block_round_trips_through_agent_accumulator() -> N
 
 
 # ---------------------------------------------------------------------------
-# Prompt-cache hints: per-session ``prompt_cache_key`` (I22).
+# Prompt-cache hints: per-session ``prompt_cache_key``.
 # ---------------------------------------------------------------------------
 
 

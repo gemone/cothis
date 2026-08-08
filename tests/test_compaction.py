@@ -1,7 +1,7 @@
 """Tests for ``cothis.ai.compaction`` — summariser selector + prompt builder.
 
-Slice A of the compaction epic: two pure, unit-testable building blocks that
-slices B (eviction policy) and C (run-loop wiring) consume. These tests pin
+Two pure, unit-testable building blocks consumed by the eviction policy
+(``plan_eviction``) and the run-loop wiring. These tests pin
 every branch of:
 
 * :func:`resolve_summary_model` — precedence (override > env > session),
@@ -11,7 +11,7 @@ every branch of:
   expects, tool_use / tool_result / thinking block semantics, the
   ``system_text`` override, the oldest-first length cap, and empty-window
   tolerance.
-* :func:`plan_eviction` (slice B) — the pressure gate (no-op under
+* :func:`plan_eviction` — the pressure gate (no-op under
   low/unknown pressure; evicts oldest under HIGH/CRITICAL), the retention
   floor, tool-pair closure / alternation preservation, determinism, and
   pressure monotonicity.
@@ -448,7 +448,7 @@ def test_module_has_no_top_level_provider_sdk_import() -> None:
 
 
 def test_public_symbols_reexported_from_package() -> None:
-    # The frozen public surface must re-export the slice-A and slice-B symbols
+    # The frozen public surface must re-export the summariser + eviction symbols
     # so later slices can ``from cothis.ai import plan_eviction`` etc.
     from cothis.ai import (  # noqa: F401 — exercising the re-export
         EvictionDecision as _ED,
@@ -470,7 +470,7 @@ def test_public_symbols_reexported_from_package() -> None:
     )
 
 
-# --- slice B: plan_eviction fixtures + helpers ------------------------------
+# --- plan_eviction fixtures + helpers --------------------------------------
 
 
 # Per-message body text sized so a multi-pair conversation's estimate lands
@@ -549,7 +549,7 @@ def _assert_strict_alternation(msgs: list[dict[str, Any]]) -> None:
         assert prev != cur, f"retained tail is not strictly alternating: {roles}"
 
 
-# --- slice B: pressure gate -------------------------------------------------
+# --- pressure gate ---------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -595,7 +595,7 @@ def test_no_eviction_when_budget_unknown() -> None:
     )
 
 
-# --- slice B: HIGH eviction -------------------------------------------------
+# --- HIGH eviction ---------------------------------------------------------
 
 
 def test_evicts_oldest_under_high_pressure() -> None:
@@ -637,7 +637,7 @@ def test_high_pressure_meets_target_ratio() -> None:
         assert estimate_input_tokens(retained_if_smaller) > target
 
 
-# --- slice B: retention floor -----------------------------------------------
+# --- retention floor -------------------------------------------------------
 
 
 def test_retention_floor_holds_under_critical() -> None:
@@ -697,11 +697,11 @@ def test_short_conversation_is_no_op() -> None:
     assert decision.reason == "no-eviction:below-floor"
 
 
-# --- slice B: window shape feeds slice A ------------------------------------
+# --- window shape feeds the summariser -------------------------------------
 
 
 def test_window_feeds_build_summarisation_request() -> None:
-    # Round-trip contract between slices A and B: the emitted window is the
+    # Round-trip contract between the summariser and the eviction policy: the
     # exact shape build_summarisation_request consumes, without raising.
     messages = _conversation_pairs(8)
     budget = _high_budget(messages)
@@ -715,7 +715,7 @@ def test_window_feeds_build_summarisation_request() -> None:
     assert request.messages[0]["role"] == "user"
 
 
-# --- slice B: tool-pair closure / alternation -------------------------------
+# --- tool-pair closure / alternation ---------------------------------------
 
 
 def _tool_heavy_conversation() -> list[dict[str, Any]]:
@@ -804,7 +804,7 @@ def test_no_safe_cut_yields_empty_window() -> None:
     assert decision.reason == "no-eviction:no-safe-cut"
 
 
-# --- slice B: determinism + monotonicity ------------------------------------
+# --- determinism + monotonicity -------------------------------------------
 
 
 def test_plan_eviction_is_deterministic() -> None:
@@ -836,7 +836,7 @@ def test_critical_evicts_at_least_as_much_as_high() -> None:
     assert medium_decision.window == []
 
 
-# --- slice B: stored-with-metadata tolerance + frozen -----------------------
+# --- stored-with-metadata tolerance + frozen -------------------------------
 
 
 def test_stored_assistant_metadata_tolerated_by_plan_eviction() -> None:

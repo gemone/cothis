@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # the first real migration (#30 adds blocks.skill/blocks.state, or later).
 # Bump this constant when a migration actually ships; the writer below pins
 # it on every sessions row so future per-row dispatch has the data.
-# v3 (#I21): adds the ``blocks_fts`` FTS5 index over ``blocks.content`` and
+# v3: adds the ``blocks_fts`` FTS5 index over ``blocks.content`` and
 # AFTER-row triggers keeping it in sync; the v2→v3 migration backfills the
 # index once from existing rows.
 SCHEMA_VERSION = 3
@@ -94,7 +94,7 @@ _DDL = (
     "CREATE TABLE IF NOT EXISTS archive_state(key TEXT PRIMARY KEY, value TEXT)",
 )
 
-# cothis (#I21): FTS5 full-text index over ``blocks.content``. External-content
+# cothis: FTS5 full-text index over ``blocks.content``. External-content
 # table (``content='blocks'``, ``content_rowid='rowid'``) — the index holds only
 # tokens; the searchable text is read back from ``blocks`` at query time, so the
 # index stays small and never drifts from the source row. AFTER-row triggers keep
@@ -348,7 +348,7 @@ class Storage:
         self._conn.execute("PRAGMA foreign_keys=ON")
         for stmt in _DDL:
             self._conn.execute(stmt)
-        # cothis (#I21): FTS5 index + sync triggers. Run separately from the
+        # cothis: FTS5 index + sync triggers. Run separately from the
         # core ``_DDL`` so a sqlite build without the FTS5 extension degrades
         # gracefully: the core schema is already in place, so every non-search
         # command keeps working; ``Storage.search`` raises a clear error and
@@ -383,7 +383,7 @@ class Storage:
                 self._conn.execute("ALTER TABLE blocks ADD COLUMN skill TEXT")
             if "state" not in cols:
                 self._conn.execute("ALTER TABLE blocks ADD COLUMN state TEXT")
-        # cothis (#I21): v2→v3 migration. The one-time ``'rebuild'`` repopulates
+        # cothis: v2→v3 migration. The one-time ``'rebuild'`` repopulates
         # ``blocks_fts`` from ``blocks`` so a DB that predates the index is
         # searchable the moment it's reopened. Guarded by ``user_version`` so
         # it runs exactly once per upgrading DB; skipped when FTS5 is absent.

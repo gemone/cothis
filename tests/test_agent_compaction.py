@@ -1,7 +1,7 @@
-"""Tests for ``cothis.agent.Agent._maybe_compact`` — compaction slice C1.
+"""Tests for ``cothis.agent.Agent._maybe_compact`` — in-memory compaction.
 
-C1 wires slices A (``resolve_summary_model`` / ``build_summarisation_request``)
-and B (``plan_eviction``) into the live agent run loop as a single in-memory
+It wires ``resolve_summary_model`` / ``build_summarisation_request``
+and ``plan_eviction`` into the live agent run loop as a single in-memory
 compaction step. These tests pin the run-loop mutation in isolation with a
 mocked summariser provider (no real network):
 
@@ -11,7 +11,7 @@ mocked summariser provider (no real network):
 * compaction is a no-op under LOW / MEDIUM / NONE / unknown pressure;
 * the once-per-run guard bounds total summarisation calls to 1;
 * a summariser failure degrades gracefully without corrupting ``_messages``;
-* the substitute preserves slice B's tool-pair closure invariant;
+* the substitute preserves the tool-pair closure invariant;
 * the different-provider path (``COTHIS_SUMMARY_MODEL``) routes to a fresh
   client;
 * the normal turn path is byte-for-byte unchanged when pressure is low;
@@ -613,9 +613,9 @@ def test_maybe_compact_critical_pressure_fires(
     assert agent._messages[0]["content"][0]["text"] == "critical summary"
 
 
-# --- (13) slice C2: CLI knobs thread into _maybe_compact --------------------
+# --- (13) CLI knobs thread into _maybe_compact -----------------------------
 #
-# These pin the wiring added in slice C2: ``Agent.summary_model`` forwards as
+# These pin the wiring: ``Agent.summary_model`` forwards as
 # ``override=`` into ``resolve_summary_model`` and ``Agent.min_retained_turns``
 # forwards into ``plan_eviction``. The spies patch the RE-BOUND names in
 # ``cothis.agent``'s namespace (``agent.py`` does ``from cothis.ai.compaction
@@ -627,7 +627,7 @@ def test_maybe_compact_threads_summary_model_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``Agent.summary_model`` forwards as ``override=`` to
-    ``resolve_summary_model`` (slice C2)."""
+    ``resolve_summary_model``."""
     from cothis.ai.compaction import SummaryTarget
 
     agent = _make_agent(monkeypatch, summary_model="openai/gpt-4o")
@@ -660,7 +660,7 @@ def test_maybe_compact_threads_summary_model_override(
 def test_maybe_compact_threads_min_retained_turns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``Agent.min_retained_turns`` forwards into ``plan_eviction`` (slice C2)."""
+    """``Agent.min_retained_turns`` forwards into ``plan_eviction``."""
     agent = _make_agent(monkeypatch, min_retained_turns=6)
     # Seed MORE groups than the floor (6) so a non-empty eviction window can
     # form above it; with only 6 groups the floor would retain everything.
@@ -693,7 +693,7 @@ def test_maybe_compact_defaults_match_pre_c2_behaviour(
     worker / acp_bridge construction sites that pass neither new param."""
     from cothis.ai.compaction import resolve_summary_model as real_rsm
 
-    agent = _make_agent(monkeypatch)  # no overrides -> C2 defaults
+    agent = _make_agent(monkeypatch)  # no overrides -> module defaults
     assert agent.summary_model is None
     assert agent.min_retained_turns == 4
     agent._messages = _seed_simple_groups(6, last_usage=_HIGH_USAGE)

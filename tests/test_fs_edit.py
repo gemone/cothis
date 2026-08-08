@@ -1,4 +1,4 @@
-"""Tests for ``fs.edit`` tool (#5 / I15).
+"""Tests for the ``fs.edit`` unique-anchor string-replace tool.
 
 Unique-anchor string search-and-replace edit. ``old_string`` must be
 unique unless ``replace_all=True``. Match is byte-exact (substring

@@ -505,7 +505,7 @@ def test_normalize_mixed_text_and_image_keeps_both() -> None:
 #
 # ``_normalize_input_schema`` is the single chokepoint that stops a
 # non-conformant MCP server from corrupting the tool-call contract for every
-# provider. These cover every case in the I16 plan's test section.
+# provider. These cover every case in the plan's test section.
 #
 # CRITIC FIX: assert ``$ref``/``$defs`` ABSENCE via a RECURSIVE dict-key walk
 # (``_schema_has_key`` below), NOT a ``json.dumps`` substring check — a

@@ -1,4 +1,4 @@
-"""Tests for ``fs.read`` line-cap + streaming (I10 tool optimisation).
+"""Tests for ``fs.read`` line-cap + streaming.
 
 The line-range path (files ≤ ``_MAX_BYTES``) now:
 - caps output at ``_MAX_LINES`` so a ≤1 MiB file with tens of thousands of
@@ -34,7 +34,7 @@ def _write_lines(path: Path, n: int, *, prefix: str = "L") -> None:
 def test_line_cap_fires_on_many_short_lines(tmp_path: Path) -> None:
     """A ≤1 MiB file with > _MAX_LINES lines caps at _MAX_LINES + a notice.
 
-    Pre-I10 this emitted all 5000 lines into one read. The byte cap never
+    Previously this emitted all 5000 lines into one read. The byte cap never
     fired (the file is ~25 KB); only the line cap bounds it.
     """
     f = tmp_path / "many.txt"

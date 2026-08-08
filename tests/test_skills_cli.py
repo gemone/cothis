@@ -1,4 +1,4 @@
-"""Tests for the ``cothis skills`` CLI subcommand (I13 / roadmap #4 follow-up)."""
+"""Tests for the ``cothis skills`` CLI subcommand."""
 
 from __future__ import annotations
 

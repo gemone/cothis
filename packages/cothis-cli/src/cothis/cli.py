@@ -425,7 +425,7 @@ def chat(
     ``--summary-model`` / ``--min-retained-turns`` apply to the legacy
     REPL path only (and to ``ask``): the TUI default spawns a worker
     subprocess that does not yet carry them, so they are a silent no-op
-    on the default path until the worker is threaded (tracked as C2).
+    on the default path until the worker is threaded (tracked as a follow-up).
     """
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
@@ -925,7 +925,7 @@ def archive_cmd(
 
 
 # ---------------------------------------------------------------------
-# TUI entrypoint (#234 slice E) — Supervisor-backed spawn on worktree pick.
+# TUI entrypoint (#234) — Supervisor-backed spawn on worktree pick.
 # Feature parity reached: the TUI drives full multi-turn sessions
 # (WS attach + run_turn + tool-call rendering + ask_user modal +
 # worktree picker + cwd fallback). ``chat`` stays as the legacy REPL
@@ -935,7 +935,7 @@ def archive_cmd(
 
 
 class _DrivenCothisApp:
-    """Production CothisApp wiring: spawn-on-pick via real Supervisor (#234 slice E).
+    """Production CothisApp wiring: spawn-on-pick via real Supervisor (#234).
 
     Defined as a factory function (not a class statement at module level) because
     it needs ``CothisApp`` which is imported lazily — Textual is heavy (~200ms)
@@ -1022,11 +1022,11 @@ class _DrivenCothisApp:
 
                 # ``attach_session_ws`` is async; ``create_task`` keeps the
                 # sync callback (Textual modal dismiss) unblocked.
-                # #I24: seed the footer's model + session cells from the
+                # Seed the footer's model + session cells from the
                 # spawn handle's sid + the CLI's known model so the status
                 # bar shows correct values BEFORE the first turn_finished
                 # frame lands (the worker emits no per-spawn frame).
-                # #I29: pass ``wt_db`` so attach replays this session's
+                # Pass ``wt_db`` so attach replays this session's
                 # stored history into ConversationView before the pump
                 # starts. The freshly-created session only has its seed
                 # user message, so this renders that opening turn.
@@ -1068,7 +1068,7 @@ class _DrivenCothisApp:
                 logging.getLogger(__name__).info(
                     "tui: resumed session %s", resume_session_id[:8],
                 )
-                # #I29: replay the resumed session's stored history on
+                # Replay the resumed session's stored history on
                 # attach. ``_resolve_db_path()`` (no cwd) resolves the same
                 # db the worker reads — the worker runs at Path.cwd()
                 # (the TUI's launch cwd), matching launch-cwd resolution
@@ -1077,7 +1077,7 @@ class _DrivenCothisApp:
                     resume_session_id, handle.ws_url, handle.token,
                     db_path=_resolve_db_path(),
                 )
-                # #I24: seed footer model/session so the status bar is
+                # Seed footer model/session so the status bar is
                 # populated before the first turn_finished frame.
                 self.footer_session = resume_session_id
                 self.footer_model = model
@@ -1104,7 +1104,7 @@ class _DrivenCothisApp:
                 # fresh port (re-crash, slow bind, port collision — the
                 # exact failures the recovery path must survive) is logged
                 # instead of swallowed as an un-retrieved task exception.
-                # #I29: no ``db_path`` is passed (replay is skipped) — the
+                # No ``db_path`` is passed (replay is skipped) — the
                 # view is already populated from the original attach, so
                 # replaying would duplicate the history. ``db_path``
                 # defaults to ``None`` → no replay.
@@ -1196,9 +1196,9 @@ def tui(
         help="Resume a session by id (auto-spawns on startup, bypasses the picker).",
     ),
 ) -> None:
-    """Launch the Textual TUI with Supervisor-backed session spawn (#234 slice E).
+    """Launch the Textual TUI with Supervisor-backed session spawn (#234).
 
-    Wires ``on_worktree_pick`` (slice D's hook) to a real Supervisor: when
+    Wires ``on_worktree_pick`` (the pick hook) to a real Supervisor: when
     the user picks a worktree via the ``n`` keypress, a new session bound to
     that cwd is created + a worker is spawned + the TUI auto-attaches its WS.
 

@@ -752,7 +752,7 @@ async def test_below_cap_concurrency_unaffected_by_semaphore(
 
     Directly re-asserts the existing overlap guarantee under the new code
     path: the semaphore is invisible when fan-out < cap (no latency
-    regression vs the unbounded I30 dispatch). Deterministic via an in-flight
+    regression vs the unbounded dispatch). Deterministic via an in-flight
     high-water counter + a gate event, no wall-clock.
     """
     state: dict[str, int] = {"in_flight": 0, "max_in_flight": 0}

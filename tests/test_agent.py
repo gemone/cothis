@@ -1229,7 +1229,7 @@ def test_coalesce_merges_adjacent_thinking_blocks() -> None:
         {"type": "thinking", "thinking": "th", "signature": "x"},
         {"type": "thinking", "thinking": "ink", "signature": "y"},
     ])
-    # Thinking merged; signatures are not preserved across merges (this slice
+    # Thinking merged; signatures are not preserved across merges (this merge
     # doesn't pass the thinking param, so Anthropic doesn't validate them).
     assert out == [{"type": "thinking", "thinking": "think", "signature": "x"}]
 

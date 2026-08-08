@@ -327,7 +327,7 @@ class _StreamTranslator:
                 await self._on_tool_call(event)
             elif name == "ToolResultEvent":
                 await self._on_tool_result(event)
-            # AskUserRequestEvent is not surfaced over ACP in I9.
+            # AskUserRequestEvent is not surfaced over ACP yet.
         await self._finish_assistant(stop_reason="stop")
 
     async def finalize_aborted(self) -> None:

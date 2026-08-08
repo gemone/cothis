@@ -16,7 +16,7 @@ server validates the bearer token (timing-safe) and protocol version, replies
 that each ``request`` runs a command and returns a ``response``; ``prompt``
 streams ``session_progress`` events as the turn runs.
 
-I9 scope: ``list`` / ``create`` / ``prompt`` are implemented. I19 adds
+Scope: ``list`` / ``create`` / ``prompt`` are implemented; later work adds
 ``abort`` / ``set_model`` / ``set_thinking``. The remaining commands
 (``attach`` / ``detach`` / ``steer``) are defined in the schema but answered
 with ``invalid_request``. CBOR, persistence, snapshot revision/broadcast, and
@@ -162,7 +162,7 @@ class ACPServer:
         self._token_digest = hashlib.sha256(token.encode("utf-8")).digest()
         self.id = server_id
         self._max_frame = max_frame_length
-        # revision is fixed at 0 in I9 (no broadcast machinery yet).
+        # revision is fixed at 0 (no broadcast machinery yet).
         self._revision = 0
 
     # ------------------------------------------------------------------ snapshot
@@ -197,7 +197,7 @@ class ACPServer:
         decoder = ClientMessageDecoder(max_frame_length=self._max_frame)
         stage = "awaitingHello"
         # Per-connection in-flight prompt registry: sessionId → active task.
-        # The connection that started a turn owns cancelling it (I19 scope).
+        # The connection that started a turn owns cancelling it.
         inflight: dict[str, asyncio.Task[None]] = {}
         try:
             async for chunk in conn:

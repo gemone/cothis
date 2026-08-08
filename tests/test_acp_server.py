@@ -381,7 +381,7 @@ async def test_server_rejects_empty_token() -> None:
 
 
 # ---------------------------------------------------------------------------
-# I19: abort / set_model / set_thinking dispatch
+# abort / set_model / set_thinking dispatch
 # ---------------------------------------------------------------------------
 
 

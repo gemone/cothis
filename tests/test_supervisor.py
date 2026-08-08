@@ -235,12 +235,12 @@ def test_status_stream_surfaces_session_state(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------
-# _should_restart (#250 slice D — threshold guard)
+# _should_restart (#250 — threshold guard)
 # ---------------------------------------------------------------------
 
 
 def test_should_restart_true_when_under_threshold() -> None:
-    """AC #250 slice D: ``_should_restart`` returns True when under threshold."""
+    """AC #250: ``_should_restart`` returns True when under threshold."""
     from cothis.supervisor import Supervisor
 
     sup = Supervisor.__new__(Supervisor)
@@ -251,7 +251,7 @@ def test_should_restart_true_when_under_threshold() -> None:
 
 
 def test_should_restart_false_when_over_threshold() -> None:
-    """AC #250 slice D: returns False when restart count exceeds threshold."""
+    """AC #250: returns False when restart count exceeds threshold."""
     from cothis.supervisor import Supervisor
 
     sup = Supervisor.__new__(Supervisor)
@@ -265,7 +265,7 @@ def test_should_restart_false_when_over_threshold() -> None:
 
 
 def test_should_restart_resets_after_window_expires() -> None:
-    """AC #250 slice D: old restarts prune from the window → should_restart True again."""
+    """AC #250: old restarts prune from the window → should_restart True again."""
     from datetime import UTC, datetime, timedelta
 
     from cothis.supervisor import Supervisor

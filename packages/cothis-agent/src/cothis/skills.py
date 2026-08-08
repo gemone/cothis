@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
-# Skill-selection persistence (#235 slice D, #415)
+# Skill-selection persistence (#235, #415)
 #
 # Read/written by the TUI's Ctrl-M config menu AND by the worker's agent
 # build (preactivation), so they live in this light module (not ``tui.py``,

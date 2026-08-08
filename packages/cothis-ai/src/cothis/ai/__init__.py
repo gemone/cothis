@@ -17,10 +17,10 @@ Public surface (frozen — other modules depend on these names):
 * :class:`SummaryTarget` / :class:`SummarisationRequest` /
   :func:`resolve_summary_model` / :func:`build_summarisation_request` — the
   compaction summariser selector + prompt builder from
-  :mod:`cothis.ai.compaction` (slice A; pure building blocks, not yet wired
+  :mod:`cothis.ai.compaction` (pure building blocks, not yet wired
   into the run loop).
 * :class:`EvictionDecision` / :func:`plan_eviction` — the compaction
-  eviction policy from :mod:`cothis.ai.compaction` (slice B; decides which
+  eviction policy from :mod:`cothis.ai.compaction` (decides which
   older turns to compact vs retain, driven by :class:`ContextBudget`).
 """
 

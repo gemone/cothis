@@ -109,8 +109,8 @@ class WorkerHandle:
     cwd: str = ""
     status: str = "running"  # "running" | "restarting" | "errored"
     restart_count: int = 0
-    # Stashed at spawn time so ``monitor_once`` can auto-restart (#250
-    # slice C) without the caller re-passing model/provider.
+    # Stashed at spawn time so ``monitor_once`` can auto-restart (#250)
+    # without the caller re-passing model/provider.
     model: str = ""
     provider: str = ""
     sessions_dir: str = ""
@@ -373,8 +373,8 @@ class Supervisor:
         ``errored``. Returns the list of crashed session_ids so the
         caller (the async loop or a test) can decide whether to restart.
 
-        Does NOT restart — that's Slice C (needs model/provider info
-        stashed at spawn time). This slice just detects + records.
+        Does NOT restart — restarting needs model/provider info
+        stashed at spawn time). This method just detects + records.
         """
         crashed: list[str] = []
         for session_id in list(self._procs.keys()):
