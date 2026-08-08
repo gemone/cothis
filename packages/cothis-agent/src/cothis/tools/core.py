@@ -203,7 +203,7 @@ def tool(
     cothis.ai schema path, which drops per-parameter ``description``
     fields). It also exposes the five lifecycle hook decorators
     (``.pre_load()`` / ``.after_load()`` / ``.pre_execute()`` /
-    ``.after_execute()`` / ``.on_error()``) — see CONTEXT.md "Tool lifecycle".
+    ``.after_execute()`` / ``.on_error()``).
     """
 
     def decorate(fn: Any) -> ToolDef:
@@ -251,7 +251,7 @@ class _HookableTool:
     ``_hooks`` lists stay empty), so the hook chains are no-ops for YAML
     tools. The shared base is what lets ``_execute`` treat every tool the
     same — the ``Tool`` protocol's "no per-source branching" promise
-    (CONTEXT.md) holds because the gate is the type itself, not an
+    holds because the gate is the type itself, not an
     ``isinstance`` check in the dispatch path.
 
     This base does NOT carry schema, ``__name__``, ``__call__``, or any
@@ -330,10 +330,9 @@ class _HookableTool:
         winning tool only. Returns ``True`` when the tool should
         be registered; ``False`` when ``pre_load`` short-circuited (any callback
         returned ``False``) or any load hook raised. Every skip is logged at
-        ``WARNING`` — no startup decision is silent (see CONTEXT.md "Tool
-        lifecycle").
+        ``WARNING`` — no startup decision is silent.
 
-        Chain semantics (see CONTEXT.md "Tool lifecycle"):
+        Chain semantics:
         - ``pre_load``: short-circuit AND. Any ``False`` → skip, remaining
           callbacks don't run. Any exception → ``on_error`` fires
           (phase=``"pre_load"``), then skip.
@@ -853,7 +852,7 @@ def discover_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
 
     Loads YAML and Python tool declarations from ``user_dir`` (user-global)
     and ``project_dir`` (project-local). Both are optional; absence is not
-    an error. Each directory is one **layer** (see CONTEXT.md "Layer").
+    an error. Each directory is one **layer**.
 
     Layers resolve in ascending precedence: builtins → user-global →
     project-local. A higher-precedence tool with the same ``__name__``
