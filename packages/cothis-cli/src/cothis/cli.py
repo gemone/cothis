@@ -462,14 +462,18 @@ def chat(
     missing or out of this directory's scope.
 
     **Default: launches the Textual TUI** (#237 staged migration). The
-    TUI supports ``--model`` / ``--provider``. Flags not yet supported
-    by the TUI (``--resume``, ``--skill``) fall back to the legacy REPL
-    with a notice. Pass ``--legacy`` to force the REPL.
+    TUI supports ``--model`` / ``--provider`` and ``--resume`` (auto-spawns a
+    worker for the resumed session on startup). ``--skill`` still falls back
+    to the legacy REPL with a notice. Pass ``--legacy`` to force the REPL.
 
-    ``--summary-model`` / ``--min-retained-turns`` apply to the legacy
-    REPL path only (and to ``ask``): the TUI default spawns a worker
-    subprocess that does not yet carry them, so they are a silent no-op
-    on the default path until the worker is threaded (tracked as a follow-up).
+    On the default (TUI) path the worker-subprocess tuning flags
+    ``--max-concurrent-tools``, ``--max-tool-result-chars``,
+    ``--tool-timeout``, and ``--summary-model`` are forwarded to the spawned
+    worker as ``COTHIS_*`` env vars and take effect there (mirroring the
+    legacy REPL / ``ask`` behavior). ``--min-retained-turns`` is NOT yet
+    honored on the TUI path: the worker's Agent has no env-var reader for it,
+    so the default (4) always applies — use ``--legacy`` (or ``ask``) if you
+    need a non-default floor.
     """
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
@@ -480,7 +484,16 @@ def chat(
             if resume is not None:
                 _validate_session_id_arg(resume)
                 _check_resume_exists(_resolve_db_path(), resume)
-            _launch_tui_app(model=model, provider=provider, resume=resume)
+            _launch_tui_app(
+                model=model,
+                provider=provider,
+                resume=resume,
+                max_concurrent_tools=max_concurrent_tools,
+                max_tool_result_chars=max_tool_result_chars,
+                tool_timeout=tool_timeout,
+                summary_model=summary_model,
+                min_retained_turns=min_retained_turns,
+            )
             return
         console.print(
             "[dim]--skill not yet supported by the TUI; "
@@ -1015,6 +1028,12 @@ class _DrivenCothisApp:
         If ``resume_session_id`` is set, the app auto-spawns a worker for that
         session on ``on_mount`` (bypasses the worktree picker).
 
+        ``provider_env`` is passed verbatim as ``extra_env`` to
+        ``Supervisor.spawn_worker`` in both spawn closures. It carries both the
+        operator's ``*_API_KEY`` vars and any resolved ``COTHIS_*`` tuning vars
+        the worker's Agent / ``resolve_summary_model`` should pick up (the
+        merge happens in :func:`_launch_tui_app`).
+
         ``on_worktree_pick`` resolves the session db itself (relative to the
         picked worktree) so the spawned worker reads the same db in every
         ``_resolve_db_path`` mode — including cwd-relative project mode (#402).
@@ -1183,7 +1202,51 @@ class _DrivenCothisApp:
         return app
 
 
-def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> None:
+def _worker_tuning_env(
+    *,
+    max_concurrent_tools: int | None = None,
+    max_tool_result_chars: int | None = None,
+    tool_timeout: float | None = None,
+    summary_model: str | None = None,
+    min_retained_turns: int | None = None,
+) -> dict[str, str]:
+    """Map resolved chat tuning values to the ``COTHIS_*`` env vars the spawned
+    worker's Agent / ``resolve_summary_model`` read.
+
+    Only non-None values are forwarded: ``None`` means "do not override; let
+    the worker inherit the shell env / Agent defaults", which is what keeps
+    ``cothis tui`` (passes nothing) regression-free — the worker still gets
+    its env verbatim from ``spawn_worker``'s ``dict(os.environ)``.
+
+    NOTE: ``COTHIS_MIN_RETAINED_TURNS`` has no Agent reader yet (the worker
+    defaults to 4); forwarded here for symmetry so the day a reader is added
+    it lights up with zero plumbing change, but it is currently inert.
+    """
+    env: dict[str, str] = {}
+    if max_concurrent_tools is not None:
+        env["COTHIS_MAX_CONCURRENT_TOOLS"] = str(max_concurrent_tools)
+    if max_tool_result_chars is not None:
+        env["COTHIS_MAX_TOOL_RESULT_CHARS"] = str(max_tool_result_chars)
+    if tool_timeout is not None:
+        env["COTHIS_TOOL_TIMEOUT"] = str(tool_timeout)
+    if summary_model is not None:
+        env["COTHIS_SUMMARY_MODEL"] = summary_model
+    if min_retained_turns is not None:
+        env["COTHIS_MIN_RETAINED_TURNS"] = str(min_retained_turns)
+    return env
+
+
+def _launch_tui_app(
+    model: str,
+    provider: str,
+    resume: str | None = None,
+    *,
+    max_concurrent_tools: int | None = None,
+    max_tool_result_chars: int | None = None,
+    tool_timeout: float | None = None,
+    summary_model: str | None = None,
+    min_retained_turns: int | None = None,
+) -> None:
     """Construct Supervisor + _DrivenCothisApp and launch the Textual TUI.
 
     Shared between ``cothis tui`` and ``cothis chat`` (default TUI path,
@@ -1192,6 +1255,11 @@ def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> Non
 
     ``resume`` (optional): if set, auto-spawn a worker for the existing
     session on startup (bypasses the worktree picker).
+
+    The five tuning kwargs (all default ``None``) are forwarded to the spawned
+    worker as ``COTHIS_*`` env vars via :func:`_worker_tuning_env`. ``chat``
+    passes its resolved typer values (so they take effect in the worker);
+    ``tui`` passes nothing, preserving today's inherit-shell-env behavior.
     """
     from cothis.supervisor import Supervisor
     from cothis.tui import run as run_tui
@@ -1203,12 +1271,20 @@ def _launch_tui_app(model: str, provider: str, resume: str | None = None) -> Non
         for k, v in os.environ.items()
         if k.endswith("_API_KEY") and v
     }
+    tuning_env = _worker_tuning_env(
+        max_concurrent_tools=max_concurrent_tools,
+        max_tool_result_chars=max_tool_result_chars,
+        tool_timeout=tool_timeout,
+        summary_model=summary_model,
+        min_retained_turns=min_retained_turns,
+    )
+    worker_env = {**provider_env, **tuning_env}
 
     app = _DrivenCothisApp.build(
         supervisor=sup,
         model=model,
         provider=provider,
-        provider_env=provider_env,
+        provider_env=worker_env,
         resume_session_id=resume,
     )
     # cothis: graceful shutdown on TUI exit (#403). Without this, spawned
