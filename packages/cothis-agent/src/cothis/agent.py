@@ -1131,6 +1131,38 @@ class Agent(BaseModel):
                         "(must be > 0); using default None.",
                         env_val,
                     )
+        # ``COTHIS_MIN_RETAINED_TURNS`` tunes the compaction floor for
+        # non-CLI construction sites (the ``worker`` subprocess, the
+        # ``acp_bridge``) that pass no value — the same override-or-None idiom
+        # as ``COTHIS_MAX_CONCURRENT_TOOLS`` above. The CLI commands pass an
+        # explicit value via ``--min-retained-turns`` (typer already resolved
+        # flag > envvar > default), so this branch never overrides an
+        # operator's explicit choice. ``gt=0`` is NOT re-checked on this
+        # post-init mutation, so reject a non-positive value here: a
+        # zero/negative floor would slip past construction's ``gt=0`` and hit
+        # ``plan_eviction``'s silent clamp to 1.
+        if "min_retained_turns" not in self.model_fields_set:
+            env_val = os.environ.get("COTHIS_MIN_RETAINED_TURNS")
+            if env_val:
+                try:
+                    parsed = int(env_val)
+                except ValueError:
+                    logger.warning(
+                        "Ignoring non-integer COTHIS_MIN_RETAINED_TURNS=%r; "
+                        "using default %d.",
+                        env_val,
+                        self.min_retained_turns,
+                    )
+                    parsed = None
+                if parsed is not None and parsed > 0:
+                    self.min_retained_turns = parsed
+                elif parsed is not None:
+                    logger.warning(
+                        "Ignoring non-positive COTHIS_MIN_RETAINED_TURNS=%r "
+                        "(must be > 0); using default %d.",
+                        env_val,
+                        self.min_retained_turns,
+                    )
         self._dispatch_semaphore = asyncio.Semaphore(self.max_concurrent_tools)
 
     def attach_session(self, session: Session) -> None:
