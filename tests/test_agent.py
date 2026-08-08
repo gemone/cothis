@@ -53,6 +53,7 @@ from anthropic.types.raw_message_delta_event import Delta
 from pydantic import ValidationError
 
 from cothis.agent import (
+    _DEFAULT_MAX_TOOL_RESULT_CHARS,
     Agent,
     ContentDelta,
     MaxIterationsError,
@@ -73,6 +74,7 @@ from cothis.agent import (
     _sanitize_tool_name,
     _system_param,
     _tool_result_block,
+    _truncate_tool_result,
 )
 from cothis.ai import ContextBudget, PressureLevel
 
@@ -119,6 +121,68 @@ def test_tool_result_block_error_sets_is_error() -> None:
     b = _tool_result_block("tu_1", "Error: boom", is_error=True)
     assert b["is_error"] is True
     assert b["content"] == "Error: boom"
+
+
+# --- _truncate_tool_result (live tool-result cap) --------------------------
+# Pure, deterministic head+tail truncation. The marker is the only place
+# "truncated" / bracket delimiters appear, so on a marker-free payload the
+# split is unambiguous.
+
+
+def test_truncate_tool_result_under_cap_is_byte_for_byte_identical() -> None:
+    """Under the cap the input is returned unchanged (no-op path)."""
+    text = "x" * 100
+    out = _truncate_tool_result(text, 200)
+    assert out == text
+    assert out is text  # no-op returns the same object
+
+
+def test_truncate_tool_result_exactly_at_cap_is_unchanged() -> None:
+    """At the exact boundary (len == limit) the input is unchanged."""
+    text = "y" * 200
+    assert _truncate_tool_result(text, 200) is text
+
+
+def test_truncate_tool_result_over_cap_keeps_head_tail_and_marker() -> None:
+    """Over the cap: head prefix + marker + tail suffix, total <= cap, with the
+    exact head≈1/3 / tail≈2/3 split."""
+    cap = 200
+    # No '.', '[', ']' or the word 'truncated' anywhere — the marker is the
+    # sole occurrence, so splitting on it is unambiguous.
+    text = "abcdefghij" * 1000  # 10000 chars
+    assert len(text) > cap
+    out = _truncate_tool_result(text, cap)
+
+    assert len(out) == cap  # budget > 0 here, so the result fills the cap exactly
+
+    marker_start = out.index("...[truncated")
+    head_part = out[:marker_start]
+    rest = out[marker_start:]
+    marker_end = rest.index("]...") + len("]...")
+    marker = rest[:marker_end]
+    tail_part = rest[marker_end:]
+
+    # Head is a prefix of the original; tail is a suffix.
+    assert text.startswith(head_part)
+    assert text.endswith(tail_part)
+    # Reconstruction is exact.
+    assert head_part + marker + tail_part == out
+    # Marker wording.
+    assert "truncated" in marker
+    assert "head + tail shown" in marker
+    # Exact retained lengths: head = budget // 3, tail = budget - head.
+    budget = cap - len(marker)
+    assert len(head_part) == budget // 3
+    assert len(tail_part) == budget - budget // 3
+    # Tail-biased: the tail is at least as long as the head.
+    assert len(tail_part) >= len(head_part)
+    assert head_part and tail_part
+
+
+def test_truncate_tool_result_small_cap_never_exceeds_limit() -> None:
+    """A pathologically small cap still honours the hard limit invariant."""
+    out = _truncate_tool_result("abcdefghij" * 100, 5)
+    assert len(out) <= 5
 
 
 def test_concat_text_joins_text_blocks_skips_others() -> None:
@@ -501,6 +565,183 @@ def test_run_executes_tools_on_tool_use_then_returns(
         "tool_use_id": "tu1",
         "content": "hi",
     }
+
+
+# --- _merge_tool_result live cap (the single funnel) -----------------------
+# All exercises go through the real ``_merge_tool_result``, so they cover the
+# actual interception point used by both ``_run_inner`` and ``_run_stream_inner``.
+
+
+def test_merge_tool_result_caps_large_live_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 50k-char result is capped to head+tail+marker within the field cap."""
+    agent = _patched_agent(monkeypatch)
+    agent._merge_tool_result("tu1", "A" * 50000, is_error=False)
+    block = agent._messages[-1]["content"][-1]
+    assert block["type"] == "tool_result"
+    assert "is_error" not in block
+    content = block["content"]
+    assert len(content) <= agent.max_tool_result_chars
+    # Head + tail + marker structure: head and tail are both all-'A' spans
+    # flanking the marker.
+    marker_start = content.index("...[truncated")
+    head_part = content[:marker_start]
+    rest = content[marker_start:]
+    marker_end = rest.index("]...") + len("]...")
+    tail_part = rest[marker_end:]
+    assert set(head_part) == {"A"}
+    assert set(tail_part) == {"A"}
+    assert "truncated" in rest[:marker_end]
+
+
+def test_merge_tool_result_under_cap_is_byte_for_byte_identical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 100-char result passes through unchanged (no-op path)."""
+    agent = _patched_agent(monkeypatch)
+    agent._merge_tool_result("tu1", "x" * 100, is_error=False)
+    assert agent._messages[-1]["content"][-1]["content"] == "x" * 100
+
+
+def test_merge_tool_result_configurable_cap_overrides_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A field cap of 50 truncates a 300-char result; the default (20000) leaves
+    the same 300-char result unchanged — proving the cap value drove the cut."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    capped = Agent(
+        model="x",
+        provider="openrouter",
+        tools=[],
+        max_iterations=5,
+        max_tool_result_chars=50,
+    )
+    capped._merge_tool_result("tu1", "y" * 300, is_error=False)
+    content = capped._messages[-1]["content"][-1]["content"]
+    assert len(content) <= 50
+    assert "truncated" in content
+
+    default_agent = _patched_agent(monkeypatch)
+    assert default_agent.max_tool_result_chars == _DEFAULT_MAX_TOOL_RESULT_CHARS
+    default_agent._merge_tool_result("tu1", "y" * 300, is_error=False)
+    assert default_agent._messages[-1]["content"][-1]["content"] == "y" * 300
+
+
+def test_merge_tool_result_caps_errored_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An errored result is capped too, and the ``is_error`` flag survives."""
+    agent = _patched_agent(monkeypatch)
+    agent._merge_tool_result("tu1", "E" * 50000, is_error=True)
+    block = agent._messages[-1]["content"][-1]
+    assert block["is_error"] is True
+    content = block["content"]
+    assert len(content) <= agent.max_tool_result_chars
+    assert "truncated" in content
+
+
+# --- COTHIS_MAX_TOOL_RESULT_CHARS override-or-None -------------------------
+# Mirror the ``COTHIS_MAX_CONCURRENT_TOOLS`` tests: omit the field from the
+# ctor so ``model_fields_set`` does not contain it and the override runs.
+
+
+def test_env_override_sets_max_tool_result_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``COTHIS_MAX_TOOL_RESULT_CHARS`` sets the cap when no kwarg is passed."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MAX_TOOL_RESULT_CHARS", "12345")
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.max_tool_result_chars == 12345
+
+
+def test_env_override_non_integer_warns_and_keeps_default(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-integer env value logs a WARNING and retains the default."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MAX_TOOL_RESULT_CHARS", "not-an-int")
+    with caplog.at_level(logging.WARNING, logger="cothis.agent"):
+        agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.max_tool_result_chars == _DEFAULT_MAX_TOOL_RESULT_CHARS
+    assert "COTHIS_MAX_TOOL_RESULT_CHARS" in caplog.text
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_env_override_non_positive_warns_and_keeps_default(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bad: str,
+) -> None:
+    """A non-positive env value (0 / -1) logs a WARNING and retains the default
+    — a zero/negative cap would collapse every result to marker-only."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MAX_TOOL_RESULT_CHARS", bad)
+    with caplog.at_level(logging.WARNING, logger="cothis.agent"):
+        agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.max_tool_result_chars == _DEFAULT_MAX_TOOL_RESULT_CHARS
+    assert "non-positive" in caplog.text
+
+
+def test_explicit_kwarg_suppresses_env_override_max_tool_result_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``max_tool_result_chars`` kwarg wins over the env var."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MAX_TOOL_RESULT_CHARS", "12345")
+    agent = Agent(
+        model="x",
+        provider="openrouter",
+        tools=[],
+        max_iterations=5,
+        max_tool_result_chars=999,
+    )
+    assert agent.max_tool_result_chars == 999
+
+
+def test_run_caps_large_tool_result_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a tool returning a 50k-char string feeds
+    ``_dispatch_tool_uses`` -> ``_merge_tool_result``, and the enqueued
+    ``tool_result`` content in ``agent._messages`` is capped (head+tail+marker)
+    — proving the cap is wired through the run loop, not just the helper."""
+    agent = _patched_agent(monkeypatch)
+    big = "Z" * 50000
+    agent._tool_map["echo"] = lambda **kw: kw["msg"]
+    state = {"turn": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        state["turn"] += 1
+        if state["turn"] == 1:
+            return _msg_response(
+                [
+                    ToolUseBlock(
+                        type="tool_use",
+                        id="tu1",
+                        name="echo",
+                        input={"msg": big},
+                    )
+                ],
+                stop_reason="tool_use",
+            )
+        return _msg_response([TextBlock(type="text", text="final")])
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    assert asyncio.run(agent.run("hi")) == "final"
+    tool_result_msgs = [
+        m
+        for m in agent._messages
+        if m["role"] == "user"
+        and any(b.get("type") == "tool_result" for b in m["content"])
+    ]
+    assert tool_result_msgs
+    content = tool_result_msgs[-1]["content"][0]["content"]
+    assert len(content) <= agent.max_tool_result_chars
+    assert "truncated" in content
+    assert "head + tail shown" in content
 
 
 def test_run_returns_empty_on_end_turn_without_text(
