@@ -1,4 +1,4 @@
-"""Tests for ordered-concurrency tool dispatch (#316 / iteration I30).
+"""Tests for ordered-concurrency tool dispatch (#316).
 
 ``Agent._dispatch_tool_uses`` replaces the two serial ``for block in
 tool_uses: await self._execute_tool(block)`` loops (batch ``run`` and
@@ -66,10 +66,18 @@ if TYPE_CHECKING:
 # --- shared fixtures -------------------------------------------------------
 
 
-def _patched_agent(monkeypatch: pytest.MonkeyPatch) -> Agent:
+def _patched_agent(
+    monkeypatch: pytest.MonkeyPatch, *, max_concurrent_tools: int = 8
+) -> Agent:
     """Agent with a mocked provider — no real LLM calls."""
     monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
-    return Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    return Agent(
+        model="x",
+        provider="openrouter",
+        tools=[],
+        max_iterations=5,
+        max_concurrent_tools=max_concurrent_tools,
+    )
 
 
 def _msg_response(
@@ -634,3 +642,352 @@ def test_load_then_deactivate_same_skill_pair_is_deterministic(
     assert [r["tool_use_id"] for r in results] == ["tu1", "tu2"]
     assert results[0]["content"] == "loaded:a"
     assert results[1]["content"] == "unloaded:a"
+
+
+# --- bounded live concurrency (max_concurrent_tools) -----------------------
+#
+# ``_dispatch_tool_uses`` now acquires an ``asyncio.Semaphore`` INSIDE each
+# gathered coroutine so peak live tool executions within one fan-out turn
+# never exceed ``max_concurrent_tools``. Result ORDER (submission order),
+# the ``duration_ms`` capture, and the ``(True, "Error calling ...")`` error
+# mapping are all preserved. These tests are fully DETERMINISTIC — they use
+# shared counters and ``asyncio.Event`` gates, never wall-clock sleeps, for
+# their assertions. The ``asyncio.wait_for(..., timeout=...)`` calls below
+# are hang-guards (only fire on a regression that would otherwise deadlock
+# the suite), not timing assertions.
+
+_GUARD = 10.0  # seconds; only hit on a deadlock regression, never on pass
+
+
+def _tool_result_blocks(agent: Agent) -> list[dict[str, Any]]:
+    msg = next(
+        m
+        for m in agent._messages
+        if m["role"] == "user"
+        and any(b.get("type") == "tool_result" for b in m["content"])
+    )
+    return [b for b in msg["content"] if b.get("type") == "tool_result"]
+
+
+@pytest.mark.asyncio
+async def test_peak_live_concurrency_capped_at_configured_max(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cap=4`` with a 12-tool fan-out never exceeds 4 live executions.
+
+    Each tool increments a shared counter on entry, asserts ``counter <=
+    cap`` (fails fast if the bound ever breaks), records the high-water
+    mark, then blocks on a shared gate. Exactly ``cap`` acquire the
+    semaphore and block; the other ``total - cap`` queue on the semaphore.
+    Asserted BEFORE the gate is released — proves the cap is the configured
+    value (not accidental serialisation → 1, not unbounded → 12).
+    """
+    cap = 4
+    total = 12
+    state: dict[str, int] = {"counter": 0, "high_water": 0}
+    reached_cap = asyncio.Event()
+    proceed = asyncio.Event()
+
+    def make_tool(idx: int) -> Any:
+        async def gated(**kw: Any) -> str:
+            state["counter"] += 1
+            assert state["counter"] <= cap, (
+                f"live executions {state['counter']} exceeded cap {cap}"
+            )
+            state["high_water"] = max(state["high_water"], state["counter"])
+            if state["counter"] == cap:
+                reached_cap.set()
+            await proceed.wait()
+            state["counter"] -= 1
+            return f"r{idx}"
+
+        return gated
+
+    agent = _patched_agent(monkeypatch, max_concurrent_tools=cap)
+    for i in range(total):
+        agent._tool_map[f"tool{i}"] = make_tool(i)
+
+    turn = {"i": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        turn["i"] += 1
+        if turn["i"] == 1:
+            return _msg_response(
+                [
+                    ToolUseBlock(
+                        type="tool_use", id=f"tu{i}", name=f"tool{i}", input={}
+                    )
+                    for i in range(total)
+                ],
+                stop_reason="tool_use",
+            )
+        return _msg_response([TextBlock(type="text", text="final")])
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    task = asyncio.create_task(agent.run("hi"))
+
+    await asyncio.wait_for(reached_cap.wait(), timeout=_GUARD)
+    assert state["counter"] == cap, (
+        f"expected exactly {cap} tools live, got {state['counter']}"
+    )
+    assert state["high_water"] == cap, (
+        f"expected high-water {cap}, got {state['high_water']}"
+    )
+
+    proceed.set()  # release all; queued tools then acquire in turn
+    answer = await task
+    assert answer == "final"
+
+    # All ``total`` results merged in ORIGINAL block order, none cancelled.
+    results = _tool_result_blocks(agent)
+    assert [r["tool_use_id"] for r in results] == [f"tu{i}" for i in range(total)]
+    assert [r["content"] for r in results] == [f"r{i}" for i in range(total)]
+
+
+@pytest.mark.asyncio
+async def test_below_cap_concurrency_unaffected_by_semaphore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the default cap (8) and 2 slow async tools, both overlap.
+
+    Directly re-asserts the existing overlap guarantee under the new code
+    path: the semaphore is invisible when fan-out < cap (no latency
+    regression vs the unbounded I30 dispatch). Deterministic via an in-flight
+    high-water counter + a gate event, no wall-clock.
+    """
+    state: dict[str, int] = {"in_flight": 0, "max_in_flight": 0}
+    both_in = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def slow(**kw: Any) -> str:
+        state["in_flight"] += 1
+        state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        if state["in_flight"] == 2:
+            both_in.set()
+        await proceed.wait()
+        state["in_flight"] -= 1
+        return "done"
+
+    agent = _patched_agent(monkeypatch)  # default cap 8 > 2-tool fan-out
+    agent._tool_map["slow_a"] = slow
+    agent._tool_map["slow_b"] = slow
+
+    turn = {"i": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        turn["i"] += 1
+        if turn["i"] == 1:
+            return _msg_response(
+                [
+                    ToolUseBlock(type="tool_use", id="tu1", name="slow_a", input={}),
+                    ToolUseBlock(type="tool_use", id="tu2", name="slow_b", input={}),
+                ],
+                stop_reason="tool_use",
+            )
+        return _msg_response([TextBlock(type="text", text="final")])
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    task = asyncio.create_task(agent.run("hi"))
+
+    await asyncio.wait_for(both_in.wait(), timeout=_GUARD)
+    assert state["max_in_flight"] == 2, (
+        f"expected both tools to overlap (2), got {state['max_in_flight']} "
+        f"— semaphore serialised a below-cap fan-out"
+    )
+    proceed.set()
+    answer = await task
+    assert answer == "final"
+
+
+@pytest.mark.asyncio
+async def test_result_order_preserved_under_contention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cap=2`` with 4 tools: results land in submission order even though
+    completion order is scrambled.
+
+    Each tool blocks on a per-index gate; the gates are opened so completion
+    order (1, 0, 3, 2) differs from submission order (0, 1, 2, 3).
+    ``tool_result`` ids must still be [tu0, tu1, tu2, tu3]. Driven via a
+    per-acquisition pulse event, no wall-clock.
+    """
+    cap = 2
+    total = 4
+    acquired: list[int] = []
+    acquire_pulse = asyncio.Event()
+    releases = [asyncio.Event() for _ in range(total)]
+
+    def make_tool(idx: int) -> Any:
+        async def t(**kw: Any) -> str:
+            acquired.append(idx)
+            acquire_pulse.set()
+            await releases[idx].wait()
+            return f"r{idx}"
+
+        return t
+
+    async def wait_acquired(n: int) -> None:
+        while len(acquired) < n:
+            await asyncio.wait_for(acquire_pulse.wait(), timeout=_GUARD)
+            acquire_pulse.clear()
+
+    agent = _patched_agent(monkeypatch, max_concurrent_tools=cap)
+    for i in range(total):
+        agent._tool_map[f"tool{i}"] = make_tool(i)
+
+    turn = {"i": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        turn["i"] += 1
+        if turn["i"] == 1:
+            return _msg_response(
+                [
+                    ToolUseBlock(
+                        type="tool_use", id=f"tu{i}", name=f"tool{i}", input={}
+                    )
+                    for i in range(total)
+                ],
+                stop_reason="tool_use",
+            )
+        return _msg_response([TextBlock(type="text", text="final")])
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    task = asyncio.create_task(agent.run("hi"))
+
+    # First ``cap`` tools acquire (tool0, tool1 in FIFO semaphore order).
+    await wait_acquired(cap)
+    assert set(acquired[:cap]) == {0, 1}
+    # Scramble completion order: release tool1 before tool0, then tool3
+    # before tool2 — completion (1, 0, 3, 2) != submission (0, 1, 2, 3).
+    releases[1].set()
+    await wait_acquired(cap + 1)  # tool1 done → tool2 acquires
+    releases[0].set()
+    await wait_acquired(cap + 2)  # tool0 done → tool3 acquires
+    releases[3].set()  # tool3 done before tool2
+    releases[2].set()  # tool2 done last
+    answer = await task
+    assert answer == "final"
+
+    # Results merged in ORIGINAL block order despite scrambled completion.
+    results = _tool_result_blocks(agent)
+    assert [r["tool_use_id"] for r in results] == [f"tu{i}" for i in range(total)]
+    assert [r["content"] for r in results] == [f"r{i}" for i in range(total)]
+
+
+@pytest.mark.asyncio
+async def test_error_isolation_releases_semaphore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cap=2`` with 6 tools, one raising: the raiser maps to
+    ``(is_error=True, "Error calling ...")`` at its ORIGINAL index, siblings
+    complete normally, and results merge in original order.
+
+    The semaphore's available-permit count returns to ``cap`` after the run
+    — the direct proof that ``async with`` released on the exception path.
+    (Had it leaked, a permit would be permanently consumed; the run would
+    also eventually stall once enough errored tools drained the pool.)
+    """
+    cap = 2
+    total = 6
+    raise_idx = 2  # tool2 raises
+
+    def make_tool(idx: int) -> Any:
+        async def t(**kw: Any) -> str:
+            if idx == raise_idx:
+                raise RuntimeError("kaboom")
+            return f"r{idx}"
+
+        return t
+
+    agent = _patched_agent(monkeypatch, max_concurrent_tools=cap)
+    for i in range(total):
+        agent._tool_map[f"tool{i}"] = make_tool(i)
+
+    turn = {"i": 0}
+
+    async def fake_amessages(**kwargs: Any) -> Any:
+        turn["i"] += 1
+        if turn["i"] == 1:
+            return _msg_response(
+                [
+                    ToolUseBlock(
+                        type="tool_use", id=f"tu{i}", name=f"tool{i}", input={}
+                    )
+                    for i in range(total)
+                ],
+                stop_reason="tool_use",
+            )
+        return _msg_response([TextBlock(type="text", text="final")])
+
+    monkeypatch.setattr(agent._llm, "amessages", fake_amessages)
+    # ``agent.run`` would stall if the semaphore leaked on raise, because the
+    # errored tool's permit would never return to the pool.
+    answer = await asyncio.wait_for(agent.run("hi"), timeout=_GUARD)
+    assert answer == "final"
+
+    results = _tool_result_blocks(agent)
+    assert [r["tool_use_id"] for r in results] == [f"tu{i}" for i in range(total)]
+    by_id = {b["tool_use_id"]: b for b in results}
+    # Siblings complete normally.
+    for i in range(total):
+        if i == raise_idx:
+            continue
+        assert by_id[f"tu{i}"]["content"] == f"r{i}"
+        assert "is_error" not in by_id[f"tu{i}"]
+    # Raiser mapped to (is_error=True, "Error calling ...") at its index.
+    assert by_id[f"tu{raise_idx}"]["is_error"] is True
+    assert "Error calling" in by_id[f"tu{raise_idx}"]["content"]
+    assert "kaboom" in by_id[f"tu{raise_idx}"]["content"]
+    # The semaphore released every permit — none leaked on the raise path.
+    assert agent._dispatch_semaphore._value == cap
+
+
+# --- COTHIS_MAX_CONCURRENT_TOOLS override-or-None --------------------------
+# These cover the ``model_post_init`` env-var branch — the only tuner for the
+# non-CLI construction sites (the ``worker`` subprocess and ``acp_bridge``).
+# They deliberately OMIT ``max_concurrent_tools`` from the constructor (unlike
+# :func:`_patched_agent`, which always passes it) so the field is absent from
+# ``model_fields_set`` and the override path runs. No asyncio is needed: the
+# semaphore's initial ``_value`` equals the resolved cap.
+
+
+def test_env_override_sets_cap_when_no_explicit_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``COTHIS_MAX_CONCURRENT_TOOLS`` sets the cap when no kwarg is passed."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MAX_CONCURRENT_TOOLS", "3")
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.max_concurrent_tools == 3
+    assert agent._dispatch_semaphore._value == 3
+
+
+def test_env_override_ignores_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-positive env value falls back to the default — ``Semaphore(0)``
+    would block every dispatch forever."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MAX_CONCURRENT_TOOLS", "0")
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.max_concurrent_tools == 8
+    assert agent._dispatch_semaphore._value == 8
+
+
+def test_explicit_kwarg_suppresses_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``max_concurrent_tools`` kwarg wins over the env var: the
+    field is in ``model_fields_set``, so the override branch is skipped."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MAX_CONCURRENT_TOOLS", "3")
+    agent = Agent(
+        model="x",
+        provider="openrouter",
+        tools=[],
+        max_iterations=5,
+        max_concurrent_tools=4,
+    )
+    assert agent.max_concurrent_tools == 4
+    assert agent._dispatch_semaphore._value == 4
+

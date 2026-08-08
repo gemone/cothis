@@ -202,6 +202,16 @@ def ask(
         envvar="COTHIS_MIN_RETAINED_TURNS",
         help="Min turn-groups retained after compaction (default 4).",
     ),
+    max_concurrent_tools: int = typer.Option(
+        8,
+        "--max-concurrent-tools",
+        envvar="COTHIS_MAX_CONCURRENT_TOOLS",
+        help=(
+            "Max tool executions live at once within a single fan-out turn "
+            "(default 8). Caps concurrent MCP/shell/network pressure on "
+            "pathological fan-outs; normal turns (1-4 tools) are unaffected."
+        ),
+    ),
 ) -> None:
     """Run the agent once and print its final answer."""
     with console.status("loading...", spinner="dots"):
@@ -215,6 +225,7 @@ def ask(
             cwd=Path.cwd(),
             summary_model=summary_model,
             min_retained_turns=min_retained_turns,
+            max_concurrent_tools=max_concurrent_tools,
         )
     with console.status("thinking...", spinner="dots"):
         answer = asyncio.run(_run_and_close(agent, prompt))
@@ -364,6 +375,16 @@ def chat(
         envvar="COTHIS_MIN_RETAINED_TURNS",
         help="Min turn-groups retained after compaction (default 4).",
     ),
+    max_concurrent_tools: int = typer.Option(
+        8,
+        "--max-concurrent-tools",
+        envvar="COTHIS_MAX_CONCURRENT_TOOLS",
+        help=(
+            "Max tool executions live at once within a single fan-out turn "
+            "(default 8). Caps concurrent MCP/shell/network pressure on "
+            "pathological fan-outs; normal turns (1-4 tools) are unaffected."
+        ),
+    ),
     resume: str | None = typer.Option(
         None,
         "--resume",
@@ -431,6 +452,7 @@ def chat(
             preactivate_skills=list(skill),
             summary_model=summary_model,
             min_retained_turns=min_retained_turns,
+            max_concurrent_tools=max_concurrent_tools,
         )
     )
 
@@ -445,6 +467,7 @@ async def _chat_session(
     preactivate_skills: list[str] | None = None,
     summary_model: str | None = None,
     min_retained_turns: int = 4,
+    max_concurrent_tools: int = 8,
 ) -> None:
     # ``chat`` is the only command that persists. ``Session.new`` takes the
     # cross-process lock eagerly; the sessions row + title are written
@@ -480,6 +503,7 @@ async def _chat_session(
                 preactivate_skills=preactivate_skills or [],
                 summary_model=summary_model,
                 min_retained_turns=min_retained_turns,
+                max_concurrent_tools=max_concurrent_tools,
             )
             agent.attach_session(session)
 
