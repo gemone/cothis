@@ -22,6 +22,7 @@ and the single-tool golden event sequence.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
@@ -990,4 +991,277 @@ def test_explicit_kwarg_suppresses_env_override(
     )
     assert agent.max_concurrent_tools == 4
     assert agent._dispatch_semaphore._value == 4
+
+
+# --- tool_timeout: per-body wall-clock bound --------------------------------
+# A tiny ``tool_timeout`` (0.05s) plus a tool awaiting a never-set
+# ``asyncio.Event`` gives a deterministic hang with NO real wall-clock sleep.
+# ``_execute_tool`` is the single dispatch funnel; calling it directly tests
+# the timeout wrap point without an LLM round-trip. Every hang call is
+# wrapped in ``asyncio.wait_for(..., _GUARD)`` so a regression (timeout fails
+# to fire) fails the test fast instead of hanging the suite.
+
+
+def _timeout_agent(
+    monkeypatch: pytest.MonkeyPatch, **kw: Any
+) -> Agent:
+    """Agent with a mocked provider and caller-supplied ``tool_timeout`` /
+    ``max_concurrent_tools``. Does NOT default ``tool_timeout`` so the env
+    tests can omit it from ``model_fields_set``."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **k: MagicMock())
+    return Agent(
+        model="x",
+        provider="openrouter",
+        tools=[],
+        max_iterations=5,
+        **kw,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_fires_on_hanging_async_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool that never resolves is cut off at ``tool_timeout`` and mapped to
+    the error tuple with the exact "timed out after <s>s" wording — the same
+    ``(is_error, "Error calling ...")`` shape a raised exception produces."""
+    agent = _timeout_agent(monkeypatch, tool_timeout=0.05)
+
+    never = asyncio.Event()
+
+    async def hang(**kw: Any):
+        await never.wait()  # never set -> deterministic hang
+
+    agent._tool_map["hang"] = hang
+
+    is_error, output = await asyncio.wait_for(
+        agent._execute_tool({"name": "hang", "input": {}}), timeout=_GUARD
+    )
+    assert is_error is True
+    assert output == "Error calling hang: timed out after 0.05s"
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_does_not_fire_when_tool_completes_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool that returns well under ``tool_timeout`` yields a normal result —
+    the bound never interferes with prompt tools."""
+    agent = _timeout_agent(monkeypatch, tool_timeout=0.05)
+
+    async def quick(**kw: Any) -> str:
+        return "ok"
+
+    agent._tool_map["quick"] = quick
+
+    is_error, output = await agent._execute_tool({"name": "quick", "input": {}})
+    assert is_error is False
+    assert output == "ok"
+
+
+def test_tool_timeout_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default is ``None`` — no timeout = today's behavior (backward
+    compat). No env var set so the override branch is a no-op too."""
+    monkeypatch.delenv("COTHIS_TOOL_TIMEOUT", raising=False)
+    agent = _timeout_agent(monkeypatch)
+    assert agent.tool_timeout is None
+
+
+@pytest.mark.asyncio
+async def test_none_tool_timeout_never_enters_asyncio_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``tool_timeout is None`` the ``nullcontext`` branch runs, so
+    ``asyncio.timeout`` is never even entered. Monkeypatch it to count calls
+    and assert the counter stays 0; a fast tool still returns normally. We do
+    NOT await a never-set event under None (that would hang the test forever,
+    which is exactly the backward-compat point)."""
+    agent = _timeout_agent(monkeypatch)
+    assert agent.tool_timeout is None
+
+    calls = {"n": 0}
+    real_timeout = asyncio.timeout
+
+    def counting_timeout(delay: Any) -> Any:
+        calls["n"] += 1
+        return real_timeout(delay)
+
+    monkeypatch.setattr(asyncio, "timeout", counting_timeout)
+
+    async def quick(**kw: Any) -> str:
+        return "ok"
+
+    agent._tool_map["quick"] = quick
+    is_error, output = await agent._execute_tool({"name": "quick", "input": {}})
+    assert is_error is False
+    assert output == "ok"
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_configurable_via_ctor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tool_timeout=0.05`` passed to the ctor is honored: the hanging tool
+    is cut off and the ctor value is visible on the field."""
+    agent = _timeout_agent(monkeypatch, tool_timeout=0.05)
+    assert agent.tool_timeout == 0.05
+
+    never = asyncio.Event()
+
+    async def hang(**kw: Any):
+        await never.wait()
+
+    agent._tool_map["hang"] = hang
+
+    is_error, output = await asyncio.wait_for(
+        agent._execute_tool({"name": "hang", "input": {}}), timeout=_GUARD
+    )
+    assert is_error is True
+    assert "timed out after 0.05s" in output
+
+
+@pytest.mark.asyncio
+async def test_timed_out_tool_does_not_cancel_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One tool timing out must not cancel or reorder its sibling: tool A
+    awaits a never-set event (times out at 0.05s), tool B returns immediately.
+    Both outcomes land in SUBMISSION order; B is a normal result, A is the
+    timeout error tuple. This is the per-``_execute_tool``-coroutine guarantee
+    that keeps the gather isolation intact under the timeout."""
+    agent = _timeout_agent(
+        monkeypatch, max_concurrent_tools=8, tool_timeout=0.05
+    )
+
+    never = asyncio.Event()
+
+    async def hang(**kw: Any):
+        await never.wait()
+
+    async def quick(**kw: Any) -> str:
+        return "ok"
+
+    agent._tool_map["hang"] = hang
+    agent._tool_map["quick"] = quick
+
+    blocks = [
+        {"type": "tool_use", "id": "tu_a", "name": "hang", "input": {}},
+        {"type": "tool_use", "id": "tu_b", "name": "quick", "input": {}},
+    ]
+    outcomes = await asyncio.wait_for(
+        agent._dispatch_tool_uses(blocks), timeout=_GUARD
+    )
+
+    assert len(outcomes) == 2
+    # Submission order preserved: hang (index 0) timed out.
+    assert outcomes[0][0] is True
+    assert "timed out after 0.05s" in outcomes[0][1]
+    # Sibling completed normally — not cancelled.
+    assert outcomes[1][0] is False
+    assert outcomes[1][1] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_semaphore_released_after_tool_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``max_concurrent_tools=1`` the timed-out tool's permit must return
+    to the pool (the timeout is caught inside ``_execute_tool``, so it returns
+    normally and the ``async with`` releases). After the timeout, a follow-up
+    dispatch must acquire immediately — no deadlock. (Had the permit leaked,
+    the second dispatch would block forever and ``_GUARD`` would fire.)"""
+    cap = 1
+    agent = _timeout_agent(
+        monkeypatch, max_concurrent_tools=cap, tool_timeout=0.05
+    )
+
+    never = asyncio.Event()
+
+    async def hang(**kw: Any):
+        await never.wait()
+
+    agent._tool_map["hang"] = hang
+
+    outcomes = await asyncio.wait_for(
+        agent._dispatch_tool_uses(
+            [{"type": "tool_use", "id": "tu1", "name": "hang", "input": {}}]
+        ),
+        timeout=_GUARD,
+    )
+    assert outcomes[0][0] is True
+    assert "timed out after 0.05s" in outcomes[0][1]
+    # Permit fully restored — the dispatch-semaphore invariant holds through the timeout path.
+    assert agent._dispatch_semaphore._value == cap
+
+    # Follow-up acquires: a quick tool dispatches without blocking.
+    async def quick(**kw: Any) -> str:
+        return "ok"
+
+    agent._tool_map["quick"] = quick
+    outcomes2 = await asyncio.wait_for(
+        agent._dispatch_tool_uses(
+            [{"type": "tool_use", "id": "tu2", "name": "quick", "input": {}}]
+        ),
+        timeout=_GUARD,
+    )
+    assert outcomes2[0][0] is False
+    assert outcomes2[0][1] == "ok"
+    assert agent._dispatch_semaphore._value == cap
+
+
+# --- COTHIS_TOOL_TIMEOUT override-or-None -----------------------------------
+# Mirror the ``COTHIS_MAX_CONCURRENT_TOOLS`` override suite: omit the kwarg so
+# the field is absent from ``model_fields_set`` and the override branch runs.
+# No asyncio needed — the resolved ``tool_timeout`` float is the proof.
+
+
+def test_env_override_sets_timeout_when_no_explicit_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``COTHIS_TOOL_TIMEOUT`` sets the bound when no kwarg is passed."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **k: MagicMock())
+    monkeypatch.setenv("COTHIS_TOOL_TIMEOUT", "0.05")
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.tool_timeout == 0.05
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-1"])
+def test_env_override_ignores_bad_values(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bad: str,
+) -> None:
+    """Non-numeric (``abc``) and non-positive (``0`` / ``-1``) env values are
+    rejected with a warning and leave ``tool_timeout`` at ``None`` (no timeout
+    = today's behavior, never a silently-broken zero/negative bound)."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **k: MagicMock())
+    monkeypatch.setenv("COTHIS_TOOL_TIMEOUT", bad)
+    with caplog.at_level(logging.WARNING):
+        agent = Agent(
+            model="x", provider="openrouter", tools=[], max_iterations=5
+        )
+    assert agent.tool_timeout is None
+    assert any(
+        "COTHIS_TOOL_TIMEOUT" in rec.getMessage() and rec.levelno == logging.WARNING
+        for rec in caplog.records
+    )
+
+
+def test_explicit_kwarg_suppresses_timeout_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``tool_timeout`` kwarg wins over the env var: the field is
+    in ``model_fields_set``, so the override branch is skipped."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **k: MagicMock())
+    monkeypatch.setenv("COTHIS_TOOL_TIMEOUT", "99")
+    agent = Agent(
+        model="x",
+        provider="openrouter",
+        tools=[],
+        max_iterations=5,
+        tool_timeout=0.05,
+    )
+    assert agent.tool_timeout == 0.05
+
 

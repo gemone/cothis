@@ -16,6 +16,7 @@ Example
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -912,6 +913,36 @@ class Agent(BaseModel):
     max_tool_result_chars: int = Field(
         default=_DEFAULT_MAX_TOOL_RESULT_CHARS, gt=0
     )
+    # Per-tool wall-clock bound (seconds) on a single ``_execute_tool`` body.
+    # ``None`` (the default) means NO timeout — every existing tool behaves
+    # exactly as before, so the surface is fully backward compatible. The
+    # single most common hang vector (a runaway shell command) is already
+    # covered by the shell tool's own subprocess-level ``_SHELL_TIMEOUT_S``
+    # bound; this per-tool timeout is a secondary, opt-in net targeted at
+    # async hangs that the inner shell bound cannot catch (a stalled MCP
+    # server round-trip, an async tool awaiting a future that never resolves).
+    # Set via the ctor kwarg or ``COTHIS_TOOL_TIMEOUT`` (see model_post_init).
+    #
+    # Only ASYNC hangs are interruptible: ``asyncio.timeout`` cancels the
+    # coroutine at its next await point (MCP's network await; the shell tool's
+    # ``asyncio.to_thread`` await). A pure-SYNC blocking tool body — a
+    # ``ToolDef`` whose ``fn`` runs on the event-loop thread with no await
+    # point (e.g. ``time.sleep`` in a custom tool) — has no await point to
+    # deliver the cancellation at, so the loop stays blocked until the body
+    # returns. Solving that needs a thread executor, which contradicts the
+    # loop-thread dispatch design and is deliberately out of scope.
+    #
+    # Shell orphaning caveat: cancelling the shell tool's ``to_thread`` await
+    # does NOT kill the spawned subprocess; it keeps running until its own
+    # ``_SHELL_TIMEOUT_S``. The turn unblocks immediately (the win), but a
+    # brief orphaned subprocess is possible — a leak, not a hang.
+    #
+    # ``gt=0`` mirrors the two fields above: pydantic v2 applies numeric
+    # constraints only to non-None values, so ``None`` passes; a non-positive
+    # bound is rejected at construction (a zero/negative timeout would fire
+    # before any real work). ``float`` (not ``int``) so sub-second timeouts
+    # (used by the test suite and tight round-trips) are expressible.
+    tool_timeout: float | None = Field(default=None, gt=0)
 
     # Runtime-only state: not validated, not serialised.
     _llm: AIProvider = PrivateAttr()
@@ -1070,6 +1101,33 @@ class Agent(BaseModel):
                         "(must be > 0); using default %d.",
                         env_val,
                         self.max_tool_result_chars,
+                    )
+        # ``COTHIS_TOOL_TIMEOUT`` tunes the per-tool wall-clock bound for any
+        # construction site that passes no value — same override-or-None idiom
+        # as ``COTHIS_MAX_CONCURRENT_TOOLS`` above. Parsed as ``float`` (not
+        # ``int``) so sub-second timeouts are expressible. ``gt=0`` is NOT
+        # re-checked on this post-init mutation, so reject a non-positive value
+        # here. Unset / non-numeric / non-positive all leave ``None`` (no
+        # timeout = today's behavior), so the default stays backward compatible.
+        if "tool_timeout" not in self.model_fields_set:
+            env_val = os.environ.get("COTHIS_TOOL_TIMEOUT")
+            if env_val:
+                try:
+                    parsed = float(env_val)
+                except ValueError:
+                    logger.warning(
+                        "Ignoring non-numeric COTHIS_TOOL_TIMEOUT=%r; "
+                        "using default None.",
+                        env_val,
+                    )
+                    parsed = None
+                if parsed is not None and parsed > 0:
+                    self.tool_timeout = parsed
+                elif parsed is not None:
+                    logger.warning(
+                        "Ignoring non-positive COTHIS_TOOL_TIMEOUT=%r "
+                        "(must be > 0); using default None.",
+                        env_val,
                     )
         self._dispatch_semaphore = asyncio.Semaphore(self.max_concurrent_tools)
 
@@ -2151,6 +2209,20 @@ class Agent(BaseModel):
         (ToolDef, ``_ShellTool``, bare callables) return non-coroutine values;
         the ``isawaitable`` check skips the await for them, so their behavior
         is unchanged.
+
+        When ``self.tool_timeout`` is set, the body (step 2 only) is wrapped in
+        ``asyncio.timeout``; a timeout fires ``on_error`` (phase ``tool``) and
+        returns ``(True, "Error calling <name>: timed out after <s>s")`` — the
+        same failed-event shape as a raised exception, so hooks and the
+        notify-bus see a uniform failure. The timeout is per ``_execute_tool``
+        coroutine, so a timed-out tool never cancels its siblings in a
+        concurrent fan-out, and the dispatch semaphore is always released (the
+        timeout is caught inside this method, so ``_execute_tool`` returns
+        normally). Only ASYNC hangs are interruptible: a pure-sync blocking
+        ``ToolDef`` body (on the event-loop thread, no await point) cannot be
+        cancelled by ``asyncio.timeout`` and will still block the turn — see
+        the ``tool_timeout`` field docstring. ``None`` means no timeout
+        (today's behavior).
         """
         name = tool_use["name"]
         args: dict[str, Any] = tool_use.get("input") or {}
@@ -2240,9 +2312,34 @@ class Agent(BaseModel):
                 args["_session"] = self._session
             arg_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
             logger.debug("→ %s(%s)", name, arg_repr)
-            result = tool(**args)
-            if inspect.isawaitable(result):
-                result = await result
+            # Wall-clock the body only. ``mark_inflight`` is OUTSIDE the
+            # timeout (above) so the in-flight window always balances through
+            # the ``finally`` below regardless of how the body ends. A single
+            # ``async with`` covers both the sync call and the conditional
+            # await. ``nullcontext`` is both a sync+async CM, so the ``None``
+            # path is observably identical to today's behavior (no timeout entered,
+            # nothing cancelled). Only async hangs are interruptible — see the
+            # ``tool_timeout`` field docstring for the sync-blocking limitation.
+            cm = (
+                asyncio.timeout(self.tool_timeout)
+                if self.tool_timeout is not None
+                else contextlib.nullcontext()
+            )
+            async with cm:
+                result = tool(**args)
+                if inspect.isawaitable(result):
+                    result = await result
+        except TimeoutError as exc:
+            # asyncio.timeout raises the builtin TimeoutError (a subclass of
+            # Exception), so this clause MUST precede the generic one or it is
+            # swallowed with the wrong "raised: {exc}" message. Map it to the
+            # same failed-event shape as a raised exception so on_error hooks
+            # and the notify-bus ``tool_call`` event see a uniform failure.
+            logger.debug("← %s timed out after %ss", name, self.tool_timeout)
+            logger.debug("tool %r on_error fired (phase=tool)", name)
+            run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
+            _emit_terminal("failed", ok=False)
+            return True, f"Error calling {name}: timed out after {self.tool_timeout}s"
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             logger.debug("← %s raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=tool)", name)
