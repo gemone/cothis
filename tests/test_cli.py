@@ -1559,3 +1559,78 @@ async def test_chat_session_threads_compaction_flags_to_agent(
     assert captured["summary_model"] == "openai/gpt-4o"
     assert captured["min_retained_turns"] == 3
 
+
+def test_ask_threads_tool_tuning_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``ask --max-tool-result-chars 1234 --tool-timeout 12.5`` reaches the Agent ctor."""
+    captured, result = _ask_capture_agent(
+        monkeypatch,
+        ["--max-tool-result-chars", "1234", "--tool-timeout", "12.5", "hi"],
+    )
+    assert result.exit_code == 0, f"ask failed: {result.output}"
+    assert captured["max_tool_result_chars"] == 1234
+    assert captured["tool_timeout"] == 12.5
+
+
+def test_ask_tool_tuning_flags_override_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flag > env precedence for the two tool-tuning flags (mirrors --min-retained-turns)."""
+    captured, result = _ask_capture_agent(
+        monkeypatch,
+        ["--max-tool-result-chars", "4", "--tool-timeout", "9", "hi"],
+        env={
+            "COTHIS_MAX_TOOL_RESULT_CHARS": "5",
+            "COTHIS_TOOL_TIMEOUT": "5",
+        },
+    )
+    assert result.exit_code == 0, f"ask failed: {result.output}"
+    assert captured["max_tool_result_chars"] == 4
+    assert captured["tool_timeout"] == 9.0
+
+
+@pytest.mark.asyncio
+async def test_chat_session_threads_tool_tuning_flags_to_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_chat_session`` (chat's ``--legacy`` REPL path) forwards the tool-tuning
+    flags into the in-process ``Agent(...)`` ctor.
+
+    The TUI default path is intentionally NOT asserted here — it spawns a
+    worker subprocess that does not yet carry the flags (deferred follow-up).
+    """
+    from unittest.mock import AsyncMock
+
+    import cothis.cli as cli_mod
+
+    monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
+    mock_session = MagicMock()
+    mock_session.close = MagicMock()
+    monkeypatch.setattr(cli_mod.Session, "new", lambda *a, **k: mock_session)
+
+    captured: dict = {}
+    mock_agent = MagicMock()
+    mock_agent.attach_session = MagicMock()
+    mock_agent.aclose = AsyncMock()
+    monkeypatch.setattr(
+        cli_mod, "Agent", lambda **kw: (captured.update(kw), mock_agent)[1],
+    )
+
+    class _EOFSession:
+        async def prompt_async(self, *_a: object, **_k: object) -> str:
+            raise EOFError
+
+    monkeypatch.setattr(
+        "prompt_toolkit.shortcuts.PromptSession",
+        lambda *a, **k: _EOFSession(),
+    )
+
+    await cli_mod._chat_session(
+        model="m",
+        provider="p",
+        max_iterations=1,
+        max_tokens=None,
+        max_tool_result_chars=1234,
+        tool_timeout=7.5,
+    )
+
+    assert captured["max_tool_result_chars"] == 1234
+    assert captured["tool_timeout"] == 7.5
+

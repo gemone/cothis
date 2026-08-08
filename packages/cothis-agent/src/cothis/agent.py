@@ -1074,11 +1074,13 @@ class Agent(BaseModel):
                         self.max_concurrent_tools,
                     )
         # ``COTHIS_MAX_TOOL_RESULT_CHARS`` tunes the live tool-result cap for
-        # any construction site that passes no value — currently all of them
-        # (``worker`` / ``acp_bridge`` and the CLI, which has no
-        # ``--max-tool-result-chars`` flag yet) — same override-or-None idiom
-        # as ``COTHIS_MAX_CONCURRENT_TOOLS`` above. ``gt=0`` is NOT re-checked on
-        # this post-init mutation, so reject a non-positive value here: a
+        # non-CLI construction sites (the ``worker`` subprocess, the
+        # ``acp_bridge``) that pass no value — the same override-or-None idiom
+        # as ``COTHIS_MAX_CONCURRENT_TOOLS`` above. The CLI commands pass an
+        # explicit value via ``--max-tool-result-chars`` (typer already
+        # resolved flag > envvar > default), so this branch never overrides an
+        # operator's explicit choice. ``gt=0`` is NOT re-checked on this
+        # post-init mutation, so reject a non-positive value here: a
         # zero/negative cap would collapse every result to marker-only.
         if "max_tool_result_chars" not in self.model_fields_set:
             env_val = os.environ.get("COTHIS_MAX_TOOL_RESULT_CHARS")
