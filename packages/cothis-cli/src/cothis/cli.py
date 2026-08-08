@@ -466,14 +466,11 @@ def chat(
     worker for the resumed session on startup). ``--skill`` still falls back
     to the legacy REPL with a notice. Pass ``--legacy`` to force the REPL.
 
-    On the default (TUI) path the worker-subprocess tuning flags
+    On the default (TUI) path all five worker-subprocess tuning flags —
     ``--max-concurrent-tools``, ``--max-tool-result-chars``,
-    ``--tool-timeout``, and ``--summary-model`` are forwarded to the spawned
-    worker as ``COTHIS_*`` env vars and take effect there (mirroring the
-    legacy REPL / ``ask`` behavior). ``--min-retained-turns`` is NOT yet
-    honored on the TUI path: the worker's Agent has no env-var reader for it,
-    so the default (4) always applies — use ``--legacy`` (or ``ask``) if you
-    need a non-default floor.
+    ``--tool-timeout``, ``--summary-model``, and ``--min-retained-turns`` —
+    are forwarded to the spawned worker as ``COTHIS_*`` env vars and take
+    effect there (mirroring the legacy REPL / ``ask`` behavior).
     """
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
     # Staged migration (#237): default to TUI; --legacy keeps the REPL.
@@ -1218,9 +1215,9 @@ def _worker_tuning_env(
     ``cothis tui`` (passes nothing) regression-free — the worker still gets
     its env verbatim from ``spawn_worker``'s ``dict(os.environ)``.
 
-    NOTE: ``COTHIS_MIN_RETAINED_TURNS`` has no Agent reader yet (the worker
-    defaults to 4); forwarded here for symmetry so the day a reader is added
-    it lights up with zero plumbing change, but it is currently inert.
+    ``COTHIS_MIN_RETAINED_TURNS`` is honored by the worker's Agent via the
+    ``model_post_init`` override-or-None reader, so a forwarded value takes
+    effect there just like the other tuning vars.
     """
     env: dict[str, str] = {}
     if max_concurrent_tools is not None:
