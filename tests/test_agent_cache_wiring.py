@@ -1,4 +1,4 @@
-"""End-to-end wiring of the session id into ``amessages`` (I22).
+"""End-to-end wiring of the session id into ``amessages``.
 
 The agent threads ``session_id`` from the attached :class:`~cothis.session.Session`
 into every provider ``amessages`` call (both the non-stream ``run`` and the

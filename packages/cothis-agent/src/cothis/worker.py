@@ -99,7 +99,7 @@ class SessionWorker:
         # below reads this so the agent (which knows nothing about the WS
         # surface) can emit the event.
         self._active_conn: Connection | None = None
-        # #I24: interrupt-vs-timeout tie-breaker. ``interrupt_turn`` flips
+        # Interrupt-vs-timeout tie-breaker. ``interrupt_turn`` flips
         # this to ``True`` BEFORE cancelling ``_active_turn``; ``_stream_turn``
         # resets it to ``False`` at turn start. A ``CancelledError`` reaching
         # ``_stream_turn`` with the flag set is an intentional interrupt (no

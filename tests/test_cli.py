@@ -516,7 +516,7 @@ def test_tui_command_dispatches_to_cothis_tui_run(
     """AC #237: ``cothis tui`` launches the Textual app via ``cothis.tui.run``.
 
     The test monkeypatches ``cothis.tui.run`` so the actual Textual event
-    loop isn't started (which would block the test). After slice E (#234),
+    loop isn't started (which would block the test). With the TUI wiring (#234),
     ``tui`` passes a ``CothisApp`` subclass instance (``_DrivenCothisApp``)
     into ``run`` rather than letting ``run`` construct a bare ``CothisApp``.
     The test verifies the dispatch + that an app instance is passed.
@@ -583,9 +583,9 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """AC #234 slice E: ``_DrivenCothisApp.on_worktree_pick`` spawns a session bound to the picked cwd.
+    """AC #234: ``_DrivenCothisApp.on_worktree_pick`` spawns a session bound to the picked cwd.
 
-    The driven app overrides slice D's logging stub with the real spawn
+    The driven app overrides the logging stub with the real spawn
     recipe: Session.new → Supervisor.spawn_worker → schedule
     attach_session_ws. This test stubs Session + Supervisor so the
     spawn args are verifiable without a real subprocess.
@@ -676,7 +676,7 @@ def test_driven_cothis_app_on_worktree_pick_spawns_session(
     assert len(scheduled) == 1
 
     # attach_session_ws carried the worktree DB path so replay-on-attach
-    # fires (I29).
+    # fires.
     assert len(attach_calls) == 1
     assert attach_calls[0][3] is not None
 
@@ -1411,13 +1411,13 @@ async def test_worker_session_preactivation_filters_unavailable_skills(
     )
 
 
-# --- compaction CLI flags (slice C2: --summary-model / --min-retained-turns) -
+# --- compaction CLI flags (--summary-model / --min-retained-turns) ---------
 #
-# These pin the two operator knobs added in slice C2. They mirror the
+# These pin the two operator knobs. They mirror the
 # ``--max-tokens`` / ``COTHIS_MAX_TOKENS`` idiom. ``--min-retained-turns``
 # carries ``envvar=COTHIS_MIN_RETAINED_TURNS`` (typer reads it); ``--summary-model``
 # deliberately has NO envvar= so the env read stays inside the agent's
-# ``resolve_summary_model`` (slice A behaviour preserved byte-for-byte).
+# ``resolve_summary_model`` (the env-var behaviour preserved byte-for-byte).
 
 
 def _ask_capture_agent(
@@ -1496,7 +1496,7 @@ def test_ask_summary_model_env_not_read_by_typer(
 
     With ``COTHIS_SUMMARY_MODEL`` set and no ``--summary-model`` flag, the
     Agent ctor receives ``summary_model=None`` so the env read is delegated
-    to ``resolve_summary_model`` inside the agent (slice A behaviour
+    to ``resolve_summary_model`` inside the agent (the env-var behaviour
     preserved byte-for-byte). This pins the no-envvar= design.
     """
     captured, result = _ask_capture_agent(
@@ -1510,11 +1510,11 @@ def test_ask_summary_model_env_not_read_by_typer(
 async def test_chat_session_threads_compaction_flags_to_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_chat_session`` (chat's ``--legacy`` REPL path) forwards the C2 flags
-    into the in-process ``Agent(...)`` ctor.
+    """``_chat_session`` (chat's ``--legacy`` REPL path) forwards the compaction
+    flags into the in-process ``Agent(...)`` ctor.
 
     The TUI default path is intentionally NOT asserted here — it spawns a
-    worker subprocess that does not yet carry the flags (deferred C2 item).
+    worker subprocess that does not yet carry the flags (deferred follow-up).
     """
     from unittest.mock import AsyncMock
 

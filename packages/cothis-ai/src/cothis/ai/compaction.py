@@ -1,4 +1,4 @@
-"""Summariser selection + summarisation prompt builder (compaction slice A).
+"""Summariser selection + summarisation prompt builder (compaction).
 
 A pure-data companion to :mod:`cothis.ai.context_budget`. Where the budget
 primitive reports *how full* the context window is, this module answers the
@@ -13,10 +13,10 @@ two questions compaction asks once the budget says "compact":
    plus one system text block: the exact shape
    :meth:`cothis.ai.base.AIProvider.amessages` consumes.
 
-Slice A deliberately stops here. It *selects* and *shapes*; it never
+This module deliberately stops here. It *selects* and *shapes*; it never
 *executes* an ``amessages`` call and never wires into the live agent loop
-(slice C owns the run-loop wiring via ``SessionPhase="compaction"``; slice B
-owns the eviction policy that decides which turns constitute the window).
+(the run loop owns the wiring via ``SessionPhase="compaction"``; the eviction policy
+decides which turns constitute the window).
 
 No I/O, no SDK imports, no provider-client construction — this preserves the
 providers' lazy-client invariant and matches :mod:`cothis.ai.context_budget`'s
@@ -41,7 +41,7 @@ from cothis.ai.context_budget import (
 # ``provider/model`` or a bare ``model`` (which inherits the session
 # provider); empty / whitespace-only is treated as unset. Mirrors the
 # ``COTHIS_MAX_TOKENS`` / ``--max-tokens`` idiom — a typer flag in front of
-# this env var is wiring, deferred to slice C.
+# this env var is wiring, exposed via a typer flag.
 _SUMMARY_MODEL_ENV = "COTHIS_SUMMARY_MODEL"
 
 # Default cap on the rendered transcript length, in characters. When the
@@ -71,7 +71,7 @@ _TRUNCATION_TAIL = "...[truncated]"
 #: stay grounded after the older turns are summarised.
 #:
 #: This default is the one open knob the user flagged for confirmation;
-#: slice C may expose it via a typer flag in front of the same env-var
+#: a typer flag may expose it in front of the same env-var
 #: idiom as ``COTHIS_SUMMARY_MODEL``.
 _DEFAULT_MIN_RETAINED_TURNS = 4
 
@@ -112,7 +112,7 @@ class SummaryTarget:
     Resolved by :func:`resolve_summary_model`. A frozen value type: once
     selected it is passed unchanged to
     :func:`cothis.ai.base.get_provider` and
-    :func:`cothis.ai.model_metadata.resolve_max_tokens` in slice C.
+    :func:`cothis.ai.model_metadata.resolve_max_tokens` at call time.
     """
 
     model: str
@@ -132,7 +132,7 @@ class SummarisationRequest:
     * :attr:`messages` — exactly one ``user`` turn whose single text block is
       the labelled transcript rendered from ``window``.
     * :attr:`max_tokens` — the output cap, carried through unchanged for the
-      ``amessages`` call (slice C computes it via
+      ``amessages`` call (computed at call time via
       :func:`~cothis.ai.model_metadata.resolve_max_tokens`).
 
     Frozen: a built request is a snapshot, never mutated before send.
@@ -310,7 +310,7 @@ def resolve_summary_model(
     Precedence (highest first):
 
     1. ``override`` argument — explicit, programmatic (e.g. a future typer
-       flag from slice C). Empty / whitespace-only is treated as unset.
+       flag). Empty / whitespace-only is treated as unset.
     2. :data:`_SUMMARY_MODEL_ENV` (``COTHIS_SUMMARY_MODEL``) — the
        operator-knob default, with the same parse rules as ``override``.
     3. The session pair ``(session_provider, session_model)`` — summarise
@@ -403,10 +403,10 @@ def build_summarisation_request(
 
     * ``window`` — older turns to condense (post-projection Anthropic shape).
     * ``max_tokens`` — output cap, carried through unchanged for the
-      ``amessages`` call. Slice C computes it via
+      ``amessages`` call. Computed at call time via
       :func:`~cothis.ai.model_metadata.resolve_max_tokens`.
     * ``system_text`` — replaces the default :data:`SUMMARY_SYSTEM_PROMPT`
-      verbatim when set (testability + slice-C customisation). ``None`` keeps
+      verbatim when set (testability + call-site customisation). ``None`` keeps
       the default.
     * ``max_window_chars`` — overall transcript cap; oldest turns are
       truncated past it (see :func:`_render_window`).
@@ -428,12 +428,12 @@ def build_summarisation_request(
 
 
 # =============================================================================
-# Slice B — eviction policy (the "which turns to compact" decision).
+# Eviction policy (the "which turns to compact" decision).
 # =============================================================================
 #
 # A PURE decision function. Given the live ``_messages`` shape + a
 # :class:`~cothis.ai.context_budget.ContextBudget`, it selects WHICH older
-# turns form the summarisation window (the exact shape slice A's
+# turns form the summarisation window (the exact shape the
 # :func:`build_summarisation_request` consumes) and which stay verbatim. It
 # never executes the summarisation call, never mutates the input list, and
 # never imports the higher-layer :mod:`cothis.agent` module (would be a
@@ -457,14 +457,14 @@ class EvictionDecision:
     """The result of one :func:`plan_eviction` call — what to compact vs keep.
 
     A pure value type: ``plan_eviction`` READS ``messages`` and returns a
-    decision; it does not mutate the live agent state (slice C applies the
+    decision; it does not mutate the live agent state (the run loop applies the
     decision by feeding :attr:`window` to
     :func:`build_summarisation_request` and splicing :attr:`retained`).
 
     Attributes:
 
     * :attr:`window` — the older turns to compact, as a contiguous PREFIX of
-      ``messages`` in original order. Anthropic-shaped (the renderer in slice
+      ``messages`` in original order. Anthropic-shaped (the renderer
       A tolerates both the projected ``{role, content}`` form and the
       stored-with-metadata assistant form). Empty when no eviction fires.
     * :attr:`retained` — the active tail, kept verbatim, ``messages[len(window):]``.
@@ -473,7 +473,7 @@ class EvictionDecision:
       decision (``None`` when the budget was unknown). Observability only.
     * :attr:`evicted_token_estimate` — :func:`estimate_input_tokens` over
       :attr:`window`; ``0`` when no eviction fires. A deterministic heuristic
-      (char/4), NOT a real token count — slice C re-checks the real budget
+      (char/4), NOT a real token count — the run loop re-checks the real budget
       after the summary lands.
     * :attr:`reason` — short ``"<outcome>:<cause>"`` tag for logs/telemetry,
       e.g. ``"evicted:high-pressure"``, ``"no-eviction:low-pressure"``,
@@ -481,7 +481,7 @@ class EvictionDecision:
 
     Frozen: a decision is a snapshot; callers must not mutate it. The
     ``window`` / ``retained`` lists reference the same dict objects as the
-    input (slice B decides, it does not copy) — slice C is the sole mutator.
+    input (this function decides, it does not copy) — the run loop is the sole mutator.
     """
 
     window: list[dict[str, Any]]
@@ -497,7 +497,7 @@ def _message_content_blocks(message: dict[str, Any]) -> list[Any]:
     A bare-string ``content`` has no structured blocks (and therefore no
     ``tool_use`` / ``tool_result``); a list content yields the list; anything
     else (``None``, unexpected types) yields ``[]``. Never raises — every
-    slice-B helper reads the message shape tolerantly.
+    helper reads the message shape tolerantly.
     """
     content = message.get("content")
     if isinstance(content, list):
@@ -637,12 +637,12 @@ def plan_eviction(
     critical_floor_ratio: float = _DEFAULT_CRITICAL_FLOOR_RATIO,
     summary_overhead_tokens: int = 0,
 ) -> EvictionDecision:
-    """Decide which older turns to compact vs retain (pure; slice B).
+    """Decide which older turns to compact vs retain (pure).
 
     Selects a contiguous PREFIX of ``messages`` as the summarisation window
     and leaves the rest as the verbatim retained tail, driven by
     ``budget.pressure``. The window is fed straight into
-    :func:`build_summarisation_request` by slice C; this function only
+    :func:`build_summarisation_request` by the run loop; this function only
     DECIDES — it never executes the call, mutates ``messages``, or imports
     the agent loop.
 
@@ -688,7 +688,7 @@ def plan_eviction(
     * ``summary_overhead_tokens`` — conservative reserve for the summary's
       own size, subtracted from the HIGH retained-token target so the
       post-compaction context has room for both tail and summary. Defaults
-      ``0`` (slice C owns the post-summary recheck).
+      ``0`` (the run loop owns the post-summary recheck).
 
     Determinism: a pure function of ``(messages, budget, params)`` — no env,
     no random, no I/O. Identical input yields an equal :class:`EvictionDecision`

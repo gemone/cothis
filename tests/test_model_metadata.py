@@ -1,6 +1,6 @@
 """Tests for ``cothis.model_metadata`` and the Agent's ``max_tokens`` wiring.
 
-The resolver is the silent-breakage surface of slice #32: a wrong return
+The resolver is the silent-breakage surface for issue #32: a wrong return
 either cuts a generation off mid-tool-call (too small) or 400s the request
 (too large). These tests cover every branch of the matching strategy
 without touching the network — the bundled JSON is read via

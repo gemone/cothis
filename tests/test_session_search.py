@@ -88,7 +88,7 @@ def _make_session(
 def _downgrade_to_v2(db_path: Path) -> None:
     """Strip the FTS5 index + triggers and pin ``user_version=2``.
 
-    Simulates a legacy DB written before #I21 so the next ``Storage`` open
+    Simulates a legacy DB written before the FTS5 index landed so the next ``Storage`` open
     exercises the v2→v3 migration + backfill path (not the fresh-DDL path).
     """
     conn = sqlite3.connect(db_path)

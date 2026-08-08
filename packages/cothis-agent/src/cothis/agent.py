@@ -708,7 +708,7 @@ def _coalesce_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
     preserved verbatim and never merged.
 
     cothis: ``thinking`` signatures are not preserved across merges — this
-    slice does not pass the ``thinking`` param, so Anthropic doesn't validate
+    merge does not pass the ``thinking`` param, so Anthropic doesn't validate
     them on the way back, and other providers' reasoning blocks never carry
     a real signature anyway. The empty-text-block root cause is already
     fixed in ``cothis.ai`` (``openai.py`` uses a truthiness ``if
@@ -788,15 +788,15 @@ class Agent(BaseModel):
     # appended after the first user message; resume rebuild (#71)
     # treats the pair as a normal model-invoked load.
     preactivate_skills: list[str] = Field(default_factory=list)
-    # cothis: compaction slice C2 — operator knobs exposed via the
+    # cothis: compaction operator knobs exposed via the
     # ``--summary-model`` / ``--min-retained-turns`` CLI flags (ask/chat).
     # ``summary_model`` is a pure override-or-None: when ``None`` (the
     # worker / acp_bridge construction sites, or ``ask`` with no flag),
     # ``resolve_summary_model`` reads ``COTHIS_SUMMARY_MODEL`` itself,
-    # preserving slice A's env-var behaviour byte-for-byte. The literal
+    # preserving the env-var behaviour byte-for-byte. The literal
     # ``4`` mirrors ``cothis.ai.compaction._DEFAULT_MIN_RETAINED_TURNS``
     # (kept as a literal rather than imported because it is a private
-    # name; the three literals are noted as a drift risk in C2). The
+    # name; the three literals are noted as a drift risk). The
     # ``gt=0`` constraint rejects a non-positive floor at construction
     # (a clear error rather than plan_eviction's silent clamp to 1).
     summary_model: str | None = None
@@ -850,12 +850,12 @@ class Agent(BaseModel):
     # ``_execute_tool`` emits ``started`` + (``completed`` | ``failed``)
     # rows into ``notify_events`` via the session storage connection.
     _bus: NotifyBus | None = PrivateAttr(default=None)
-    # cothis: compaction slice C1 — in-memory observability phase. Flips to
+    # cothis: compaction in-memory observability phase. Flips to
     # ``"compaction"`` around the summarisation call in ``_maybe_compact``
     # and is restored to ``"idle"`` in the ``finally``. Observability-only
-    # in C1: the ACP bridge (``acp_bridge._Session.snapshot``) still
+    # for now: the ACP bridge (``acp_bridge._Session.snapshot``) still
     # hardcodes ``phase="idle"`` for clients; wiring this field into the
-    # snapshot is C2. Tracked here (not derived) so a later slice can emit
+    # snapshot is deferred. Tracked here (not derived) so a future change can emit
     # ``"turn"`` during the loop body without re-deriving state.
     _phase: SessionPhase = PrivateAttr(default="idle")
     # Once-per-run compaction guard: bounds total summarisation calls to 1
@@ -1036,7 +1036,7 @@ class Agent(BaseModel):
     async def _maybe_compact(self) -> None:
         """Compact the conversation in-memory when context pressure is HIGH+.
 
-        The single entry point slice C wires into the turn loop (called at
+        The single entry point wires into the turn loop (called at
         the TOP of each iteration in both ``_run_inner`` and
         ``_run_stream_inner``, before ``_request_messages`` / ``amessages``).
         On the common path (pressure below HIGH, or already attempted this
@@ -1063,11 +1063,11 @@ class Agent(BaseModel):
         7. ATOMIC substitute: build ``[summary_user_msg] + retained`` as a
            NEW list and assign ``self._messages`` only after the summary is
            in hand. The old list is discarded whole; the retained tail
-           entries are the same dict objects (slice B does not copy).
+           entries are the same dict objects (not copied).
         8. Recompute ``context_budget()`` and log at INFO (decision reason,
            evicted token estimate, new pressure). No loop — a still-HIGH
-           post-summary budget is handled by the next user turn (or C2's
-           auto-recompaction).
+           post-summary budget is handled by the next user turn (or a
+           subsequent auto-recompaction pass).
         9. ``finally`` restores ``_phase="idle"``.
 
         Failure path: ANY exception from steps 4-6 is caught, logged at
@@ -1076,11 +1076,11 @@ class Agent(BaseModel):
         restored in ``finally``. The normal turn then proceeds — the next
         ``amessages`` may overflow, but state is never corrupted.
 
-        C1 scope: purely in-memory. NO session-store writes (so a resumed
+        Scope: purely in-memory. NO session-store writes (so a resumed
         session re-compacts in-memory; durable persistence of the summary
-        block is C2). No ``CompactionEvent`` is yielded on the stream path
-        (C2). ``_phase`` is observability-only — the ACP bridge still
-        reports ``"idle"`` to clients until C2 wires it in.
+        block is deferred). No ``CompactionEvent`` is yielded on the stream
+        path (deferred). ``_phase`` is observability-only — the ACP bridge
+        still reports ``"idle"`` to clients until the snapshot wiring lands.
         """
         if self._compaction_attempted_this_run:
             return
@@ -1155,7 +1155,7 @@ class Agent(BaseModel):
             }
             # Atomic substitute: build the new list speculatively and
             # assign only after the summary is in hand. The retained tail
-            # entries are the same dict objects (slice B does not copy),
+            # entries are the same dict objects (not copied),
             # preserving identity of the retained turns.
             self._messages = [summary_msg, *list(decision.retained)]
             new_budget = self.context_budget()
@@ -1304,7 +1304,7 @@ class Agent(BaseModel):
         ``MessageStopEvent`` is only a stream-termination latch (the first one
         seen ends iteration; openrouter emits duplicates).
 
-        cothis: thinking blocks are accumulated passively (this slice does not
+        cothis: thinking blocks are accumulated passively (this code does not
         pass the ``thinking`` param, so claude won't emit them and other
         providers never do); they are replayed verbatim if they ever arrive,
         since stripping them makes the model re-invoke tools.

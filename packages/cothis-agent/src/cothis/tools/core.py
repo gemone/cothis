@@ -1027,7 +1027,7 @@ class HandleManager:
         self._slots: dict[type[ResourceHandle], _HandleSlot] = {}
         # Per-class acquire locks guard the cold-acquire critical section in
         # ``ensure_acquired`` against the check-then-acquire race exposed by
-        # concurrent dispatch (I30: ``_dispatch_tool_uses`` runs independent
+        # concurrent dispatch (``_dispatch_tool_uses`` runs independent
         # tool_uses via ``asyncio.gather``). One lock per handle class so
         # siblings sharing a class (notably all MCP tools on one server share
         # one ``MCPSessionHandle``) serialise their cold-acquire, while
@@ -1042,7 +1042,7 @@ class HandleManager:
         an unbound class (``bind`` may not have seen every class yet), so the
         lock must spring into existence on the same path. One lock per class
         — never a manager-wide lock, which would serialise unrelated classes
-        and kill the I30 concurrency win.
+        and kill the concurrency win.
         """
         lock = self._acquire_locks.get(cls)
         if lock is None:
@@ -1113,7 +1113,7 @@ class HandleManager:
         handle is in-flight, the pool temporarily exceeds ``max_handles``
         — a tool call must never fail because the pool is busy.
 
-        Concurrency-safe under I30's ``_dispatch_tool_uses`` (independent
+        Concurrency-safe under ``_dispatch_tool_uses`` (independent
         tool_uses run via ``asyncio.gather``): the already-live fast path is
         lock-free; the cold-acquire critical section (budget check → evict →
         ``acquire()`` → set ``live_at``) is guarded by a per-class lock with
@@ -1130,8 +1130,8 @@ class HandleManager:
             slot = _HandleSlot(instance=cls())
             self._slots[cls] = slot
         if not slot.is_live:
-            # Cold path. Before I31 the check-then-acquire was a race: two
-            # tool_uses sharing this class (I30 dispatches independent blocks
+            # Cold path. Before the per-class lock the check-then-acquire was a race: two
+            # tool_uses sharing this class (concurrent dispatch runs independent blocks
             # concurrently via ``asyncio.gather``) both observed
             # ``is_live == False``, both awaited ``acquire()``, double-
             # connecting (orphaned MCP sessions). The per-class lock makes

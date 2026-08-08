@@ -1133,7 +1133,7 @@ def _build_signature(arg_specs: list[dict[str, Any]]) -> inspect.Signature:
     Each declared arg becomes a ``Parameter`` of the declared ``type``
     (defaulting to ``str``), so the cothis.ai ``inspect.signature``-based
     schema builder picks them up. All args are keyword-or-positional with
-    no default; optional args (``required: false``) are a later slice.
+    no default; optional args (``required: false``) are not yet supported.
     """
     params = [
         inspect.Parameter(

@@ -6,7 +6,7 @@
 - ``ConversationView`` (center): scrollable Markdown + tool-call cards.
 - ``TextArea`` input (bottom, ``id="input"``): multiline input with Ctrl+Enter to send.
 - ``CothisFooter`` (very bottom, ``id="footer"``): one-line status bar —
-  model / session short-id / context pressure / active skills / run-state (#I24).
+  model / session short-id / context pressure / active skills / run-state.
 
 Stream routing per the design-review sign-off (#228, 2026-07-24):
 ``ContentDelta(kind="text")`` renders as normal assistant content;
@@ -17,9 +17,9 @@ as inline cards with a status badge.
 WS attach (``attach_ws`` / ``attach_session_ws``) + ``run_turn``
 forwarding (``send_run_turn``) landed with #252/#319. Multi-session
 dispatch + the worktree picker (#234) are wired up; ``on_worktree_pick``
-(slice D) is the spawn contract for production CLI wiring.
+is the spawn contract for production CLI wiring.
 
-Esc-to-interrupt (#I24): ``Binding('escape','interrupt_turn')``
+Esc-to-interrupt: ``Binding('escape','interrupt_turn')``
 cancels the in-flight turn via the worker's ``interrupt_turn`` control
 message (the same task-cancel primitive used for run_turn-supersede and
 disconnect). The worker emits ``turn_started`` / ``turn_finished`` frames
@@ -79,7 +79,7 @@ _STREAM_FINALIZE_S = 0.3
 
 
 # ---------------------------------------------------------------------
-# Skill selection persistence (#235 slice D)
+# Skill selection persistence (#235)
 # ---------------------------------------------------------------------
 
 
@@ -99,7 +99,7 @@ class SessionList(ListView):
     Populated by ``CothisApp.refresh_session_list`` (driven from
     ``Storage.list_sessions_in_cwd_tree``). Each row's label carries
     the session's cwd + worktree branch when applicable (#234 AC #3);
-    rows are sorted by cwd for visual grouping by worktree (slice F).
+    rows are sorted by cwd for visual grouping by worktree.
     Selection fires ``on_list_view_selected`` → ``on_session_selected``.
     """
 
@@ -177,7 +177,7 @@ class ConversationView(VerticalScroll):
         # so the per-delta append path stays linear. ``renderable_str`` joins
         # lazily — only the final Markdown parse needs the joined string.
         self._text_buf: list[str] = []
-        # Thinking-segment accumulator (#I11). Kept separate from
+        # Thinking-segment accumulator. Kept separate from
         # ``_text_buf`` so ``renderable_str`` (the text-segment source, read
         # by tests + inspection) stays free of reasoning content. Finalised
         # into a collapsed, dimmed ``Collapsible`` so the model's reasoning is
@@ -299,7 +299,7 @@ class ConversationView(VerticalScroll):
         return card
 
     def render_replayed_message(self, msg: dict) -> None:
-        """Render one rebuilt ``{role, content: [blocks]}`` message (#I29).
+        """Render one rebuilt ``{role, content: [blocks]}`` message.
 
         Replay-on-attach reuses the existing primitives — there is no
         parallel renderer. A user text block routes through
@@ -311,7 +311,7 @@ class ConversationView(VerticalScroll):
         so the streaming-throttle path is bypassed). A ``tool_use`` block
         mounts a ``done``-status card (historical calls are already
         finished). ``thinking`` / ``image`` blocks are silently skipped
-        (slice A deferral).
+        (deferred).
 
         Leaves the view state clean (``_finalized=True``,
         ``_stream_static=None``) after each assistant text block, so the
@@ -351,7 +351,7 @@ class ConversationView(VerticalScroll):
                         status="done",
                         call_id=b.get("id"),
                     )
-                # thinking / image / tool_result: deferred (slice A).
+                # thinking / image / tool_result: deferred.
 
     def _refresh_stream(self) -> None:
         """Mount/refresh the plain-text streaming widget, throttled.
@@ -462,7 +462,7 @@ class ConversationView(VerticalScroll):
 
 
 class ConfigMenuModal(ModalScreen[set[str] | None]):
-    """Config menu modal — toggleable skill entries (#235 slice B+C).
+    """Config menu modal — toggleable skill entries (#235).
 
     Each skill is a ``Button`` that toggles selected/unselected on click.
     ``Done`` dismisses with the selected set; ``Esc`` dismisses with
@@ -518,7 +518,7 @@ class ConfigMenuModal(ModalScreen[set[str] | None]):
 
 
 class AskUserModal(ModalScreen[str | None]):
-    """Modal for interactive tool questions (#229 slice E).
+    """Modal for interactive tool questions (#229).
 
     Shows ``prompt`` + one ``Button`` per choice. On click: dismiss
     with the chosen value. Esc or Cancel: dismiss with ``None``
@@ -559,7 +559,7 @@ class AskUserModal(ModalScreen[str | None]):
 
 
 class WorktreePickerModal(ModalScreen[str | None]):
-    """Modal for choosing a git worktree for a new session (#234 slice B).
+    """Modal for choosing a git worktree for a new session (#234).
 
     Shows one ``Button`` per worktree (label = branch name when on a
     branch, else the path basename). On click: dismiss with the
@@ -625,7 +625,7 @@ class WorktreePickerModal(ModalScreen[str | None]):
 
 
 class CothisFooter(Static):
-    """One-line status bar — surfaces run-state + key signals at a glance (#I24).
+    """One-line status bar — surfaces run-state + key signals at a glance.
 
     Renders five cells left-to-right:
 
@@ -692,7 +692,7 @@ class CothisApp(App):
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("n", "new_session", "New session", show=True),
         Binding("ctrl+m", "menu", "Menu", show=True),
-        # Esc → interrupt a running turn (#I24). No ``priority=True``: an
+        # Esc → interrupt a running turn. No ``priority=True``: an
         # app-level priority binding would steal Esc from pushed modal
         # screens (modals install their own non-priority Esc binding to
         # dismiss). Textual resolves bindings top-screen-first for non-
@@ -704,7 +704,7 @@ class CothisApp(App):
     ]
 
     # -----------------------------------------------------------------
-    # Run-state + footer reactives (#I24) — the app's first reactives.
+    # Run-state + footer reactives — the app's first reactives.
     # Plain attrs would work, but reactives let a single combined watcher
     # (``_refresh_footer``) re-render the footer widget on any change with
     # no ad-hoc call sites. ``run_state`` is a constrained literal set
@@ -737,7 +737,7 @@ class CothisApp(App):
         self.on_new_session(worktrees)
 
     def on_new_session(self, worktrees: list) -> None:
-        """Mount ``WorktreePickerModal``; route the chosen path to ``on_worktree_pick`` (#234 slice C/D).
+        """Mount ``WorktreePickerModal``; route the chosen path to ``on_worktree_pick`` (#234).
 
         Hook fired by ``action_new_session`` (the ``n`` keypress). The
         picker shows one ``Button`` per worktree; on dismiss the chosen
@@ -763,7 +763,7 @@ class CothisApp(App):
         self.push_screen(WorktreePickerModal(worktrees), _on_dismiss)
 
     def on_worktree_pick(self, path: str) -> None:
-        """Hook fired when the user picks a worktree for a new session (#234 slice D).
+        """Hook fired when the user picks a worktree for a new session (#234).
 
         Default: log the choice. The CLI / caller overrides this to
         call ``Supervisor.spawn_worker`` + ``SessionStorage.new`` +
@@ -777,13 +777,13 @@ class CothisApp(App):
         """
         logger.info(
             "tui: worktree picked for new session: %s "
-            "(spawn + attach wiring lands in slice E)",
+            "(spawn + attach wiring lands in the CLI integration)",
             path,
         )
 
     # -----------------------------------------------------------------
-    # Menu binding (#235 slice A) — Ctrl-M opens the config menu.
-    # The modal listing skills / MCP / LSP servers lands in Slice B;
+    # Menu binding (#235) — Ctrl-M opens the config menu.
+    # The modal listing skills / MCP / LSP servers lands in the config menu;
     # this is the binding + dispatch contract only.
     # -----------------------------------------------------------------
 
@@ -800,9 +800,9 @@ class CothisApp(App):
         """Hook fired by ``action_menu`` (Ctrl-M).
 
         Default: log + return. Subclasses override to mount a modal
-        (Slice B) that lists skills via ``discover_tools``, MCP servers
+        that lists skills via ``discover_tools``, MCP servers
         via ``MCPServer``, and any LSP servers. Selecting entries
-        re-runs ``discover_tools`` with the chosen layers (Slice C/D).
+        re-runs ``discover_tools`` with the chosen layers.
         """
         logger.info("tui: menu action fired (Ctrl-M)")
         from cothis.skills import load_skill_selection, save_skill_selection
@@ -826,7 +826,7 @@ class CothisApp(App):
         """Return the names of skills discoverable from the current cwd.
 
         Wraps ``cothis.skills.discover_skills`` so the menu modal
-        (Slice B, not yet implemented) can display the list without
+        (not yet implemented) can display the list without
         importing the skills module directly. Returns an empty list
         when no skills are installed.
         """
@@ -841,12 +841,12 @@ class CothisApp(App):
     # and we don't need to call any methods on it outside this file.
     _ws: Any = None
     _ws_pump_task: asyncio.Task[None] | None = None
-    # Multi-session WS connections (#230 slice B). Keyed by session_id;
+    # Multi-session WS connections (#230). Keyed by session_id;
     # each entry has its own pump task. The single-session ``_ws`` /
     # ``_ws_pump_task`` above stay for backward compat (``attach_ws``).
     _ws_by_session: dict[str, Any] = {}
     _ws_pump_tasks_by_session: dict[str, asyncio.Task[None]] = {}
-    # Active session id (#230 slice A) — the session the user is currently
+    # Active session id (#230) — the session the user is currently
     # interacting with. Future slices route ``send_run_turn`` to the active
     # session's WS + highlight the entry in ``SessionList``.
     _active_session_id: str | None = None
@@ -861,7 +861,7 @@ class CothisApp(App):
             )
             yield ConversationView()
         yield TextArea(id="input")
-        # Footer (#I24): docked at the very bottom, beneath the input. Both
+        # Footer: docked at the very bottom, beneath the input. Both
         # widgets use ``dock: bottom``; Textual stacks docked siblings in DOM
         # order with the LAST mounted closest to the screen edge, so mounting
         # the footer after the input places it below the input.
@@ -886,7 +886,7 @@ class CothisApp(App):
         self._refresh_footer()
 
     # -----------------------------------------------------------------
-    # Footer reactives → re-render (#I24). One ``watch_*`` per reactive
+    # Footer reactives → re-render. One ``watch_*`` per reactive
     # delegates to a single combined callback so a turn_finished payload
     # (which updates all four data cells at once) re-paints the footer
     # once per changed field rather than four times.
@@ -1080,7 +1080,7 @@ class CothisApp(App):
         self.set_active_session(session_id)
 
     # -----------------------------------------------------------------
-    # Active-session tracking (#230 slice A)
+    # Active-session tracking (#230)
     # -----------------------------------------------------------------
 
     def set_active_session(self, session_id: str) -> None:
@@ -1089,7 +1089,7 @@ class CothisApp(App):
         Called by ``on_session_selected`` and by callers that spawn a
         new session (``on_new_session`` override → spawn → ``set_active``).
         Future slices use this to route ``send_run_turn`` to the right
-        WS connection (#230 slice C) + highlight the focused entry.
+        WS connection (#230) + highlight the focused entry.
         """
         previous = self._active_session_id
         self._active_session_id = session_id
@@ -1097,7 +1097,7 @@ class CothisApp(App):
             self.on_active_session_changed(session_id)
 
     def on_active_session_changed(self, session_id: str) -> None:
-        """Hook fired when the active session changes (#230 slice A/D).
+        """Hook fired when the active session changes (#230).
 
         Default: update SessionList visual highlight — the matching
         ListItem gains ``active-session`` CSS class; all others lose
@@ -1151,7 +1151,7 @@ class CothisApp(App):
         self._ws = None
         # A dropped worker mid-turn leaves run_state stale ("running"); if
         # the active session has no other reachable WS, return to idle so
-        # the footer + the Esc guard don't reference a dead connection (#I24).
+        # the footer + the Esc guard don't reference a dead connection.
         if self._ws_by_session.get(self._active_session_id or "") is None:
             self.run_state = "idle"
         if task is not None and not task.done():
@@ -1164,11 +1164,11 @@ class CothisApp(App):
             await ws.close()
 
     # -----------------------------------------------------------------
-    # Multi-session WS attach (#230 slice B)
+    # Multi-session WS attach (#230)
     # -----------------------------------------------------------------
 
     def replay_session_history(self, session_id: str, db_path: Path) -> None:
-        """Replay a session's stored history into ``ConversationView`` (#I29).
+        """Replay a session's stored history into ``ConversationView``.
 
         Reads the rebuilt messages via ``Session.peek_messages`` — the
         lock-free, read-only storage surface already used by
@@ -1211,7 +1211,7 @@ class CothisApp(App):
         session as active via ``set_active_session``. Idempotent:
         re-attaching replaces the previous connection for that session.
 
-        Replay-on-attach (#I29): when ``db_path`` is supplied, the
+        Replay-on-attach: when ``db_path`` is supplied, the
         session's stored history is replayed into ``ConversationView``
         AFTER the WS connects + is stored but BEFORE the pump task
         starts — so the rendered history is visible immediately on
@@ -1239,7 +1239,7 @@ class CothisApp(App):
         ws = self._ws_by_session.pop(session_id, None)
         # If the detached session was active, its worker is going away —
         # clear a stale "running" so the footer + Esc guard don't reference
-        # a dead connection (#I24).
+        # a dead connection.
         if session_id == self._active_session_id:
             self.run_state = "idle"
         if task is not None and not task.done():
@@ -1264,7 +1264,7 @@ class CothisApp(App):
         await ws.send(json.dumps({"type": "run_turn", "prompt": prompt}))
 
     async def send_interrupt_turn(self) -> None:
-        """Forward an ``interrupt_turn`` control message to the active worker (#I24).
+        """Forward an ``interrupt_turn`` control message to the active worker.
 
         Mirrors ``send_run_turn``'s WS routing (active-session WS with a
         single-session ``_ws`` fallback). No-op when no WS is attached —
@@ -1286,7 +1286,7 @@ class CothisApp(App):
             pass
 
     async def action_interrupt_turn(self) -> None:
-        """Esc-key action — interrupt the in-flight turn (#I24).
+        """Esc-key action — interrupt the in-flight turn.
 
         Guarded on run-state: only interrupts when ``run_state == "running"``.
         When idle (or already interrupted) Esc is a harmless no-op — it sends
@@ -1367,21 +1367,21 @@ class CothisApp(App):
                     msg.get("tool"), call_id,
                 )
         elif typ == "ask_user_request":
-            # #229 slice C: forward to the overridable hook. Default
+            # #229: forward to the overridable hook. Default
             # auto-rejects (sends resolve_ask with value=None) so the
             # worker doesn't block in tests; subclasses mount a modal
-            # (Slice E).
+            # (handled by the CLI integration).
             self.on_ask_user_request(
                 ask_id=msg.get("ask_id", ""),
                 prompt=msg.get("prompt", ""),
                 choices=msg.get("choices", []),
             )
         elif typ == "turn_started":
-            # #I24: worker opened a turn — flip run-state so the footer's
+            # Worker opened a turn — flip run-state so the footer's
             # state cell reads "running" and Esc becomes an armed interrupt.
             self.run_state = "running"
         elif typ == "turn_finished":
-            # #I24: terminal frame on every turn exit path (normal end,
+            # Terminal frame on every turn exit path (normal end,
             # timeout, error, interrupt). This is the authoritative refresh
             # — it carries the post-turn context pressure + any skill
             # load/deactivate that happened during the turn. Reconciles

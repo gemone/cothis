@@ -6,7 +6,7 @@ the same cwd; tools resolve user-supplied paths through
 :func:`_resolve_under` which rejects absolute paths and cwd escapes.
 
 Pure: no disk I/O. The first real consumer (``fs.read``) exercises
-the WORKDIR contract; the temporary probe tool shipped in slice #2
+the WORKDIR contract; the temporary probe tool shipped earlier
 has been removed.
 
 cothis: ADR deferred per PRD #46 — current shape is the floor, not

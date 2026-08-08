@@ -692,13 +692,13 @@ async def test_adopt_seeds_live_instance() -> None:
     assert calls == ["release"]
 
 
-# --- concurrent cold-acquire (I31) --------------------------------------
+# --- concurrent cold-acquire -------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_concurrent_ensure_acquired_acquires_once() -> None:
     """Two tools sharing a handle class acquire exactly once under concurrent
-    dispatch (I31).
+    dispatch.
 
     Before the per-class acquire lock, ``ensure_acquired``'s check-then-acquire
     was a race: two tool_uses sharing a class (every MCP tool on one server
@@ -735,7 +735,7 @@ async def test_concurrent_ensure_acquired_acquires_once() -> None:
     mgr.bind(b)
 
     # Concurrent dispatch — mimics ``_dispatch_tool_uses`` running both
-    # tool_uses via ``asyncio.gather`` (I30).
+    # tool_uses via ``asyncio.gather``.
     await asyncio.gather(ensure_handle_ready(a), ensure_handle_ready(b))
 
     assert acquire_count[0] == 1  # would be 2 without the per-class lock
@@ -747,12 +747,12 @@ async def test_concurrent_ensure_acquired_acquires_once() -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_acquire_independent_classes_parallel() -> None:
-    """Distinct handle classes acquire in parallel, not serialised (I31).
+    """Distinct handle classes acquire in parallel, not serialised.
 
     The lock is per-class, not manager-wide: two tools binding DIFFERENT
     handle classes must still have their ``acquire()`` calls overlap. This
     guards against an accidental manager-wide lock regression (which would
-    serialise all cold-acquires and kill the I30 concurrency win).
+    serialise all cold-acquires and kill the concurrency win).
     Deterministic overlap probe — each acquire increments a shared
     ``in_flight`` counter and records the high-water mark before yielding.
     """

@@ -29,7 +29,7 @@ from importlib.resources import files
 from typing import Any
 
 # Anthropic's own default when a model isn't in litellm; matches the value
-# hardcoded in #31 before this slice landed, so behaviour is unchanged for
+# hardcoded in #31 previously, so behaviour is unchanged for
 # unknown models.
 _FALLBACK_MAX_TOKENS = 8192
 

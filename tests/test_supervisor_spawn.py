@@ -9,7 +9,7 @@ WS client to the resulting URI.
 Companion to ``tests/test_worker_cli_integration.py`` (#250 path a,
 entrypoint half): that test drives the worker side directly via
 ``subprocess.Popen``; this test drives the supervisor side. Together
-they cover the full #250 path (a) slice — supervisor + worker
+they cover the full #250 path (a) — supervisor + worker
 subprocess, no WS attached yet (the TUI attachment is #252).
 
 Out of scope (tracked under #227 full follow-up):
@@ -82,7 +82,7 @@ async def test_spawn_worker_returns_handle_with_live_ws(tmp_path: Path) -> None:
         assert handle.ws_url.startswith("ws://127.0.0.1:")
         assert len(handle.token) >= 32
         assert handle.status == "running"
-        # model + provider stashed for auto-restart (#250 slice C enabler)
+        # model + provider stashed for auto-restart (#250)
         assert handle.model == "openai/gpt-oss-120b"
         assert handle.provider == "openrouter"
 
@@ -222,7 +222,7 @@ async def test_check_worker_health_running_then_exited(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------
-# monitor_once — crash detection (#250 slice B)
+# monitor_once — crash detection (#250)
 # ---------------------------------------------------------------------
 
 
@@ -230,7 +230,7 @@ async def test_check_worker_health_running_then_exited(tmp_path: Path) -> None:
 async def test_monitor_once_detects_crash_and_records_lifecycle(
     tmp_path: Path,
 ) -> None:
-    """AC #250 slice B: ``monitor_once`` detects a crashed worker + records lifecycle.
+    """AC #250: ``monitor_once`` detects a crashed worker + records lifecycle.
 
     Spawns a real worker, SIGKILLs it to simulate a crash, calls
     ``monitor_once`` — verifies the crash was detected, the lifecycle
@@ -283,13 +283,13 @@ async def test_monitor_once_detects_crash_and_records_lifecycle(
 
 
 # ---------------------------------------------------------------------
-# _restart_worker (#250 slice C — auto-restart)
+# _restart_worker (#250 — auto-restart)
 # ---------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_restart_worker_re_spawns_after_crash(tmp_path: Path) -> None:
-    """AC #250 slice C: ``_restart_worker`` re-spawns a crashed worker.
+    """AC #250: ``_restart_worker`` re-spawns a crashed worker.
 
     Kill the worker (SIGKILL), detect via ``monitor_once``, then call
     ``_restart_worker`` — verifies the new worker is running + the
@@ -343,7 +343,7 @@ async def test_restart_worker_re_spawns_after_crash(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------
-# monitor_worker_health — continuous loop (#250 slice C)
+# monitor_worker_health — continuous loop (#250)
 #
 # The loop orchestrates three pieces: monitor_once (detect), backoff_seconds
 # (wait), _restart_worker (re-spawn). Each piece has its own unit test; this
@@ -361,7 +361,7 @@ async def test_monitor_worker_health_loops_detect_backoff_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #250 slice C: the loop detects a crash + restarts after backoff.
+    """AC #250: the loop detects a crash + restarts after backoff.
 
     One crash → one restart; the second iteration sees the recovered
     worker + stops re-spawning. Verifies the wiring between
@@ -419,7 +419,7 @@ async def test_monitor_worker_health_skips_when_over_threshold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #250 slice C: the loop leaves a session ``errored`` when over restart threshold.
+    """AC #250: the loop leaves a session ``errored`` when over restart threshold.
 
     Threshold guard: if ``_should_restart`` returns False (too many
     crashes in the window), the loop logs + skips — doesn't keep

@@ -124,7 +124,7 @@ def test_non_stream_forwards_kwargs_and_returns_sdk_message(
     assert kwargs["messages"] is msgs
     assert kwargs["max_tokens"] == 128
     # The provider attaches the cache_control breakpoint on the last system
-    # block (I22) — so the single-block system gains ``cache_control``.
+    # block — so the single-block system gains ``cache_control``.
     assert kwargs["system"] == [
         {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
     ]
@@ -209,7 +209,7 @@ def test_stream_uses_messages_stream_helper(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # ---------------------------------------------------------------------------
-# Provider-owned cache_control breakpoint on the last system block (I22).
+# Provider-owned cache_control breakpoint on the last system block.
 # ---------------------------------------------------------------------------
 
 

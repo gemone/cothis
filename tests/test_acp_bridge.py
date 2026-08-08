@@ -210,7 +210,7 @@ async def test_models_unknown_model_advertises_none_limits() -> None:
 
 
 # ---------------------------------------------------------------------------
-# I19: abort / set_model / set_thinking + cancellation finalisation
+# abort / set_model / set_thinking + cancellation finalisation
 # ---------------------------------------------------------------------------
 
 

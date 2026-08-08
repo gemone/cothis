@@ -874,7 +874,7 @@ async def test_tool_call_result_pointer_without_call_id_is_no_op(
 
 # ---------------------------------------------------------------------
 # Session list populate (#252 item 5 — list pane half; selection
-# handling is a separate slice).
+# handling is separate).
 # ---------------------------------------------------------------------
 
 
@@ -1243,12 +1243,12 @@ async def test_action_new_session_passes_empty_list_when_not_in_git_repo(
 async def test_on_new_session_default_mounts_worktree_picker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #234 slice C: default ``on_new_session`` pushes ``WorktreePickerModal``.
+    """AC #234: default ``on_new_session`` pushes ``WorktreePickerModal``.
 
-    Replaces the slice-A no-op stub. Now Ctrl-N → ``action_new_session``
-    → ``on_new_session`` mounts the picker (added in slice B) so the
-    user sees the worktree list. Slice D will wire session creation on
-    dismiss; this slice closes the "modal mounts" wiring contract.
+    Replaces the prior no-op stub. Now Ctrl-N → ``action_new_session``
+    → ``on_new_session`` mounts the picker so the
+    user sees the worktree list. The pick handler wires session creation on
+    dismiss; this closes the "modal mounts" wiring contract.
     """
     from cothis.git import Worktree
     from cothis.tui import CothisApp, WorktreePickerModal
@@ -1273,10 +1273,10 @@ async def test_on_new_session_default_mounts_worktree_picker(
 async def test_action_new_session_keypress_pushes_picker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #234 slice C: ``n`` keypress → ``action_new_session`` → picker mounts.
+    """AC #234: ``n`` keypress → ``action_new_session`` → picker mounts.
 
     End-to-end via the actual keypress binding (``n``, not ``ctrl+n`` —
-    the binding was added in slice A). The default ``on_new_session``
+    the binding was added previously). The default ``on_new_session``
     mounts ``WorktreePickerModal``; the test verifies the modal is on
     top of the screen stack after the keypress.
     """
@@ -1308,10 +1308,10 @@ async def test_action_new_session_keypress_pushes_picker(
 async def test_on_worktree_pick_default_logs_path(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AC #234 slice D: default ``on_worktree_pick`` logs the chosen path.
+    """AC #234: default ``on_worktree_pick`` logs the chosen path.
 
     The hook is the contract for "create a session bound to this cwd"
-    — slice E (CLI integration) overrides it to call
+    — the CLI integration overrides it to call
     ``Supervisor.spawn_worker`` etc. The default impl logs so the
     wiring is observable without spawning, mirroring the other no-op
     hooks (``on_session_selected``, ``on_menu_open``) that subclasses
@@ -1341,11 +1341,11 @@ async def test_on_worktree_pick_default_logs_path(
 async def test_picker_dismiss_routes_to_on_worktree_pick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #234 slice D: ``WorktreePickerModal`` dismiss → ``on_worktree_pick``.
+    """AC #234: ``WorktreePickerModal`` dismiss → ``on_worktree_pick``.
 
     Subclass captures the routed path via ``on_worktree_pick`` (the
-    contract that slice E will override). The picker is mounted via
-    the default ``on_new_session`` (slice C); picking a button
+    contract that the CLI integration overrides). The picker is mounted via
+    the default ``on_new_session``; picking a button
     dismisses + routes to the hook. Verifies the wiring end-to-end
     without spawning.
     """
@@ -1382,7 +1382,7 @@ async def test_picker_dismiss_routes_to_on_worktree_pick(
         assert isinstance(modal, WorktreePickerModal)
 
         # Click the second worktree's button — routes to on_worktree_pick
-        # with that path (index-based ID per slice B).
+        # with that path (index-based ID).
         feature_button = next(
             b for b in modal.query(Button) if b.id == "wt-1"
         )
@@ -1399,7 +1399,7 @@ async def test_picker_dismiss_routes_to_on_worktree_pick(
 async def test_picker_dismiss_cancel_does_not_call_on_worktree_pick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #234 slice D: cancelling the picker → ``on_worktree_pick`` NOT called.
+    """AC #234: cancelling the picker → ``on_worktree_pick`` NOT called.
 
     Cancellation (Esc / Cancel button) is distinct from picking a
     worktree. The ``on_new_session`` dismiss callback short-circuits
@@ -1443,8 +1443,8 @@ async def test_picker_dismiss_cancel_does_not_call_on_worktree_pick(
 
 
 # ---------------------------------------------------------------------
-# ask_user_request dispatch (#229 slice C) — TUI side. Worker-side
-# Future blocking is Slice D; modal UI is Slice E.
+# ask_user_request dispatch (#229) — TUI side. Worker-side
+# Future blocking + modal UI land in later wiring.
 # ---------------------------------------------------------------------
 
 
@@ -1452,7 +1452,7 @@ async def test_picker_dismiss_cancel_does_not_call_on_worktree_pick(
 async def test_ask_user_request_dispatches_to_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #229 slice C: inbound ``ask_user_request`` fires the hook with args.
+    """AC #229: inbound ``ask_user_request`` fires the hook with args.
 
     Subclass captures the call; verifies the hook receives ``ask_id``,
     ``prompt``, + ``choices``.
@@ -1503,9 +1503,9 @@ async def test_ask_user_request_dispatches_to_hook(
 async def test_ask_user_request_mounts_modal_and_routes_pick_to_resolve_ask(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #229 slice F: ``ask_user_request`` → mount modal → pick → ``resolve_ask``.
+    """AC #229: ``ask_user_request`` → mount modal → pick → ``resolve_ask``.
 
-    Replaces the slice-C auto-reject stub. Now the default
+    Replaces the prior auto-reject stub. Now the default
     ``on_ask_user_request`` pushes ``AskUserModal``; when the user
     clicks a choice button the dismiss callback fires + sends
     ``resolve_ask`` with the chosen value over the active session's WS.
@@ -1564,7 +1564,7 @@ async def test_ask_user_request_mounts_modal_and_routes_pick_to_resolve_ask(
 async def test_ask_user_request_cancel_sends_resolve_ask_with_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #229 slice F: cancelling the modal → ``resolve_ask`` with ``value=None``.
+    """AC #229: cancelling the modal → ``resolve_ask`` with ``value=None``.
 
     The agent treats ``None`` as "user declined" and the tool returns
     accordingly. This is the correct behaviour for Esc / Cancel — the
@@ -1620,13 +1620,13 @@ async def test_ask_user_request_cancel_sends_resolve_ask_with_none(
 
 
 # ---------------------------------------------------------------------
-# Menu binding (#235 slice A) — Ctrl-M fires ``on_menu_open`` hook.
+# Menu binding (#235) — Ctrl-M fires ``on_menu_open`` hook.
 # ---------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_action_menu_fires_on_menu_open_hook() -> None:
-    """AC #235 slice A: ``action_menu`` calls ``on_menu_open``."""
+    """AC #235: ``action_menu`` calls ``on_menu_open``."""
     from cothis.tui import CothisApp
 
     class _CapturingApp(CothisApp):
@@ -1690,7 +1690,7 @@ async def test_list_configurable_skills_empty_when_none_installed(
 async def test_config_menu_modal_renders_skill_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #235 slice B/C: ``action_menu`` pushes ConfigMenuModal with toggleable skill buttons."""
+    """AC #235: ``action_menu`` pushes ConfigMenuModal with toggleable skill buttons."""
     from pathlib import Path as _Path
 
     from textual.widgets import Button
@@ -1728,7 +1728,7 @@ async def test_config_menu_modal_renders_skill_names(
 async def test_config_menu_modal_toggle_selects_and_dismisses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #235 slice C: clicking a skill button toggles selection; Done returns the set."""
+    """AC #235: clicking a skill button toggles selection; Done returns the set."""
     from pathlib import Path as _Path
 
     from textual.widgets import Button
@@ -1776,7 +1776,7 @@ async def test_config_menu_modal_toggle_selects_and_dismisses(
 
 
 # ---------------------------------------------------------------------
-# Active-session highlight (#230 slice D) — SessionList items gain
+# Active-session highlight (#230) — SessionList items gain
 # ``active-session`` CSS class when their session becomes active.
 # ---------------------------------------------------------------------
 
@@ -1785,7 +1785,7 @@ async def test_config_menu_modal_toggle_selects_and_dismisses(
 async def test_set_active_session_highlights_matching_list_item(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #230 slice D: the active session's ListItem gains ``active-session`` class.
+    """AC #230: the active session's ListItem gains ``active-session`` class.
 
     Seeds two sessions, selects one, verifies only its ListItem has
     the ``active-session`` class; the other doesn't.
@@ -1836,7 +1836,7 @@ async def test_set_active_session_highlights_matching_list_item(
 
 
 # ---------------------------------------------------------------------
-# Multi-session WS (#230 slice B)
+# Multi-session WS (#230)
 # ---------------------------------------------------------------------
 
 
@@ -1844,7 +1844,7 @@ async def test_set_active_session_highlights_matching_list_item(
 async def test_attach_session_ws_stores_in_dict_and_sets_active(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #230 slice B: ``attach_session_ws`` stores WS in ``_ws_by_session``."""
+    """AC #230: ``attach_session_ws`` stores WS in ``_ws_by_session``."""
     from cothis.tui import CothisApp
 
     fake = _FakeWS([])
@@ -1876,7 +1876,7 @@ async def test_attach_session_ws_stores_in_dict_and_sets_active(
 async def test_attach_session_ws_multiple_sessions_coexist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #230 slice B: two sessions attached simultaneously, both alive."""
+    """AC #230: two sessions attached simultaneously, both alive."""
     from cothis.tui import CothisApp
 
     fake_a = _FakeWS([])
@@ -1917,7 +1917,7 @@ async def test_attach_session_ws_multiple_sessions_coexist(
 async def test_send_run_turn_routes_to_active_session_ws(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #230 slice C: ``send_run_turn`` routes to the active session's WS."""
+    """AC #230: ``send_run_turn`` routes to the active session's WS."""
     import json as _json
 
     from cothis.tui import CothisApp
@@ -1959,13 +1959,13 @@ async def test_send_run_turn_routes_to_active_session_ws(
 
 
 # ---------------------------------------------------------------------
-# AskUserModal (#229 slice E)
+# AskUserModal (#229)
 # ---------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_ask_user_modal_renders_prompt_and_choices() -> None:
-    """AC #229 slice E: modal shows prompt + one button per choice."""
+    """AC #229: modal shows prompt + one button per choice."""
     from textual.widgets import Button, Label
 
     from cothis.tui import AskUserModal, CothisApp
@@ -1994,7 +1994,7 @@ async def test_ask_user_modal_renders_prompt_and_choices() -> None:
 
 @pytest.mark.asyncio
 async def test_ask_user_modal_choice_button_dismisses_with_value() -> None:
-    """AC #229 slice E: clicking a choice button dismisses with that value."""
+    """AC #229: clicking a choice button dismisses with that value."""
     from textual.widgets import Button
 
     from cothis.tui import AskUserModal, CothisApp
@@ -2023,13 +2023,13 @@ async def test_ask_user_modal_choice_button_dismisses_with_value() -> None:
 
 
 # ---------------------------------------------------------------------
-# WorktreePickerModal (#234 slice B)
+# WorktreePickerModal (#234)
 # ---------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_worktree_picker_renders_one_button_per_worktree_plus_cancel() -> None:
-    """AC #234 slice B: modal shows branch-labeled buttons + Cancel.
+    """AC #234: modal shows branch-labeled buttons + Cancel.
 
     A worktree on a branch shows the branch name; a detached worktree
     falls back to its path basename. The Cancel button is always
@@ -2075,7 +2075,7 @@ async def test_worktree_picker_renders_one_button_per_worktree_plus_cancel() -> 
 
 @pytest.mark.asyncio
 async def test_worktree_picker_button_dismisses_with_path_str() -> None:
-    """AC #234 slice B: clicking a worktree button dismisses with its path.
+    """AC #234: clicking a worktree button dismisses with its path.
 
     The dismiss value is the path as a string — what the caller stuffs
     into the new session's ``cwd``. Index-based IDs (paths contain
@@ -2117,7 +2117,7 @@ async def test_worktree_picker_button_dismisses_with_path_str() -> None:
 
 @pytest.mark.asyncio
 async def test_worktree_picker_cancel_dismisses_with_none() -> None:
-    """AC #234 slice B: Cancel button dismisses with ``None``.
+    """AC #234: Cancel button dismisses with ``None``.
 
     ``None`` is the "user cancelled, no new session" signal — callers
     treat it distinctly from any path string.
@@ -2196,7 +2196,7 @@ async def test_worktree_picker_current_dir_dismisses_with_cwd(
 
 @pytest.mark.asyncio
 async def test_worktree_picker_empty_list_renders_only_cancel() -> None:
-    """AC #234 slice B: empty worktree list → just the Cancel button.
+    """AC #234: empty worktree list → just the Cancel button.
 
     Edge case: not a git repo, or git binary missing — ``list_worktrees``
     returns ``[]``. The modal still mounts (no crash) so the user sees
@@ -2238,14 +2238,14 @@ async def test_worktree_picker_empty_list_renders_only_cancel() -> None:
 
 
 # ---------------------------------------------------------------------
-# Skill selection persistence (#235 slice D)
+# Skill selection persistence (#235)
 # ---------------------------------------------------------------------
 
 
 def test_save_and_load_skill_selection_round_trip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #235 slice D: save → load round-trips the selected set."""
+    """AC #235: save → load round-trips the selected set."""
     from cothis.skills import load_skill_selection, save_skill_selection
 
     monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
@@ -2258,7 +2258,7 @@ def test_save_and_load_skill_selection_round_trip(
 def test_load_skill_selection_empty_when_file_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #235 slice D: no file → empty set (first run)."""
+    """AC #235: no file → empty set (first run)."""
     from cothis.skills import load_skill_selection
 
     monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
@@ -2268,7 +2268,7 @@ def test_load_skill_selection_empty_when_file_missing(
 def test_load_skill_selection_handles_corrupt_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #235 slice D: corrupt JSON → empty set + no crash."""
+    """AC #235: corrupt JSON → empty set + no crash."""
     from cothis.skills import _skill_selection_path, load_skill_selection
 
     monkeypatch.setenv("COTHIS_HOME", str(tmp_path))
@@ -2328,7 +2328,7 @@ async def test_config_menu_seeds_from_saved_selection(
 
 
 # ---------------------------------------------------------------------
-# Thinking-block rendering (#I11) — ``append_delta("thinking", ...)``
+# Thinking-block rendering — ``append_delta("thinking", ...)``
 # accumulates into ``_thinking_buf`` (separate from ``_text_buf``) and
 # finalises into a collapsed, dimmed ``Collapsible(Markdown(source),
 # title="reasoning", classes="thinking-block")``. Thinking stays OUT of
@@ -2338,7 +2338,7 @@ async def test_config_menu_seeds_from_saved_selection(
 
 @pytest.mark.asyncio
 async def test_thinking_delta_renders_as_collapsible_after_finalise() -> None:
-    """#I11: thinking deltas mount a collapsed Collapsible on finalise.
+    """Thinking deltas mount a collapsed Collapsible on finalise.
 
     ``append_delta("thinking", ...)`` accumulates into ``_thinking_buf``;
     ``_finalize_active()`` flushes it as ``Collapsible(Markdown(source),
@@ -2377,7 +2377,7 @@ async def test_thinking_delta_renders_as_collapsible_after_finalise() -> None:
 
 @pytest.mark.asyncio
 async def test_thinking_stays_out_of_renderable_str_while_collapsible_mounted() -> None:
-    """#I11: a mounted thinking Collapsible coexists with a ``renderable_str``
+    """A mounted thinking Collapsible coexists with a ``renderable_str``
     that EXCLUDES the reasoning.
 
     ``renderable_str`` reads ``_text_buf`` only; thinking lives in
@@ -2412,7 +2412,7 @@ async def test_thinking_stays_out_of_renderable_str_while_collapsible_mounted() 
 
 @pytest.mark.asyncio
 async def test_thinking_then_text_mounts_collapsible_before_markdown() -> None:
-    """#I11: a kind switch (thinking → text) finalises thinking first, so
+    """A kind switch (thinking → text) finalises thinking first, so
     the Collapsible mounts BEFORE the text Markdown in DOM order.
 
     Event order must match DOM order: the model's reasoning block
@@ -2455,7 +2455,7 @@ async def test_thinking_then_text_mounts_collapsible_before_markdown() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_call_after_thinking_flushes_collapsible_above_card() -> None:
-    """#I11: a tool call after streaming thinking flushes the thinking
+    """A tool call after streaming thinking flushes the thinking
     block so the Collapsible mounts ABOVE the ToolCallCard.
 
     ``append_tool_call`` calls ``_finalize_active()`` (the boundary
@@ -2496,7 +2496,7 @@ async def test_tool_call_after_thinking_flushes_collapsible_above_card() -> None
 
 
 # ---------------------------------------------------------------------
-# Footer + Esc-to-interrupt (#I24)
+# Footer + Esc-to-interrupt
 #
 # Headless coverage for the status bar + run-state lifecycle. Drives
 # run-state via ``_dispatch_ws_message`` / ``action_interrupt_turn`` directly
@@ -2507,7 +2507,7 @@ async def test_tool_call_after_thinking_flushes_collapsible_above_card() -> None
 
 @pytest.mark.asyncio
 async def test_footer_is_mounted_and_renders_idle_state() -> None:
-    """Footer mounts on launch + its initial render shows the 5 cells (#I24)."""
+    """Footer mounts on launch + its initial render shows the 5 cells."""
     from cothis.tui import CothisApp, CothisFooter
 
     app = CothisApp()
@@ -2523,7 +2523,7 @@ async def test_footer_is_mounted_and_renders_idle_state() -> None:
 
 @pytest.mark.asyncio
 async def test_turn_started_sets_run_state_running() -> None:
-    """``turn_started`` WS frame flips ``run_state`` to ``running`` (#I24)."""
+    """``turn_started`` WS frame flips ``run_state`` to ``running``."""
     from cothis.tui import CothisApp, CothisFooter
 
     app = CothisApp()
@@ -2538,7 +2538,7 @@ async def test_turn_started_sets_run_state_running() -> None:
 
 @pytest.mark.asyncio
 async def test_turn_finished_updates_footer_fields_and_run_state() -> None:
-    """``turn_finished`` payload updates footer cells + reconciles to idle (#I24)."""
+    """``turn_finished`` payload updates footer cells + reconciles to idle."""
     from cothis.tui import CothisApp, CothisFooter
 
     app = CothisApp()
@@ -2574,7 +2574,7 @@ async def test_turn_finished_updates_footer_fields_and_run_state() -> None:
 async def test_action_interrupt_turn_sends_interrupt_and_sets_interrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """While ``running``, ``action_interrupt_turn`` sends one ``interrupt_turn`` frame (#I24)."""
+    """While ``running``, ``action_interrupt_turn`` sends one ``interrupt_turn`` frame."""
     import json as _json
 
     from cothis.tui import CothisApp
@@ -2604,7 +2604,7 @@ async def test_action_interrupt_turn_sends_interrupt_and_sets_interrupted(
 
 @pytest.mark.asyncio
 async def test_action_interrupt_turn_is_noop_when_idle() -> None:
-    """When idle (default), ``action_interrupt_turn`` sends nothing + state unchanged (#I24)."""
+    """When idle (default), ``action_interrupt_turn`` sends nothing + state unchanged."""
     from cothis.tui import CothisApp
 
     app = CothisApp()
@@ -2618,7 +2618,7 @@ async def test_action_interrupt_turn_is_noop_when_idle() -> None:
 
 @pytest.mark.asyncio
 async def test_action_interrupt_turn_noop_when_running_but_no_ws() -> None:
-    """Running + no WS attached → interrupt is a safe no-op (no crash, no state corruption) (#I24)."""
+    """Running + no WS attached → interrupt is a safe no-op (no crash, no state corruption)."""
     from cothis.tui import CothisApp
 
     app = CothisApp()
@@ -2634,7 +2634,7 @@ async def test_action_interrupt_turn_noop_when_running_but_no_ws() -> None:
 
 @pytest.mark.asyncio
 async def test_turn_finished_after_interrupt_reconciles_to_idle() -> None:
-    """Optimistic ``interrupted`` reconciles to ``idle`` on the terminal frame (#I24)."""
+    """Optimistic ``interrupted`` reconciles to ``idle`` on the terminal frame."""
     from cothis.tui import CothisApp
 
     app = CothisApp()
@@ -2661,7 +2661,7 @@ async def test_turn_finished_after_interrupt_reconciles_to_idle() -> None:
 async def test_escape_keypress_routes_to_interrupt_when_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``pilot.press('escape')`` while running triggers the interrupt action (#I24).
+    """``pilot.press('escape')`` while running triggers the interrupt action.
 
     Also covers the priority-binding + TextArea-focus interaction: with the
     input focused, Esc must still route to the app-level binding (not be
@@ -2703,7 +2703,7 @@ async def test_escape_keypress_routes_to_interrupt_when_running(
 async def test_escape_dismisses_modal_not_interrupts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When a modal is pushed, Esc dismisses the modal — app interrupt does NOT fire (#I24).
+    """When a modal is pushed, Esc dismisses the modal — app interrupt does NOT fire.
 
     Regression guard for the Esc-binding-collision risk: the app-level
     non-priority ``Binding('escape')`` routes through the focused-widget
@@ -2752,7 +2752,7 @@ async def test_escape_dismisses_modal_not_interrupts(
 
 
 # ---------------------------------------------------------------------
-# Replay-on-attach (#I29, slice A): on attach the TUI reads the session
+# Replay-on-attach: on attach the TUI reads the session
 # store, rebuilds the Anthropic-shape messages, and renders them into
 # ConversationView reusing the existing primitives. The live-streaming
 # attach path stays behaviour-identical (db_path defaults None). Tests
@@ -2801,7 +2801,7 @@ def _seed_history_session(
 
 @pytest.mark.asyncio
 async def test_replay_renders_seeded_history(tmp_path: Path) -> None:
-    """Replay renders stored text + a done tool card into ConversationView (#I29)."""
+    """Replay renders stored text + a done tool card into ConversationView."""
     from textual.widgets import Markdown
 
     from cothis.tui import ConversationView, CothisApp, ToolCallCard
@@ -2832,7 +2832,7 @@ async def test_replay_renders_seeded_history(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_replay_empty_session_leaves_view_blank(tmp_path: Path) -> None:
-    """An empty session (peek_messages returns []) renders nothing (#I29)."""
+    """An empty session (peek_messages returns []) renders nothing."""
     from textual.widgets import Markdown
 
     from cothis.session import Session
@@ -2855,7 +2855,7 @@ async def test_replay_empty_session_leaves_view_blank(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_replay_missing_db_is_best_effort_no_crash(tmp_path: Path) -> None:
-    """A missing/corrupt DB logs a warning and leaves the view blank (#I29).
+    """A missing/corrupt DB logs a warning and leaves the view blank.
 
     Mirrors ``refresh_session_list``'s missing-DB contract: the TUI
     stays usable when the storage layer is unavailable.
@@ -2881,7 +2881,7 @@ async def test_replay_missing_db_is_best_effort_no_crash(tmp_path: Path) -> None
 async def test_attach_session_ws_replay_is_opt_in(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """``db_path=`` triggers replay on attach; omitting it leaves the view blank (#I29).
+    """``db_path=`` triggers replay on attach; omitting it leaves the view blank.
 
     Pins the opt-in contract: every existing 3-positional-arg caller
     (production crash-restart + tests) stays behaviour-identical because
@@ -2928,7 +2928,7 @@ async def test_attach_session_ws_replay_is_opt_in(
 
 @pytest.mark.asyncio
 async def test_replay_leaves_view_state_clean_for_live_stream(tmp_path: Path) -> None:
-    """After replay, a live ``append_delta`` still renders a fresh segment (#I29).
+    """After replay, a live ``append_delta`` still renders a fresh segment.
 
     Regression guard for the streaming path: replay must not leave
     ``_finalized`` / ``_stream_static`` stuck, or the next live delta
@@ -2966,7 +2966,7 @@ async def test_replay_leaves_view_state_clean_for_live_stream(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_replay_multi_turn_history_preserves_dom_order(tmp_path: Path) -> None:
-    """A multi-turn history (user/assistant/user/assistant) renders in message order (#I29)."""
+    """A multi-turn history (user/assistant/user/assistant) renders in message order."""
     from textual.widgets import Markdown
 
     from cothis.session import Session

@@ -1,4 +1,4 @@
-"""Regression: the skill tools reach the model on every production path (#I12).
+"""Regression: the skill tools reach the model on every production path.
 
 ``cothis.skills`` ships two model-facing tools — ``load_skill`` and
 ``deactivate_skill`` — for the Agent to activate and retire skills at runtime.
