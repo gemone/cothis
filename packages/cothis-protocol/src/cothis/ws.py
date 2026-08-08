@@ -18,7 +18,7 @@ bind/shutdown signals and the worker uses ``anyio.fail_after`` for its turn
 timeout, so neither side names ``asyncio`` directly. The ``websockets``
 library is asyncio-only, but it runs unchanged under anyio's asyncio backend;
 if a second backend ever appears, only the adapter in this file needs to
-change — the worker is already backend-neutral. See ADR-0017 §6.
+change — the worker is already backend-neutral.
 """
 
 from __future__ import annotations
@@ -134,7 +134,7 @@ class _WSConn:
 class WebSocketServerTransport:
     """Production adapter over ``websockets`` (#248).
 
-    Binds ``127.0.0.1:0`` (random loopback port — see ADR-0017 §2), enforces a
+    Binds ``127.0.0.1:0`` (random loopback port), enforces a
     bearer-token handshake via the ``auth`` callback passed to ``bind``, and
     caps concurrent connections so a flood of handshakes can't exhaust the
     worker. ``bind`` opens the socket (``uri`` becomes available); ``serve``

@@ -1752,7 +1752,7 @@ class Agent(BaseModel):
         return self._session.active_skills
 
     async def _ensure_handles(self) -> None:
-        """Acquire eager/pinned handles once, on first run (ADR-0005).
+        """Acquire eager/pinned handles once, on first run.
 
         Runs after ``model_post_init`` bound every declared handle and after
         ``_ensure_mcp`` has bound any MCP-session handles, so ``eager`` /
@@ -1767,7 +1767,7 @@ class Agent(BaseModel):
         """Resolve MCP servers into callable tools once, on first run.
 
         Deferred out of ``model_post_init`` because connecting is async and
-        needs a running event loop (ADR-0005). Creates one
+        needs a running event loop. Creates one
         ``ClientSessionGroup`` for the whole Agent (the SDK manages
         connections, tool aggregation, name prefixing, and teardown), then
         connects each declared server into it. Each remote tool the group
@@ -1789,7 +1789,7 @@ class Agent(BaseModel):
 
         # Prefix each tool with the server's self-reported
         # ``Implementation.name``, falling back to the YAML ``name:`` label
-        # when the server reports an empty name (ADR-0005). The hook fires
+        # when the server reports an empty name. The hook fires
         # inside ``connect_to_server`` with nothing identifying *which*
         # cothis server is connecting, so the fallback label travels through
         # a shared mutable cell: the writer sets it immediately before each
@@ -2205,7 +2205,7 @@ class Agent(BaseModel):
         tool's output). ``tool_use["input"]`` is already a dict (the Messages
         API delivers it parsed), so the old JSON-string parsing is gone.
 
-        Dispatch is async (ADR-0004) to support async tools (MCP). Sync tools
+        Dispatch is async to support async tools (MCP). Sync tools
         (ToolDef, ``_ShellTool``, bare callables) return non-coroutine values;
         the ``isawaitable`` check skips the await for them, so their behavior
         is unchanged.

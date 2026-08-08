@@ -9,7 +9,7 @@ Lives in its own process, separate from any worker. Writes
 ``session_lifecycle`` events to its OWN SQLite DB
 (``~/.cothis/supervisor.db`` by default) — the worker holds each
 session's ``FileLock(timeout=0)``, so the Supervisor cannot write
-there (ADR-0018).
+there.
 """
 
 from __future__ import annotations

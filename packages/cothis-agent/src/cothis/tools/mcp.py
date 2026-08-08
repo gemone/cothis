@@ -13,7 +13,7 @@ the ``ClientSessionGroup`` consumes each server's params via
 ``connect_into``, lists remote tools, and aggregates them under prefixed
 names (``{label}.{remote}`` via ``component_name_hook``). Each aggregated
 tool is wrapped in an ``MCPClientTool`` so it inherits ``_HookableTool`` for
-lifecycle hooks. See ADR-0005 §2 (deferred connect) and §4 (name prefix).
+lifecycle hooks.
 """
 
 from __future__ import annotations
@@ -321,7 +321,7 @@ class MCPSessionHandle(ResourceHandle):
     server (so each server is one pool entry keyed by its own class), with
     ``_group`` and ``_params`` set as class attributes. ``keepalive`` / ``pin``
     come from the YAML declaration, so MCP sessions follow the same
-    keepalive + LRU lifecycle as any other handle (ADR-0005).
+    keepalive + LRU lifecycle as any other handle.
     """
 
     # Set on the dynamic subclass generated per server in ``_ensure_mcp``.
@@ -332,7 +332,7 @@ class MCPSessionHandle(ResourceHandle):
     # *which* cothis server is connecting, so ``acquire`` publishes its own
     # label first — an empty-name server keeps its own prefix across
     # re-acquires instead of inheriting the last-connected server's
-    # (ADR-0005 §4).
+    # prefix.
     _fallback: dict[str, str]
     _fallback_label: str
     _session: Any = None
@@ -458,7 +458,6 @@ class MCPServer(_HookableTool):
 
     Session lifecycle is owned by the ``ClientSessionGroup`` the Agent holds:
     one ``async with group`` covers every server's connection + teardown.
-    See ADR-0005.
 
     The *transport* is the only thing that differs between MCP kinds, so it's
     the only injected piece: ``params`` is the SDK's ``StdioServerParameters``
@@ -491,7 +490,7 @@ class MCPServer(_HookableTool):
         can't collide with a real tool name in the registry. The tool-name
         prefix uses the bare label — what the user wrote in YAML ``name:``,
         stripped of the handle decoration. Used as the fallback when the server
-        reports an empty ``Implementation.name`` (ADR-0005).
+        reports an empty ``Implementation.name``.
         """
         return self.__name__[4:] if self.__name__.startswith("mcp:") else self.__name__
 
@@ -537,7 +536,7 @@ class MCPServer(_HookableTool):
                 f"MCP SDK shape changed: ClientSessionGroup.tools is "
                 f"{type(tools_attr).__name__}, expected dict "
                 f"(prefixed-name → Tool). connect_into's snapshot "
-                f"diff needs updating; see ADR-0005 and issue #63."
+                f"diff needs updating; see issue #63."
             )
         before = set(tools_attr)
         try:
@@ -591,7 +590,7 @@ def _make_mcp_server(
     source: str | None,
     keepalive: float = 600.0,
 ) -> MCPServer:
-    """Label guard + ``mcp:`` handle prefix for stdio/http builders (ADR-0005)."""
+    """Label guard + ``mcp:`` handle prefix for stdio/http builders."""
     where = f" in {source}" if source else ""
     if not label:
         msg = f"MCP server label is empty{where}; set a non-empty 'name:'"
@@ -633,7 +632,7 @@ def _build_mcp_stdio_server(spec: dict[str, Any], source: str | None) -> MCPServ
     arguments; ``env`` the subprocess environment (secrets — never logged,
     story 32). The handle name is ``mcp:`` + ``name`` (or the file stem) —
     prefixed so it can't collide with a real tool name. Does NOT connect —
-    that's deferred to Agent startup (ADR-0005). Raises ``ValueError`` on a
+    that's deferred to Agent startup. Raises ``ValueError`` on a
     malformed declaration, naming the field + source.
     """
     from mcp import StdioServerParameters
@@ -685,7 +684,7 @@ def _build_mcp_http_server(spec: dict[str, Any], source: str | None) -> MCPServe
     ``url`` (required) is the remote server endpoint; ``headers`` an optional
     mapping sent on every request (secrets like ``Authorization`` — never
     logged, story 32). The handle name is ``mcp:`` + ``name`` (or the file
-    stem). Does NOT connect — deferred to Agent startup (ADR-0005). Reuses
+    stem). Does NOT connect — deferred to Agent startup. Reuses
     the stdio path's session lifecycle, discovery, dispatch, and
     normalization; only the transport (``StreamableHttpParameters``) differs.
     Raises ``ValueError`` on a malformed declaration, naming the field + source.

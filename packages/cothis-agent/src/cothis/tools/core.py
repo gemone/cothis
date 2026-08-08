@@ -327,7 +327,7 @@ class _HookableTool:
         """Run ``pre_load`` + ``after_load`` chains. Return True if tool registers.
 
         Called by ``discover_tools`` AFTER cross-layer shadow resolution, on the
-        winning tool only (see ADR-0003). Returns ``True`` when the tool should
+        winning tool only. Returns ``True`` when the tool should
         be registered; ``False`` when ``pre_load`` short-circuited (any callback
         returned ``False``) or any load hook raised. Every skip is logged at
         ``WARNING`` — no startup decision is silent (see CONTEXT.md "Tool
@@ -763,7 +763,7 @@ def _check_same_layer_duplicate(tool: Tool, source: str, seen: dict[str, str]) -
     with a single shared ``seen`` dict spanning both YAML and Python files
     across the entire layer directory tree (``rglob``, including
     subdirectories). A YAML file and a Python file in the same layer
-    claiming one name raise here (format is never a layer; see ADR-0003).
+    claiming one name raise here (format is never a layer).
     This is an author error, not an intentional override.
 
     **Cross-layer** conflicts (project-local vs user-global, custom vs
@@ -794,12 +794,12 @@ def load_tools_from_layer(dir_path: Path) -> list[Tool]:
 
     YAML and Python share a single ``seen`` dict — a YAML file and a Python
     file in the same directory claiming one ``name:`` is a **same-layer
-    conflict** and raises ``ValueError`` (format is never a layer; see
-    ADR-0003). This is the load-time check that catches author errors.
+    conflict** and raises ``ValueError`` (format is never a layer).
+    This is the load-time check that catches author errors.
 
     Does NOT run lifecycle hooks (``pre_load`` / ``after_load``). Hook gating
     is ``discover_tools``'s concern — it runs after cross-layer shadow resolution,
-    on the winning tool only (see ADR-0003).
+    on the winning tool only.
 
     Empty / missing directory yields ``[]``. Python import failures
     (``ImportError``, ``SyntaxError``, module top-level errors) are logged at
@@ -868,7 +868,7 @@ def discover_tools(project_dir: Path, user_dir: Path) -> list[Tool]:
     resolution, on the winning tool only. A shadowed tool's hooks never
     fire. If the winner's ``pre_load`` returns ``False`` or raises, the
     slot goes **empty — no fallback** to the shadowed tool (shadowing is a
-    replacement, not a try). See ADR-0003.
+    replacement, not a try).
     """
     from cothis.tools.builtins import TOOLS
 

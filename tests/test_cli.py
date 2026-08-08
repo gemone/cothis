@@ -324,7 +324,7 @@ def test_no_shadow_loads_both(tmp_path: Any, caplog: Any) -> None:
 def test_pre_load_false_on_winner_empties_slot_no_fallback(
     tmp_path: Any, caplog: Any
 ) -> None:
-    """Winner's pre_load=False empties the slot — no fallback to shadowed (#10 + ADR-0003).
+    """Winner's pre_load=False empties the slot — no fallback to shadowed (#10).
 
     Project-local tool shadows user-global, then the winner's pre_load
     returns False. The slot goes empty — the shadowed user-global tool
@@ -353,7 +353,7 @@ def test_pre_load_false_on_winner_empties_slot_no_fallback(
 
     names = {t.__name__ for t in tools}
     assert "shared.tool" not in names  # winner dropped, no fallback to user-global
-    # Observability (ADR-0003 + grilling #10): the pre_load=False skip must be
+    # Observability (grilling #10): the pre_load=False skip must be
     # logged at WARNING so it's visible by default. Filter on the tools logger
     # (the skip is emitted from ``_run_load_hooks`` in tools.py, not cli.py).
     pre_load_skips = [
@@ -368,7 +368,7 @@ def test_pre_load_false_on_winner_empties_slot_no_fallback(
 
 
 def test_shadowed_tool_load_hooks_never_fire(tmp_path: Any, monkeypatch: Any) -> None:
-    """A shadowed tool's load hooks never fire (ADR-0003 Q3).
+    """A shadowed tool's load hooks never fire.
 
     The guarantee is structural — load hooks run in the post-merge loop on
     winners only, so a shadowed loser never reaches ``_run_load_hooks``.

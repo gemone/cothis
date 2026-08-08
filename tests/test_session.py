@@ -568,7 +568,7 @@ def test_reload_inserts_sentinel_when_first_message_is_assistant(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """``_rebuild_messages`` inserts a sentinel user turn when the first
-    message is assistant (#146, ADR-0008 follow-up).
+    message is assistant (#146).
 
     Simulates a poison-drop on first drain: the user-row write fails
     exhaustively, the assistant-row write succeeds. On reload the

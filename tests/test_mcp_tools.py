@@ -274,7 +274,7 @@ def test_mcp_server_label_strips_handle_prefix() -> None:
     """``_label`` strips the ``mcp:`` discovery-handle prefix from
     ``__name__``, yielding the raw YAML ``name:`` value used as the
     tool-name prefix fallback when a server reports an empty
-    ``Implementation.name`` (ADR-0005)."""
+    ``Implementation.name``."""
     assert MCPServer(name="mcp:context7", params=None)._label == "context7"
     # A name without the handle prefix passes through unchanged.
     assert MCPServer(name="custom", params=None)._label == "custom"
@@ -717,7 +717,7 @@ def test_normalize_schema_deepcopy_contract() -> None:
 @pytest.mark.asyncio
 async def test_connect_into_discovers_tools_with_schema() -> None:
     """``connect_into`` lists remote tools, each wrapped with its ``inputSchema``
-    and a server-prefixed ``__name__`` (ADR-0005). ``_remote_name`` is the same
+    and a server-prefixed ``__name__``. ``_remote_name`` is the same
     prefixed name — the group routes ``call_tool`` by it."""
     server = MCPServer(name="mcp:test-server", params=None)
     async with in_memory_group(_make_server()) as group:
@@ -1334,7 +1334,7 @@ async def test_duplicate_prefixed_tool_name_first_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two ``MCPClientTool``s resolving to the same prefixed name: first-write-wins,
-    the duplicate is logged at ERROR (ADR-0005).
+    the duplicate is logged at ERROR.
 
     Simulated by patching one server's ``connect_into`` to return its first
     tool twice (same ``__name__``). The Agent's ``_ensure_mcp`` keeps the
@@ -1372,7 +1372,7 @@ async def test_prefix_falls_back_to_yaml_label_when_server_name_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When a server reports an empty ``Implementation.name``, the tool prefix
-    falls back to the YAML ``name:`` label (ADR-0005). Defensive against a
+    falls back to the YAML ``name:`` label. Defensive against a
     non-conformant server that sends an empty string where the spec requires a
     non-empty name."""
     _mock_llm(monkeypatch)

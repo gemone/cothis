@@ -47,7 +47,6 @@ _BOUNDARY_SITES = [
         "shape_check_regex": r"isinstance\([^)]*tools[^)]*,\s*dict\)",
         "action_regex": r"raise\s+RuntimeError|logger\.warning",
         "issue_ref": "#63",
-        "adr_ref": "ADR-0005",
     },
     {
         "id": "slash.register",

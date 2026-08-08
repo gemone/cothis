@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 # consumer join. Exhaustion → poison-row drop (same loss ceiling as kill -9).
 _WRITE_RETRY_BACKOFFS: tuple[float, ...] = (0.1, 0.5, 2.0)
 
-# close() join timeouts; see ADR-0009 for the lock-contract rationale.
+# close() join timeouts (lock-contract rationale).
 _CLOSE_JOIN_TIMEOUT: float = 5.0
 _CLOSE_GRACE_PERIOD: float = 1.0
 
@@ -325,7 +325,7 @@ def _rebuild_messages(
     else:
         cut_msg_idx = None
 
-    # cothis: assistant-first guard (#146, ADR-0008 follow-up). If the
+    # cothis: assistant-first guard (#146). If the
     # first message is not ``role="user"``, the user-row write was lost
     # (poison-drop on first drain). Anthropic's Messages API rejects
     # assistant-first sequences; insert a sentinel so resume works, and
@@ -334,7 +334,7 @@ def _rebuild_messages(
         logger.critical(
             "Session reload: first message is role=%r (expected 'user'); "
             "inserting a sentinel user turn. This indicates a poison-drop "
-            "on first drain (ADR-0008). The session is resumable but may "
+            "on first drain. The session is resumable but may "
             "be missing the first user turn's content.",
             messages[0].get("role"),
         )
@@ -1059,15 +1059,15 @@ class Session:
             flush_sync=flush_sync,
         )
         session._lock = lock
-        # cothis: see ADR-0010 §3 for the eager fork-row write.
+        # cothis: eager fork-row write so --resume <fork_id> works immediately.
         session._write_fork_row()
         return session
 
     def _write_fork_row(self) -> None:
         """Persist the sessions row eagerly so ``--resume <fork_id>`` works.
 
-        See ADR-0010 §3 for why this deviates from ``Session.new``'s
-        lazy-row strategy.
+        This deviates from ``Session.new``'s lazy-row strategy so the fork
+        is resumable before any message is written.
         """
         updated_at = _now_iso()
         self._maybe_write_gitignore()
@@ -1381,7 +1381,7 @@ class Session:
         if not rows:
             return
         updated_at = _now_iso()
-        # cothis: cold-session promote-on-first-write (#86, ADR-0011 §3).
+        # cothis: cold-session promote-on-first-write (#86).
         # The session was loaded from the cold DB; hot has no rows for
         # it. ``promote_session`` moves rows cold→hot atomically with
         # ``updated_at=now`` so the 90-day threshold doesn't immediately

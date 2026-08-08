@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy DDL — runs on every ``NotifyBus.__init__``. CREATE TABLE IF NOT
 # EXISTS makes re-opening an existing db a no-op. No migration
-# framework for a single table (see ADR-0016).
+# framework for a single table.
 _DDL = (
     """
     CREATE TABLE IF NOT EXISTS notify_events(
