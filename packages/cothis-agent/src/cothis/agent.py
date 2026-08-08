@@ -479,6 +479,76 @@ def _tool_result_block(
     return block
 
 
+# Default cap (in characters) on the CONTENT of a single LIVE tool result —
+# the first line of defence against a pathological payload (a multi-MB file
+# dump, a verbose build log) blowing the context window before compaction
+# ever triggers. 20000 chars is ~5k tokens at the codebase's ~4-chars/token
+# estimate (:func:`cothis.ai.context_budget.estimate_input_tokens`), large
+# enough that normal results (source files, shell output) pass through
+# byte-for-byte unchanged, small enough to bound one result to ~5k tokens.
+# This is deliberately the LOOSER guardrail vs compaction's tighter
+# ``_TOOL_RESULT_CHAR_CAP`` (4000): the live cap fires on the just-produced
+# result, and compaction re-tightens to 4000 later when evicting OLD turns.
+# The two layers never contradict — a result that fits 20000 but exceeds
+# 4000 is simply re-capped during summarisation. Distinct name on purpose
+# (live guardrail vs summarisation re-cap). Tunable via the
+# ``max_tool_result_chars`` field / ``COTHIS_MAX_TOOL_RESULT_CHARS`` env var.
+_DEFAULT_MAX_TOOL_RESULT_CHARS = 20_000
+
+
+def _truncate_tool_result(text: str, limit: int) -> str:
+    """Cap ``text`` at ``limit`` chars, keeping a head prefix, a tail suffix,
+    and a truncation marker between them. A no-op when ``text`` fits.
+
+    Tool output's highest-value content clusters at the END (error trace,
+    exit status, final lines of a build log), while the head carries command
+    echo / file headers. So the budget remaining AFTER reserving the marker
+    is split tail-biased: ~1/3 head, ~2/3 tail. The marker length is
+    subtracted BEFORE the split — mirroring compaction's
+    :func:`~cothis.ai.compaction._truncate` (``keep = max(limit - len(marker), 0)``)
+    — so a truncated value never exceeds ``limit``.
+
+    The marker embeds the elided character count, whose digit width feeds
+    back into the budget (marker length). A small fixed-point iteration
+    reconciles the two: digit width only grows at powers of ten, so this
+    converges in a handful of steps; a defensive clip guarantees
+    ``len(out) <= limit`` even for an absurdly small cap (marker alone
+    exceeding the limit).
+
+    Pure and deterministic: a function of ``(text, limit)`` only — no clock,
+    no random. At ``len(text) <= limit`` the input is returned byte-for-byte
+    unchanged.
+    """
+    total = len(text)
+    if total <= limit:
+        return text
+    # Reconcile the elided count with the marker it drives. ``new_elided``
+    # is the chars NOT shown (total minus the post-marker budget); once it
+    # stops moving the marker string is stable.
+    elided = total - limit
+    marker = ""
+    budget = 0
+    for _ in range(8):
+        marker = f"...[truncated {elided} chars — head + tail shown]..."
+        budget = max(limit - len(marker), 0)
+        new_elided = total - budget
+        if new_elided == elided:
+            break
+        elided = new_elided
+    head = budget // 3
+    tail = budget - head
+    out = text[:head] + marker
+    # ``text[-tail:]`` with tail==0 returns the WHOLE string (``-0 == 0``);
+    # index from the end instead so a zero-width tail contributes nothing.
+    if tail:
+        out += text[total - tail:]
+    # Marker-alone-exceeds-limit edge (only under a pathologically small cap):
+    # clip to the hard limit so the invariant ``len(out) <= limit`` always holds.
+    if len(out) > limit:
+        return out[:limit]
+    return out
+
+
 def _append_merged(
     messages: list[dict[str, Any]], role: str, block: dict[str, Any]
 ) -> None:
@@ -816,6 +886,32 @@ class Agent(BaseModel):
     # the unbounded case — it only bites on pathological fan-outs (a 30-block
     # turn), bounding concurrent MCP subprocesses / shell / network pressure.
     max_concurrent_tools: int = Field(default=8, gt=0)
+    # Cap (in characters) on the CONTENT of a single LIVE tool result, applied
+    # at the single funnel ``_merge_tool_result`` BEFORE the result enters
+    # ``_messages`` AND is persisted to the Session — so what the model saw and
+    # what is recoverable from history are identical. The default (20000) is
+    # deliberately the LOOSER guardrail vs compaction's tighter
+    # ``_TOOL_RESULT_CHAR_CAP`` (4000): this live cap bounds a pathological
+    # payload (a multi-MB file dump, a verbose build log) on arrival, and
+    # compaction re-tightens to 4000 later when evicting OLD turns. Two
+    # layers, never contradictory.
+    #
+    # NOTE: the FULL original tool output is NOT recoverable from conversation
+    # history once capped — the notify-bus ``result_pointer`` resolves to the
+    # (now-capped) block. This is consistent with compaction's later re-cap
+    # (the model would never see more); a future full-fidelity tool-output
+    # feature would need a separate out-of-band store.
+    #
+    # ``gt=0`` mirrors ``max_concurrent_tools``: a non-positive cap would
+    # collapse every result to marker-only, so reject it at construction.
+    # ``model_post_init`` re-checks ``> 0`` for the env mutation (pydantic
+    # does not re-validate post-init). The default references
+    # :data:`_DEFAULT_MAX_TOOL_RESULT_CHARS` directly (no literal
+    # duplication, so no drift risk — unlike ``min_retained_turns``'s
+    # literal ``4`` which mirrors the compaction module's private default).
+    max_tool_result_chars: int = Field(
+        default=_DEFAULT_MAX_TOOL_RESULT_CHARS, gt=0
+    )
 
     # Runtime-only state: not validated, not serialised.
     _llm: AIProvider = PrivateAttr()
@@ -945,6 +1041,35 @@ class Agent(BaseModel):
                         "(must be > 0); using default %d.",
                         env_val,
                         self.max_concurrent_tools,
+                    )
+        # ``COTHIS_MAX_TOOL_RESULT_CHARS`` tunes the live tool-result cap for
+        # any construction site that passes no value — currently all of them
+        # (``worker`` / ``acp_bridge`` and the CLI, which has no
+        # ``--max-tool-result-chars`` flag yet) — same override-or-None idiom
+        # as ``COTHIS_MAX_CONCURRENT_TOOLS`` above. ``gt=0`` is NOT re-checked on
+        # this post-init mutation, so reject a non-positive value here: a
+        # zero/negative cap would collapse every result to marker-only.
+        if "max_tool_result_chars" not in self.model_fields_set:
+            env_val = os.environ.get("COTHIS_MAX_TOOL_RESULT_CHARS")
+            if env_val:
+                try:
+                    parsed = int(env_val)
+                except ValueError:
+                    logger.warning(
+                        "Ignoring non-integer COTHIS_MAX_TOOL_RESULT_CHARS=%r; "
+                        "using default %d.",
+                        env_val,
+                        self.max_tool_result_chars,
+                    )
+                    parsed = None
+                if parsed is not None and parsed > 0:
+                    self.max_tool_result_chars = parsed
+                elif parsed is not None:
+                    logger.warning(
+                        "Ignoring non-positive COTHIS_MAX_TOOL_RESULT_CHARS=%r "
+                        "(must be > 0); using default %d.",
+                        env_val,
+                        self.max_tool_result_chars,
                     )
         self._dispatch_semaphore = asyncio.Semaphore(self.max_concurrent_tools)
 
@@ -1510,6 +1635,15 @@ class Agent(BaseModel):
         The optional ``skill`` parameter tags the block for
         persist-time skill tagging (#164).
         """
+        # Live tool-result cap — the single funnel both ``_run_inner`` and
+        # ``_run_stream_inner`` reach the conversation through, so capping
+        # here covers batch + streaming in one site. Applied to ``output``
+        # regardless of ``is_error`` (an errored result is capped for free),
+        # BEFORE the block is built — so the capped content is exactly what
+        # enters ``self._messages`` AND is persisted to the Session
+        # (consistent with what the model saw). Under-cap results are
+        # byte-for-byte unchanged.
+        output = _truncate_tool_result(output, self.max_tool_result_chars)
         result_block = _tool_result_block(block_id, output, is_error)
         if skill is not None:
             result_block["_cothis_skill"] = skill
