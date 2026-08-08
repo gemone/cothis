@@ -354,8 +354,8 @@ class MCPClientTool(_HookableTool):
 
     Produced by ``MCPServer.connect_into`` — one instance per remote tool the
     server exposes. Inherits ``_HookableTool`` so ``_execute`` runs its hook
-    chains uniformly with every other tool (CONTEXT.md "no per-source
-    branching in ``_execute``"). Carries a pre-built ``__cothis_schema__``
+    chains uniformly with every other tool, with no per-source branching
+    in ``_execute``. Carries a pre-built ``__cothis_schema__``
     from the server's ``inputSchema`` (Anthropic tool shape's ``input_schema``,
     a JSON Schema passed through verbatim).
 

@@ -375,7 +375,7 @@ def test_shadowed_tool_load_hooks_never_fire(tmp_path: Any, monkeypatch: Any) ->
     This test pins the negative case: if a regression re-added hook calls
     to the loader, the loser's ``after_load`` side effect would happen.
     The loser is a Python tool (YAML tools can't register hooks); the
-    winner is a YAML tool shadowing it — format is never a layer (Q1).
+    winner is a YAML tool shadowing it — format is never a layer.
     """
     marker = tmp_path / "loser_hook_fired"
     monkeypatch.setenv("COTHIS_TEST_HOOK_MARKER", str(marker))

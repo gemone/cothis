@@ -67,7 +67,7 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
     Gating: if a tool's executable is not on PATH the tool is not registered
     — the model never sees a tool it cannot dispatch on this host. The skip
     is logged at ``WARNING`` per tool (every startup decision is observable
-    by default — see CONTEXT.md "Tool lifecycle").
+    by default).
 
     See ``_compile_spec`` for the shell-YAML shape and ``CommandBlock`` for
     the contract. ``preview`` shares the same compile path, so the two
