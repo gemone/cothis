@@ -212,6 +212,27 @@ def ask(
             "pathological fan-outs; normal turns (1-4 tools) are unaffected."
         ),
     ),
+    max_tool_result_chars: int = typer.Option(
+        20_000,
+        "--max-tool-result-chars",
+        envvar="COTHIS_MAX_TOOL_RESULT_CHARS",
+        help=(
+            "Max characters retained from a single tool result before it is "
+            "truncated to a marker (default 20000). Caps prompt bloat from "
+            "verbose tools; the full output is not recoverable once capped."
+        ),
+    ),
+    tool_timeout: float | None = typer.Option(
+        None,
+        "--tool-timeout",
+        envvar="COTHIS_TOOL_TIMEOUT",
+        help=(
+            "Per-tool wall-clock bound in seconds. Omit or leave unset for "
+            "no timeout (the default, fully backward compatible). Must be "
+            "> 0; interrupts async hangs at the next await point (a stalled "
+            "MCP round-trip), not pure-sync blocking tool bodies."
+        ),
+    ),
 ) -> None:
     """Run the agent once and print its final answer."""
     with console.status("loading...", spinner="dots"):
@@ -226,6 +247,8 @@ def ask(
             summary_model=summary_model,
             min_retained_turns=min_retained_turns,
             max_concurrent_tools=max_concurrent_tools,
+            max_tool_result_chars=max_tool_result_chars,
+            tool_timeout=tool_timeout,
         )
     with console.status("thinking...", spinner="dots"):
         answer = asyncio.run(_run_and_close(agent, prompt))
@@ -385,6 +408,27 @@ def chat(
             "pathological fan-outs; normal turns (1-4 tools) are unaffected."
         ),
     ),
+    max_tool_result_chars: int = typer.Option(
+        20_000,
+        "--max-tool-result-chars",
+        envvar="COTHIS_MAX_TOOL_RESULT_CHARS",
+        help=(
+            "Max characters retained from a single tool result before it is "
+            "truncated to a marker (default 20000). Caps prompt bloat from "
+            "verbose tools; the full output is not recoverable once capped."
+        ),
+    ),
+    tool_timeout: float | None = typer.Option(
+        None,
+        "--tool-timeout",
+        envvar="COTHIS_TOOL_TIMEOUT",
+        help=(
+            "Per-tool wall-clock bound in seconds. Omit or leave unset for "
+            "no timeout (the default, fully backward compatible). Must be "
+            "> 0; interrupts async hangs at the next await point (a stalled "
+            "MCP round-trip), not pure-sync blocking tool bodies."
+        ),
+    ),
     resume: str | None = typer.Option(
         None,
         "--resume",
@@ -453,6 +497,8 @@ def chat(
             summary_model=summary_model,
             min_retained_turns=min_retained_turns,
             max_concurrent_tools=max_concurrent_tools,
+            max_tool_result_chars=max_tool_result_chars,
+            tool_timeout=tool_timeout,
         )
     )
 
@@ -468,6 +514,8 @@ async def _chat_session(
     summary_model: str | None = None,
     min_retained_turns: int = 4,
     max_concurrent_tools: int = 8,
+    max_tool_result_chars: int = 20_000,
+    tool_timeout: float | None = None,
 ) -> None:
     # ``chat`` is the only command that persists. ``Session.new`` takes the
     # cross-process lock eagerly; the sessions row + title are written
@@ -504,6 +552,8 @@ async def _chat_session(
                 summary_model=summary_model,
                 min_retained_turns=min_retained_turns,
                 max_concurrent_tools=max_concurrent_tools,
+                max_tool_result_chars=max_tool_result_chars,
+                tool_timeout=tool_timeout,
             )
             agent.attach_session(session)
 
