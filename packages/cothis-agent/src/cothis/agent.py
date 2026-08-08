@@ -801,6 +801,21 @@ class Agent(BaseModel):
     # (a clear error rather than plan_eviction's silent clamp to 1).
     summary_model: str | None = None
     min_retained_turns: int = Field(default=4, gt=0)
+    # Cap on the number of tool executions that may
+    # be live at once inside a single fan-out turn (``_dispatch_tool_uses``
+    # gathers all ``tool_use`` blocks of a turn and runs the non-skill ones
+    # concurrently). The bound is enforced by an ``asyncio.Semaphore``
+    # acquired INSIDE each gathered coroutine, never around the gather, so
+    # result ORDER (submission order) and the existing error-mapping /
+    # stream-event pairing are unchanged. ``gt=0`` mirrors
+    # ``min_retained_turns``: ``asyncio.Semaphore(0)`` would block forever,
+    # so reject a non-positive bound at construction with a clear error
+    # rather than a silent hang. The literal ``8`` is well above real-world
+    # single-turn fan-out (most turns carry 1-4 blocks), so normal turns
+    # acquire immediately with zero contention and latency is identical to
+    # the unbounded case — it only bites on pathological fan-outs (a 30-block
+    # turn), bounding concurrent MCP subprocesses / shell / network pressure.
+    max_concurrent_tools: int = Field(default=8, gt=0)
 
     # Runtime-only state: not validated, not serialised.
     _llm: AIProvider = PrivateAttr()
@@ -849,6 +864,11 @@ class Agent(BaseModel):
     # so each user turn gets a fresh budget. Marked BEFORE the network call
     # so a summariser failure does not retry within the same run.
     _compaction_attempted_this_run: bool = PrivateAttr(default=False)
+    # Bounds live tool executions within one
+    # fan-out turn. A ``PrivateAttr`` (no ``default_factory``) because the
+    # bound is the validated ``max_concurrent_tools`` int, which a
+    # default_factory cannot see. Created in ``model_post_init`` instead.
+    _dispatch_semaphore: asyncio.Semaphore = PrivateAttr()
 
     def model_post_init(self, __context: Any) -> None:
         from cothis.ai import get_provider
@@ -886,6 +906,47 @@ class Agent(BaseModel):
         # Tools without ``_handle_cls`` are skipped by ``bind``.
         for tool in self._tool_map.values():
             self._handle_manager.bind(tool)
+        # Construct the per-Agent dispatch
+        # semaphore. Built here (not as a PrivateAttr ``default_factory``)
+        # because the bound is the validated ``max_concurrent_tools`` int.
+        # Python 3.14 lazily binds asyncio primitives to the running loop on
+        # first ``await``, so constructing it here — outside any loop — is
+        # safe. One semaphore per Agent is correct: turns are serial and only
+        # one gather runs at a time, so the bound is exactly "max concurrent
+        # tools within a single fan-out turn".
+        # Non-CLI construction sites (the ``worker`` subprocess, the
+        # ``acp_bridge``) pass no value, so the field sits at its default.
+        # Let ``COTHIS_MAX_CONCURRENT_TOOLS`` tune those paths without
+        # spawn-protocol changes — the override-or-None idiom already used by
+        # ``summary_model`` / ``COTHIS_SUMMARY_MODEL``. The CLI commands pass
+        # an explicit value (typer already resolved flag > envvar > default),
+        # so this branch never overrides an operator's explicit choice.
+        if "max_concurrent_tools" not in self.model_fields_set:
+            env_val = os.environ.get("COTHIS_MAX_CONCURRENT_TOOLS")
+            if env_val:
+                try:
+                    parsed = int(env_val)
+                except ValueError:
+                    logger.warning(
+                        "Ignoring non-integer COTHIS_MAX_CONCURRENT_TOOLS=%r; "
+                        "using default %d.",
+                        env_val,
+                        self.max_concurrent_tools,
+                    )
+                    parsed = None
+                # ``gt=0`` is not re-checked on this post-init mutation, so
+                # reject a non-positive value here: ``Semaphore(0)`` would
+                # block every dispatch forever.
+                if parsed is not None and parsed > 0:
+                    self.max_concurrent_tools = parsed
+                elif parsed is not None:
+                    logger.warning(
+                        "Ignoring non-positive COTHIS_MAX_CONCURRENT_TOOLS=%r "
+                        "(must be > 0); using default %d.",
+                        env_val,
+                        self.max_concurrent_tools,
+                    )
+        self._dispatch_semaphore = asyncio.Semaphore(self.max_concurrent_tools)
 
     def attach_session(self, session: Session) -> None:
         """Bind a :class:`~cothis.session.Session` for persistence.
@@ -1836,6 +1897,14 @@ class Agent(BaseModel):
           inside each tool body via check-then-add / check-then-discard
           sequences, and overlapping dispatches would race. They still
           overlap in time with non-skill blocks (different state).
+        * A per-Agent ``asyncio.Semaphore`` (``max_concurrent_tools``,
+          default 8) bounds TOTAL live tool executions within the fan-out.
+          It is acquired INSIDE each gathered coroutine, never around the
+          gather, so result order is unchanged; for a normal fan-out
+          (tools <= cap) every coroutine acquires immediately, so live
+          concurrency and latency are identical to the unbounded case. The
+          single acquisition order is always semaphore -> skill_lock, so
+          there is no circular wait and no deadlock.
 
         Non-skill-marker tools run UNLOCKED, so any tool that injects the
         session (``inject_session=True``) or mutates shared state from its
@@ -1862,16 +1931,34 @@ class Agent(BaseModel):
             block: dict[str, Any],
         ) -> tuple[bool, str, str | None, int]:
             skill = self._skill_for_block(block)
-            started = time.monotonic()
             try:
-                if skill is not None:
-                    # Serialise skill-marker dispatches so the
-                    # ``Session._active_skills`` mutation inside the tool
-                    # body can't race with a sibling load/deactivate.
-                    async with skill_lock:
+                # Cap TOTAL live tool executions
+                # across the fan-out. The semaphore is acquired INSIDE each
+                # gathered coroutine (never around the gather), so result
+                # ORDER (submission order) is unchanged and ``gather`` still
+                # returns outcomes in order. ``async with`` releases on every
+                # path (normal return, the inner ``except`` mapping an
+                # Exception to the error tuple, and a propagating
+                # BaseException), so the semaphore can never leak and starve
+                # later tools.
+                async with self._dispatch_semaphore:
+                    # ``started`` is captured AFTER the acquire so per-call
+                    # ``duration_ms`` reflects each tool's own wall-clock and
+                    # EXCLUDES semaphore queue wait (the documented
+                    # invariant + the streamed ToolResultEvent duration).
+                    started = time.monotonic()
+                    if skill is not None:
+                        # Serialise skill-marker dispatches so the
+                        # ``Session._active_skills`` mutation inside the tool
+                        # body can't race with a sibling load/deactivate.
+                        # Nested INSIDE the semaphore — only skill markers
+                        # take this lock, always after the semaphore, so the
+                        # single acquisition order (semaphore -> skill_lock)
+                        # holds everywhere and there is no circular wait.
+                        async with skill_lock:
+                            is_error, output = await self._execute_tool(block)
+                    else:
                         is_error, output = await self._execute_tool(block)
-                else:
-                    is_error, output = await self._execute_tool(block)
             except Exception as exc:  # noqa: BLE001 — defense in depth
                 wire_name = block.get("name")
                 name = getattr(
