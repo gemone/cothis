@@ -754,7 +754,7 @@ def test_loader_discovers_tool_with_pre_load_hooks(tmp_path: Any) -> None:
     """The loader discovers a tool regardless of its pre_load hooks.
 
     Hooks are NOT run by the loader — they run later in ``discover_tools``
-    after cross-layer merge (see ADR-0003). The loader returns all
+    after cross-layer merge. The loader returns all
     discovered candidates.
     """
     from cothis.tools.core import load_tools_from_layer
@@ -778,7 +778,7 @@ def test_pre_load_any_false_skips_tool() -> None:
     """If any ``pre_load`` callback returns False, ``_run_load_hooks`` returns False.
 
     The loader discovers the tool; the skip happens when ``discover_tools`` runs
-    load hooks on it (see ADR-0003). The third callback never runs.
+    load hooks on it. The third callback never runs.
     """
 
     @tool("t")
@@ -1165,7 +1165,7 @@ def test_on_error_fire_logged(caplog: Any) -> None:
 
 # --------------------------------------------------------------------
 # Duplicate tool name detection (issue #3, story 44; issue #12)
-# Three behaviors coexist (ADR-0003):
+# Three behaviors coexist:
 #   - same-layer duplicate (any format combo) → raise
 #   - cross-layer (project vs user, custom vs builtin) → shadow
 #   - builtin override → shadow
@@ -1215,7 +1215,7 @@ def test_python_duplicate_names_detected(tmp_path: Any) -> None:
 def test_cross_format_same_layer_duplicate_raises(tmp_path: Any) -> None:
     """YAML + Python in the SAME directory claiming one name → raise.
 
-    Format is never a layer (ADR-0003 Q1): a YAML file and a Python file
+    Format is never a layer: a YAML file and a Python file
     in the same directory are same-layer, so they raise — not shadow.
     This is the case the pre-#12 per-format ``seen`` dicts couldn't catch.
     """

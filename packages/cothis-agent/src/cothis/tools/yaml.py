@@ -51,7 +51,7 @@ def load_yaml_tools(yaml_text: str, *, source: str | None = None) -> list[Tool]:
 
     - **MCP server** (``type: mcp.stdio`` / ``type: mcp.http``): an
       ``MCPServer`` handle producing many tools at Agent startup — see
-      ``_build_mcp_stdio_server`` / ``_build_mcp_http_server`` and ADR-0005.
+      ``_build_mcp_stdio_server`` / ``_build_mcp_http_server``.
       An unknown ``type:`` raises ``ValueError`` naming the file + value +
       valid options (story 30).
     - **Multi-tool** (top-level ``tools:`` list): each entry is compiled,
@@ -180,7 +180,7 @@ class CommandBlock:
     ``load_yaml_tools``'s concern, so ``preview`` can render any platform's
     branch regardless of host PATH.
 
-    Execution mode (ADR-0001) is carried by ``command``'s type: ``list[str]``
+    Execution mode is carried by ``command``'s type: ``list[str]``
     = argv mode, ``str`` = shell mode. ``shell`` is the declared interpreter
     name in shell mode, ``None`` in argv mode — locked to the command type
     by ``_compile``.
@@ -669,7 +669,7 @@ class _ShellTool(_HookableTool):
     ``__cothis_schema__`` (so per-arg descriptions reach the LLM without
     going through the cothis.ai schema path).
 
-    Dispatch (type-driven, ADR-0001):
+    Dispatch (type-driven):
     - ``command`` is a list → argv mode: ``Popen(list, shell=False)``.
     - ``command`` is a str → shell mode: ``_shell_argv`` selects the dispatch
       path per interpreter — argv mode (``shell=False``) for POSIX and

@@ -26,7 +26,7 @@ injectable so the worker's message-handling logic is unit-testable with a
 mock transport — no socket bound. The only concurrency primitives the worker
 reaches for are ``anyio.fail_after`` (backend-neutral cancel scope for the
 turn timeout) and ``asyncio.create_task`` (background dispatch of ``run_turn``
-so control messages stay readable during a turn, #316). See ADR-0017 §6.
+so control messages stay readable during a turn, #316).
 
 Interactive ``ask_user`` flow (#229 B+D-3): a tool inside ``Agent.run_stream``
 calls ``Agent._ask_user`` → the worker-installed ``_on_ask_user`` callback
