@@ -993,6 +993,63 @@ def test_explicit_kwarg_suppresses_env_override(
     assert agent._dispatch_semaphore._value == 4
 
 
+# --- COTHIS_MIN_RETAINED_TURNS override-or-None ----------------------------
+# These cover the ``model_post_init`` env-var branch for the compaction floor
+# — the only tuner for the non-CLI construction sites (the ``worker``
+# subprocess and ``acp_bridge``). They deliberately OMIT ``min_retained_turns``
+# from the constructor so the field is absent from ``model_fields_set`` and the
+# override path runs.
+
+
+def test_min_retained_turns_env_override_when_no_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``COTHIS_MIN_RETAINED_TURNS`` sets the floor when no kwarg is passed."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MIN_RETAINED_TURNS", "9")
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.min_retained_turns == 9
+
+
+def test_min_retained_turns_env_override_ignores_non_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-positive env value falls back to the default — a zero/negative
+    floor would slip past construction's ``gt=0`` and hit ``plan_eviction``'s
+    silent clamp to 1."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MIN_RETAINED_TURNS", "0")
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.min_retained_turns == 4
+
+
+def test_min_retained_turns_env_override_ignores_non_integer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-integer env value falls back to the default."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MIN_RETAINED_TURNS", "abc")
+    agent = Agent(model="x", provider="openrouter", tools=[], max_iterations=5)
+    assert agent.min_retained_turns == 4
+
+
+def test_min_retained_turns_explicit_kwarg_suppresses_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``min_retained_turns`` kwarg wins over the env var: the
+    field is in ``model_fields_set``, so the override branch is skipped."""
+    monkeypatch.setattr("cothis.ai.get_provider", lambda *a, **kw: MagicMock())
+    monkeypatch.setenv("COTHIS_MIN_RETAINED_TURNS", "9")
+    agent = Agent(
+        model="x",
+        provider="openrouter",
+        tools=[],
+        max_iterations=5,
+        min_retained_turns=7,
+    )
+    assert agent.min_retained_turns == 7
+
+
 # --- tool_timeout: per-body wall-clock bound --------------------------------
 # A tiny ``tool_timeout`` (0.05s) plus a tool awaiting a never-set
 # ``asyncio.Event`` gives a deterministic hang with NO real wall-clock sleep.
