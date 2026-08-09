@@ -667,6 +667,91 @@ args:
     )
 
 
+# ====================================================================
+# Optional-arg render: omitted ``required: false`` arg renders EMPTY
+# (argv-mode drops the element; shell-mode renders the token gone)
+# ====================================================================
+
+
+def test_optional_arg_omitted_drops_argv_element() -> None:
+    """An omitted optional arg referenced in argv mode renders empty and is
+    dropped — the model may omit a ``required: false`` arg without breaking
+    the render (no ``KeyError``, no ``"None"`` residue)."""
+    yaml_text = """
+name: t
+description: Search.
+command: ["echo", "{q}", "{limit}"]
+args:
+  - name: q
+    type: str
+  - name: limit
+    type: int
+    required: false
+"""
+    cmd, _ = preview(yaml_text, q="hi")  # limit omitted
+    assert cmd == ["echo", "hi"]
+
+
+def test_optional_arg_present_keeps_argv_element() -> None:
+    """An optional arg the model DOES pass still substitutes normally."""
+    yaml_text = """
+name: t
+description: Search.
+command: ["echo", "{q}", "{limit}"]
+args:
+  - name: q
+    type: str
+  - name: limit
+    type: int
+    required: false
+"""
+    cmd, _ = preview(yaml_text, q="hi", limit=10)
+    assert cmd == ["echo", "hi", "10"]
+
+
+def test_optional_arg_omitted_renders_empty_in_shell_mode() -> None:
+    """An omitted optional arg in shell mode renders the template with the
+    token empty (gone) — no ``KeyError``, no literal ``"None"``."""
+    yaml_text = """
+name: t
+description: Search.
+shell: bash
+command: "echo {q} {limit}"
+args:
+  - name: q
+    type: str
+  - name: limit
+    type: int
+    required: false
+"""
+    cmd, _ = preview(yaml_text, q="hi")  # limit omitted
+    # The optional token renders empty — ``hi`` passes through unquoted
+    # (plain alphanumeric, no quoting needed) and the trailing ``{limit}``
+    # is gone (leaves its surrounding whitespace).
+    assert cmd == "echo hi "
+    assert "None" not in cmd
+
+
+def test_required_arg_omitted_still_raises_keyerror() -> None:
+    """An omitted REQUIRED arg still surfaces as ``KeyError``.
+
+    The empty-default rule is scoped to optional args: a required arg missing
+    from ``kwargs`` is a caller-side contract violation, and render must keep
+    surfacing it (not silently drop it)."""
+    yaml_text = """
+name: t
+command: ["echo", "{q}", "{limit}"]
+args:
+  - name: q
+    type: str
+  - name: limit
+    type: int
+"""
+    block = _shell_tool(yaml_text)._block
+    with pytest.raises(KeyError):
+        block.render(limit=10)  # required ``q`` omitted
+
+
 def test_per_platform_args_merge_override_same_named(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

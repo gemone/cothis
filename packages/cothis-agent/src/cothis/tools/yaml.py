@@ -231,9 +231,13 @@ class CommandBlock:
         argv mode → ``[rendered element per argv item]`` (list preserved).
         shell mode → rendered template string. Uses ``str.format_map``
         semantics (``{name}`` substitutes, ``{{`` escapes a literal ``{``,
-        ``{n:03d}`` / ``{p!r}`` honoured). A referenced arg missing from
-        ``kwargs`` raises ``KeyError`` — a caller-side contract violation,
-        not a compile-time bug.
+        ``{n:03d}`` / ``{p!r}`` honoured). An omitted REQUIRED arg whose
+        placeholder is referenced raises ``KeyError`` — a caller-side
+        contract violation, not a compile-time bug. An omitted OPTIONAL
+        (``required: false``) arg renders EMPTY: ``format_map`` sees the
+        name mapped to ``""`` so it never KeyErrors, argv-mode drops the
+        element via the existing empty-string filter, and shell-mode
+        renders the template with the optional token gone.
 
         Pure: no subprocess, no filesystem, no gating. The list-vs-string
         render fork lives here and only here. Shell-mode values are quoted
@@ -1104,11 +1108,25 @@ def _value_mapping(
       tokenisation — so quoting only applies to shell mode.
     - Other values pass through as-is so Python format specs can apply
       (``{n:03d}`` needs an int, not a str).
+    - An omitted OPTIONAL arg (``required: false``) maps to ``""`` so a
+      referenced placeholder renders EMPTY instead of raising ``KeyError``:
+      argv-mode drops the element via the existing empty-string filter;
+      shell-mode renders the template with the token gone. An omitted
+      REQUIRED arg is left out so ``format_map`` surfaces the ``KeyError``
+      (a caller-side contract violation, not a render bug).
     """
     mapping: dict[str, Any] = {}
     for spec in arg_specs:
         name = spec["name"]
         if name not in values:
+            if spec.get("required", True):
+                continue
+            # Omitted optional arg — render empty so a referenced placeholder
+            # resolves to nothing instead of KeyErroring. Bypasses the
+            # quoting/flag logic below (an empty value is not a value to
+            # quote). argv-mode's ``if rendered != ""`` filter drops the
+            # element; shell-mode leaves the optional token empty.
+            mapping[name] = ""
             continue
         value = values[name]
         flag = spec.get("to")
