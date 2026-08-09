@@ -1132,18 +1132,32 @@ def _build_signature(arg_specs: list[dict[str, Any]]) -> inspect.Signature:
 
     Each declared arg becomes a ``Parameter`` of the declared ``type``
     (defaulting to ``str``), so the cothis.ai ``inspect.signature``-based
-    schema builder picks them up. All args are keyword-or-positional with
-    no default; optional args (``required: false``) are not yet supported.
+    schema builder picks them up. All args are keyword-or-positional.
+
+    An arg declared ``required: false`` is optional: it carries a ``None``
+    default so the signature agrees with the JSON schema built by
+    ``_build_tool_schema`` (which omits optional args from ``required``).
+    The two layers must stay consistent — otherwise the schema tells the
+    model an arg may be omitted while the signature layer treats it as
+    required. Python forbids a non-default parameter after one with a
+    default, so required parameters are emitted first and optional ones
+    after (a stable partition; declaration order is preserved within each
+    group). The model always passes args by name, and the LLM-facing schema
+    is built from ``arg_specs`` in declaration order — not from this
+    signature — so the partition is unobservable at the call site.
     """
-    params = [
-        inspect.Parameter(
+    required_params: list[inspect.Parameter] = []
+    optional_params: list[inspect.Parameter] = []
+    for a in arg_specs:
+        is_required = a.get("required", True)
+        param = inspect.Parameter(
             a["name"],
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
             annotation=_ARG_TYPES.get(a.get("type", "str"), str),
+            default=inspect.Parameter.empty if is_required else None,
         )
-        for a in arg_specs
-    ]
-    return inspect.Signature(params)
+        (required_params if is_required else optional_params).append(param)
+    return inspect.Signature(required_params + optional_params)
 
 
 def _build_tool_schema(

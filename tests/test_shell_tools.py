@@ -23,6 +23,7 @@ Tests spawn short-lived subprocesses (``echo``) but never touch the network.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import shutil
 import sys
@@ -563,6 +564,107 @@ args:
     props = schema["input_schema"]["properties"]
     assert "used" in props
     assert "unused" not in props
+
+
+def test_optional_arg_absent_from_schema_required() -> None:
+    """An arg declared ``required: false`` is omitted from ``required``.
+
+    The schema builder already honours ``required: false``; this test pins
+    the contract so the signature layer (next test) has a stable counterpart
+    to stay consistent with.
+    """
+    yaml_text = """
+name: t
+description: Search.
+command: ["echo", "{q}", "{limit}"]
+args:
+  - name: q
+    type: str
+  - name: limit
+    type: int
+    required: false
+"""
+    schema = _shell_tool(yaml_text).__cothis_schema__
+    assert schema is not None
+    assert schema["input_schema"]["required"] == ["q"]
+    assert "limit" in schema["input_schema"]["properties"]
+
+
+def test_optional_arg_carries_signature_default() -> None:
+    """A ``required: false`` arg gets a ``None`` default in ``__signature__``.
+
+    The signature must agree with the JSON schema: both say the arg is
+    optional. Before this, every arg became a parameter with no default, so
+    the binding layer treated an arg the model was told it could omit as
+    required.
+    """
+    yaml_text = """
+name: t
+description: Search.
+command: ["echo", "{q}", "{limit}"]
+args:
+  - name: q
+    type: str
+  - name: limit
+    type: int
+    required: false
+"""
+    sig = _shell_tool(yaml_text).__signature__
+    assert sig.parameters["q"].default is inspect.Parameter.empty
+    assert sig.parameters["limit"].default is None
+    assert sig.parameters["limit"].annotation is int
+
+
+def test_optional_arg_before_required_partitions_valid_signature() -> None:
+    """An optional arg declared before a required one still builds.
+
+    Python forbids a non-default parameter after one with a default, so the
+    builder partitions required-first / optional-last. Declaration order is
+    preserved within each group; the schema (built from ``arg_specs``) keeps
+    declaration order regardless.
+    """
+    yaml_text = """
+name: t
+command: ["echo", "{a}", "{b}", "{c}"]
+args:
+  - name: a
+    type: str
+  - name: b
+    type: str
+    required: false
+  - name: c
+    type: str
+"""
+    tool = _shell_tool(yaml_text)
+    sig = tool.__signature__
+    # Required emitted first, optional last — valid ordering.
+    assert list(sig.parameters) == ["a", "c", "b"]
+    assert sig.parameters["a"].default is inspect.Parameter.empty
+    assert sig.parameters["c"].default is inspect.Parameter.empty
+    assert sig.parameters["b"].default is None
+    # Schema keeps declaration order; only required args listed.
+    schema = tool.__cothis_schema__
+    assert schema is not None
+    assert list(schema["input_schema"]["properties"]) == ["a", "b", "c"]
+    assert schema["input_schema"]["required"] == ["a", "c"]
+
+
+def test_all_required_signature_unchanged() -> None:
+    """With no optional args the signature keeps declaration order, no defaults."""
+    yaml_text = """
+name: t
+command: ["echo", "{a}", "{b}"]
+args:
+  - name: a
+    type: str
+  - name: b
+    type: int
+"""
+    sig = _shell_tool(yaml_text).__signature__
+    assert list(sig.parameters) == ["a", "b"]
+    assert all(
+        p.default is inspect.Parameter.empty for p in sig.parameters.values()
+    )
 
 
 def test_per_platform_args_merge_override_same_named(
