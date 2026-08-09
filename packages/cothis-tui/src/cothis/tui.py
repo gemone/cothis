@@ -645,11 +645,14 @@ class WorktreePickerModal(ModalScreen[str | None]):
 class CothisFooter(Static):
     """One-line status bar — surfaces run-state + key signals at a glance.
 
-    Renders five cells left-to-right:
+    Renders up to five cells left-to-right:
 
-    ``model | session:<short-id> | ctx:<pressure> | skills:[a,b] | state:<run_state>``
+    ``model | [session:<short-id> |] ctx:<pressure> | skills:[a,b] | state:<run_state>``
 
-    * ``<short-id>`` — first 8 chars of the active session id.
+    * ``<short-id>`` — first 8 chars of the active session id. Shown ONLY
+      when more than one session is attached (``CothisApp._attached_session_count
+      > 1``); in the common single-session case the id is redundant noise and
+      is hidden.
     * ``<pressure>`` — the ``PressureLevel`` value string (``none`` / ``low`` /
       ``medium`` / ``high`` / ``critical``) or ``?`` when unknown.
     * ``skills`` — comma-joined sorted active-skills set, or ``-`` when empty.
@@ -872,11 +875,11 @@ class CothisApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main"):
-            yield SessionList(
-                ListItem(Label("session-1")),
-                ListItem(Label("session-2")),
-                id="session-list",
-            )
+            # SessionList starts empty; ``refresh_session_list`` (caller-driven,
+            # e.g. from the CLI once storage is wired) populates it from the
+            # session DB. No placeholder items — they used to read as fake
+            # "session-1"/"session-2" rows on launch.
+            yield SessionList(id="session-list")
             yield ConversationView()
         yield TextArea(id="input")
         # Footer: docked at the very bottom, beneath the input. Both
@@ -928,20 +931,38 @@ class CothisApp(App):
     def _render_footer_str(self) -> str:
         """Compose the one-line footer render from the current reactives.
 
-        Cells: ``model | session:<short-id> | ctx:<pressure> | skills:[..] |
-        state:<run_state>``. ``<short-id>`` is the first 8 chars of
-        ``footer_session`` (the full id is stored; only the render is
-        shortened). ``<pressure>`` falls back to ``?`` when unknown (the
-        TUI never carries the raw ``None`` to the user-facing string).
+        Cells: ``model | [session:<short-id> |] ctx:<pressure> |
+        skills:[..] | state:<run_state>``. The ``session:<short-id>`` cell
+        is rendered ONLY when more than one session is attached — in the
+        common single-session case the id is redundant noise, so it is
+        hidden (see ``_attached_session_count``). ``<short-id>`` is the
+        first 8 chars of ``footer_session`` (the full id is stored; only
+        the render is shortened). ``<pressure>`` falls back to ``?`` when
+        unknown (the TUI never carries the raw ``None`` to the user-facing
+        string).
         """
-        short_sid = self.footer_session[:8]
         pressure = self.footer_pressure or "?"
         skills = ",".join(self.footer_skills) if self.footer_skills else "-"
         model = self.footer_model or "-"
-        return (
-            f"{model} | session:{short_sid} | "
-            f"ctx:{pressure} | skills:{skills} | state:{self.run_state}"
-        )
+        cells = [model]
+        if self._attached_session_count() > 1:
+            cells.append(f"session:{self.footer_session[:8]}")
+        cells.append(f"ctx:{pressure}")
+        cells.append(f"skills:{skills}")
+        cells.append(f"state:{self.run_state}")
+        return " | ".join(cells)
+
+    def _attached_session_count(self) -> int:
+        """Number of sessions with a live WS the user can switch among.
+
+        The footer's ``session:`` cell shows only when this is > 1, so the
+        common single-session case hides the redundant id. Multi-session WS
+        attach (#230) is the signal that switching is meaningful — a bare
+        ``attach_ws`` (single-session path) leaves this at 0 and the cell
+        stays hidden, matching the "no need to show the active session when
+        there's only one" contract.
+        """
+        return len(self._ws_by_session)
 
     def _refresh_footer(self) -> None:
         """Re-render the footer widget from the current reactives.
@@ -960,9 +981,15 @@ class CothisApp(App):
     async def action_send_prompt(self) -> None:
         """Read input text → render locally → forward to worker if attached.
 
-        Local echo always runs (the user expects to see their prompt
-        immediately). When a WS is attached (#252 item 1), the prompt
-        is also forwarded as a ``run_turn`` control message — the
+        Slash-prefixed commands (``/``) are intercepted BEFORE local echo:
+        ``/session <id>`` (alias ``/switch``) changes the active session
+        without echoing or forwarding to the worker. An unknown ``/...``
+        returns False from ``_handle_slash_command`` and falls through to
+        the normal prompt path so agent-side slash commands still work.
+
+        For normal prompts, local echo always runs (the user expects to see
+        their prompt immediately). When a WS is attached (#252 item 1), the
+        prompt is also forwarded as a ``run_turn`` control message — the
         worker drives the assistant-side rendering via subsequent
         ``assistant_delta`` frames pumped by ``_pump_ws``.
 
@@ -974,11 +1001,77 @@ class CothisApp(App):
         text = input_widget.text.strip()
         if not text:
             return
+        if text.startswith("/") and self._handle_slash_command(text):
+            input_widget.text = ""
+            return
         view = self.query_one(ConversationView)
         view.append_user_message(text)
         input_widget.text = ""
         if self._ws is not None:
             await self.send_run_turn(text)
+
+    def _handle_slash_command(self, text: str) -> bool:
+        """Route a ``/``-prefixed command. Return True if consumed.
+
+        ``/session <id>`` (alias ``/switch``): switch the active session by
+        full id or unambiguous prefix (short-id friendly). Resolution runs
+        against the attached session ids (``_ws_by_session``); when nothing
+        is attached the raw arg still routes to ``on_session_selected`` so a
+        subclass can wire spawn-and-attach. Returns False for an empty or
+        unknown command so the caller falls through to the normal prompt
+        path (preserving agent-side slash commands + the literal "/..." case).
+        """
+        parts = text[1:].split(None, 1)
+        if not parts or not parts[0]:
+            return False
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if cmd in ("session", "switch"):
+            self._switch_session_command(arg)
+            return True
+        return False
+
+    def _switch_session_command(self, arg: str) -> None:
+        """``/session <id>`` — switch the active session by id or unique prefix.
+
+        Matches ``arg`` against the attached session ids: exact match first,
+        then a unique-prefix match (so an 8-char short id works). An
+        ambiguous prefix logs + is a no-op; a missing arg logs + is a no-op.
+        The resolved id routes to ``on_session_selected`` — the SAME hook
+        the left-pane click uses — so the two switch paths (``/`` command +
+        SessionList click) stay identical. The raw arg routes there ONLY
+        when nothing is attached (the driven-app subclass spawn+attaches a
+        NEW session for an unknown id); with sessions attached an unmatched
+        id is a logged no-op, not a phantom switch.
+        """
+        if not arg:
+            logger.info("tui: /session requires a session id")
+            return
+        session_ids = list(self._ws_by_session)
+        target: str | None = arg if arg in session_ids else None
+        if target is None:
+            matches = [s for s in session_ids if s.startswith(arg)]
+            if len(matches) == 1:
+                target = matches[0]
+            elif len(matches) > 1:
+                logger.info(
+                    "tui: /session %r matches %d attached sessions; "
+                    "use more characters",
+                    arg, len(matches),
+                )
+                return
+        if target is not None:
+            self.on_session_selected(target)
+            return
+        # No exact/prefix match. Route the raw arg ONLY when nothing is
+        # attached — the driven-app subclass overrides on_session_selected
+        # to spawn+attach a NEW session for an unknown id. With sessions
+        # already attached, an unmatched id would set a phantom active id
+        # (no ws for it) and silently break the next turn, so no-op.
+        if not session_ids:
+            self.on_session_selected(arg)
+            return
+        logger.info("tui: /session %r matches no attached session", arg)
 
     def append_assistant_delta(self, kind: str = "text", text: str = "") -> None:
         """Forward a WS ``assistant_delta`` to the conversation view.
@@ -1119,11 +1212,16 @@ class CothisApp(App):
 
         Default: update SessionList visual highlight — the matching
         ListItem gains ``active-session`` CSS class; all others lose
-        it. Subclasses can override for additional effects (input
-        focus routing etc.) but should call ``super().on_active_session_changed()``
-        to preserve the highlight.
+        it — AND mirror ``session_id`` into ``footer_session`` so the
+        (now conditional) footer ``session:`` cell reflects the active
+        session immediately after a switch, not only on the next worker
+        ``turn_finished`` frame. Subclasses can override for additional
+        effects (input focus routing etc.) but should call
+        ``super().on_active_session_changed()`` to preserve the highlight
+        + footer sync.
         """
         logger.info("tui: active session changed → %s", session_id)
+        self.footer_session = session_id
         try:
             session_list = self.query_one(SessionList)
         except Exception:  # noqa: BLE001 — compose may not have run yet
@@ -1260,6 +1358,12 @@ class CothisApp(App):
         # a dead connection.
         if session_id == self._active_session_id:
             self.run_state = "idle"
+        # The attached-session count may have crossed the 1-boundary that
+        # gates the footer's ``session:`` cell. Detaching a NON-active
+        # session flips no reactive (run_state / footer_session unchanged),
+        # so repaint explicitly to hide/show the cell. Idempotent with the
+        # run_state watcher path above.
+        self._refresh_footer()
         if task is not None and not task.done():
             task.cancel()
             try:

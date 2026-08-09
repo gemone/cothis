@@ -2507,7 +2507,12 @@ async def test_tool_call_after_thinking_flushes_collapsible_above_card() -> None
 
 @pytest.mark.asyncio
 async def test_footer_is_mounted_and_renders_idle_state() -> None:
-    """Footer mounts on launch + its initial render shows the 5 cells."""
+    """Footer mounts on launch + its initial render shows the always-on cells.
+
+    The ``session:`` cell is conditional on >1 attached session, so it is
+    ABSENT from the default render (0 sessions attached — the common case).
+    Dedicated tests below cover the conditional show/hide.
+    """
     from cothis.tui import CothisApp, CothisFooter
 
     app = CothisApp()
@@ -2516,7 +2521,9 @@ async def test_footer_is_mounted_and_renders_idle_state() -> None:
         footer = app.query_one(CothisFooter)
         rendered = str(footer.content)
         assert "state:idle" in rendered
-        assert "session:" in rendered
+        assert "session:" not in rendered, (
+            f"session cell should be hidden with 0 sessions; got {rendered!r}"
+        )
         assert "ctx:" in rendered
         assert "skills:" in rendered
 
@@ -2564,7 +2571,11 @@ async def test_turn_finished_updates_footer_fields_and_run_state() -> None:
         assert app.footer_skills == ["git-commit"]
         footer_render = str(app.query_one(CothisFooter).content)
         assert "m1" in footer_render
-        assert "session:abcdef01" in footer_render
+        # The ``session:`` cell is conditional on >1 attached session; this
+        # test attaches none, so the cell is hidden. The reactive above
+        # (``footer_session == "abcdef0123"``) already pins the data; the
+        # conditional render is covered by the dedicated multi-session test.
+        assert "session:" not in footer_render
         assert "ctx:medium" in footer_render
         assert "skills:git-commit" in footer_render
         assert "state:idle" in footer_render
@@ -3072,3 +3083,342 @@ async def test_replay_renders_thinking_block_as_collapsible(tmp_path: Path) -> N
             f"thinking Collapsible (idx {positions_col[0]}) must precede the "
             f"assistant text Markdown (idx {max(positions_md)})"
         )
+
+
+# ---------------------------------------------------------------------
+# Layout: SessionList starts empty (no fake placeholder items on launch).
+# The list is populated by ``refresh_session_list`` once storage is wired;
+# showing hardcoded "session-1"/"session-2" rows before that read as real
+# sessions, which was the "weird layout" complaint.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_list_starts_empty_on_launch() -> None:
+    """SessionList has zero items on launch (no placeholder rows)."""
+    from textual.widgets import ListItem
+
+    from cothis.tui import CothisApp, SessionList
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        items = list(app.query_one(SessionList).query(ListItem))
+        assert items == [], (
+            f"SessionList should start empty; got {len(items)} placeholder(s)"
+        )
+
+
+# ---------------------------------------------------------------------
+# Footer conditional ``session:`` cell — hidden unless >1 session attached.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_footer_hides_session_cell_with_single_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One session attached → the ``session:`` cell stays hidden."""
+    from cothis.tui import CothisApp, CothisFooter
+
+    fake = _FakeWS([])
+
+    async def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("sess-a", "ws://fake/agent", "tok")
+        await pilot.pause()
+        footer_render = str(app.query_one(CothisFooter).content)
+        assert "session:" not in footer_render, (
+            f"session cell should be hidden with 1 session; got {footer_render!r}"
+        )
+        await app.detach_session_ws("sess-a")
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_footer_shows_session_cell_when_multiple_sessions_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two sessions attached → the ``session:`` cell renders + tracks active.
+
+    Detaching back down to one hides the cell again (the detach path repaints
+    even when a non-active session is detached).
+    """
+    from cothis.tui import CothisApp, CothisFooter
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    async def fake_connect_async(uri: str, **kw: object) -> _FakeWS:
+        return fake_connect(uri, **kw)
+
+    monkeypatch.setattr("websockets.connect", fake_connect_async)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("sess-a", "ws://fake/agent-a", "tok")
+        await app.attach_session_ws("sess-b", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+        footer_render = str(app.query_one(CothisFooter).content)
+        assert "session:" in footer_render, (
+            f"session cell should show with 2 sessions; got {footer_render!r}"
+        )
+        # Active session is sess-b (last attached); footer tracks it via
+        # on_active_session_changed.
+        assert "session:sess-b" in footer_render
+
+        # Detach the NON-active session (sess-a) → count drops to 1, cell
+        # hides. This exercises the explicit ``_refresh_footer`` in detach
+        # (no reactive fires for a non-active detach).
+        await app.detach_session_ws("sess-a")
+        await pilot.pause()
+        footer_render = str(app.query_one(CothisFooter).content)
+        assert "session:" not in footer_render, (
+            f"session cell should hide after dropping to 1 session; "
+            f"got {footer_render!r}"
+        )
+
+        await app.detach_session_ws("sess-b")
+        await pilot.pause()
+
+
+# ---------------------------------------------------------------------
+# Slash-command session switching (``/session <id>``) — the ``/``-prefixed
+# switch path that mirrors the left-pane SessionList click.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_slash_session_switches_active_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/session <id>`` switches the active session (exact id match).
+
+    No local echo (the input is cleared but nothing is appended to the
+    conversation) + no run_turn forwarded.
+    """
+    from textual.widgets import TextArea
+
+    from cothis.tui import ConversationView, CothisApp
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    async def fake_connect_async(uri: str, **kw: object) -> _FakeWS:
+        return fake_connect(uri, **kw)
+
+    monkeypatch.setattr("websockets.connect", fake_connect_async)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("sess-a", "ws://fake/agent-a", "tok")
+        await app.attach_session_ws("sess-b", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+        assert app._active_session_id == "sess-b"
+
+        bar = app.query_one("#input", TextArea)
+        bar.text = "/session sess-a"
+        await app.action_send_prompt()
+        await pilot.pause()
+
+        assert app._active_session_id == "sess-a"
+        # Input cleared…
+        assert bar.text == ""
+        # …and nothing was echoed into the conversation.
+        view = app.query_one(ConversationView)
+        assert "/session" not in view.renderable_str
+        # No run_turn forwarded on either WS.
+        assert fake_a.sent == []
+        assert fake_b.sent == []
+
+        await app.detach_session_ws("sess-a")
+        await app.detach_session_ws("sess-b")
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_slash_session_resolves_unique_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/session <prefix>`` resolves a unique short-id prefix."""
+    from cothis.tui import CothisApp
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    async def fake_connect_async(uri: str, **kw: object) -> _FakeWS:
+        return fake_connect(uri, **kw)
+
+    monkeypatch.setattr("websockets.connect", fake_connect_async)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("abcdef0123", "ws://fake/agent-a", "tok")
+        await app.attach_session_ws("xyz789abcd", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+
+        app._switch_session_command("abc")
+        await pilot.pause()
+        assert app._active_session_id == "abcdef0123"
+
+        await app.detach_session_ws("abcdef0123")
+        await app.detach_session_ws("xyz789abcd")
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_slash_session_ambiguous_prefix_is_noop(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An ambiguous prefix logs + leaves the active session unchanged."""
+    import logging
+
+    from cothis.tui import CothisApp
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    async def fake_connect_async(uri: str, **kw: object) -> _FakeWS:
+        return fake_connect(uri, **kw)
+
+    monkeypatch.setattr("websockets.connect", fake_connect_async)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("abc111", "ws://fake/agent-a", "tok")
+        await app.attach_session_ws("abc222", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+        before = app._active_session_id
+
+        with caplog.at_level(logging.INFO, logger="cothis.tui"):
+            app._switch_session_command("abc")
+            await pilot.pause()
+
+        assert app._active_session_id == before, (
+            "ambiguous prefix must not switch the active session"
+        )
+        assert any("matches 2" in r.getMessage() for r in caplog.records), (
+            "expected an ambiguity log; "
+            f"got {[r.getMessage() for r in caplog.records]}"
+        )
+
+        await app.detach_session_ws("abc111")
+        await app.detach_session_ws("abc222")
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_slash_session_unmatched_with_attached_is_noop(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unmatched id WITH sessions attached does not phantom-switch.
+
+    Regression guard: routing the raw unmatched arg to
+    ``on_session_selected`` would set a phantom active id (no ws for it)
+    and silently break the next turn. With sessions attached an unmatched
+    id must log + leave the active session unchanged.
+    """
+    import logging
+
+    from cothis.tui import CothisApp
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    async def fake_connect_async(uri: str, **kw: object) -> _FakeWS:
+        return fake_connect(uri, **kw)
+
+    monkeypatch.setattr("websockets.connect", fake_connect_async)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("abc111", "ws://fake/agent-a", "tok")
+        await app.attach_session_ws("abc222", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+        before = app._active_session_id
+
+        with caplog.at_level(logging.INFO, logger="cothis.tui"):
+            app._switch_session_command("nonsense-id")
+            await pilot.pause()
+
+        assert app._active_session_id == before, (
+            "an unmatched id with sessions attached must not switch the "
+            "active session (no phantom switch)"
+        )
+        assert any(
+            "matches no attached session" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "expected a no-match log; "
+            f"got {[r.getMessage() for r in caplog.records]}"
+        )
+
+        await app.detach_session_ws("abc111")
+        await app.detach_session_ws("abc222")
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_slash_session_missing_arg_is_noop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``/session`` with no id logs + does not switch."""
+    import logging
+
+    from cothis.tui import CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        before = app._active_session_id
+        with caplog.at_level(logging.INFO, logger="cothis.tui"):
+            app._switch_session_command("")
+            await pilot.pause()
+        assert app._active_session_id == before
+        assert any("requires a session id" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_unknown_slash_command_falls_through_to_prompt() -> None:
+    """An unknown ``/foo`` is treated as a normal prompt (echoed, not consumed)."""
+    from textual.widgets import TextArea
+
+    from cothis.tui import ConversationView, CothisApp
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        bar = app.query_one("#input", TextArea)
+        bar.text = "/notacommand hello"
+        await app.action_send_prompt()
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+        # Fell through: echoed as a normal user prompt, input cleared.
+        assert "/notacommand hello" in view.renderable_str
+        assert bar.text == ""
