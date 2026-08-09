@@ -383,6 +383,14 @@ class ConversationView(VerticalScroll):
         self._finalized = True
         self.mount(md)
         self._follow(at_bottom)
+        # The freshly-mounted Markdown's height settles a layout pass later;
+        # if the user was pinned, re-pin then so the segment end doesn't sit
+        # a couple of lines short on the next frame. ``immediate=True`` in
+        # ``_follow`` reads the pre-settle max_scroll_y, so a deferred
+        # re-pin is required to catch the settled height (#409 stream-pin
+        # robustness across runner speeds).
+        if at_bottom:
+            self.call_after_refresh(self._follow, True)
 
     def _at_bottom(self) -> bool:
         """True when the view is within a line of the bottom (#409)."""
