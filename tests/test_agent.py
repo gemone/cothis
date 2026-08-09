@@ -58,6 +58,7 @@ from cothis.agent import (
     ContentDelta,
     MaxIterationsError,
     ToolCallEvent,
+    ToolErrorCategory,
     ToolResultEvent,
     _apply_stream_delta,
     _assemble_system,
@@ -73,6 +74,7 @@ from cothis.agent import (
     _request_messages,
     _sanitize_tool_name,
     _system_param,
+    _tool_error_message,
     _tool_result_block,
     _truncate_tool_result,
 )
@@ -869,6 +871,78 @@ def test_execute_tool_exception_returns_error(
     agent._tool_map["boom"] = boom
     is_error, out = asyncio.run(agent._execute_tool({"name": "boom", "input": {}}))
     assert is_error is True
+    assert "kaboom" in out
+
+
+def test_tool_error_message_wraps_in_category_envelope() -> None:
+    """The renderer emits a leading ``[tool_error:<category>]`` token the model
+    can extract, ahead of the verbatim per-site prose."""
+    assert _tool_error_message("runtime", "Error calling boom: x") == (
+        "[tool_error:runtime] Error calling boom: x"
+    )
+    # Verbatim prose preserved (existing diagnostics still substring-match).
+    msg = _tool_error_message("unknown_tool", "Error: unknown tool 'nope'.")
+    assert msg.endswith("Error: unknown tool 'nope'.")
+
+
+@pytest.mark.parametrize(
+    "category",
+    ["unknown_tool", "invalid_args", "timeout", "runtime"],
+)
+def test_tool_error_message_category_is_machine_extractable(
+    category: ToolErrorCategory,
+) -> None:
+    """Every category token is extractable via one stable regex — the contract
+    the model branches recovery on (retry a timeout, not an unknown_tool)."""
+    msg = _tool_error_message(category, "detail")
+    m = re.match(r"^\[tool_error:(\w+)\]", msg)
+    assert m is not None
+    assert m.group(1) == category
+
+
+def test_tool_error_message_handles_empty_and_special_detail() -> None:
+    """Edge details don't corrupt the leading category token: an empty detail
+    still renders the envelope (with a trailing space), and a ``]`` or newline
+    inside the detail can't break the anchored ``[tool_error:<category>]``
+    prefix the model extracts."""
+    assert _tool_error_message("runtime", "") == "[tool_error:runtime] "
+    # A ``]`` in the detail lands after the prefix's closing bracket, so the
+    # anchored token still extracts cleanly.
+    bracket = _tool_error_message("timeout", "bad]value")
+    assert re.match(r"^\[tool_error:timeout\]", bracket)
+    assert bracket.endswith("bad]value")
+    # A newline in the detail doesn't shift the prefix either.
+    newline = _tool_error_message("unknown_tool", "line1\nline2")
+    assert re.match(r"^\[tool_error:unknown_tool\]", newline)
+    assert "line1\nline2" in newline
+
+
+def test_execute_tool_unknown_tool_emits_unknown_tool_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown-tool call is rendered with the ``unknown_tool`` category so the
+    model can tell it apart from a retryable runtime/timeout failure."""
+    agent = _patched_agent(monkeypatch)
+    is_error, out = asyncio.run(agent._execute_tool({"name": "nope", "input": {}}))
+    assert is_error is True
+    assert out.startswith("[tool_error:unknown_tool]")
+    assert "unknown tool" in out
+
+
+def test_execute_tool_exception_emits_runtime_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool-body exception is rendered with the ``runtime`` category (distinct
+    from ``timeout`` / ``unknown_tool`` / ``invalid_args``)."""
+
+    def boom(**kw: Any) -> Any:
+        raise ValueError("kaboom")
+
+    agent = _patched_agent(monkeypatch)
+    agent._tool_map["boom"] = boom
+    is_error, out = asyncio.run(agent._execute_tool({"name": "boom", "input": {}}))
+    assert is_error is True
+    assert out.startswith("[tool_error:runtime]")
     assert "kaboom" in out
 
 

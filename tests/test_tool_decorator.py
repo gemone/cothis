@@ -964,7 +964,9 @@ async def test_pre_execute_exception_short_circuits_and_returns_error(
     tu = {"name": "guarded", "input": {"x": "hi"}}
     is_error, result = await agent._execute_tool(tu)
     assert is_error is True
-    assert result.startswith("Error calling guarded: blocked by pre_execute")
+    assert result.startswith(
+        "[tool_error:invalid_args] Error calling guarded: blocked by pre_execute"
+    )
 
 
 @pytest.mark.asyncio
@@ -1051,7 +1053,7 @@ async def test_on_error_fires_on_tool_body_exception(monkeypatch: Any) -> None:
     tu = {"name": "crash", "input": {}}
     is_error, result = await agent._execute_tool(tu)
     assert is_error is True
-    assert result.startswith("Error calling crash")
+    assert result.startswith("[tool_error:runtime] Error calling crash")
     assert errors == [("tool body failed", "tool")]
 
 
