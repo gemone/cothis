@@ -308,10 +308,12 @@ class ConversationView(VerticalScroll):
         because the matching ``tool_use`` card already renders on the
         assistant side). An assistant text block mounts one Markdown
         widget via ``_finalize_segment`` (the buffer is seeded directly
-        so the streaming-throttle path is bypassed). A ``tool_use`` block
-        mounts a ``done``-status card (historical calls are already
-        finished). ``thinking`` / ``image`` blocks are silently skipped
-        (deferred).
+        so the streaming-throttle path is bypassed). A ``thinking`` block
+        mounts the SAME collapsed, dimmed ``Collapsible`` the live path
+        uses (via ``_mount_thinking_block``) so replay matches live; an
+        ``image`` block is silently skipped (deferred). A ``tool_use``
+        block mounts a ``done``-status card (historical calls are already
+        finished).
 
         Leaves the view state clean (``_finalized=True``,
         ``_stream_static=None``) after each assistant text block, so the
@@ -345,13 +347,17 @@ class ConversationView(VerticalScroll):
                     self._text_buf = [b["text"]]
                     self._finalized = False
                     self._finalize_segment()
+                elif btype == "thinking" and b.get("thinking"):
+                    # Reuse the live path's primitive so replay matches live
+                    # — reasoning mounts as a collapsed, dimmed Collapsible.
+                    self._mount_thinking_block(b["thinking"])
                 elif btype == "tool_use":
                     self.append_tool_call(
                         b.get("name", "?"),
                         status="done",
                         call_id=b.get("id"),
                     )
-                # thinking / image / tool_result: deferred.
+                # image / tool_result: deferred.
 
     def _refresh_stream(self) -> None:
         """Mount/refresh the plain-text streaming widget, throttled.
@@ -395,26 +401,38 @@ class ConversationView(VerticalScroll):
         self._finalize_segment()
         self._finalize_thinking()
 
+    def _mount_thinking_block(self, text: str) -> None:
+        """Mount one thinking block as a collapsed, dimmed ``Collapsible``.
+
+        Shared by the live streaming path (``_finalize_thinking``) and the
+        replay-on-attach path (``render_replayed_message``) so both render
+        reasoning through the SAME primitive — they cannot drift. Collapsed
+        by default (``Collapsible`` ctor) with the ``.thinking-block`` CSS
+        class so reasoning stays dimmed + out of the way until the user
+        expands it — the "dimmed/collapsed, toggle to expand" contract
+        documented on ``ContentDelta``.
+        """
+        at_bottom = self._at_bottom()
+        self.mount(
+            Collapsible(
+                Markdown(text), title="reasoning", classes="thinking-block",
+            )
+        )
+        self._follow(at_bottom)
+
     def _finalize_thinking(self) -> None:
         """Mount the accumulated thinking as a collapsed, dimmed ``Collapsible``.
 
         Idempotent: a no-op when ``_thinking_buf`` is empty. The buffer is
         cleared on mount so a subsequent thinking segment starts fresh.
-        Collapsed by default (``Collapsible`` ctor) so reasoning stays out of
-        the way until the user expands it — the "dimmed/collapsed, toggle to
-        expand" contract documented on ``ContentDelta``.
+        Delegates to ``_mount_thinking_block`` (shared with the replay path)
+        so the live + replay renderers cannot drift.
         """
         if not self._thinking_buf:
             return
         source = "".join(self._thinking_buf)
         self._thinking_buf = []
-        at_bottom = self._at_bottom()
-        self.mount(
-            Collapsible(
-                Markdown(source), title="reasoning", classes="thinking-block",
-            )
-        )
-        self._follow(at_bottom)
+        self._mount_thinking_block(source)
 
     def _finalize_segment(self) -> None:
         """Swap the streaming ``Static`` for a ``Markdown`` widget (one parse).
