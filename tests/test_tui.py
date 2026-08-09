@@ -32,6 +32,62 @@ async def test_app_launches_with_three_panes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_grid_layout_stacks_panes_vertically() -> None:
+    """The four grid rows stack top-to-bottom: header / main / input / footer.
+
+    The grid (``grid-rows: 1 1fr auto 1``) replaces the old dock-based
+    layout; every pane must be placed by the grid, so the footer sits
+    BENEATH the input (not docked above it) and the conversation row owns
+    the remaining height.
+    """
+    from cothis.tui import ConversationView, CothisApp, CothisFooter
+
+    app = CothisApp()
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        header = app.query_one("Header")
+        main = app.query_one("#main")
+        conv = app.query_one(ConversationView)
+        input_box = app.query_one("#input")
+        footer = app.query_one(CothisFooter)
+        assert header.region.y < main.region.y < input_box.region.y < footer.region.y
+        # Conversation gets the full remaining height: taller than the
+        # input and footer combined, and it spans the full width in
+        # single-session mode (sidebar hidden).
+        assert conv.region.height > input_box.region.height + footer.region.height
+        assert conv.region.width == app.size.width
+
+
+@pytest.mark.asyncio
+async def test_input_auto_grows_then_scrolls_internally() -> None:
+    """The input ``TextArea`` grows with content, then scrolls past a cap.
+
+    ``height: auto`` sizes the box to the prompt (min 3 rows); past
+    ``max-height`` it stops growing and scrolls internally, so a long
+    prompt never squeezes the conversation out of the 1fr row.
+    """
+    from textual.widgets import TextArea
+
+    from cothis.tui import CothisApp
+
+    app = CothisApp()
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        input_box = app.query_one("#input", TextArea)
+        conv = app.query_one("ConversationView")
+        idle_conv_height = conv.region.height
+        idle_input_height = input_box.region.height
+        assert idle_input_height >= 3  # min-height floor
+        input_box.text = "\n".join(f"line {i}" for i in range(30))
+        await pilot.pause()
+        assert input_box.region.height > idle_input_height  # grew
+        assert input_box.region.height <= 8  # capped at max-height
+        assert input_box.max_scroll_y > 0  # internal scroll past the cap
+        assert conv.region.height < idle_conv_height  # conversation shrank
+
+
+
+@pytest.mark.asyncio
 async def test_conversation_view_appends_text_delta() -> None:
     """``append_delta(kind='text', ...)`` accumulates into renderable."""
     from cothis.tui import ConversationView, CothisApp

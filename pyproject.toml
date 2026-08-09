@@ -4,6 +4,14 @@ members = ["packages/*"]
 [tool.uv]
 package = false
 
+# Point ty (CLI + LSP) at the uv workspace venv so third-party imports
+# resolve everywhere — including the LSP auxiliary scanner, which launches
+# ``ty server`` from a cwd where auto-discovery misses ``.venv``. The
+# directory (not interpreter) form keeps this portable across OSes: ty
+# locates ``bin/python`` / ``Scripts/python.exe`` inside the venv itself.
+[tool.ty.environment]
+python = ".venv"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
