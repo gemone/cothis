@@ -110,18 +110,18 @@ def _strip_ansi(data: bytes) -> bytes:
 def test_tui_input_receives_keystrokes_over_real_pty() -> None:
     """Typing into the focused ``TextArea`` inserts characters over a real PTY.
 
-    Launch focus is ``SessionList`` (``CothisApp.on_mount``); two Tabs move
-    focus SessionList -> ConversationView -> TextArea. Typing then must
-    insert into the TextArea — pre-#375 the ``InputBar(Container)`` wrapper
-    dropped every keystroke on this exact path.
+    The composer input holds default focus at launch (``CothisApp.on_mount``
+    → ``_refocus_input``), so keystrokes land in the prompt with no Tab
+    navigation. Typing must insert into the TextArea — pre-#375 the
+    ``InputBar(Container)`` wrapper dropped every keystroke on this exact
+    path; a focus regression (default focus moved off the input) fails
+    here because the marker would type into nothing.
     """
     marker = "PTYMARKER375"
     proc, master = _spawn_tui_pty()
     try:
         _drain(master, deadline=3.0)  # let the TUI finish its first render
-        os.write(master, b"\t\t")  # focus the TextArea
-        time.sleep(0.4)
-        _drain(master, deadline=0.5)
+        # Input holds default focus — type directly, no Tab navigation.
         os.write(master, marker.encode())
         time.sleep(1.0)
         output = _drain(master, deadline=2.0)
