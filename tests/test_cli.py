@@ -1287,16 +1287,52 @@ def test_launch_tui_app_without_resume_passes_none(
 # ---------------------------------------------------------------------
 # Chat → TUI dispatch routing (#237)
 #
-# ``chat`` defaults to the TUI; ``--legacy`` and ``--skill`` fall back
-# to the REPL. These tests verify the routing without launching either
-# path (both are stubbed).
+# ``chat`` defaults to the rich REPL (prompt_toolkit + rich streaming);
+# ``--tui`` opts into the worker-based Textual shell; ``--legacy`` is a
+# no-op for compatibility. These tests verify the routing without
+# launching either path (both are stubbed).
 # ---------------------------------------------------------------------
 
 
-def test_chat_defaults_to_tui(
+def test_chat_defaults_to_rich_repl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #237: ``cothis chat`` (no flags) routes to ``_launch_tui_app``."""
+    """``cothis chat`` (no flags) routes to the rich REPL (asyncio.run).
+
+    The rich REPL — prompt_toolkit input + rich streaming — is the default
+    chat experience; the worker-based Textual shell is the ``--tui`` opt-in.
+    """
+    import asyncio
+
+    import cothis.cli as cli_mod
+
+    tui_called: list[bool] = []
+    asyncio_called: list[bool] = []
+
+    def fake_launch(*args: object, **kwargs: object) -> None:
+        tui_called.append(True)
+
+    def fake_run(coro: Any) -> None:
+        asyncio_called.append(True)
+        coro.close()
+
+    monkeypatch.setattr(cli_mod, "_launch_tui_app", fake_launch)
+    monkeypatch.setattr(asyncio, "run", fake_run)
+
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["chat"])
+    assert result.exit_code == 0, f"chat command failed: {result.output}"
+    assert tui_called == [], "default chat must NOT launch the Textual shell"
+    assert len(asyncio_called) == 1, "rich REPL (asyncio.run) should be called"
+
+
+def test_chat_tui_flag_launches_worker_tui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cothis chat --tui`` opts into the worker-based Textual shell."""
+    import asyncio
+
     import cothis.cli as cli_mod
 
     captured: list[dict] = []
@@ -1323,19 +1359,18 @@ def test_chat_defaults_to_tui(
             "min_retained_turns": min_retained_turns,
         })
 
+    def fake_run(coro: Any) -> None:
+        raise AssertionError("rich REPL must not run with --tui")
+
     monkeypatch.setattr(cli_mod, "_launch_tui_app", fake_launch)
+    monkeypatch.setattr(asyncio, "run", fake_run)
 
     from typer.testing import CliRunner
     runner = CliRunner()
-    result = runner.invoke(cli_mod.app, ["chat"])
-    assert result.exit_code == 0, f"chat command failed: {result.output}"
-    assert len(captured) == 1, (
-        f"expected _launch_tui_app called once; got {captured}"
-    )
+    result = runner.invoke(cli_mod.app, ["chat", "--tui"])
+    assert result.exit_code == 0, f"chat --tui failed: {result.output}"
+    assert len(captured) == 1, f"expected _launch_tui_app once; got {captured}"
     assert captured[0]["resume"] is None
-    # The five tuning flags are forwarded from the chat call site to
-    # _launch_tui_app (resolved typer defaults here: 8 / 20000 / None /
-    # None / 4). Pinning the wiring end-to-end at the call site.
     assert captured[0]["max_concurrent_tools"] == 8
     assert captured[0]["max_tool_result_chars"] == 20_000
     assert captured[0]["tool_timeout"] is None
@@ -1673,17 +1708,16 @@ async def test_chat_session_threads_compaction_flags_to_agent(
         cli_mod, "Agent", lambda **kw: (captured.update(kw), mock_agent)[1],
     )
 
-    # PromptSession.prompt_async -> EOFError on first call so the REPL loop
-    # breaks immediately without reading stdin (Python 3.14 parses the
-    # ``except EOFError, KeyboardInterrupt:`` tuple form, so EOFError is
-    # caught and the loop breaks).
-    class _EOFSession:
-        async def prompt_async(self, *_a: object, **_k: object) -> str:
-            raise EOFError
+    # The rich streaming chat is the loop; patch it out so the test
+    # only verifies the Agent ctor flags (the app itself is covered by
+    # test_streaming_tui_*).
+    streamed: list[object] = []
+
+    async def fake_streaming_chat(agent: object) -> None:
+        streamed.append(agent)
 
     monkeypatch.setattr(
-        "prompt_toolkit.shortcuts.PromptSession",
-        lambda *a, **k: _EOFSession(),
+        "cothis.streaming_tui.run_streaming_chat", fake_streaming_chat,
     )
 
     await cli_mod._chat_session(
@@ -1729,11 +1763,9 @@ def test_ask_tool_tuning_flags_override_env(monkeypatch: pytest.MonkeyPatch) -> 
 async def test_chat_session_threads_tool_tuning_flags_to_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_chat_session`` (chat's ``--legacy`` REPL path) forwards the tool-tuning
-    flags into the in-process ``Agent(...)`` ctor.
-
-    The TUI default path is intentionally NOT asserted here — it spawns a
-    worker subprocess that does not yet carry the flags (deferred follow-up).
+    """``_chat_session`` (the default rich streaming path) forwards the
+    tool-tuning flags into the in-process ``Agent(...)`` ctor, then hands
+    the agent to the streaming chat.
     """
     from unittest.mock import AsyncMock
 
@@ -1752,13 +1784,13 @@ async def test_chat_session_threads_tool_tuning_flags_to_agent(
         cli_mod, "Agent", lambda **kw: (captured.update(kw), mock_agent)[1],
     )
 
-    class _EOFSession:
-        async def prompt_async(self, *_a: object, **_k: object) -> str:
-            raise EOFError
+    streamed: list[object] = []
+
+    async def fake_streaming_chat(agent: object) -> None:
+        streamed.append(agent)
 
     monkeypatch.setattr(
-        "prompt_toolkit.shortcuts.PromptSession",
-        lambda *a, **k: _EOFSession(),
+        "cothis.streaming_tui.run_streaming_chat", fake_streaming_chat,
     )
 
     await cli_mod._chat_session(
@@ -1772,4 +1804,7 @@ async def test_chat_session_threads_tool_tuning_flags_to_agent(
 
     assert captured["max_tool_result_chars"] == 1234
     assert captured["tool_timeout"] == 7.5
+    assert streamed == [mock_agent], (
+        "the streaming chat must receive the constructed agent"
+    )
 

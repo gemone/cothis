@@ -24,8 +24,6 @@ maybe_profile()
 import click  # cost: ~5ms
 import typer  # cost: ~30ms (loads click + shell completion)
 from rich.console import Console  # cost: ~15ms
-from rich.live import Live  # cost: ~5ms
-from rich.markdown import Markdown  # cost: ~5ms
 
 from cothis.agent import Agent, MaxIterationsError, ToolCallEvent, ToolResultEvent
 from cothis.session import (
@@ -444,10 +442,21 @@ def chat(
             "Synthesises a load_skill pair after the first user message."
         ),
     ),
+    tui: bool = typer.Option(
+        False,
+        "--tui",
+        help=(
+            "Launch the worker-based Textual shell instead of the rich REPL "
+            "(the default chat experience)."
+        ),
+    ),
     legacy: bool = typer.Option(
         False,
         "--legacy",
-        help="Use the legacy REPL instead of the Textual TUI (#237).",
+        help=(
+            "Accepted for compatibility; the rich REPL is now the default "
+            "chat experience, so this flag is a no-op."
+        ),
     ),
 ) -> None:
     """Run an interactive multi-turn chat session.
@@ -461,41 +470,36 @@ def chat(
     picker. Errors with "not found, run ``cothis history``" if the id is
     missing or out of this directory's scope.
 
-    **Default: launches the Textual TUI** (#237 staged migration). The
-    TUI supports ``--model`` / ``--provider`` and ``--resume`` (auto-spawns a
-    worker for the resumed session on startup). ``--skill`` still falls back
-    to the legacy REPL with a notice. Pass ``--legacy`` to force the REPL.
+    **Default: the rich streaming chat** — prompt_toolkit input (``❯ ``)
+    with a virtualized transcript (only visible lines render), follow-end
+    scroll, and a ``/`` command menu. Pass ``--tui`` for the opt-in worker-based
+    Textual shell (multi-session picker, transient ``/sessions``
+    switching, persistent-focus composer). ``--skill`` works in both.
 
-    On the default (TUI) path all five worker-subprocess tuning flags —
+    On the ``--tui`` path all five worker-subprocess tuning flags —
     ``--max-concurrent-tools``, ``--max-tool-result-chars``,
     ``--tool-timeout``, ``--summary-model``, and ``--min-retained-turns`` —
     are forwarded to the spawned worker as ``COTHIS_*`` env vars and take
-    effect there (mirroring the legacy REPL / ``ask`` behavior).
+    effect there (mirroring the rich REPL / ``ask`` behavior).
     """
-    # Staged migration (#237): default to TUI; --legacy keeps the REPL.
-    # Staged migration (#237): default to TUI; --legacy keeps the REPL.
-    # --resume is supported via the TUI's on_mount auto-spawn.
-    # --skill still falls back to legacy (not yet wired in the TUI).
-    if not legacy:
-        if not skill:
-            if resume is not None:
-                _validate_session_id_arg(resume)
-                _check_resume_exists(_resolve_db_path(), resume)
-            _launch_tui_app(
-                model=model,
-                provider=provider,
-                resume=resume,
-                max_concurrent_tools=max_concurrent_tools,
-                max_tool_result_chars=max_tool_result_chars,
-                tool_timeout=tool_timeout,
-                summary_model=summary_model,
-                min_retained_turns=min_retained_turns,
-            )
-            return
-        console.print(
-            "[dim]--skill not yet supported by the TUI; "
-            "using legacy REPL. Pass --legacy to silence this notice.[/dim]"
+    if tui:
+        # Opt-in worker-based Textual shell (previously the default).
+        if resume is not None:
+            _validate_session_id_arg(resume)
+            _check_resume_exists(_resolve_db_path(), resume)
+        _launch_tui_app(
+            model=model,
+            provider=provider,
+            resume=resume,
+            max_concurrent_tools=max_concurrent_tools,
+            max_tool_result_chars=max_tool_result_chars,
+            tool_timeout=tool_timeout,
+            summary_model=summary_model,
+            min_retained_turns=min_retained_turns,
         )
+        return
+    # Rich REPL is the default chat experience (prompt_toolkit + rich
+    # streaming). ``--skill`` works here directly (preactivate_skills).
     asyncio.run(
         _chat_session(
             model=model,
@@ -567,110 +571,17 @@ async def _chat_session(
             )
             agent.attach_session(session)
 
-        # prompt_toolkit over stdlib ``input()``: CPython auto-loads GNU readline
-        # for ``input``, which mis-counts CJK / wide-char column width and leaves
-        # visual residue on backspace. prompt_toolkit does its own ``wcwidth``
-        # accounting and renders the line itself.
-        #
-        # ``prompt_async`` (not sync ``prompt`` via ``asyncio.to_thread``): the
-        # latter races interpreter shutdown on Ctrl-C — the worker stays blocked
-        # on stdin while the main thread unwinds, producing a noisy traceback.
-        # prompt_toolkit (~115ms) is chat-REPL-only — import here, not at
-        # module top, so ask/history/delete/archive/tui/worker/--help don't
-        # pay for a REPL widget they never instantiate (#386).
-        from prompt_toolkit.shortcuts import PromptSession
-        prompts = PromptSession()
-        try:
-            while True:
-                try:
-                    prompt_text = await prompts.prompt_async(">>> ")
-                except EOFError, KeyboardInterrupt:
-                    console.print()
-                    break
-                if not prompt_text.strip():
-                    continue
+        # Full-screen streaming chat: virtualized transcript (rich +
+        # prompt_toolkit) with follow-end scroll and a ``/`` command menu.
+        # ``run_streaming_chat`` owns ``agent.aclose()``.
+        from cothis.streaming_tui import run_streaming_chat
 
-                await _stream_answer(agent, prompt_text)
-        finally:
-            await agent.aclose()
+        await run_streaming_chat(agent)
     finally:
-        # Idempotent: if attach succeeded, ``agent.aclose()`` above already
-        # closed the session (drained + joined + storage closed). If Agent
+        # Idempotent: if the streaming chat already closed the agent
+        # (drained + joined + storage closed), this is a no-op; if Agent
         # construction failed before attach, this is the cleanup path.
         session.close()
-
-
-async def _stream_answer(agent: Agent, prompt: str) -> None:
-    """Run one turn of the agent and stream the final answer as Markdown.
-
-    Event protocol from ``Agent.run_stream``:
-      * ``ToolCallEvent``  — printed inline (``calling fs.read(...)``) so the
-        user can see why a multi-step turn is taking time. Printed *above*
-        the spinner's animation row, which rich's Status handles cleanly.
-      * ``ContentDelta``   — a content delta of the final answer (``kind``
-        separates normal text from thinking; only ``text`` is rendered here).
-
-    The ReAct loop is multi-turn: tool-call turns and content turns alternate.
-    This consumer drives a two-state display:
-      * ``thinking``  — spinner running; ToolCallEvents printed inline.
-      * ``streaming`` — spinner stopped; a Live Markdown view re-renders as
-        content deltas arrive.
-    Transitions happen per-event, not per-turn, because a single provider
-    turn can interleave tool calls and content. The consumer must drain
-    the *whole* generator — closing it early (the old ``break`` + ``return``
-    shape) truncated the ReAct loop the moment a tool-call-only turn had no
-    content delta to show, so the agent stopped after one tool call.
-    """
-    stream = agent.run_stream(prompt)
-    status = console.status("thinking...", spinner="dots")
-    live: Live | None = None
-    has_max_iterations_error = False
-    accumulated = ""
-    status.start()
-    try:
-        async for event in stream:
-            if isinstance(event, ToolCallEvent):
-                if live is not None:
-                    live.stop()
-                    live = None
-                    accumulated = ""
-                    status.start()
-                console.print(_format_tool_call(event), style="dim")
-                continue
-            if isinstance(event, ToolResultEvent):
-                # Legacy REPL doesn't render tool completion inline — the
-                # next assistant delta implicitly signals "tools done".
-                # Consumed by the TUI via WS instead (#254).
-                continue
-            # Content delta — first one spins up Live, subsequent ones update it.
-            if live is None:
-                status.stop()
-                accumulated = event.text
-                live = Live(
-                    Markdown(accumulated), console=console, refresh_per_second=10
-                )
-                live.start()
-            else:
-                accumulated += event.text
-                live.update(Markdown(accumulated))
-    except MaxIterationsError as exc:
-        has_max_iterations_error = True
-        if live is not None:
-            live.stop()
-        else:
-            status.stop()
-        console.print(f"[red]Error:[/red] {exc}")
-        return
-    finally:
-        if has_max_iterations_error:
-            pass  # already handled in except
-        elif live is not None:
-            live.stop()
-            console.print()
-        elif accumulated:
-            console.print(Markdown(accumulated))
-        else:
-            status.stop()
 
 
 def _format_tool_call(event: ToolCallEvent) -> str:
