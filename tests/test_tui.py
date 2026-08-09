@@ -3422,3 +3422,124 @@ async def test_unknown_slash_command_falls_through_to_prompt() -> None:
         # Fell through: echoed as a normal user prompt, input cleared.
         assert "/notacommand hello" in view.renderable_str
         assert bar.text == ""
+
+
+# ---------------------------------------------------------------------
+# View-swap on session switch (#230) — switching the active session
+# clears ConversationView + replays the target session's history so the
+# view matches the active session (both switch paths — SessionList click
+# + ``/session`` — route through ``on_active_session_changed``).
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_switch_swaps_view_to_target_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switching the active session clears the old view + replays the target.
+
+    Seeds two sessions with distinct history, activates one (its history
+    renders), then activates the other: the previous session's messages
+    are gone and only the target's are shown. Before the parity fix, the
+    highlight + footer moved but the view kept showing the previous
+    session's messages.
+    """
+    from textual.widgets import Markdown
+
+    from cothis.session import Session
+    from cothis.tui import ConversationView, CothisApp
+
+    db_path = tmp_path / "session.db"
+
+    s1 = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s1.append_message("user", [{"type": "text", "text": "alpha-msg"}])
+    sid1 = s1.session_id
+    s1.close()
+
+    s2 = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s2.append_message("user", [{"type": "text", "text": "beta-msg"}])
+    sid2 = s2.session_id
+    s2.close()
+
+    monkeypatch.chdir(tmp_path)
+
+    def _md_sources(app: CothisApp) -> list[str]:
+        view = app.query_one(ConversationView)
+        return [getattr(md, "_markdown", "") or "" for md in view.query(Markdown)]
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+
+        # Activate session 1 → its history replays into the view.
+        app.set_active_session(sid1)
+        await pilot.pause()
+        sources = _md_sources(app)
+        assert any("alpha-msg" in s for s in sources), (
+            f"expected alpha-msg after activating {sid1[:8]}; got {sources!r}"
+        )
+        assert not any("beta-msg" in s for s in sources)
+
+        # Switch to session 2 → view clears + replays session 2 only.
+        app.set_active_session(sid2)
+        await pilot.pause()
+        sources = _md_sources(app)
+        assert any("beta-msg" in s for s in sources), (
+            f"expected beta-msg after switching to {sid2[:8]}; got {sources!r}"
+        )
+        assert not any("alpha-msg" in s for s in sources), (
+            "previous session content must be cleared on switch; "
+            f"got {sources!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_switch_view_swap_is_noop_without_db_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no session DB known, switching leaves the rendered content intact.
+
+    Pins the no-op contract: the base app (no storage) never captures
+    ``_db_path``, so ``on_active_session_changed`` must NOT clear+replay —
+    the single-session / storage-less paths keep their content and live
+    streaming keeps working.
+    """
+    from cothis.tui import ConversationView, CothisApp
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    async def fake_connect_async(uri: str, **kw: object) -> _FakeWS:
+        return fake_connect(uri, **kw)
+
+    monkeypatch.setattr("websockets.connect", fake_connect_async)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.attach_session_ws("sess-a", "ws://fake/agent-a", "tok")
+        await app.attach_session_ws("sess-b", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+
+        # Render some live content (no db_path anywhere → _db_path is None).
+        app.append_assistant_delta("text", "streamed content")
+        view = app.query_one(ConversationView)
+        view._finalize_segment()
+        await pilot.pause()
+        assert "streamed content" in view.renderable_str
+
+        # Switch active session — no db_path → a no-op for the view.
+        app.set_active_session("sess-a")
+        await pilot.pause()
+        assert "streamed content" in view.renderable_str, (
+            "view must be untouched when no session DB is known"
+        )
+
+        await app.detach_session_ws("sess-a")
+        await app.detach_session_ws("sess-b")
+        await pilot.pause()
