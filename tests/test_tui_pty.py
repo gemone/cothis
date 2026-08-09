@@ -122,6 +122,10 @@ def test_tui_input_receives_keystrokes_over_real_pty() -> None:
     try:
         _drain(master, deadline=3.0)  # let the TUI finish its first render
         # Input holds default focus — type directly, no Tab navigation.
+        # A short settle lets on_mount's focus assignment land even on
+        # slow runners (macOS CI), so keystrokes don't race the focus.
+        time.sleep(0.4)
+        _drain(master, deadline=0.5)
         os.write(master, marker.encode())
         time.sleep(1.0)
         output = _drain(master, deadline=2.0)
