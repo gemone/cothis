@@ -1,8 +1,11 @@
 """``cothis.tui`` — Textual TUI core (#228).
 
-3-pane layout for a single attached session:
+Adaptive pane layout:
 
-- ``SessionList`` (left): sessions from the session table.
+- ``SessionList`` (left): sessions from the session table. Auto-hidden
+  in single-session mode (≤1 session listed or attached) so
+  ``ConversationView`` takes the full width — the sidebar only appears
+  when the user can actually switch among sessions.
 - ``ConversationView`` (center): scrollable Markdown + tool-call cards.
 - ``TextArea`` input (bottom, ``id="input"``): multiline input with Ctrl+Enter to send.
 - ``CothisFooter`` (very bottom, ``id="footer"``): one-line status bar —
@@ -101,6 +104,11 @@ class SessionList(ListView):
     the session's cwd + worktree branch when applicable (#234 AC #3);
     rows are sorted by cwd for visual grouping by worktree.
     Selection fires ``on_list_view_selected`` → ``on_session_selected``.
+
+    Display is adaptive: ``CothisApp._sync_sidebar`` hides the pane when
+    there's at most one session to switch among (single-session mode) so
+    the conversation takes the full width; the pane appears when a second
+    session is listed or attached.
     """
 
     DEFAULT_CSS = """
@@ -703,7 +711,7 @@ class CothisFooter(Static):
 
 
 class CothisApp(App):
-    """Textual app shell — 3-pane layout, single session.
+    """Textual app shell — adaptive pane layout, single or multi session.
 
     Keymap per design-review sign-off (#228, 2026-07-24):
 
@@ -929,6 +937,7 @@ class CothisApp(App):
         the fix is that typing now inserts characters instead of being
         dropped by the old wrapper.
         """
+        self._sync_sidebar()
         self.query_one(SessionList).focus()
         # Seed the footer with the initial idle render so the status bar
         # shows the documented cells (``state:idle`` etc.) before any WS
@@ -992,6 +1001,25 @@ class CothisApp(App):
         there's only one" contract.
         """
         return len(self._ws_by_session)
+
+    def _sync_sidebar(self) -> None:
+        """Show the ``SessionList`` sidebar only when switching is possible.
+
+        Single-session mode (≤1 session listed or attached) hides the pane
+        so ``ConversationView`` takes the full width — the "weird layout"
+        complaint was a near-empty 24-col sidebar eating a quarter of the
+        screen for one session. Visible iff more than one row is listed OR
+        more than one WS is attached — the same multi-session signal that
+        gates the footer's ``session:`` cell. Re-run at mount, after
+        ``refresh_session_list``, and after attach/detach; idempotent.
+        """
+        try:
+            session_list = self.query_one(SessionList)
+        except Exception:  # noqa: BLE001 — compose may not have run yet
+            return
+        session_list.display = (
+            len(session_list.children) > 1 or self._attached_session_count() > 1
+        )
 
     def _refresh_footer(self) -> None:
         """Re-render the footer widget from the current reactives.
@@ -1190,6 +1218,9 @@ class CothisApp(App):
             session_list.append(
                 ListItem(Label(f"{label}  ({cwd_hint})"), id=f"s_{row.id}")
             )
+        # The listed-count may have crossed the 1-boundary that gates the
+        # sidebar — hide/show the pane for the single/multi-session modes.
+        self._sync_sidebar()
 
     # -----------------------------------------------------------------
     # Session selection (#252 item 5 — selection half; list-half landed
@@ -1404,6 +1435,9 @@ class CothisApp(App):
             self._pump_ws_connection(ws)
         )
         self.set_active_session(session_id)
+        # Attached-count may have crossed the 1-boundary that gates the
+        # sidebar — show the pane once a second session is attached.
+        self._sync_sidebar()
 
     async def detach_session_ws(self, session_id: str) -> None:
         """Close + remove one session's WS connection (multi-session #230)."""
@@ -1420,6 +1454,9 @@ class CothisApp(App):
         # so repaint explicitly to hide/show the cell. Idempotent with the
         # run_state watcher path above.
         self._refresh_footer()
+        # Same boundary gates the sidebar — hide the pane when the count
+        # drops back to single-session mode.
+        self._sync_sidebar()
         if task is not None and not task.done():
             task.cancel()
             try:

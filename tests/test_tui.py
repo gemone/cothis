@@ -3110,6 +3110,141 @@ async def test_session_list_starts_empty_on_launch() -> None:
 
 
 # ---------------------------------------------------------------------
+# Layout: the SessionList sidebar auto-hides in single-session mode so
+# ConversationView takes the full width (the "weird layout" complaint —
+# a near-empty 24-col sidebar ate a quarter of the screen for one
+# session). Visible only when switching among sessions is possible.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sidebar_hidden_on_launch_with_no_sessions() -> None:
+    """No sessions → the sidebar is hidden; ConversationView is full-width."""
+    from cothis.tui import ConversationView, CothisApp, SessionList
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session_list = app.query_one(SessionList)
+        assert session_list.display is False, (
+            f"empty sidebar should be hidden; got display={session_list.display!r}"
+        )
+        main = app.query_one("#main")
+        conv = app.query_one(ConversationView)
+        assert conv.region.width == main.region.width, (
+            f"conversation should span the full width when the sidebar is "
+            f"hidden; got conv={conv.region.width} vs main={main.region.width}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_sidebar_hidden_with_single_listed_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One session in the list → the sidebar stays hidden."""
+    from cothis.session import Session
+    from cothis.tui import CothisApp, SessionList
+
+    db_path = tmp_path / "session.db"
+    s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
+    s.append_message("user", [{"type": "text", "text": "only one"}])
+    s.close()
+
+    monkeypatch.chdir(tmp_path)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+        assert app.query_one(SessionList).display is False, (
+            "single-session mode should hide the sidebar"
+        )
+
+
+@pytest.mark.asyncio
+async def test_sidebar_shown_with_multiple_listed_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two+ sessions in the list → the sidebar appears for switching."""
+    from cothis.session import Session
+    from cothis.session.storage import SessionRow
+    from cothis.tui import CothisApp, SessionList
+
+    db_path = tmp_path / "session.db"
+    cwd_a = tmp_path / "worktree-a"
+    cwd_b = tmp_path / "worktree-b"
+    seeded: list[SessionRow] = []
+    for cwd in (cwd_a, cwd_b):
+        s = Session.new(db_path, cwd=cwd, model="m", flush_sync=True)
+        s.append_message("user", [{"type": "text", "text": "hi"}])
+        s.close()
+        from cothis.session.storage import Storage
+
+        storage = Storage(db_path)
+        try:
+            row = storage.load_session(s.session_id)
+            assert row is not None
+            seeded.append(row)
+        finally:
+            storage.close()
+
+    # Stub so both sessions pass the cwd-visibility filter.
+    monkeypatch.setattr(
+        "cothis.session.storage.Storage.list_sessions_in_cwd_tree",
+        lambda self, cwd: seeded,
+    )
+    monkeypatch.setattr("cothis.git.list_worktrees", lambda _cwd: [])
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.refresh_session_list(db_path)
+        await pilot.pause()
+        assert app.query_one(SessionList).display is True, (
+            "multi-session mode should show the sidebar"
+        )
+
+
+@pytest.mark.asyncio
+async def test_sidebar_tracks_attached_session_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sidebar shows once 2 sessions attach; hides again when one detaches.
+
+    Mirrors the footer's ``session:`` cell boundary — the sidebar is the
+    same "can I switch?" signal, so it follows the attached-WS count.
+    """
+    from cothis.tui import CothisApp, SessionList
+
+    fake_a = _FakeWS([])
+    fake_b = _FakeWS([])
+
+    def fake_connect(uri: str, **kw: object) -> _FakeWS:
+        return fake_a if "agent-a" in str(uri) else fake_b
+
+    async def fake_connect_async(uri: str, **kw: object) -> _FakeWS:
+        return fake_connect(uri, **kw)
+
+    monkeypatch.setattr("websockets.connect", fake_connect_async)
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        session_list = app.query_one(SessionList)
+        assert session_list.display is False, "start hidden (no sessions)"
+        await app.attach_session_ws("sess-a", "ws://fake/agent-a", "tok")
+        await pilot.pause()
+        assert session_list.display is False, "one session → still hidden"
+        await app.attach_session_ws("sess-b", "ws://fake/agent-b", "tok")
+        await pilot.pause()
+        assert session_list.display is True, "two sessions → sidebar shows"
+        await app.detach_session_ws("sess-b")
+        await pilot.pause()
+        assert session_list.display is False, "back to one → sidebar hides"
+
+
+# ---------------------------------------------------------------------
 # Footer conditional ``session:`` cell — hidden unless >1 session attached.
 # ---------------------------------------------------------------------
 
