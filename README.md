@@ -95,11 +95,14 @@ VERBOSE=1 uv run cothis ask "list the files in src"
 uv run cothis chat
 ```
 
-`chat` now launches the **Textual TUI** by default (#237): a 3-pane
-layout — `SessionList` (left) + `ConversationView` (center) + a `TextArea`
-input (bottom). Press `n` to create a new session (worktree picker or current
-directory); type a prompt + `Ctrl+Enter` to send. The worker streams
-deltas, tool-call cards, and interactive questions (`AskUserModal`).
+`chat` launches the **Textual TUI** by default (#237): a focused
+transcript shell — a full-height scrollable `ConversationView` with a fixed
+composer dock below it (input + shortcut hint) and a one-line status bar.
+Session navigation is transient (`/sessions` picker), never a sidebar; the
+input holds focus so you can always type. Press `Ctrl+N` to create a new
+session (worktree picker or current directory); type a prompt + `Ctrl+Enter`
+to send. The worker streams deltas, tool-call cards, and interactive
+questions (`AskUserModal`).
 
 ```bash
 uv run cothis chat -m anthropic/claude-3.5-haiku

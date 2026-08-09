@@ -1,11 +1,12 @@
-"""Tests for ``cothis.tui`` (#228).
+"""Tests for ``cothis.tui`` — the focused transcript shell.
 
-Covers the 3-pane layout + interactivity API:
+Covers the pi-inspired composition + interactivity API:
 
-- 3 panes exist + are queryable.
+- the transcript owns the full viewport; composer + status dock are fixed.
+- no header / no session sidebar (session switching is a transient picker).
 - ``ConversationView.append_delta(kind, text)`` routes text vs thinking.
-- ``ConversationView.append_tool_call`` mounts an inline card.
-- the input ``TextArea`` accepts multi-line text + clears on send.
+- user prompts render as background-tinted blocks.
+- the input holds default + persistent focus.
 - ``action_send_prompt`` echoes the user prompt into the conversation.
 - ``append_assistant_delta`` + ``append_tool_call`` forward to the view.
 """
@@ -19,43 +20,44 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_app_launches_with_three_panes() -> None:
-    """Pilot launches CothisApp; all three panes are queryable."""
-    from cothis.tui import ConversationView, CothisApp
+async def test_app_launches_with_focused_transcript_shell() -> None:
+    """Pilot launches CothisApp; the transcript shell panes are queryable.
+
+    No header, no sidebar: conversation (full viewport), composer dock
+    (input + hint), status dock — the pi-inspired composition.
+    """
+    from cothis.tui import ConversationView, CothisApp, CothisFooter
 
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        assert app.query_one("SessionList") is not None
         assert app.query_one(ConversationView) is not None
+        assert app.query_one("#composer") is not None
         assert app.query_one("#input") is not None
+        assert app.query_one(CothisFooter) is not None
 
 
 @pytest.mark.asyncio
-async def test_grid_layout_stacks_panes_vertically() -> None:
-    """The four grid rows stack top-to-bottom: header / main / input / footer.
+async def test_transcript_composer_footer_stack_vertically() -> None:
+    """The shell stacks top-to-bottom: transcript / composer / status dock.
 
-    The grid (``grid-rows: 1 1fr auto 1``) replaces the old dock-based
-    layout; every pane must be placed by the grid, so the footer sits
-    BENEATH the input (not docked above it) and the conversation row owns
-    the remaining height.
+    The transcript owns all flexible height (pi's scrollable-transcript
+    model); the composer and footer are fixed below it. No grid, no dock
+    hacks — a plain vertical layout.
     """
     from cothis.tui import ConversationView, CothisApp, CothisFooter
 
     app = CothisApp()
     async with app.run_test(size=(100, 40)) as pilot:
         await pilot.pause()
-        header = app.query_one("Header")
-        main = app.query_one("#main")
         conv = app.query_one(ConversationView)
+        composer = app.query_one("#composer")
         input_box = app.query_one("#input")
         footer = app.query_one(CothisFooter)
-        assert header.region.y < main.region.y < input_box.region.y < footer.region.y
-        # Conversation gets the full remaining height: taller than the
-        # input and footer combined, and it spans the full width in
-        # single-session mode (sidebar hidden).
-        assert conv.region.height > input_box.region.height + footer.region.height
+        assert conv.region.y < composer.region.y < footer.region.y
+        # Transcript spans the full width and holds the flexible height.
         assert conv.region.width == app.size.width
+        assert conv.region.height > input_box.region.height + footer.region.height
 
 
 @pytest.mark.asyncio
@@ -84,7 +86,6 @@ async def test_input_auto_grows_then_scrolls_internally() -> None:
         assert input_box.region.height <= 8  # capped at max-height
         assert input_box.max_scroll_y > 0  # internal scroll past the cap
         assert conv.region.height < idle_conv_height  # conversation shrank
-
 
 
 @pytest.mark.asyncio
@@ -151,7 +152,7 @@ async def test_input_bar_accepts_text() -> None:
 @pytest.mark.asyncio
 async def test_send_prompt_echoes_into_conversation() -> None:
     """``action_send_prompt`` posts the input text to ConversationView + clears."""
-    from textual.widgets import TextArea
+    from textual.widgets import Markdown, TextArea
 
     from cothis.tui import ConversationView, CothisApp
 
@@ -163,7 +164,8 @@ async def test_send_prompt_echoes_into_conversation() -> None:
         await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
-        assert "what is 2+2?" in view.renderable_str
+        boxes = [w for w in view.query(Markdown) if "user-message" in w.classes]
+        assert boxes and "what is 2+2?" in boxes[-1]._markdown
         assert bar.text == ""
 
 
@@ -212,7 +214,7 @@ async def test_append_tool_call_via_app() -> None:
 @pytest.mark.asyncio
 async def test_ctrl_enter_keypress_sends_prompt() -> None:
     """Ctrl+Enter binding triggers send_prompt via the actual keypress."""
-    from textual.widgets import TextArea
+    from textual.widgets import Markdown, TextArea
 
     from cothis.tui import ConversationView, CothisApp
 
@@ -224,14 +226,15 @@ async def test_ctrl_enter_keypress_sends_prompt() -> None:
         await pilot.press("ctrl+enter")
         await pilot.pause()
         view = app.query_one(ConversationView)
-        assert "via keypress" in view.renderable_str
+        boxes = [w for w in view.query(Markdown) if "user-message" in w.classes]
+        assert boxes and "via keypress" in boxes[-1]._markdown
         assert bar.text == ""
 
 
 @pytest.mark.asyncio
 async def test_user_message_brackets_are_escaped() -> None:
     """Brackets in user text are escaped so Markdown injection is blocked."""
-    from textual.widgets import TextArea
+    from textual.widgets import Markdown, TextArea
 
     from cothis.tui import ConversationView, CothisApp
 
@@ -243,8 +246,10 @@ async def test_user_message_brackets_are_escaped() -> None:
         await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
-        assert "\\[click\\]" in view.renderable_str
-        assert "[click]" not in view.renderable_str.replace("\\[click\\]", "")
+        boxes = [w for w in view.query(Markdown) if "user-message" in w.classes]
+        assert boxes, "user prompt must render as a tinted box"
+        assert "\\[click\\]" in boxes[-1]._markdown
+        assert "[click]" not in boxes[-1]._markdown.replace("\\[click\\]", "")
 
 
 @pytest.mark.asyncio
@@ -285,7 +290,9 @@ async def test_tool_call_flushes_text_segment_for_dom_order() -> None:
         # immediate children of the ConversationView scroll container.
         children = list(view.children)
         positions_md = [i for i, c in enumerate(children) if isinstance(c, Markdown)]
-        positions_card = [i for i, c in enumerate(children) if isinstance(c, ToolCallCard)]
+        positions_card = [
+            i for i, c in enumerate(children) if isinstance(c, ToolCallCard)
+        ]
         assert len(positions_card) == 1
         assert positions_md[0] < positions_card[0] < positions_md[1]
 
@@ -333,7 +340,7 @@ async def test_append_delta_segmented_streaming_is_linear_not_quadratic() -> Non
     ratio = t_large / t_small if t_small > 0 else float("inf")
     assert ratio <= 8.0, (
         f"expected ≤8.0× slowdown on 4× workload (linear + overhead); "
-        f"got {ratio:.2f}× (small={t_small*1000:.1f}ms, large={t_large*1000:.1f}ms) — "
+        f"got {ratio:.2f}× (small={t_small * 1000:.1f}ms, large={t_large * 1000:.1f}ms) — "
         f"buffer is accumulating O(N²) work somewhere"
     )
 
@@ -726,9 +733,12 @@ async def test_action_send_prompt_forwards_run_turn_when_attached(
         await app.action_send_prompt()
         await pilot.pause()
 
-        # Local echo: user prompt lands in the view.
+        # Local echo: user prompt lands in the view as a tinted box.
+        from textual.widgets import Markdown
+
         view = app.query_one(ConversationView)
-        assert "what is 2+2?" in view.renderable_str
+        boxes = [w for w in view.query(Markdown) if "user-message" in w.classes]
+        assert boxes and "what is 2+2?" in boxes[-1]._markdown
         # Bar cleared.
         assert bar.text == ""
         # Outbound: run_turn control message on the WS.
@@ -760,7 +770,10 @@ async def test_action_send_prompt_no_forwarding_when_not_attached() -> None:
         await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
-        assert "hello" in view.renderable_str
+        from textual.widgets import Markdown
+
+        boxes = [w for w in view.query(Markdown) if "user-message" in w.classes]
+        assert boxes and "hello" in boxes[-1]._markdown
         assert bar.text == ""
         # No WS attached → ``send_run_turn`` is a no-op. The view's
         # content matches exactly the local echo (no extra frames).
@@ -783,26 +796,32 @@ async def test_tool_call_result_pointer_updates_card_status_by_call_id(
     from cothis.tui import CothisApp, ToolCallCard
 
     frames = [
-        _json.dumps({
-            "type": "tool_call_started",
-            "tool": "fs.read",
-            "arguments": {"path": "a.py"},
-            "call_id": "tu_first",
-        }),
-        _json.dumps({
-            "type": "tool_call_started",
-            "tool": "fs.read",
-            "arguments": {"path": "b.py"},
-            "call_id": "tu_second",
-        }),
-        _json.dumps({
-            "type": "tool_call_result_pointer",
-            "tool": "fs.read",
-            "is_error": False,
-            "duration_ms": 5,
-            "pointer": "session:s:tool:tu_second",
-            "call_id": "tu_second",
-        }),
+        _json.dumps(
+            {
+                "type": "tool_call_started",
+                "tool": "fs.read",
+                "arguments": {"path": "a.py"},
+                "call_id": "tu_first",
+            }
+        ),
+        _json.dumps(
+            {
+                "type": "tool_call_started",
+                "tool": "fs.read",
+                "arguments": {"path": "b.py"},
+                "call_id": "tu_second",
+            }
+        ),
+        _json.dumps(
+            {
+                "type": "tool_call_result_pointer",
+                "tool": "fs.read",
+                "is_error": False,
+                "duration_ms": 5,
+                "pointer": "session:s:tool:tu_second",
+                "call_id": "tu_second",
+            }
+        ),
     ]
     fake = _FakeWS(frames)
 
@@ -841,20 +860,24 @@ async def test_tool_call_result_pointer_error_flips_card_to_failed(
     from cothis.tui import CothisApp, ToolCallCard
 
     frames = [
-        _json.dumps({
-            "type": "tool_call_started",
-            "tool": "fs.read",
-            "arguments": {"path": "a.py"},
-            "call_id": "tu_err",
-        }),
-        _json.dumps({
-            "type": "tool_call_result_pointer",
-            "tool": "fs.read",
-            "is_error": True,
-            "duration_ms": 5,
-            "pointer": None,
-            "call_id": "tu_err",
-        }),
+        _json.dumps(
+            {
+                "type": "tool_call_started",
+                "tool": "fs.read",
+                "arguments": {"path": "a.py"},
+                "call_id": "tu_err",
+            }
+        ),
+        _json.dumps(
+            {
+                "type": "tool_call_result_pointer",
+                "tool": "fs.read",
+                "is_error": True,
+                "duration_ms": 5,
+                "pointer": None,
+                "call_id": "tu_err",
+            }
+        ),
     ]
     fake = _FakeWS(frames)
 
@@ -891,20 +914,24 @@ async def test_tool_call_result_pointer_without_call_id_is_no_op(
     from cothis.tui import CothisApp, ToolCallCard
 
     frames = [
-        _json.dumps({
-            "type": "tool_call_started",
-            "tool": "fs.read",
-            "arguments": {"path": "a.py"},
-            "call_id": "tu_x",
-        }),
+        _json.dumps(
+            {
+                "type": "tool_call_started",
+                "tool": "fs.read",
+                "arguments": {"path": "a.py"},
+                "call_id": "tu_x",
+            }
+        ),
         # Result frame without call_id — legacy shape.
-        _json.dumps({
-            "type": "tool_call_result_pointer",
-            "tool": "fs.read",
-            "is_error": False,
-            "duration_ms": 5,
-            "pointer": None,
-        }),
+        _json.dumps(
+            {
+                "type": "tool_call_result_pointer",
+                "tool": "fs.read",
+                "is_error": False,
+                "duration_ms": 5,
+                "pointer": None,
+            }
+        ),
     ]
     fake = _FakeWS(frames)
 
@@ -936,18 +963,18 @@ async def test_tool_call_result_pointer_without_call_id_is_no_op(
 
 @pytest.mark.asyncio
 async def test_refresh_session_list_populates_from_db(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #252 item 5 (list): ``refresh_session_list`` shows sessions visible from cwd.
+    """AC #252 item 5 (list): ``refresh_session_list`` indexes cwd-visible sessions.
 
     Seeds a Storage DB with two sessions (one matching the test cwd,
     one in an unrelated directory), then calls refresh_session_list.
-    Only the cwd-visible session appears in SessionList.
+    Only the cwd-visible session appears in the session index (the
+    source the transient ``/sessions`` picker renders from).
     """
-    from textual.widgets import ListItem
-
     from cothis.session import Session
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp
 
     db_path = tmp_path / "session.db"
 
@@ -958,7 +985,10 @@ async def test_refresh_session_list_populates_from_db(
 
     # Hidden session: cwd is an unrelated directory.
     hidden = Session.new(
-        db_path, cwd=tmp_path / "elsewhere", model="m", flush_sync=True,
+        db_path,
+        cwd=tmp_path / "elsewhere",
+        model="m",
+        flush_sync=True,
     )
     hidden.append_message("user", [{"type": "text", "text": "out of scope"}])
     hidden.close()
@@ -971,10 +1001,10 @@ async def test_refresh_session_list_populates_from_db(
         app.refresh_session_list(db_path)
         await pilot.pause()
 
-        session_list = app.query_one(SessionList)
-        items = list(session_list.query(ListItem))
-        # Only the visible session shows up.
-        assert len(items) == 1
+        ids = [row[0] for row in app._session_rows]
+        # Only the visible session is indexed.
+        assert visible.session_id in ids
+        assert hidden.session_id not in ids
 
 
 @pytest.mark.asyncio
@@ -984,9 +1014,9 @@ async def test_refresh_session_list_missing_db_is_no_crash(
     """AC #252 item 5: a missing / corrupt DB is logged, not crashed on.
 
     The TUI must stay usable when the session DB can't be opened —
-    refresh leaves the SessionList empty + a warning in the log.
+    refresh leaves the session index empty + a warning in the log.
     """
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp
 
     bogus_path = tmp_path / "does-not-exist.db"
     app = CothisApp()
@@ -995,25 +1025,23 @@ async def test_refresh_session_list_missing_db_is_no_crash(
         # No raise; the call logs + returns.
         app.refresh_session_list(bogus_path)
         await pilot.pause()
-        # The app stays alive + queryable when storage can't be opened.
-        assert app.query_one(SessionList) is not None
+        # The app stays alive + the index stays empty.
+        assert app._session_rows == []
+        assert app.query_one("#input") is not None
 
 
 @pytest.mark.asyncio
 async def test_session_selection_fires_hook_with_session_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #252 item 5 (selection): clicking a ListItem fires ``on_session_selected``.
+    """AC #252 item 5 (selection): picking a session fires ``on_session_selected``.
 
-    The hook receives the session id (without the ``s_`` prefix that
-    Textual imposes because hex session ids can begin with a digit).
-    Subclasses override the hook to wire spawn-and-attach; this test
-    uses a capturing subclass to verify the call.
+    The transient ``/sessions`` picker hands the picked id (without any
+    id prefix) to the hook. Subclasses override the hook to wire
+    spawn-and-attach; this test uses a capturing subclass.
     """
-    from textual.widgets import ListItem
-
-    from cothis.session import Session
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp, SessionPickerModal
 
     class _CapturingApp(CothisApp):
         def __init__(self) -> None:
@@ -1024,6 +1052,8 @@ async def test_session_selection_fires_hook_with_session_id(
             self.captured.append(session_id)
 
     db_path = tmp_path / "session.db"
+    from cothis.session import Session
+
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
     s.append_message("user", [{"type": "text", "text": "hi"}])
     sid = s.session_id
@@ -1036,39 +1066,34 @@ async def test_session_selection_fires_hook_with_session_id(
         await pilot.pause()
         app.refresh_session_list(db_path)
         await pilot.pause()
+        assert len(app._session_rows) == 1
 
-        session_list = app.query_one(SessionList)
-        items = list(session_list.query(ListItem))
-        assert len(items) == 1
-        # Trigger selection by posting a Selected message directly. The
-        # user-facing way is keyboard enter on the cursor, but the test
-        # harness wants the explicit message — it bypasses the focus /
-        # cursor-position dance that flaked earlier pilot runs.
-        first_item = items[0]
-        session_list.post_message(SessionList.Selected(session_list, first_item, 0))
+        # Open the transient picker and select the (only) session.
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionPickerModal)
+        await pilot.press("enter")  # first row selected
         await pilot.pause()
 
     assert app.captured == [sid], (
-        f"expected on_session_selected called once with {sid!r}; "
-        f"got {app.captured!r}"
+        f"expected on_session_selected called once with {sid!r}; got {app.captured!r}"
     )
 
 
 @pytest.mark.asyncio
 async def test_refresh_session_list_enriches_label_with_worktree_branch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #234 #3: SessionList label includes ``branch:<name>`` when the session's cwd is in a known worktree.
+    """AC #234 #3: session index label includes ``branch:<name>`` when cwd is in a known worktree.
 
-    Stubs ``list_worktrees`` so the test is hermetic (no real git binary
-    needed). When the stub returns a Worktree whose path is an ancestor
-    of the session's cwd, the label gains ``· branch:<name>``.
+    Stubs ``list_worktrees`` so the test is hermetic. When the stub
+    returns a Worktree whose path is an ancestor of the session's cwd,
+    the label gains ``· branch:<name>``.
     """
-    from textual.widgets import Label, ListItem
-
     from cothis.git import Worktree
     from cothis.session import Session
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp
 
     db_path = tmp_path / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
@@ -1088,31 +1113,23 @@ async def test_refresh_session_list_enriches_label_with_worktree_branch(
         app.refresh_session_list(db_path)
         await pilot.pause()
 
-        session_list = app.query_one(SessionList)
-        items = list(session_list.query(ListItem))
-        assert len(items) == 1
-        label_widget = items[0].query_one(Label)
-        # ``Label`` inherits ``Static``; the source text lives on the
-        # mangled private attr ``_Static__content``.
-        label_str = str(getattr(label_widget, "_Static__content"))
-        assert "branch:feature-branch" in label_str, (
-            f"expected branch enrichment in label; got {label_str!r}"
-        )
+        assert len(app._session_rows) == 1
+        label = app._session_rows[0][1]
+        assert "branch:feature-branch" in label, f"got {label!r}"
 
 
 @pytest.mark.asyncio
 async def test_refresh_session_list_skips_branch_when_no_worktree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #234 #3: when ``list_worktrees`` returns ``[]``, label has no branch suffix.
 
     The cwd-only label is preserved — the TUI degrades cleanly when
     not in a git repo or git binary missing.
     """
-    from textual.widgets import Label, ListItem
-
     from cothis.session import Session
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp
 
     db_path = tmp_path / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
@@ -1128,21 +1145,17 @@ async def test_refresh_session_list_skips_branch_when_no_worktree(
         app.refresh_session_list(db_path)
         await pilot.pause()
 
-        session_list = app.query_one(SessionList)
-        items = list(session_list.query(ListItem))
-        assert len(items) == 1
-        label_widget = items[0].query_one(Label)
-        label_str = str(getattr(label_widget, "_Static__content"))
-        assert "branch:" not in label_str, (
-            f"no branch expected when worktrees empty; got {label_str!r}"
-        )
+        assert len(app._session_rows) == 1
+        label = app._session_rows[0][1]
+        assert "branch:" not in label, f"got {label!r}"
 
 
 @pytest.mark.asyncio
 async def test_refresh_session_list_groups_sessions_by_cwd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #234 #5: sessions with the same cwd land adjacent in SessionList.
+    """AC #234 #5: sessions with the same cwd land adjacent in the session index.
 
     Visual grouping by worktree: stable sort by cwd, with ``updated_at``
     as the within-group tiebreaker. Three sessions in two cwds end up
@@ -1157,11 +1170,9 @@ async def test_refresh_session_list_groups_sessions_by_cwd(
     import re
     from itertools import groupby
 
-    from textual.widgets import Label, ListItem
-
     from cothis.session import Session
     from cothis.session.storage import SessionRow
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp
 
     db_path = tmp_path / "session.db"
     cwd_a = tmp_path / "worktree-a"
@@ -1200,16 +1211,13 @@ async def test_refresh_session_list_groups_sessions_by_cwd(
         app.refresh_session_list(db_path)
         await pilot.pause()
 
-        session_list = app.query_one(SessionList)
-        items = list(session_list.query(ListItem))
-        assert len(items) == 3
+        assert len(app._session_rows) == 3
 
-        # Pull cwd out of each item's label "(path)" suffix to check grouping.
+        # Pull cwd out of each label's "(path)" suffix to check grouping.
         cwds_in_list_order: list[str] = []
-        for item in items:
-            label_str = str(getattr(item.query_one(Label), "_Static__content"))
-            match = re.search(r"\(([^)]+)\)", label_str)
-            assert match is not None, f"no cwd in label {label_str!r}"
+        for _sid, label in app._session_rows:
+            match = re.search(r"\(([^)]+)\)", label)
+            assert match is not None, f"no cwd in label {label!r}"
             cwds_in_list_order.append(match.group(1).split(" · ")[0])
 
         # Sessions with the same cwd must be adjacent.
@@ -1229,7 +1237,8 @@ async def test_refresh_session_list_groups_sessions_by_cwd(
 
 @pytest.mark.asyncio
 async def test_action_new_session_fires_hook_with_worktrees(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #234: ``action_new_session`` calls ``on_new_session`` with the worktree list.
 
@@ -1266,7 +1275,8 @@ async def test_action_new_session_fires_hook_with_worktrees(
 
 @pytest.mark.asyncio
 async def test_action_new_session_passes_empty_list_when_not_in_git_repo(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #234: when ``list_worktrees`` returns ``[]``, the hook gets an empty list.
 
@@ -1317,8 +1327,7 @@ async def test_on_new_session_default_mounts_worktree_picker(
 
         modal = app.screen
         assert isinstance(modal, WorktreePickerModal), (
-            f"expected WorktreePickerModal on top; "
-            f"got {type(app.screen).__name__}"
+            f"expected WorktreePickerModal on top; got {type(app.screen).__name__}"
         )
 
         modal.action_dismiss_modal()
@@ -1329,12 +1338,13 @@ async def test_on_new_session_default_mounts_worktree_picker(
 async def test_action_new_session_keypress_pushes_picker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #234: ``n`` keypress → ``action_new_session`` → picker mounts.
+    """AC #234: ``Ctrl+N`` keypress → ``action_new_session`` → picker mounts.
 
-    End-to-end via the actual keypress binding (``n``, not ``ctrl+n`` —
-    the binding was added previously). The default ``on_new_session``
-    mounts ``WorktreePickerModal``; the test verifies the modal is on
-    top of the screen stack after the keypress.
+    End-to-end via the actual keypress binding. The binding is a modified
+    key (not bare ``n``) because the input holds focus — a bare ``n``
+    would type into the prompt. The default ``on_new_session`` mounts
+    ``WorktreePickerModal``; the test verifies the modal is on top of the
+    screen stack after the keypress.
     """
     from cothis.git import Worktree
     from cothis.tui import CothisApp, WorktreePickerModal
@@ -1350,7 +1360,7 @@ async def test_action_new_session_keypress_pushes_picker(
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("n")
+        await pilot.press("ctrl+n")
         await pilot.pause()
 
         modal = app.screen
@@ -1428,10 +1438,12 @@ async def test_picker_dismiss_routes_to_on_worktree_pick(
     async with app.run_test() as pilot:
         await pilot.pause()
         # Mount the picker via the default on_new_session hook.
-        app.on_new_session([
-            Worktree(Path("/repo/main"), "main"),
-            Worktree(Path("/repo/feat"), "feature/x"),
-        ])
+        app.on_new_session(
+            [
+                Worktree(Path("/repo/main"), "main"),
+                Worktree(Path("/repo/feat"), "feature/x"),
+            ]
+        )
         await pilot.pause()
 
         modal = app.screen
@@ -1439,15 +1451,12 @@ async def test_picker_dismiss_routes_to_on_worktree_pick(
 
         # Click the second worktree's button — routes to on_worktree_pick
         # with that path (index-based ID).
-        feature_button = next(
-            b for b in modal.query(Button) if b.id == "wt-1"
-        )
+        feature_button = next(b for b in modal.query(Button) if b.id == "wt-1")
         await pilot.click(feature_button)
         await pilot.pause()
 
     assert captured == [str(Path("/repo/feat"))], (
-        f"expected on_worktree_pick to be called with /repo/feat; "
-        f"got {captured}"
+        f"expected on_worktree_pick to be called with /repo/feat; got {captured}"
     )
 
 
@@ -1523,20 +1532,30 @@ async def test_ask_user_request_dispatches_to_hook(
             self.captured: dict = {}
 
         def on_ask_user_request(
-            self, *, ask_id: str, prompt: str, choices: list,
+            self,
+            *,
+            ask_id: str,
+            prompt: str,
+            choices: list,
         ) -> None:  # type: ignore[override]
             self.captured = {
-                "ask_id": ask_id, "prompt": prompt, "choices": choices,
+                "ask_id": ask_id,
+                "prompt": prompt,
+                "choices": choices,
             }
 
-    fake = _FakeWS([
-        _json.dumps({
-            "type": "ask_user_request",
-            "ask_id": "ask_42",
-            "prompt": "Deploy to prod?",
-            "choices": ["yes", "no"],
-        }),
-    ])
+    fake = _FakeWS(
+        [
+            _json.dumps(
+                {
+                    "type": "ask_user_request",
+                    "ask_id": "ask_42",
+                    "prompt": "Deploy to prod?",
+                    "choices": ["yes", "no"],
+                }
+            ),
+        ]
+    )
 
     async def fake_connect(uri: str, **kw: object) -> _FakeWS:
         return fake
@@ -1551,7 +1570,9 @@ async def test_ask_user_request_dispatches_to_hook(
             await pilot.pause()
 
     assert app.captured == {
-        "ask_id": "ask_42", "prompt": "Deploy to prod?", "choices": ["yes", "no"],
+        "ask_id": "ask_42",
+        "prompt": "Deploy to prod?",
+        "choices": ["yes", "no"],
     }
 
 
@@ -1572,14 +1593,18 @@ async def test_ask_user_request_mounts_modal_and_routes_pick_to_resolve_ask(
 
     from cothis.tui import AskUserModal, CothisApp
 
-    fake = _FakeWS([
-        _json.dumps({
-            "type": "ask_user_request",
-            "ask_id": "ask_99",
-            "prompt": "Continue?",
-            "choices": ["y", "n"],
-        }),
-    ])
+    fake = _FakeWS(
+        [
+            _json.dumps(
+                {
+                    "type": "ask_user_request",
+                    "ask_id": "ask_99",
+                    "prompt": "Continue?",
+                    "choices": ["y", "n"],
+                }
+            ),
+        ]
+    )
 
     async def fake_connect(uri: str, **kw: object) -> _FakeWS:
         return fake
@@ -1598,21 +1623,20 @@ async def test_ask_user_request_mounts_modal_and_routes_pick_to_resolve_ask(
             f"expected AskUserModal on top; got {type(app.screen).__name__}"
         )
 
-        yes_button = next(
-            b for b in modal.query(Button) if b.id == "choice-y"
-        )
+        yes_button = next(b for b in modal.query(Button) if b.id == "choice-y")
         await pilot.click(yes_button)
         await pilot.pause()
 
     resolve_frames = [
-        _json.loads(f) for f in fake.sent
-        if _json.loads(f).get("type") == "resolve_ask"
+        _json.loads(f) for f in fake.sent if _json.loads(f).get("type") == "resolve_ask"
     ]
     assert len(resolve_frames) == 1, (
         f"expected 1 resolve_ask frame; got {resolve_frames}"
     )
     assert resolve_frames[0] == {
-        "type": "resolve_ask", "ask_id": "ask_99", "value": "y",
+        "type": "resolve_ask",
+        "ask_id": "ask_99",
+        "value": "y",
     }
 
 
@@ -1633,14 +1657,18 @@ async def test_ask_user_request_cancel_sends_resolve_ask_with_none(
 
     from cothis.tui import AskUserModal, CothisApp
 
-    fake = _FakeWS([
-        _json.dumps({
-            "type": "ask_user_request",
-            "ask_id": "ask_cancel",
-            "prompt": "Deploy?",
-            "choices": ["yes", "no"],
-        }),
-    ])
+    fake = _FakeWS(
+        [
+            _json.dumps(
+                {
+                    "type": "ask_user_request",
+                    "ask_id": "ask_cancel",
+                    "prompt": "Deploy?",
+                    "choices": ["yes", "no"],
+                }
+            ),
+        ]
+    )
 
     async def fake_connect(uri: str, **kw: object) -> _FakeWS:
         return fake
@@ -1657,21 +1685,20 @@ async def test_ask_user_request_cancel_sends_resolve_ask_with_none(
         modal = app.screen
         assert isinstance(modal, AskUserModal)
 
-        cancel_button = next(
-            b for b in modal.query(Button) if b.id == "ask-cancel"
-        )
+        cancel_button = next(b for b in modal.query(Button) if b.id == "ask-cancel")
         await pilot.click(cancel_button)
         await pilot.pause()
 
     resolve_frames = [
-        _json.loads(f) for f in fake.sent
-        if _json.loads(f).get("type") == "resolve_ask"
+        _json.loads(f) for f in fake.sent if _json.loads(f).get("type") == "resolve_ask"
     ]
     assert len(resolve_frames) == 1, (
         f"expected 1 resolve_ask frame; got {resolve_frames}"
     )
     assert resolve_frames[0] == {
-        "type": "resolve_ask", "ask_id": "ask_cancel", "value": None,
+        "type": "resolve_ask",
+        "ask_id": "ask_cancel",
+        "value": None,
     }
 
 
@@ -1717,7 +1744,8 @@ async def test_list_configurable_skills_returns_discovered_names(
         Skill(name="fs-read", description="d2", body="b2", source=_Path("/y")),
     ]
     monkeypatch.setattr(
-        "cothis.skills.discover_skills", lambda _cwd: fake_skills,
+        "cothis.skills.discover_skills",
+        lambda _cwd: fake_skills,
     )
 
     app = CothisApp()
@@ -1759,7 +1787,8 @@ async def test_config_menu_modal_renders_skill_names(
         Skill(name="fs-read", description="d2", body="b2", source=_Path("/y")),
     ]
     monkeypatch.setattr(
-        "cothis.skills.discover_skills", lambda _cwd: fake_skills,
+        "cothis.skills.discover_skills",
+        lambda _cwd: fake_skills,
     )
 
     app = CothisApp()
@@ -1797,7 +1826,8 @@ async def test_config_menu_modal_toggle_selects_and_dismisses(
         Skill(name="fs-read", description="d2", body="b2", source=_Path("/y")),
     ]
     monkeypatch.setattr(
-        "cothis.skills.discover_skills", lambda _cwd: fake_skills,
+        "cothis.skills.discover_skills",
+        lambda _cwd: fake_skills,
     )
 
     captured: list = []
@@ -1815,16 +1845,12 @@ async def test_config_menu_modal_toggle_selects_and_dismisses(
         assert isinstance(modal, ConfigMenuModal)
         assert modal._selected == set()
 
-        git_button = next(
-            b for b in modal.query(Button) if b.id == "skill-git-commit"
-        )
+        git_button = next(b for b in modal.query(Button) if b.id == "skill-git-commit")
         await pilot.click(git_button)
         await pilot.pause()
         assert "git-commit" in modal._selected
 
-        done_button = next(
-            b for b in modal.query(Button) if b.id == "menu-done"
-        )
+        done_button = next(b for b in modal.query(Button) if b.id == "menu-done")
         await pilot.click(done_button)
         await pilot.pause()
 
@@ -1832,24 +1858,24 @@ async def test_config_menu_modal_toggle_selects_and_dismisses(
 
 
 # ---------------------------------------------------------------------
-# Active-session highlight (#230) — SessionList items gain
-# ``active-session`` CSS class when their session becomes active.
+# Active-session tracking (#230) — the status dock's ``session:`` cell
+# mirrors the active session after a switch (the visible signal, since
+# the shell has no permanent sidebar).
 # ---------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_set_active_session_highlights_matching_list_item(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+async def test_set_active_session_updates_footer_session_cell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC #230: the active session's ListItem gains ``active-session`` class.
+    """AC #230: ``set_active_session`` mirrors the id into the status dock.
 
-    Seeds two sessions, selects one, verifies only its ListItem has
-    the ``active-session`` class; the other doesn't.
+    Seeds two sessions, activates each, verifies the footer's
+    ``session:`` cell tracks the active session id (short form).
     """
-    from textual.widgets import ListItem
-
     from cothis.session import Session
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp
 
     db_path = tmp_path / "session.db"
 
@@ -1871,24 +1897,17 @@ async def test_set_active_session_highlights_matching_list_item(
         app.refresh_session_list(db_path)
         await pilot.pause()
 
-        # Activate the first session.
+        # Activate the first session: the footer reactive mirrors the id.
+        # (The rendered ``session:`` cell is gated by attached-WS count —
+        # covered separately by test_footer_session_cell_tracks_attached_count.)
         app.set_active_session(sid1)
         await pilot.pause()
-
-        items = list(app.query_one(SessionList).query(ListItem))
-        assert len(items) == 2
-        classes = {item.id: item.classes for item in items}
-        assert "active-session" in classes[f"s_{sid1}"]
-        assert "active-session" not in classes[f"s_{sid2}"]
+        assert app.footer_session == sid1
 
         # Switch to the second session.
         app.set_active_session(sid2)
         await pilot.pause()
-
-        items = list(app.query_one(SessionList).query(ListItem))
-        classes = {item.id: item.classes for item in items}
-        assert "active-session" not in classes[f"s_{sid1}"]
-        assert "active-session" in classes[f"s_{sid2}"]
+        assert app.footer_session == sid2
 
 
 # ---------------------------------------------------------------------
@@ -1997,7 +2016,8 @@ async def test_send_run_turn_routes_to_active_session_ws(
         await app.send_run_turn("hello from b")
         assert len(fake_b.sent) == 1
         assert _json.loads(fake_b.sent[0]) == {
-            "type": "run_turn", "prompt": "hello from b",
+            "type": "run_turn",
+            "prompt": "hello from b",
         }
         assert fake_a.sent == []
 
@@ -2006,7 +2026,8 @@ async def test_send_run_turn_routes_to_active_session_ws(
         await app.send_run_turn("hello from a")
         assert len(fake_a.sent) == 1
         assert _json.loads(fake_a.sent[0]) == {
-            "type": "run_turn", "prompt": "hello from a",
+            "type": "run_turn",
+            "prompt": "hello from a",
         }
 
         await app.detach_session_ws("session-a")
@@ -2036,10 +2057,15 @@ async def test_ask_user_modal_renders_prompt_and_choices() -> None:
         assert isinstance(modal, AskUserModal)
 
         labels = list(modal.query(Label))
-        assert any("Deploy to prod?" in str(getattr(l, "_Static__content", "")) for l in labels)
+        assert any(
+            "Deploy to prod?" in str(getattr(l, "_Static__content", "")) for l in labels
+        )
 
         buttons = list(modal.query(Button))
-        button_labels = [b.label.plain if hasattr(b.label, "plain") else str(b.label) for b in buttons]
+        button_labels = [
+            b.label.plain if hasattr(b.label, "plain") else str(b.label)
+            for b in buttons
+        ]
         assert "yes" in button_labels
         assert "no" in button_labels
         assert "Cancel" in button_labels
@@ -2069,9 +2095,7 @@ async def test_ask_user_modal_choice_button_dismisses_with_value() -> None:
         modal = app.screen
         assert isinstance(modal, AskUserModal)
 
-        yes_button = next(
-            b for b in modal.query(Button) if b.id == "choice-y"
-        )
+        yes_button = next(b for b in modal.query(Button) if b.id == "choice-y")
         await pilot.click(yes_button)
         await pilot.pause()
 
@@ -2162,9 +2186,7 @@ async def test_worktree_picker_button_dismisses_with_path_str() -> None:
 
         # Click the second button (feature/y) — verifies index-based ID
         # routing works for non-first entries.
-        feature_button = next(
-            b for b in modal.query(Button) if b.id == "wt-1"
-        )
+        feature_button = next(b for b in modal.query(Button) if b.id == "wt-1")
         await pilot.click(feature_button)
         await pilot.pause()
 
@@ -2207,7 +2229,8 @@ async def test_worktree_picker_cancel_dismisses_with_none() -> None:
 
 @pytest.mark.asyncio
 async def test_worktree_picker_current_dir_dismisses_with_cwd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The ``Current directory`` button dismisses with ``str(Path.cwd())``.
 
@@ -2239,9 +2262,7 @@ async def test_worktree_picker_current_dir_dismisses_with_cwd(
         await pilot.pause()
 
         modal = app.screen
-        cwd_button = next(
-            b for b in modal.query(Button) if b.id == "worktree-cwd"
-        )
+        cwd_button = next(b for b in modal.query(Button) if b.id == "worktree-cwd")
         await pilot.click(cwd_button)
         await pilot.pause()
 
@@ -2299,7 +2320,8 @@ async def test_worktree_picker_empty_list_renders_only_cancel() -> None:
 
 
 def test_save_and_load_skill_selection_round_trip(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #235: save → load round-trips the selected set."""
     from cothis.skills import load_skill_selection, save_skill_selection
@@ -2312,7 +2334,8 @@ def test_save_and_load_skill_selection_round_trip(
 
 
 def test_load_skill_selection_empty_when_file_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #235: no file → empty set (first run)."""
     from cothis.skills import load_skill_selection
@@ -2322,7 +2345,8 @@ def test_load_skill_selection_empty_when_file_missing(
 
 
 def test_load_skill_selection_handles_corrupt_json(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC #235: corrupt JSON → empty set + no crash."""
     from cothis.skills import _skill_selection_path, load_skill_selection
@@ -2341,7 +2365,8 @@ def test_load_skill_selection_handles_corrupt_json(
 
 @pytest.mark.asyncio
 async def test_on_menu_open_persists_selection_on_dismiss(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#415: on_menu_open's dismiss path saves the selection (production wiring)."""
     from cothis.skills import load_skill_selection
@@ -2363,7 +2388,8 @@ async def test_on_menu_open_persists_selection_on_dismiss(
 
 @pytest.mark.asyncio
 async def test_config_menu_seeds_from_saved_selection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#415: reopening the menu shows the previously-saved selection."""
     from cothis.skills import save_skill_selection
@@ -2495,7 +2521,9 @@ async def test_thinking_then_text_mounts_collapsible_before_markdown() -> None:
         # Markdown nested inside the Collapsible is NOT a direct child,
         # so positions_md captures only the text-segment Markdown.
         children = list(view.children)
-        positions_col = [i for i, c in enumerate(children) if isinstance(c, Collapsible)]
+        positions_col = [
+            i for i, c in enumerate(children) if isinstance(c, Collapsible)
+        ]
         positions_md = [i for i, c in enumerate(children) if isinstance(c, Markdown)]
         assert len(positions_col) == 1, (
             f"expected one Collapsible direct child; got {positions_col}"
@@ -2537,8 +2565,12 @@ async def test_tool_call_after_thinking_flushes_collapsible_above_card() -> None
         await pilot.pause()
 
         children = list(view.children)
-        positions_col = [i for i, c in enumerate(children) if isinstance(c, Collapsible)]
-        positions_card = [i for i, c in enumerate(children) if isinstance(c, ToolCallCard)]
+        positions_col = [
+            i for i, c in enumerate(children) if isinstance(c, Collapsible)
+        ]
+        positions_card = [
+            i for i, c in enumerate(children) if isinstance(c, ToolCallCard)
+        ]
         assert len(positions_col) == 1, (
             f"expected one thinking Collapsible above the card; got {positions_col}"
         )
@@ -2759,9 +2791,9 @@ async def test_escape_keypress_routes_to_interrupt_when_running(
         await pilot.press("escape")
         await pilot.pause()
         assert app.run_state == "interrupted"
-        assert any(
-            _json.loads(s) == {"type": "interrupt_turn"} for s in fake.sent
-        ), f"expected an interrupt_turn frame; sent={fake.sent}"
+        assert any(_json.loads(s) == {"type": "interrupt_turn"} for s in fake.sent), (
+            f"expected an interrupt_turn frame; sent={fake.sent}"
+        )
         await app.detach_ws()
         await pilot.pause()
 
@@ -2809,9 +2841,7 @@ async def test_escape_dismisses_modal_not_interrupts(
         # …and the app never sent an interrupt_turn frame.
         assert not any(
             _json.loads(s).get("type") == "interrupt_turn" for s in fake.sent
-        ), (
-            f"Esc should have dismissed the modal, not interrupted; sent={fake.sent}"
-        )
+        ), f"Esc should have dismissed the modal, not interrupted; sent={fake.sent}"
         # run_state is unchanged — the interrupt action did not fire.
         assert app.run_state == "running"
         await app.detach_ws()
@@ -2830,7 +2860,8 @@ async def test_escape_dismisses_modal_not_interrupts(
 
 
 def _seed_history_session(
-    db: Path, cwd: Path,
+    db: Path,
+    cwd: Path,
 ) -> tuple[str, Path]:
     """Seed a session with user text + assistant [text + tool_use] + tool_result.
 
@@ -2946,7 +2977,8 @@ async def test_replay_missing_db_is_best_effort_no_crash(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_attach_session_ws_replay_is_opt_in(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """``db_path=`` triggers replay on attach; omitting it leaves the view blank.
 
@@ -2971,7 +3003,10 @@ async def test_attach_session_ws_replay_is_opt_in(
     async with app_with.run_test() as pilot:
         await pilot.pause()
         await app_with.attach_session_ws(
-            sid, "ws://fake/agent", "tok", db_path=db,
+            sid,
+            "ws://fake/agent",
+            "tok",
+            db_path=db,
         )
         await pilot.pause()
         view = app_with.query_one(ConversationView)
@@ -3025,9 +3060,7 @@ async def test_replay_leaves_view_state_clean_for_live_stream(tmp_path: Path) ->
         markdowns = list(view.query(Markdown))
         # One new Markdown mounted for the live delta.
         assert len(markdowns) == replayed_markdowns + 1
-        live_sources = [
-            getattr(md, "_markdown", "") or "" for md in markdowns
-        ]
+        live_sources = [getattr(md, "_markdown", "") or "" for md in markdowns]
         assert any("live token" in src for src in live_sources)
 
 
@@ -3044,11 +3077,13 @@ async def test_replay_multi_turn_history_preserves_dom_order(tmp_path: Path) -> 
     sid = s.session_id
     s.append_message("user", [{"type": "text", "text": "first question"}])
     s.append_message(
-        "assistant", [{"type": "text", "text": "first answer"}],
+        "assistant",
+        [{"type": "text", "text": "first answer"}],
     )
     s.append_message("user", [{"type": "text", "text": "second question"}])
     s.append_message(
-        "assistant", [{"type": "text", "text": "second answer"}],
+        "assistant",
+        [{"type": "text", "text": "second answer"}],
     )
     s.close()
 
@@ -3062,9 +3097,7 @@ async def test_replay_multi_turn_history_preserves_dom_order(tmp_path: Path) -> 
         # Four Markdown segments in DOM order: u1, a1, u2, a2.
         markdowns = list(view.query(Markdown))
         assert len(markdowns) == 4
-        sources = [
-            getattr(md, "_markdown", "") or "" for md in markdowns
-        ]
+        sources = [getattr(md, "_markdown", "") or "" for md in markdowns]
         assert "first question" in sources[0]
         assert "first answer" in sources[1]
         assert "second question" in sources[2]
@@ -3072,9 +3105,7 @@ async def test_replay_multi_turn_history_preserves_dom_order(tmp_path: Path) -> 
 
         # DOM order of immediate children matches message order.
         children = list(view.children)
-        positions = [
-            i for i, c in enumerate(children) if isinstance(c, Markdown)
-        ]
+        positions = [i for i, c in enumerate(children) if isinstance(c, Markdown)]
         assert positions == sorted(positions)
 
 
@@ -3130,7 +3161,9 @@ async def test_replay_renders_thinking_block_as_collapsible(tmp_path: Path) -> N
 
         # DOM order matches event order: reasoning precedes the answer text.
         children = list(view.children)
-        positions_col = [i for i, c in enumerate(children) if isinstance(c, Collapsible)]
+        positions_col = [
+            i for i, c in enumerate(children) if isinstance(c, Collapsible)
+        ]
         positions_md = [i for i, c in enumerate(children) if isinstance(c, Markdown)]
         assert len(positions_col) == 1 and len(positions_md) == 2, (
             f"unexpected child counts: col={positions_col}, md={positions_md}"
@@ -3142,7 +3175,7 @@ async def test_replay_renders_thinking_block_as_collapsible(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------
-# Layout: SessionList starts empty (no fake placeholder items on launch).
+# Shell: no permanent session list (transient /sessions picker only).
 # The list is populated by ``refresh_session_list`` once storage is wired;
 # showing hardcoded "session-1"/"session-2" rows before that read as real
 # sessions, which was the "weird layout" complaint.
@@ -3150,56 +3183,53 @@ async def test_replay_renders_thinking_block_as_collapsible(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_session_list_starts_empty_on_launch() -> None:
-    """SessionList has zero items on launch (no placeholder rows)."""
-    from textual.widgets import ListItem
+async def test_no_session_sidebar_pane_on_launch() -> None:
+    """The shell has no permanent session list pane (transient picker only).
 
-    from cothis.tui import CothisApp, SessionList
+    Session navigation is a ``/sessions`` modal, never a sidebar — so the
+    launch DOM contains zero ``ListView`` widgets and the transcript owns
+    the full viewport.
+    """
+    from textual.widgets import ListView
+
+    from cothis.tui import CothisApp
 
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        items = list(app.query_one(SessionList).query(ListItem))
-        assert items == [], (
-            f"SessionList should start empty; got {len(items)} placeholder(s)"
+        assert list(app.query(ListView)) == [], (
+            "no ListView pane should exist in the transcript shell"
         )
 
 
 # ---------------------------------------------------------------------
-# Layout: the SessionList sidebar auto-hides in single-session mode so
-# ConversationView takes the full width (the "weird layout" complaint —
-# a near-empty 24-col sidebar ate a quarter of the screen for one
-# session). Visible only when switching among sessions is possible.
+# Shell: no session sidebar at all — session navigation is a transient
+# ``/sessions`` picker, so the transcript always owns the full viewport.
 # ---------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_sidebar_hidden_on_launch_with_no_sessions() -> None:
-    """No sessions → the sidebar is hidden; ConversationView is full-width."""
-    from cothis.tui import ConversationView, CothisApp, SessionList
+async def test_transcript_full_width_on_launch_with_no_sessions() -> None:
+    """No sessions → the transcript spans the full viewport (no sidebar)."""
+    from cothis.tui import ConversationView, CothisApp
 
     app = CothisApp()
-    async with app.run_test() as pilot:
+    async with app.run_test(size=(100, 40)) as pilot:
         await pilot.pause()
-        session_list = app.query_one(SessionList)
-        assert session_list.display is False, (
-            f"empty sidebar should be hidden; got display={session_list.display!r}"
-        )
-        main = app.query_one("#main")
         conv = app.query_one(ConversationView)
-        assert conv.region.width == main.region.width, (
-            f"conversation should span the full width when the sidebar is "
-            f"hidden; got conv={conv.region.width} vs main={main.region.width}"
+        assert conv.region.width == app.size.width, (
+            f"transcript should span the full width; got {conv.region.width}"
         )
 
 
 @pytest.mark.asyncio
-async def test_sidebar_hidden_with_single_listed_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+async def test_single_listed_session_no_auto_picker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One session in the list → the sidebar stays hidden."""
+    """One session in the index → no modal is pushed; the picker is transient."""
     from cothis.session import Session
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp, SessionPickerModal
 
     db_path = tmp_path / "session.db"
     s = Session.new(db_path, cwd=tmp_path, model="m", flush_sync=True)
@@ -3213,19 +3243,26 @@ async def test_sidebar_hidden_with_single_listed_session(
         await pilot.pause()
         app.refresh_session_list(db_path)
         await pilot.pause()
-        assert app.query_one(SessionList).display is False, (
-            "single-session mode should hide the sidebar"
-        )
+        assert len(app._session_rows) == 1
+        # No modal auto-shown on refresh.
+        assert not isinstance(app.screen, SessionPickerModal)
+        # The picker is available on demand.
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionPickerModal)
 
 
 @pytest.mark.asyncio
-async def test_sidebar_shown_with_multiple_listed_sessions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+async def test_multiple_listed_sessions_picker_lists_both(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two+ sessions in the list → the sidebar appears for switching."""
+    """Two+ sessions in the index → the transient picker lists them all."""
+    from textual.widgets import ListView
+
     from cothis.session import Session
     from cothis.session.storage import SessionRow
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp, SessionPickerModal
 
     db_path = tmp_path / "session.db"
     cwd_a = tmp_path / "worktree-a"
@@ -3257,21 +3294,25 @@ async def test_sidebar_shown_with_multiple_listed_sessions(
         await pilot.pause()
         app.refresh_session_list(db_path)
         await pilot.pause()
-        assert app.query_one(SessionList).display is True, (
-            "multi-session mode should show the sidebar"
-        )
+        assert len(app._session_rows) == 2
+        app.action_sessions()
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, SessionPickerModal)
+        lv = modal.query_one("#session-picker-list", ListView)
+        assert len(lv.children) == 2
 
 
 @pytest.mark.asyncio
-async def test_sidebar_tracks_attached_session_count(
+async def test_footer_session_cell_tracks_attached_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Sidebar shows once 2 sessions attach; hides again when one detaches.
+    """The status dock's ``session:`` cell follows the attached-WS count.
 
-    Mirrors the footer's ``session:`` cell boundary — the sidebar is the
-    same "can I switch?" signal, so it follows the attached-WS count.
+    The shell has no sidebar; the "can I switch?" signal is the footer's
+    ``session:<short-id>`` cell, shown only when >1 session is attached.
     """
-    from cothis.tui import CothisApp, SessionList
+    from cothis.tui import CothisApp
 
     fake_a = _FakeWS([])
     fake_b = _FakeWS([])
@@ -3287,17 +3328,16 @@ async def test_sidebar_tracks_attached_session_count(
     app = CothisApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        session_list = app.query_one(SessionList)
-        assert session_list.display is False, "start hidden (no sessions)"
+        assert "session:" not in app._render_footer_str(), "no sessions → no cell"
         await app.attach_session_ws("sess-a", "ws://fake/agent-a", "tok")
         await pilot.pause()
-        assert session_list.display is False, "one session → still hidden"
+        assert "session:" not in app._render_footer_str(), "one session → no cell"
         await app.attach_session_ws("sess-b", "ws://fake/agent-b", "tok")
         await pilot.pause()
-        assert session_list.display is True, "two sessions → sidebar shows"
+        assert "session:sess-b" in app._render_footer_str(), "two sessions → cell"
         await app.detach_session_ws("sess-b")
         await pilot.pause()
-        assert session_list.display is False, "back to one → sidebar hides"
+        assert "session:" not in app._render_footer_str(), "back to one → no cell"
 
 
 # ---------------------------------------------------------------------
@@ -3385,7 +3425,8 @@ async def test_footer_shows_session_cell_when_multiple_sessions_attached(
 
 # ---------------------------------------------------------------------
 # Slash-command session switching (``/session <id>``) — the ``/``-prefixed
-# switch path that mirrors the left-pane SessionList click.
+# switch path (the transcript shell's only session-switch surface besides
+# the transient ``/sessions`` picker).
 # ---------------------------------------------------------------------
 
 
@@ -3477,7 +3518,8 @@ async def test_slash_session_resolves_unique_prefix(
 
 @pytest.mark.asyncio
 async def test_slash_session_ambiguous_prefix_is_noop(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An ambiguous prefix logs + leaves the active session unchanged."""
     import logging
@@ -3511,8 +3553,7 @@ async def test_slash_session_ambiguous_prefix_is_noop(
             "ambiguous prefix must not switch the active session"
         )
         assert any("matches 2" in r.getMessage() for r in caplog.records), (
-            "expected an ambiguity log; "
-            f"got {[r.getMessage() for r in caplog.records]}"
+            f"expected an ambiguity log; got {[r.getMessage() for r in caplog.records]}"
         )
 
         await app.detach_session_ws("abc111")
@@ -3522,7 +3563,8 @@ async def test_slash_session_ambiguous_prefix_is_noop(
 
 @pytest.mark.asyncio
 async def test_slash_session_unmatched_with_attached_is_noop(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An unmatched id WITH sessions attached does not phantom-switch.
 
@@ -3563,12 +3605,8 @@ async def test_slash_session_unmatched_with_attached_is_noop(
             "active session (no phantom switch)"
         )
         assert any(
-            "matches no attached session" in r.getMessage()
-            for r in caplog.records
-        ), (
-            "expected a no-match log; "
-            f"got {[r.getMessage() for r in caplog.records]}"
-        )
+            "matches no attached session" in r.getMessage() for r in caplog.records
+        ), f"expected a no-match log; got {[r.getMessage() for r in caplog.records]}"
 
         await app.detach_session_ws("abc111")
         await app.detach_session_ws("abc222")
@@ -3610,22 +3648,26 @@ async def test_unknown_slash_command_falls_through_to_prompt() -> None:
         await app.action_send_prompt()
         await pilot.pause()
         view = app.query_one(ConversationView)
+        from textual.widgets import Markdown
+
+        boxes = [w for w in view.query(Markdown) if "user-message" in w.classes]
         # Fell through: echoed as a normal user prompt, input cleared.
-        assert "/notacommand hello" in view.renderable_str
+        assert boxes and "/notacommand hello" in boxes[-1]._markdown
         assert bar.text == ""
 
 
 # ---------------------------------------------------------------------
 # View-swap on session switch (#230) — switching the active session
 # clears ConversationView + replays the target session's history so the
-# view matches the active session (both switch paths — SessionList click
+# view matches the active session (both switch paths — picker selection
 # + ``/session`` — route through ``on_active_session_changed``).
 # ---------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_session_switch_swaps_view_to_target_history(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Switching the active session clears the old view + replays the target.
 
@@ -3681,8 +3723,7 @@ async def test_session_switch_swaps_view_to_target_history(
             f"expected beta-msg after switching to {sid2[:8]}; got {sources!r}"
         )
         assert not any("alpha-msg" in s for s in sources), (
-            "previous session content must be cleared on switch; "
-            f"got {sources!r}"
+            f"previous session content must be cleared on switch; got {sources!r}"
         )
 
 
