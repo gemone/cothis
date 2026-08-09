@@ -359,6 +359,29 @@ class ConversationView(VerticalScroll):
                     )
                 # image / tool_result: deferred.
 
+    def clear(self) -> None:
+        """Unmount every rendered message + reset the streaming state.
+
+        Fired on a session change (``on_active_session_changed``): the
+        previous session's messages are wiped so the target session's
+        replayed history is the only thing on screen. Resets the
+        streaming accumulators (``_text_buf`` / ``_thinking_buf`` /
+        ``_stream_static`` / ``_finalized``) and the ``_cards_by_call_id``
+        index so a fresh live stream after the swap starts clean, and
+        stops the idle-finalise timer so a pending parse can't fire into
+        the now-empty view.
+        """
+        if self._finalize_timer is not None:
+            self._finalize_timer.stop()
+            self._finalize_timer = None
+        for child in list(self.children):
+            child.remove()
+        self._stream_static = None
+        self._text_buf = []
+        self._thinking_buf = []
+        self._cards_by_call_id = {}
+        self._finalized = False
+
     def _refresh_stream(self) -> None:
         """Mount/refresh the plain-text streaming widget, throttled.
 
@@ -871,6 +894,12 @@ class CothisApp(App):
     # interacting with. Future slices route ``send_run_turn`` to the active
     # session's WS + highlight the entry in ``SessionList``.
     _active_session_id: str | None = None
+    # Session DB last used to populate ``SessionList`` / replay history.
+    # Captured in ``refresh_session_list`` + ``attach_session_ws`` so
+    # ``on_active_session_changed`` can replay the target session's history
+    # on a switch. ``None`` for the base app / storage-less tests → the
+    # view swap is a no-op (single-session flow stays intact).
+    _db_path: Path | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1107,6 +1136,10 @@ class CothisApp(App):
         """
         from cothis.session.storage import Storage
 
+        # Remember the DB so a later session switch (SessionList click /
+        # ``/session``) can replay the target session's history without
+        # the caller re-passing the path.
+        self._db_path = db_path
         try:
             storage = Storage(db_path)
         except Exception as exc:  # noqa: BLE001 — best-effort UI populate
@@ -1215,23 +1248,42 @@ class CothisApp(App):
         it — AND mirror ``session_id`` into ``footer_session`` so the
         (now conditional) footer ``session:`` cell reflects the active
         session immediately after a switch, not only on the next worker
-        ``turn_finished`` frame. Subclasses can override for additional
-        effects (input focus routing etc.) but should call
-        ``super().on_active_session_changed()`` to preserve the highlight
-        + footer sync.
+        ``turn_finished`` frame. When a session DB is known
+        (``_db_path``), ALSO clear ``ConversationView`` + replay the
+        target session's stored history so the view matches the active
+        session after a switch — a no-op with no ``_db_path`` (base
+        app / storage-less tests) so the single-session flow stays
+        green. Subclasses can override for additional effects (input
+        focus routing etc.) but should call
+        ``super().on_active_session_changed()`` to preserve the
+        highlight + footer sync + view swap.
         """
         logger.info("tui: active session changed → %s", session_id)
         self.footer_session = session_id
         try:
             session_list = self.query_one(SessionList)
         except Exception:  # noqa: BLE001 — compose may not have run yet
+            session_list = None
+        if session_list is not None:
+            target_id = f"s_{session_id}"
+            for item in session_list.query(ListItem):
+                if item.id == target_id:
+                    item.add_class("active-session")
+                else:
+                    item.remove_class("active-session")
+        # Clear the previous session's messages + replay the target
+        # session's stored history so the view matches the active
+        # session after a switch. No-op when no session DB is known —
+        # the view keeps its content and the single-session /
+        # storage-less test paths stay green.
+        if self._db_path is None:
             return
-        target_id = f"s_{session_id}"
-        for item in session_list.query(ListItem):
-            if item.id == target_id:
-                item.add_class("active-session")
-            else:
-                item.remove_class("active-session")
+        try:
+            view = self.query_one(ConversationView)
+        except Exception:  # noqa: BLE001 — compose may not have run yet
+            return
+        view.clear()
+        self.replay_session_history(session_id, self._db_path)
 
     # -----------------------------------------------------------------
     # WS attach (#252 item 1) — caller supplies URI + bearer token
@@ -1343,6 +1395,10 @@ class CothisApp(App):
         )
         self._ws_by_session[session_id] = ws
         if db_path is not None:
+            # Remember the DB so a later switch to ANOTHER session can
+            # replay that target's history without the caller re-passing
+            # the path.
+            self._db_path = db_path
             self.replay_session_history(session_id, db_path)
         self._ws_pump_tasks_by_session[session_id] = asyncio.create_task(
             self._pump_ws_connection(ws)
