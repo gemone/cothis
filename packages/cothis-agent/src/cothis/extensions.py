@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -87,6 +88,15 @@ def _find_uv() -> str:
     return uv
 
 
+def _extensions_python_version() -> str:
+    """The Python major.minor the extensions venv should target.
+
+    The extensions venv is spawned by cothis, so it tracks the running
+    interpreter (``sys.version_info``) rather than a hardcoded pin.
+    """
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -129,7 +139,9 @@ class ExtensionManager:
         venv.parent.mkdir(parents=True, exist_ok=True)
 
         # 1. Ensure the shared venv exists (uv venv is idempotent).
-        self._run_uv(uv, ["venv", str(venv), "--python", "3.14"])
+        self._run_uv(
+            uv, ["venv", str(venv), "--python", _extensions_python_version()]
+        )
         # 2. Install all specs at once into the shared venv.
         self._run_uv(uv, ["pip", "install", *specs, "--python", str(venv)])
         # 3. Read back versions.
