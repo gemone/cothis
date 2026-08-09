@@ -2,9 +2,13 @@
 
 The durable layer under :class:`cothis.session.Session`. One
 ``sqlite3.Connection`` per ``Storage`` (therefore per ``Session``), opened
-with ``check_same_thread=False``; access is temporally partitioned (see
-``Session`` docstring — load runs on the main thread before the consumer
-starts; all writes are consumer-thread), so no mutex is needed.
+with ``check_same_thread=False``. Access is serialised by a
+:class:`threading.Lock` around every consumer-facing DML + ``close`` —
+the consumer thread writes while the caller thread may ``close``, and the
+two would otherwise race on the shared connection (the old "temporal
+partitioning, no mutex" contract broke the moment ``close`` stopped
+waiting for the consumer: closing a connection mid-``write_atomic`` is a
+use-after-close that segfaults, Windows CI #479).
 
 This module is **CRUD-only**. It owns:
 
@@ -36,6 +40,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import threading
 from pathlib import Path
 from typing import NamedTuple
 
@@ -328,12 +333,24 @@ class Storage:
 
     The connection is ``check_same_thread=False`` because the consumer
     thread writes while (during ``load`` only) the main thread may read.
-    The two never overlap in time: ``load`` completes before the consumer
-    starts; ``close`` joins the consumer before the connection is touched
-    again. Temporal partitioning, not a mutex.
+    Reads are temporally partitioned as before — ``load`` completes before
+    the consumer starts — but the write path and ``close`` are protected
+    by a :attr:`_lock`: ``close`` runs on the caller's thread while the
+    consumer may be mid-``write_atomic``, and without the lock closing the
+    connection under an in-flight write is a use-after-close (native crash
+    on Windows CI, #479). The lock is uncontended in the single-writer
+    steady state — it only matters at the close boundary.
     """
 
     def __init__(self, db_path: Path) -> None:
+        # Serialises the consumer's writes against a caller-thread ``close``.
+        # Uncontended in steady state (one writer at a time); only the
+        # close-vs-in-flight-write boundary ever contends.
+        self._lock = threading.Lock()
+        # Set by ``close`` so a consumer that survives the join (the
+        # ``Session.close`` timeout path) drops its residual write instead
+        # of executing on a closed connection.
+        self._closed = False
         self._conn = sqlite3.connect(
             db_path,
             check_same_thread=False,
@@ -426,6 +443,22 @@ class Storage:
         assistant-message invariant (Q2-A) depends on — N blocks share
         one txn, all-or-nothing.
         """
+        with self._lock:
+            if self._closed:
+                # ``close`` ran (caller thread) while this write was
+                # queued — the connection is gone, so drop the batch.
+                # This is the documented "loss ceiling" path in
+                # ``Session.close``, made crash-free.
+                return
+            self._write_atomic_locked(session_row, block_rows, updated_at)
+
+    def _write_atomic_locked(
+        self,
+        session_row: SessionRow | None,
+        block_rows: list[BlockRow],
+        updated_at: str,
+    ) -> None:
+        """The actual transaction body, run under ``self._lock``."""
         # session_id for the updated_at UPDATE: prefer the blocks (covers
         # the no-session-row case after first drain), fall back to the
         # freshly-inserted session_row (covers a hypothetical blocks-empty
@@ -522,13 +555,16 @@ class Storage:
         rewritten to the same value). The caller (Session) drives this
         from the consumer thread so the single-writer invariant holds.
         """
-        cur = self._conn.execute(
-            "UPDATE blocks SET state='archived' "
-            "WHERE session_id=? AND skill=?",
-            (session_id, skill),
-        )
-        self._conn.commit()
-        return cur.rowcount
+        with self._lock:
+            if self._closed:
+                return 0
+            cur = self._conn.execute(
+                "UPDATE blocks SET state='archived' "
+                "WHERE session_id=? AND skill=?",
+                (session_id, skill),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def load_blocks_through_seq(
         self, session_id: str, max_seq: int
@@ -655,8 +691,17 @@ class Storage:
             )
 
     def close(self) -> None:
-        """Close the connection. Idempotent — safe to call twice."""
-        if self._conn is not None:
+        """Close the connection. Idempotent — safe to call twice.
+
+        Runs under ``_lock`` so a consumer thread mid-``write_atomic``
+        finishes first; once ``_closed`` is set the consumer drops any
+        residual batch instead of touching the closed connection (the
+        ``Session.close`` timeout path — see :attr:`_closed`).
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
 
     def search(self, query: str, *, limit: int = 50) -> list[SearchHit]:

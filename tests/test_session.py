@@ -278,6 +278,42 @@ def test_storage_does_not_deadlock_under_threaded_contention(tmp_path: Path) -> 
     assert not any(t.is_alive() for t in threads), "a writer thread timed out"
 
 
+def test_close_without_waiting_for_consumer_drops_residual_without_crashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the #479 Windows crash: closing storage under a live consumer.
+
+    ``Session.close`` joins the consumer with a bounded timeout then closes
+    storage unconditionally — so when the consumer is slow (WAL fsync /
+    write-retry backoffs on a loaded CI runner), the connection is closed
+    while the consumer thread is still inside ``write_atomic``. On the old
+    code that was a use-after-close: a native access violation on Windows
+    (#479), SIGSEGV on Linux (reproduced). Now ``Storage`` serialises
+    writes against ``close`` behind a lock + ``_closed`` flag: ``close``
+    waits out the in-flight write, then the consumer drops any residual
+    batch instead of touching the closed connection.
+
+    Forces the timeout path deterministically: zero join timeouts + 1000
+    queued writes that the consumer cannot possibly drain in the instant
+    between ``join(0)`` and ``storage.close()``.
+    """
+    import cothis.session as session_mod
+
+    monkeypatch.setattr(session_mod, "_CLOSE_JOIN_TIMEOUT", 0.0)
+    monkeypatch.setattr(session_mod, "_CLOSE_GRACE_PERIOD", 0.0)
+
+    db_path = tmp_path / "session.db"
+    s = session_mod.Session.new(db_path, cwd=tmp_path, model="m")
+    for i in range(1000):
+        s.append_block("user", {"type": "text", "text": f"msg-{i}"})
+    s.close()  # join(0) → storage closed while the consumer is mid-drain
+
+    # No crash. The consumer exits after dropping the residual batches.
+    assert s._consumer is not None
+    s._consumer.join(timeout=10)
+    assert not s._consumer.is_alive(), "consumer should have exited"
+
+
 # ---------------------------------------------------------------------
 # 3. Crash recovery (drop trailing orphan tool_use)
 # ---------------------------------------------------------------------
