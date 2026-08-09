@@ -3009,3 +3009,66 @@ async def test_replay_multi_turn_history_preserves_dom_order(tmp_path: Path) -> 
             i for i, c in enumerate(children) if isinstance(c, Markdown)
         ]
         assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_replay_renders_thinking_block_as_collapsible(tmp_path: Path) -> None:
+    """A historical ``thinking`` block mounts the same Collapsible as live.
+
+    Regression guard: the replay path used to silently skip ``thinking``
+    blocks, so a reasoning block visible during the live turn vanished on
+    re-attach. Replay must now route ``thinking`` through the SAME
+    ``_mount_thinking_block`` primitive the live path uses — collapsed +
+    dimmed (``.thinking-block``), title ``reasoning`` — so the two
+    renderers agree.
+    """
+    from textual.widgets import Collapsible, Markdown
+
+    from cothis.session import Session
+    from cothis.tui import ConversationView, CothisApp
+
+    db = tmp_path / "sessions" / "session.db"
+    s = Session.new(db, cwd=tmp_path, model="m", flush_sync=True)
+    sid = s.session_id
+    s.append_message("user", [{"type": "text", "text": "explain it"}])
+    s.append_message(
+        "assistant",
+        [
+            {"type": "thinking", "thinking": "weighing the options", "signature": "s"},
+            {"type": "text", "text": "the answer is here."},
+        ],
+    )
+    s.close()
+
+    app = CothisApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.replay_session_history(sid, db)
+        await pilot.pause()
+        view = app.query_one(ConversationView)
+
+        collapsibles = list(view.query(Collapsible))
+        assert len(collapsibles) == 1, (
+            f"expected one replayed thinking Collapsible; got {len(collapsibles)}"
+        )
+        col = collapsibles[0]
+        assert str(col.title) == "reasoning"
+        assert col.has_class("thinking-block"), (
+            "replayed thinking Collapsible must carry the .thinking-block class"
+        )
+        md = col.query_one(Markdown)
+        assert "weighing the options" in md._markdown, (
+            f"reasoning not in replayed Collapsible; got {md._markdown!r}"
+        )
+
+        # DOM order matches event order: reasoning precedes the answer text.
+        children = list(view.children)
+        positions_col = [i for i, c in enumerate(children) if isinstance(c, Collapsible)]
+        positions_md = [i for i, c in enumerate(children) if isinstance(c, Markdown)]
+        assert len(positions_col) == 1 and len(positions_md) == 2, (
+            f"unexpected child counts: col={positions_col}, md={positions_md}"
+        )
+        assert positions_col[0] < max(positions_md), (
+            f"thinking Collapsible (idx {positions_col[0]}) must precede the "
+            f"assistant text Markdown (idx {max(positions_md)})"
+        )
