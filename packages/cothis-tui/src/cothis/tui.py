@@ -43,6 +43,7 @@ from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import (
     Button,
     Collapsible,
@@ -65,6 +66,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _TOOL_STATUS_ICONS = {"running": ">>", "done": "OK", "failed": "XX"}
+
+# pi's dark theme palette (packages/coding-agent/src/modes/interactive/theme/dark.json)
+# — the visual identity the transcript shell is built on: near-black page
+# (#18181e), slate user-message blocks (#343541), state-colored tool cards
+# (pending #282832 / success #283228 / error #3c2828), teal accent (#8abeb7),
+# warm markdown headings (#f0c674). Mapping the palette onto Textual's theme
+# slots keeps every ``$var`` in the CSS resolving to a pi colour.
+_PI_THEME = Theme(
+    name="pi-dark",
+    primary="#8abeb7",
+    secondary="#5f87ff",
+    accent="#8abeb7",
+    foreground="#d4d4d4",
+    background="#18181e",
+    surface="#1e1e24",
+    panel="#282832",
+    boost="#343541",
+    warning="#ffff00",
+    error="#cc6666",
+    success="#b5bd68",
+    dark=True,
+    variables={
+        "tool-success": "#283228",
+        "tool-error": "#3c2828",
+        "heading": "#f0c674",
+        "link": "#81a2be",
+        "dim": "#666666",
+    },
+)
 
 # Streaming-render throttle + finalisation (#407). Re-parsing Markdown on
 # every text delta is O(S²) in the segment size. While streaming, deltas
@@ -95,8 +125,16 @@ class ToolCallCard(Static):
     ToolCallCard {
         margin: 0 0 0 2;
         padding: 0 1;
-        background: $surface;
-        border-left: thick $accent;
+        background: $panel;
+        border-left: thick $secondary;
+    }
+    ToolCallCard.tool-success {
+        background: #283228;
+        border-left: thick #b5bd68;
+    }
+    ToolCallCard.tool-error {
+        background: #3c2828;
+        border-left: thick #cc6666;
     }
     """
 
@@ -113,6 +151,14 @@ class ToolCallCard(Static):
 
     def set_status(self, status: str) -> None:
         self._status = status
+        for cls in ("tool-pending", "tool-success", "tool-error"):
+            self.remove_class(cls)
+        if status == "done":
+            self.add_class("tool-success")
+        elif status == "failed":
+            self.add_class("tool-error")
+        else:
+            self.add_class("tool-pending")
         self.update(self._render_str())
 
     def _render_str(self) -> str:
@@ -137,18 +183,38 @@ class ConversationView(VerticalScroll):
         padding: 1 2;
         scrollbar-gutter: stable;
     }
-    ConversationView > Markdown.user-message {
-        background: $panel;
+    ConversationView > .user-message {
+        background: $boost;
         color: $text;
         padding: 1 2;
         margin: 0 0 1 0;
         border-left: thick $accent;
     }
+    ConversationView > .user-message > Markdown {
+        color: $text;
+    }
+    ConversationView MarkdownH1,
+    ConversationView MarkdownH2,
+    ConversationView MarkdownH3 {
+        color: #f0c674;
+    }
+    ConversationView MarkdownParagraph,
+    ConversationView MarkdownStream {
+        color: $text;
+    }
+    ConversationView MarkdownBlockQuote {
+        color: $text-muted;
+        border-left: thick $secondary;
+    }
+    ConversationView MarkdownFence {
+        background: $panel;
+        color: #b5bd68;
+    }
     ConversationView > Collapsible.thinking-block {
         margin: 0 0 0 2;
         padding: 0 1;
-        border-left: thick $primary-darken-2;
-        color: $text-disabled;
+        border-left: thick $secondary;
+        color: $text-muted;
     }
     """
 
@@ -383,23 +449,40 @@ class ConversationView(VerticalScroll):
         self._finalized = True
         self.mount(md)
         self._follow(at_bottom)
-        # The freshly-mounted Markdown's height settles a layout pass later;
-        # if the user was pinned, re-pin then so the segment end doesn't sit
-        # a couple of lines short on the next frame. ``immediate=True`` in
-        # ``_follow`` reads the pre-settle max_scroll_y, so a deferred
-        # re-pin is required to catch the settled height (#409 stream-pin
-        # robustness across runner speeds).
-        if at_bottom:
-            self.call_after_refresh(self._follow, True)
 
     def _at_bottom(self) -> bool:
         """True when the view is within a line of the bottom (#409)."""
         return self.scroll_y >= self.max_scroll_y - 1
 
     def _follow(self, was_at_bottom: bool) -> None:
-        """Re-pin to the bottom iff the user was already there."""
+        """Re-pin to the bottom iff the user was already there.
+
+        The immediate pin reads the max_scroll_y current at the moment the
+        content changed, which can sit a couple of lines short of the
+        settled height (mount/update layout lands a beat later on slower
+        runners). A deferred re-check re-pins then — but only if the user
+        has NOT scrolled since the pin, preserving the #409 no-yank
+        contract for someone who scrolled up to read earlier output.
+        """
         if was_at_bottom:
             self.scroll_end(animate=False, immediate=True)
+            self.call_after_refresh(self._recheck_follow, self.scroll_y)
+
+    def _recheck_follow(self, pinned_at: float, attempts: int = 0) -> None:
+        """Re-pin to the settled bottom after a layout pass, bounded.
+
+        ``pinned_at`` is the scroll position the immediate pin reached. If
+        the user scrolled up since then (scroll_y dropped below it), do not
+        yank them back (#409). Otherwise re-pin to the now-settled
+        max_scroll_y; if the height grew again mid-check, re-check once
+        more (bounded) rather than leaving the view a couple of lines
+        short on a loaded runner.
+        """
+        if self.scroll_y < pinned_at or attempts >= 3:
+            return
+        self.scroll_end(animate=False, immediate=True)
+        if self.scroll_y < self.max_scroll_y - 1:
+            self.call_after_refresh(self._recheck_follow, pinned_at, attempts + 1)
 
 
 # ---------------------------------------------------------------------

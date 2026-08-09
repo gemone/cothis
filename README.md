@@ -11,7 +11,7 @@ under `.agents/tools/` (see [Custom tools](#custom-tools)).
 > loop, translated to idiomatic Python and direct provider SDKs.
 
 - `cothis ask "..."` — one-shot prompt, plain-text output (pipe-friendly).
-- `cothis chat` — interactive multi-turn session in the Textual TUI (3-pane layout, worktree-aware sessions, `--legacy` for the old REPL).
+- `cothis chat` — interactive multi-turn session (rich REPL by default: `>>> ` prompt + streamed Markdown; `--tui` for the worker-based Textual shell).
 
 Requires Python ≥ 3.14.
 
@@ -126,15 +126,16 @@ Run `cothis --help`, `cothis ask --help`, or `cothis chat --help` for
 the full list of flags.
 
 
-### `tui` — alias for the default TUI path
+### `tui` — the worker-based Textual shell
 
 ```bash
 uv run cothis tui
 ```
 
-Same as `chat` — launches the Textual TUI with Supervisor-backed session
-spawn. Provided as a separate entrypoint for users who want the TUI
-without the `chat` name. Same `--model` / `--provider` flags.
+Launches the opt-in Textual shell with Supervisor-backed session spawn
+(the same experience as `chat --tui`). Provided as a separate entrypoint
+for users who want the widget shell without the `chat` name. Same
+`--model` / `--provider` flags.
 
 
 ### Session management — `history` / `delete` / `archive`
