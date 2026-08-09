@@ -38,8 +38,9 @@ _ANSI_OSC = re.compile(rb"\x1b\][^\x07]*\x07")
 def _spawn_tui_pty(cols: int = 90, rows: int = 24) -> tuple[subprocess.Popen, int]:
     """Spawn ``python -m cothis.tui`` on a fresh PTY; return (proc, master_fd).
 
-    The slave is sized via ``TIOCSWINSZ`` so Textual lays out the 3 panes
-    (input docked at the bottom) instead of falling back to a 0x0 PTY.
+    The slave is sized via ``TIOCSWINSZ`` so Textual lays out the 4 grid rows
+    (header / conversation / input / footer) instead of falling back to a
+    0x0 PTY.
     ``TERM=xterm-256color`` makes Textual pick its real terminal driver —
     the code path the bug lived in.
 
@@ -51,9 +52,9 @@ def _spawn_tui_pty(cols: int = 90, rows: int = 24) -> tuple[subprocess.Popen, in
     import pty
     import termios
 
-    openpty = getattr(pty, "openpty")
-    ioctl = getattr(fcntl, "ioctl")
-    tiocswinsz = getattr(termios, "TIOCSWINSZ")
+    openpty = getattr(pty, "openpty")  # noqa: B009 — deliberate: Windows ty-safe member access
+    ioctl = getattr(fcntl, "ioctl")  # noqa: B009 — deliberate: Windows ty-safe member access
+    tiocswinsz = getattr(termios, "TIOCSWINSZ")  # noqa: B009 — deliberate: Windows ty-safe member access
 
     master, slave = openpty()
     ioctl(slave, tiocswinsz, struct.pack("HHHH", rows, cols, 0, 0))

@@ -1,14 +1,17 @@
 """``cothis.tui`` — Textual TUI core (#228).
 
-Adaptive pane layout:
+Grid layout (four rows, no dock hacks — every widget is placed by the
+grid, ``Header { dock: none }`` overrides its default top-dock):
 
-- ``SessionList`` (left): sessions from the session table. Auto-hidden
-  in single-session mode (≤1 session listed or attached) so
-  ``ConversationView`` takes the full width — the sidebar only appears
-  when the user can actually switch among sessions.
-- ``ConversationView`` (center): scrollable Markdown + tool-call cards.
-- ``TextArea`` input (bottom, ``id="input"``): multiline input with Ctrl+Enter to send.
-- ``CothisFooter`` (very bottom, ``id="footer"``): one-line status bar —
+- row 1 ``Header`` (1 row): app title bar.
+- row 2 ``#main`` (``1fr``): ``SessionList`` (left) + ``ConversationView``
+  (center). The sidebar is auto-hidden in single-session mode (≤1 session
+  listed or attached) so ``ConversationView`` takes the full width — the
+  sidebar only appears when the user can actually switch among sessions.
+- row 3 ``TextArea`` input (``auto``): multiline input with Ctrl+Enter to
+  send. Auto-grows with content (``min-height: 3``) up to ``max-height: 8``,
+  then scrolls internally — a long prompt never squeezes the conversation.
+- row 4 ``CothisFooter`` (1 row): one-line status bar —
   model / session short-id / context pressure / active skills / run-state.
 
 Stream routing per the design-review sign-off (#228, 2026-07-24):
@@ -697,7 +700,6 @@ class CothisFooter(Static):
     DEFAULT_CSS = """
     CothisFooter#footer {
         height: 1;
-        dock: bottom;
         background: $boost;
         color: $text-disabled;
         padding: 0 1;
@@ -723,18 +725,22 @@ class CothisApp(App):
     TITLE = "cothis"
     CSS = """
     Screen {
-        layout: vertical;
+        layout: grid;
+        grid-size: 1 4;
+        grid-rows: 1 1fr auto 1;
+        grid-columns: 1fr;
     }
-    #main {
-        height: 1fr;
+    Header {
+        dock: none;
     }
     SessionList > ListItem.active-session {
         background: $boost;
         text-style: bold;
     }
     TextArea#input {
-        height: 3;
-        dock: bottom;
+        height: auto;
+        min-height: 3;
+        max-height: 8;
         border: round $secondary;
     }
     """
