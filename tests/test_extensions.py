@@ -25,6 +25,14 @@ def test_extract_name_git_url() -> None:
     assert _extract_name("https://github.com/x/cool-pkg.git") == "cool-pkg"
 
 
+def test_extensions_python_version_tracks_running_interpreter() -> None:
+    import sys
+
+    from cothis.extensions import _extensions_python_version
+
+    assert _extensions_python_version() == f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
 def test_install_into_shared_venv(tmp_path):
     from cothis.extensions import ExtensionManager
 
@@ -42,6 +50,29 @@ def test_install_into_shared_venv(tmp_path):
     assert exts[0].version == "13.7.0"
     manifest = json.loads((tmp_path / "extensions" / "extensions.json").read_text())
     assert len(manifest["extensions"]) == 2
+
+
+def test_install_venv_uses_running_interpreter_python(tmp_path):
+    from cothis.extensions import ExtensionManager
+
+    mgr = ExtensionManager(tmp_path)
+    # Patch the helper to a sentinel so the assertion is interpreter-
+    # independent: this proves the ``uv venv`` call wires the helper's
+    # value through (not a hardcoded pin) — a regression to a literal
+    # version would fail here even on an interpreter that matches it.
+    with patch(
+        "cothis.extensions._extensions_python_version", return_value="9.99"
+    ):
+        with patch("cothis.extensions.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="rich 13.7.0\n", stderr=""),
+            ]
+            mgr.install(["rich"])
+    venv_args = mock_run.call_args_list[0].args[0]
+    assert "--python" in venv_args
+    assert venv_args[venv_args.index("--python") + 1] == "9.99"
 
 
 def test_install_uv_missing(tmp_path):
