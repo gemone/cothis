@@ -510,7 +510,14 @@ async def test_auto_follow_does_not_yank_user_who_scrolled_up(
             view.append_delta("text", f"line {i}\n")
             await pilot.pause()
         view._finalize_segment()
-        await pilot.pause()
+        # The pin lands once the mounted Markdown's layout settles; CI
+        # runners vary in speed, so poll briefly instead of asserting on
+        # the first beat (a stale max_scroll_y makes the pin look 1 line
+        # short).
+        for _ in range(20):
+            await pilot.pause()
+            if view.scroll_y >= view.max_scroll_y - 1:
+                break
         assert view.scroll_y >= view.max_scroll_y - 1  # pinned
 
         # User scrolls UP to read earlier output.
