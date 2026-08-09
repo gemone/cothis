@@ -26,7 +26,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 # cothis: the Anthropic stream-event types (``RawMessageStartEvent`` etc.)
 # and ``TextDelta`` are imported lazily inside ``Agent.run_stream`` instead
@@ -478,6 +478,44 @@ def _tool_result_block(
     if is_error:
         block["is_error"] = True
     return block
+
+
+# Stable category tokens for the structured tool-error envelope. Every
+# tool-failure return site renders through ``_tool_error_message`` with one
+# of these so the model sees a machine-extractable ``[tool_error:<token>]``
+# category (instead of parsing scattered ad-hoc prose) and can pick a
+# recovery strategy — e.g. retry a ``timeout`` but not an ``unknown_tool``
+# or ``invalid_args`` call. The ``is_error`` wire flag and the
+# ``(is_error, output)`` contract are unchanged; the structure lives INSIDE
+# the output string, so notify-bus events and the ``is_error`` flag are
+# unaffected.
+ToolErrorCategory = Literal[
+    "unknown_tool",  # tool name not in the tool map
+    "invalid_args",  # pre_execute input-interception gate rejected the call
+    "timeout",       # per-tool wall-clock bound (``tool_timeout``) exceeded
+    "runtime",       # any other exception (body, handle acquire, base-exception)
+]
+
+
+def _tool_error_message(category: ToolErrorCategory, message: str) -> str:
+    """Wrap a tool-failure message in a stable, category-tagged envelope.
+
+    Returns ``"[tool_error:<category>] <message>"`` so every failure
+    rendered at the dispatch return sites (``_execute_tool`` and
+    ``_dispatch_tool_uses``) shares one consistent shape the model can
+    parse — a leading ``[tool_error:<token>]`` the model extracts to
+    branch its recovery — while the trailing prose stays human-readable.
+    ``message`` is the existing per-site prose (e.g.
+    ``"Error calling fs.read: ..."``), passed through verbatim so existing
+    substring diagnostics are preserved; only the leading category
+    envelope is added.
+
+    The Anthropic ``tool_result`` wire contract (an ``is_error`` boolean
+    plus a string ``content``) and the ``_execute_tool``
+    ``(is_error, output)`` return shape are unchanged — structure goes
+    INSIDE the output string.
+    """
+    return f"[tool_error:{category}] {message}"
 
 
 # Default cap (in characters) on the CONTENT of a single LIVE tool result —
@@ -2158,11 +2196,12 @@ class Agent(BaseModel):
         streamed ``ToolResultEvent`` durations reflect each tool's own
         wall-clock rather than the gather's total span.
 
-        ``_execute_tool`` already maps tool-body exceptions to
-        ``(True, "Error calling ...")``; ``return_exceptions=True`` plus
-        the inner ``except`` is belt-and-braces so one failing tool never
-        cancels its siblings — the gather always completes and every
-        result lands at its original index.
+        ``_execute_tool`` already maps tool-body exceptions to a
+        category-tagged ``(True, "[tool_error:runtime] Error calling ...")``;
+        ``return_exceptions=True`` plus the inner ``except`` is
+        belt-and-braces so one failing tool never cancels its siblings —
+        the gather always completes and every result lands at its original
+        index.
         """
         skill_lock = asyncio.Lock()
 
@@ -2205,7 +2244,9 @@ class Agent(BaseModel):
                 )
                 return (
                     True,
-                    f"Error calling {name}: {exc}",
+                    _tool_error_message(
+                        "runtime", f"Error calling {name}: {exc}"
+                    ),
                     skill,
                     int((time.monotonic() - started) * 1000),
                 )
@@ -2231,7 +2272,14 @@ class Agent(BaseModel):
                     self._tool_map.get(wire_name), "__name__", wire_name,
                 )
                 outcomes.append(
-                    (True, f"Error calling {name}: {item}", skill, 0)
+                    (
+                        True,
+                        _tool_error_message(
+                            "runtime", f"Error calling {name}: {item}"
+                        ),
+                        skill,
+                        0,
+                    )
                 )
         return outcomes
 
@@ -2259,9 +2307,10 @@ class Agent(BaseModel):
 
         When ``self.tool_timeout`` is set, the body (step 2 only) is wrapped in
         ``asyncio.timeout``; a timeout fires ``on_error`` (phase ``tool``) and
-        returns ``(True, "Error calling <name>: timed out after <s>s")`` — the
-        same failed-event shape as a raised exception, so hooks and the
-        notify-bus see a uniform failure. The timeout is per ``_execute_tool``
+        returns ``(True, "[tool_error:timeout] Error calling <name>: timed out
+        after <s>s")`` — the same category-tagged failed-event shape as a
+        raised exception, so hooks and the notify-bus see a uniform failure.
+        The timeout is per ``_execute_tool``
         coroutine, so a timed-out tool never cancels its siblings in a
         concurrent fan-out, and the dispatch semaphore is always released (the
         timeout is caught inside this method, so ``_execute_tool`` returns
@@ -2277,7 +2326,9 @@ class Agent(BaseModel):
         tool = self._tool_map.get(name)
         if tool is None:
             logger.debug("tool %s not in tool_map (unknown tool)", name)
-            return True, f"Error: unknown tool {name!r}."
+            return True, _tool_error_message(
+                "unknown_tool", f"Error: unknown tool {name!r}."
+            )
 
         # cothis: the model echoes the wire-sanitised name (``fs.read`` →
         # ``fs_read``); restore the original ``__name__`` so human-facing
@@ -2289,7 +2340,9 @@ class Agent(BaseModel):
         except Exception as exc:  # noqa: BLE001 — author hook code
             logger.debug("← %s pre_execute raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=pre_execute)", name)
-            return True, f"Error calling {name}: {exc}"
+            return True, _tool_error_message(
+                "invalid_args", f"Error calling {name}: {exc}"
+            )
 
         # Ensure the tool's ResourceHandle (if any) is acquired before the
         # body runs — self-healing path. No-op for tools without a
@@ -2299,7 +2352,9 @@ class Agent(BaseModel):
         except Exception as exc:  # noqa: BLE001 — acquire may fail (network, …)
             logger.debug("← %s handle acquire raised: %s", name, exc)
             run_hooks_safe(tool, "_run_on_error", exc, "handle", args)
-            return True, f"Error calling {name}: {exc}"
+            return True, _tool_error_message(
+                "runtime", f"Error calling {name}: {exc}"
+            )
 
         # Emit ``started`` after pre_execute + handle acquire succeed and
         # before the body runs. Single dispatch point covers every tool
@@ -2386,13 +2441,18 @@ class Agent(BaseModel):
             logger.debug("tool %r on_error fired (phase=tool)", name)
             run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
             _emit_terminal("failed", ok=False)
-            return True, f"Error calling {name}: timed out after {self.tool_timeout}s"
+            return True, _tool_error_message(
+                "timeout",
+                f"Error calling {name}: timed out after {self.tool_timeout}s",
+            )
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             logger.debug("← %s raised: %s", name, exc)
             logger.debug("tool %r on_error fired (phase=tool)", name)
             run_hooks_safe(tool, "_run_on_error", exc, "tool", args)
             _emit_terminal("failed", ok=False)
-            return True, f"Error calling {name}: {exc}"
+            return True, _tool_error_message(
+                "runtime", f"Error calling {name}: {exc}"
+            )
         finally:
             # End the in-flight window so the reaper can reclaim this
             # handle again; no-op for tools without a bound handle.

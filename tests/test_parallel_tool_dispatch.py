@@ -1095,7 +1095,7 @@ async def test_tool_timeout_fires_on_hanging_async_tool(
         agent._execute_tool({"name": "hang", "input": {}}), timeout=_GUARD
     )
     assert is_error is True
-    assert output == "Error calling hang: timed out after 0.05s"
+    assert output == "[tool_error:timeout] Error calling hang: timed out after 0.05s"
 
 
 @pytest.mark.asyncio
