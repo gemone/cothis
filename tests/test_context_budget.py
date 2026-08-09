@@ -253,6 +253,75 @@ def test_estimate_handles_block_list_content() -> None:
     assert estimate_input_tokens(messages) > 0
 
 
+def test_estimate_counts_string_system_prompt() -> None:
+    # The system prompt is a large fixed cost the provider bills on the
+    # first turn; the heuristic must count it, not just message bodies.
+    # Same messages, a string persona added → strictly larger estimate.
+    messages = [{"role": "user", "content": "hi"}]
+    without_system = estimate_input_tokens(messages)
+    with_system = estimate_input_tokens(messages, system="x" * 400)
+    assert with_system > without_system
+
+
+def test_estimate_counts_block_list_system_prompt() -> None:
+    # After assembly the agent holds the system prompt as a block list
+    # (each block ``{type, text, cache_control?}``). That shape is counted
+    # too — the persona text dominates; ``cache_control`` is negligible.
+    messages = [{"role": "user", "content": "hi"}]
+    blocks = [
+        {"type": "text", "text": "y" * 400, "cache_control": {"type": "ephemeral"}},
+    ]
+    assert estimate_input_tokens(messages, system=blocks) > estimate_input_tokens(messages)
+
+
+def test_estimate_counts_tool_schemas() -> None:
+    # Tool/schema definitions are the other large fixed cost. Passing the
+    # Anthropic-shaped ``{name, description, input_schema}`` list raises
+    # the estimate versus the messages-only baseline.
+    messages = [{"role": "user", "content": "hi"}]
+    tools = [
+        {
+            "name": "search",
+            "description": "Search the web.",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
+    assert estimate_input_tokens(messages, tools=tools) > estimate_input_tokens(messages)
+
+
+def test_estimate_system_and_tools_combined_is_monotonic() -> None:
+    # Larger system prompt + larger tool set → larger estimate (the core
+    # monotonicity contract holds across all three counted components).
+    messages = [{"role": "user", "content": "hi"}]
+    small = estimate_input_tokens(
+        messages, system="s" * 100, tools=[{"name": "a", "input_schema": {}}]
+    )
+    large = estimate_input_tokens(
+        messages,
+        system="s" * 400,
+        tools=[{"name": "a", "input_schema": {}}, {"name": "b", "input_schema": {}}],
+    )
+    assert large > small
+
+
+def test_estimate_empty_messages_with_system_is_nonzero() -> None:
+    # Pre-first-turn with no messages but a system prompt already loaded:
+    # the context is NOT empty — the heuristic reports the system cost
+    # rather than 0. This is the honest fix for the pre-first-turn signal.
+    assert estimate_input_tokens([], system="x" * 400) > 0
+
+
+def test_estimate_omitting_system_and_tools_counts_messages_only() -> None:
+    # Backwards compatibility for the compaction path: it estimates a
+    # *delta* over a retained message window and must exclude the
+    # (constant) system/tools overhead. Default kwargs → messages only,
+    # identical to a direct call with no system/tools.
+    messages = [{"role": "user", "content": "hello world"}]
+    assert estimate_input_tokens(messages) == estimate_input_tokens(
+        messages, system=None, tools=None
+    )
+
+
 # --- ContextBudget.is_known -------------------------------------------------
 
 
