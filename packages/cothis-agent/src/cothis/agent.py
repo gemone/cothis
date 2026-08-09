@@ -1236,18 +1236,31 @@ class Agent(BaseModel):
            ``usage.input_tokens`` (+ Anthropic cache fields). Exact, free,
            the provider's own count.
         2. **Heuristic fallback** (pre-first-turn / no usage yet): a
-           char/4 estimate over the ``{role, content}`` projection. Bounded
-           error (~±20%), zero-dependency, covers messages only.
+           char/4 estimate over the message bodies, the system prompt,
+           and the tool/schema definitions — every component the provider
+           bills on the first turn. Bounded error (~±20%), zero-dependency.
 
         O(messages) and cheap: one ``model_info`` lookup against the
         already-cached metadata, plus one backwards walk to the last
         assistant ``usage`` (or, in the fallback path, one forward walk
-        to estimate the projection).
+        to estimate the messages, system prompt, and tool schemas).
         """
         capacity = model_info(self.model, self.provider)["contextWindow"]
         used = _last_observed_input_tokens(self._messages)
         if used is None:
-            used = estimate_input_tokens(_request_messages(self._messages))
+            # Pre-first-turn: count the full input the provider will bill —
+            # message bodies, the system prompt, and the tool/schema
+            # definitions — so the heuristic signal is honest about the
+            # (large, fixed) system+tools overhead before any usage lands.
+            # ``self.system`` is read raw (not via ``_system_param``) to
+            # avoid the AGENTS.md file reads that path performs, keeping
+            # the budget build cheap; whatever shape it holds (str
+            # persona, pre-assembled block list, or None) is counted as-is.
+            used = estimate_input_tokens(
+                _request_messages(self._messages),
+                system=self.system,
+                tools=self._tool_schemas(),
+            )
         return build_context_budget(used=used, capacity=capacity)
 
     async def _maybe_compact(self) -> None:

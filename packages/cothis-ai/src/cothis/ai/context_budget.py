@@ -130,29 +130,66 @@ def total_input_tokens_from_usage(
     return base + (cache_create or 0) + (cache_read or 0)
 
 
-def estimate_input_tokens(messages: list[dict[str, Any]]) -> int:
-    """Heuristic char/4 token estimate over the ``{role, content}`` projection.
+def _system_char_count(system: str | list[dict[str, Any]] | None) -> int:
+    """Deterministic char count for the system prompt in the shape the
+    agent holds it. A ``str`` persona is counted as-is; a pre-built
+    block list (the shape after assembly — each block
+    ``{type, text, cache_control?}``) is serialised whole. The
+    ``cache_control`` directive is a few chars of control metadata,
+    negligible against the text bodies. ``None`` / empty → 0.
+    """
+    if not system:
+        return 0
+    if isinstance(system, str):
+        return len(system)
+    return len(json.dumps(system, ensure_ascii=False))
+
+
+def _tools_char_count(tools: list[dict[str, Any]] | None) -> int:
+    """Deterministic char count for the tool/schema definitions in the
+    Anthropic shape (``{name, description, input_schema}``) ``amessages``
+    sends. ``None`` / empty → 0.
+    """
+    if not tools:
+        return 0
+    return len(json.dumps(tools, ensure_ascii=False))
+
+
+def estimate_input_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    system: str | list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    """Heuristic char/4 token estimate over what the provider bills.
 
     Used only as a fallback when no observed ``usage`` is available
-    (pre-first-turn, or a response that lacked usage). Walks each
-    message's ``{role, content}`` projection, serialises it
-    deterministically, and divides the total character count by
-    :data:`_CHARS_PER_TOKEN`.
+    (pre-first-turn, or a response that lacked usage). Counts every
+    component the provider bills against the input cap on the first
+    turn — the message bodies, the system prompt, and the tool/schema
+    definitions — so the pre-first-turn signal is honest instead of
+    understating pressure by a large constant (the system prompt +
+    tool schemas are a non-trivial fixed cost for an agent).
+
+    Walks each message's ``{role, content}`` projection plus the system
+    prompt and tool schemas, serialising each deterministically, and
+    divides the total character count by :data:`_CHARS_PER_TOKEN`.
 
     Properties: zero-dependency, deterministic, monotonic in input size,
-    bounded to roughly ±20% error versus a real BPE tokeniser. Covers
-    messages only — the system prompt + tool schemas are not counted.
-    That's acceptable because the fallback exists for the
-    empty-or-near-empty case where system/tools overhead is a small
-    constant; the observed-usage path takes over from the first real
-    turn and counts everything the provider counted.
+    bounded to roughly ±20% error versus a real BPE tokeniser.
+
+    ``system`` and ``tools`` default to ``None``. The context-budget
+    build path passes the agent's current system prompt and tool schemas
+    so the pre-first-turn estimate reflects the full input. The
+    compaction path calls with messages only: it estimates a *delta*
+    over a retained message window, and the (constant) system/tools
+    overhead cancels out of that decision, so excluding them keeps the
+    eviction math honest.
 
     Not on any hot path: only called when ``_last_observed_input_tokens``
     returns ``None``.
     """
-    if not messages:
-        return 0
-    total_chars = 0
+    total_chars = _system_char_count(system) + _tools_char_count(tools)
     for m in messages:
         # Serialise only {role, content} — the stored assistant dicts
         # carry extra metadata (id/model/stop_reason/usage) that the
