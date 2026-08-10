@@ -167,3 +167,99 @@ async def test_turn_error_renders_into_transcript_and_recovers() -> None:
     assert "Missing credentials" in raw, (
         "the provider error must render into the transcript"
     )
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_idle_exits_and_running_interrupts_then_exits() -> None:
+    """Ctrl-C: interrupt a running turn, exit when idle (or on the second press).
+
+    The previous behavior made idle Ctrl-C a no-op — the app could not be
+    quit with Ctrl-C ("C-c C-c 退不出来").
+    """
+    import asyncio
+
+    import pytest
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from cothis.streaming_tui import StreamingChatApp
+
+    # Idle: first Ctrl-C exits.
+    with create_pipe_input() as pip:
+        pip.send_text("\x03")
+        with create_app_session(output=DummyOutput(), input=pip):
+            app = StreamingChatApp(run_turn=lambda p: None)
+            await asyncio.wait_for(app.run(), timeout=5)
+
+    # Running turn: first Ctrl-C interrupts, second (idle now) exits.
+    async def slow_turn(prompt: str) -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(30)
+
+    with create_pipe_input() as pip:
+        with create_app_session(output=DummyOutput(), input=pip):
+            app = StreamingChatApp(run_turn=slow_turn)
+            pip.send_text("hello\n")
+            await asyncio.sleep(0.3)
+            pip.send_text("\x03")  # interrupt
+            await asyncio.sleep(0.5)
+            pip.send_text("\x03")  # exit (interrupted/idle now)
+            await asyncio.wait_for(app.run(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_cothis_warnings_route_into_transcript() -> None:
+    """A ``cothis`` logger WARNING lands in the transcript, not on stderr.
+
+    Skills-discovery / MCP-handshake warnings used to print into the
+    full-screen layout and corrupt it; run_streaming_chat now installs a
+    handler that renders them as muted transcript lines.
+    """
+    import asyncio
+    import logging
+
+    import pytest
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from cothis.streaming_tui import run_streaming_chat
+
+    class _CapturingOutput(DummyOutput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.buf: list[str] = []
+
+        def write_raw(self, data: str) -> None:
+            self.buf.append(data)
+
+        def write(self, data: str) -> None:
+            self.buf.append(data)
+
+    class _WarningAgent:
+        async def run_stream(self, prompt: str):
+            logging.getLogger("cothis").warning("warn-in-transcript")
+            return  # turn ends immediately, no events
+            yield  # pragma: no cover
+
+        async def aclose(self) -> None:
+            pass
+
+    out = _CapturingOutput()
+    with create_pipe_input() as pip:
+        pip.send_text("hello\n")
+        with create_app_session(output=out, input=pip):
+            async def _drive() -> None:
+                await asyncio.sleep(0.5)  # let the turn's warning render
+                pip.send_text("/exit\n")
+
+            runner = asyncio.create_task(_drive())
+            await asyncio.wait_for(run_streaming_chat(_WarningAgent()), timeout=10)
+            await runner
+
+    raw = "".join(out.buf)
+    assert "warn-in-transcript" in raw, (
+        "the cothis warning must be rendered into the transcript "
+        "(not silently dropped or dumped on stderr)"
+    )
