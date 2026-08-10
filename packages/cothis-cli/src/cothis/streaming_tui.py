@@ -62,16 +62,20 @@ _RICH_CONSOLE = Console()
 
 
 def _rich_to_pt(renderable: Any, width: int) -> list[list[tuple[str, str]]]:
-    """Render a rich renderable to per-line ``(text, style)`` fragments.
+    """Render a rich renderable to per-line ``(style, text)`` fragments.
 
-    The Window only ever requests the visible slice of these lines
-    (virtual rendering); the conversion itself is the only O(content)
-    cost, and it is throttled for the streaming block.
+    prompt_toolkit formatted-text fragments are ``(style, text)`` tuples —
+    the reverse of rich's Segment order. Swapping here means the Window
+    paints the text with its style instead of parsing the text as a style
+    string (which crashes on the ``❯`` prompt char). The Window only ever
+    requests the visible slice of these lines (virtual rendering); the
+    conversion itself is the only O(content) cost, and it is throttled for
+    the streaming block.
     """
     options = _RICH_CONSOLE.options.update(width=width)
     seg_lines = _RICH_CONSOLE.render_lines(renderable, options)
     return [
-        [(seg.text, str(seg.style) if seg.style else "") for seg in line]
+        [(str(seg.style) if seg.style else "", seg.text) for seg in line]
         for line in seg_lines
     ]
 
@@ -93,7 +97,9 @@ _SLASH_COMMANDS = {
 class SlashCompleter(Completer):
     """Complete ``/<command>`` while the input starts with ``/``."""
 
-    def get_completions(self, document: Document, complete_event: Any) -> list[Completion]:
+    def get_completions(
+        self, document: Document, complete_event: Any
+    ) -> list[Completion]:
         text = document.text_before_cursor
         if not text.startswith("/"):
             return []
@@ -103,8 +109,10 @@ class SlashCompleter(Completer):
             if name.startswith(prefix):
                 out.append(
                     Completion(
-                        f"/{name}", start_position=-len(text),
-                        display=f"/{name}", display_meta=desc,
+                        f"/{name}",
+                        start_position=-len(text),
+                        display=f"/{name}",
+                        display_meta=desc,
                     )
                 )
         return out
@@ -136,7 +144,7 @@ class ConversationControl(UIControl):
         self._lines.append(fragments)
 
     def append_text(self, text: str, style: str = "") -> None:
-        self.append_fragments([(text, style)])
+        self.append_fragments([(style, text)])
 
     def begin_stream(self) -> None:
         """Open a streaming block at the current end of the transcript."""
@@ -146,7 +154,7 @@ class ConversationControl(UIControl):
         """Replace the streaming block with re-rendered fragments."""
         if self._stream_start is None:
             self.begin_stream()
-        del self._lines[self._stream_start:]
+        del self._lines[self._stream_start :]
         self._lines.extend(fragments)
 
     def end_stream(self) -> None:
@@ -217,11 +225,13 @@ class StreamingChatApp:
             key_bindings=kb,
             mouse_support=True,
             full_screen=True,
-            style=Style([
-                ("input", "ansiteal"),
-                ("prompt", "ansiteal bold"),
-                ("muted", "ansibrightblack"),
-            ]),
+            style=Style(
+                [
+                    ("input", "ansiteal"),
+                    ("prompt", "ansiteal bold"),
+                    ("muted", "ansibrightblack"),
+                ]
+            ),
         )
 
     def _bind_keys(self, kb: KeyBindings) -> None:
@@ -237,9 +247,7 @@ class StreamingChatApp:
             page = max(1, (info.window_height - 2) if info else 10)
             current = self._window.vertical_scroll or 0
             target = current + direction * page
-            max_scroll = (
-                max(0, info.content_height - info.window_height) if info else 0
-            )
+            max_scroll = max(0, info.content_height - info.window_height) if info else 0
             target = max(0, min(target, max_scroll + 1))
             self._window.vertical_scroll = target
             self._following = bool(
@@ -277,12 +285,16 @@ class StreamingChatApp:
         elif cmd == "clear":
             self.control.clear()
         else:
-            self.append_text(f"unknown command: /{cmd} (try /help)", style="class:muted")
+            self.append_text(
+                f"unknown command: /{cmd} (try /help)", style="class:muted"
+            )
         self._app.invalidate()
 
     def _start_turn(self, prompt: str) -> None:
         if self._in_turn:
-            self.append_text("[busy — wait for the turn to finish]", style="class:muted")
+            self.append_text(
+                "[busy — wait for the turn to finish]", style="class:muted"
+            )
             self._app.invalidate()
             return
         self._in_turn = True
@@ -367,9 +379,7 @@ async def run_streaming_chat(agent: Any) -> None:
                         "calling "
                         + event.name
                         + "("
-                        + ", ".join(
-                            f"{k}={v!r}" for k, v in event.arguments.items()
-                        )
+                        + ", ".join(f"{k}={v!r}" for k, v in event.arguments.items())
                         + ")",
                         style="class:muted",
                     )
