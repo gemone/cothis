@@ -12,6 +12,8 @@ Covers the three contracts the module exists for:
 
 from __future__ import annotations
 
+import pytest
+
 
 def _line(text: str) -> list[tuple[str, str]]:
     # prompt_toolkit fragments are (style, text) tuples.
@@ -105,3 +107,63 @@ def test_fragments_are_style_text_tuples() -> None:
     for frag in md_lines[0]:
         assert isinstance(frag, tuple) and len(frag) == 2
         assert not frag[1].startswith("class")  # text is the second element
+
+
+@pytest.mark.asyncio
+async def test_turn_error_renders_into_transcript_and_recovers() -> None:
+    """A failing turn (e.g. missing credentials) renders into the transcript
+    and resets the turn state instead of escaping into the event loop.
+
+    Before the ``except Exception`` guard, a provider error (credentials,
+    network) propagated out of the background turn task and froze the app
+    with ``Unhandled exception in event loop``.
+    """
+    import asyncio
+
+    import pytest
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from cothis.streaming_tui import run_streaming_chat
+
+    class _CapturingOutput(DummyOutput):
+        """DummyOutput that retains what was written (for assertions)."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.buf: list[str] = []
+
+        def write_raw(self, data: str) -> None:
+            self.buf.append(data)
+
+        def write(self, data: str) -> None:
+            self.buf.append(data)
+
+    class _FailingAgent:
+        async def run_stream(self, prompt: str):
+            raise ValueError("Missing credentials")
+            yield  # pragma: no cover
+
+        async def aclose(self) -> None:
+            pass
+
+    out = _CapturingOutput()
+    with create_pipe_input() as pip:
+        # A prompt first (triggers the failing turn) — wait for the error to
+        # render — then /exit (which would otherwise cancel the in-flight turn).
+        pip.send_text("hello\n")
+        with create_app_session(output=out, input=pip):
+            async def _run() -> None:
+                await asyncio.sleep(0.6)  # let the turn task fail + render
+                pip.send_text("/exit\n")
+                await asyncio.sleep(0.1)
+
+            runner = asyncio.create_task(_run())
+            await asyncio.wait_for(run_streaming_chat(_FailingAgent()), timeout=10)
+            await runner
+
+    raw = "".join(out.buf)
+    assert "Missing credentials" in raw, (
+        "the provider error must render into the transcript"
+    )
