@@ -9,6 +9,7 @@ factory that resolves a provider key to a concrete instance.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 if TYPE_CHECKING:
@@ -35,6 +36,19 @@ _OPENAI_COMPAT: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/v1",
     "groq": "https://api.groq.com/openai/v1",
     "mistral": "https://api.mistral.ai/v1",
+}
+
+# Canonical API-key env var per provider, used when the caller passes no
+# explicit ``api_key``. The OpenAI SDK's default is ``OPENAI_API_KEY``, which
+# is wrong for the OpenAI-compatible providers and OpenRouter — a user with
+# ``OPENROUTER_API_KEY`` set (the natural key) got ``Missing credentials``
+# because the SDK only auto-reads ``OPENAI_API_KEY``.
+_API_KEY_ENV_BY_PROVIDER: dict[str, str] = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "openai": "OPENAI_API_KEY",
 }
 
 
@@ -103,7 +117,10 @@ def get_provider(
     if p == "openrouter":
         from cothis.ai.openrouter import OpenRouterProvider
 
-        return OpenRouterProvider(api_key=api_key, api_base=api_base)
+        return OpenRouterProvider(
+            api_key=api_key or os.environ.get("OPENROUTER_API_KEY"),
+            api_base=api_base,
+        )
     if p in _OPENAI_COMPAT:
         # OpenAI-compatible providers (DeepSeek, Groq, Mistral) route
         # through the OpenAI SDK with a pinned base URL unless the caller
@@ -111,7 +128,7 @@ def get_provider(
         from cothis.ai.openai import OpenAIProvider
 
         return OpenAIProvider(
-            api_key=api_key,
+            api_key=api_key or os.environ.get(_API_KEY_ENV_BY_PROVIDER[p]),
             api_base=api_base or _OPENAI_COMPAT[p],
         )
     if p == "google":

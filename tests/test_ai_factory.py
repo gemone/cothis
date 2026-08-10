@@ -159,3 +159,27 @@ def test_module_reexports_canonical_types() -> None:
         "StopReason",
     ):
         assert hasattr(ai, name), f"missing re-export: {name}"
+
+
+def test_provider_specific_env_key_is_read_when_no_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``get_provider`` maps the provider's canonical env var when no key is passed.
+
+    The OpenAI SDK only auto-reads ``OPENAI_API_KEY``; a user with
+    ``OPENROUTER_API_KEY`` set (the natural key) previously got ``Missing
+    credentials`` because the SDK ignored it.
+    """
+    from cothis.ai import get_provider
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    provider = get_provider("openrouter")
+    assert provider._api_key == "or-key"
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "mi-key")
+    provider = get_provider("mistral")
+    assert provider._api_key == "mi-key"
+
+    # Explicit key still wins over the env.
+    provider = get_provider("openrouter", api_key="explicit")
+    assert provider._api_key == "explicit"
