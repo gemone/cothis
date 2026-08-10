@@ -398,6 +398,14 @@ async def run_streaming_chat(agent: Any) -> None:
         except asyncio.CancelledError:
             app.stream_end()
             app.append_text("[interrupted]", style="class:muted")
+        except Exception as exc:  # noqa: BLE001 — provider/config errors
+            # Credentials, network, provider-config: render the error into
+            # the transcript and return to the prompt instead of letting it
+            # escape into the event loop ("Unhandled exception in event
+            # loop" freezes the app). The user sees the message, fixes the
+            # env, and retries — or /exit.
+            app.stream_end()
+            app.append_text(f"[red]Error:[/red] {exc}")
         finally:
             if accumulated:
                 app.stream_end()
