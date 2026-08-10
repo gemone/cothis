@@ -14,7 +14,8 @@ from __future__ import annotations
 
 
 def _line(text: str) -> list[tuple[str, str]]:
-    return [(text, "")]
+    # prompt_toolkit fragments are (style, text) tuples.
+    return [("", text)]
 
 
 def test_virtual_control_serves_lines_lazily() -> None:
@@ -46,7 +47,7 @@ def test_stream_block_replaces_only_live_lines() -> None:
     from cothis.streaming_tui import ConversationControl
 
     ctl = ConversationControl()
-    ctl.append_text("user: hi")          # finalized history
+    ctl.append_text("user: hi")  # finalized history
     ctl.begin_stream()
     ctl.update_stream([_line("the "), _line("answer")])
     assert ctl.line_count == 3
@@ -81,3 +82,26 @@ def test_slash_completer_suggests_commands_only_for_slash_input() -> None:
     assert "/help" in names("/")
     assert names("hello") == []
     assert names("/nonexistent") == []
+
+
+def test_fragments_are_style_text_tuples() -> None:
+    """The control emits ``(style, text)`` tuples — prompt_toolkit's contract.
+
+    A swapped ``(text, style)`` order makes the renderer parse the prompt
+    text as a style string, crashing with ``Wrong color format '❯'``
+    (the ``❯`` prompt char). Regression guard for that crash.
+    """
+    from cothis.streaming_tui import ConversationControl
+
+    ctl = ConversationControl()
+    ctl.append_text("\u276f hi", style="class:prompt")
+    line = ctl.create_content(width=80, height=24).get_line(0)
+    assert line == [("class:prompt", "\u276f hi")]
+
+    # rich-rendered markdown also comes out as (style, text).
+    from cothis.streaming_tui import _markdown_lines
+
+    md_lines = _markdown_lines("**bold**", width=40)
+    for frag in md_lines[0]:
+        assert isinstance(frag, tuple) and len(frag) == 2
+        assert not frag[1].startswith("class")  # text is the second element
