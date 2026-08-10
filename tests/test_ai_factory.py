@@ -171,15 +171,19 @@ def test_provider_specific_env_key_is_read_when_no_api_key(
     credentials`` because the SDK ignored it.
     """
     from cothis.ai import get_provider
+    from cothis.ai.openai import OpenAIProvider
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
     provider = get_provider("openrouter")
+    assert isinstance(provider, OpenAIProvider)
     assert provider._api_key == "or-key"
 
     monkeypatch.setenv("MISTRAL_API_KEY", "mi-key")
     provider = get_provider("mistral")
+    assert isinstance(provider, OpenAIProvider)
     assert provider._api_key == "mi-key"
 
     # Explicit key still wins over the env.
     provider = get_provider("openrouter", api_key="explicit")
+    assert isinstance(provider, OpenAIProvider)
     assert provider._api_key == "explicit"
