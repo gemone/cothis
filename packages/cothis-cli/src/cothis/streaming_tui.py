@@ -197,6 +197,10 @@ class StreamingChatApp:
         self._following = True
         self._turn_task: asyncio.Task[Any] | None = None
         self._in_turn = False
+        # Set when the running turn was Ctrl-C'd; a second Ctrl-C then
+        # exits even before the cancelled task settles (task.done() lags
+        # the cancellation by a loop iteration). Reset on the next turn.
+        self._interrupted = False
 
         self._input = TextArea(
             multiline=False,
@@ -258,11 +262,24 @@ class StreamingChatApp:
         return handler
 
     def _on_ctrl_c(self, event: Any) -> None:
-        if self._turn_task is not None and not self._turn_task.done():
+        if (
+            self._turn_task is not None
+            and not self._turn_task.done()
+            and not self._interrupted
+        ):
+            # First press: interrupt the running turn. A second press
+            # (``_interrupted`` set, or the task already settled) exits.
             self._turn_task.cancel()
-            self.append_text("[interrupted]", style="class:muted")
+            self._interrupted = True
+            self.append_text(
+                "[interrupted — press Ctrl-C again to exit]",
+                style="class:muted",
+            )
             self._following = True
             self._app.invalidate()
+            return
+        # Idle, already interrupted, or the turn task settled: Ctrl-C exits.
+        self._app.exit()
 
     def _on_accept(self, buffer: Any) -> bool:
         text = (buffer.text or "").strip()
@@ -298,6 +315,7 @@ class StreamingChatApp:
             self._app.invalidate()
             return
         self._in_turn = True
+        self._interrupted = False
         self.append_text("❯ " + prompt, style="class:prompt")
         self.control.begin_stream()
         self._turn_task = self._app.create_background_task(self._run_turn(prompt))
@@ -414,7 +432,25 @@ async def run_streaming_chat(agent: Any) -> None:
 
     app = StreamingChatApp(run_turn=run_turn)
     app_ref["app"] = app
+    # Route ``cothis`` WARNING+ diagnostics (skills discovery, MCP
+    # handshake) into the transcript as muted lines instead of letting
+    # them print to stderr and corrupt the full-screen layout.
+    import logging
+
+    class _TranscriptLogHandler(logging.Handler):
+        def __init__(self, target_app: StreamingChatApp) -> None:
+            super().__init__()
+            self._target = target_app
+
+        def emit(self, record: logging.LogRecord) -> None:
+            # Logging must never crash the chat loop.
+            with suppress(Exception):
+                self._target.append_text(record.getMessage(), style="class:muted")
+
+    log_handler = _TranscriptLogHandler(app)
+    logging.getLogger("cothis").addHandler(log_handler)
     try:
         await app.run()
     finally:
+        logging.getLogger("cothis").removeHandler(log_handler)
         await agent.aclose()
