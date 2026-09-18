@@ -5,7 +5,7 @@ description = "cothis protocol - WebSocket transport seam + ACP-ready message/ev
 requires-python = ">=3.14"
 license = "Apache-2.0"
 dependencies = [
-    "anyio>=4.0",
+    "anyio>=4.14.2",
     "pydantic>=2.13.4",
     "websockets>=13.0",
 ]

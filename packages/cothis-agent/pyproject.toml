@@ -5,7 +5,7 @@ description = "cothis agent loop, tools, skills, worker, supervisor (cothis.agen
 requires-python = ">=3.14"
 license = "Apache-2.0"
 dependencies = [
-    "anyio>=4.0",
+    "anyio>=4.14.2",
     "cothis-ai",
     "cothis-protocol",
     "cothis-storage",
